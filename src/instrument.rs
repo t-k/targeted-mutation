@@ -478,6 +478,16 @@ impl Finder<'_> {
         });
     }
 
+    /// The value of a `const` or `static`. The compiler computes it: like the code of a
+    /// `const fn`, it is mutated by building.
+    fn constant(&mut self, attrs: &[syn::Attribute], value: &syn::Expr) {
+        if !is_test_only(attrs) && !is_skipped(attrs) {
+            self.const_depth += 1;
+            self.visit_expr(value);
+            self.const_depth -= 1;
+        }
+    }
+
     /// Registers a site: numbered, or among those that need a build of their own.
     fn add(&mut self, mut site: Site) {
         if self.const_depth > 0 {
@@ -1036,37 +1046,18 @@ impl<'ast> Visit<'ast> for Finder<'_> {
     fn visit_generics(&mut self, _: &'ast syn::Generics) {}
     fn visit_generic_argument(&mut self, _: &'ast syn::GenericArgument) {}
     fn visit_variant(&mut self, _: &'ast syn::Variant) {}
-    // The value of a constant is computed by the compiler: like the code of a
-    // `const fn`, it is mutated by building.
     fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
-        if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) {
-            self.const_depth += 1;
-            self.visit_expr(&node.expr);
-            self.const_depth -= 1;
-        }
+        self.constant(&node.attrs, &node.expr);
     }
     fn visit_item_static(&mut self, node: &'ast syn::ItemStatic) {
-        if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) {
-            self.const_depth += 1;
-            self.visit_expr(&node.expr);
-            self.const_depth -= 1;
-        }
+        self.constant(&node.attrs, &node.expr);
     }
     fn visit_impl_item_const(&mut self, node: &'ast syn::ImplItemConst) {
-        if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) {
-            self.const_depth += 1;
-            self.visit_expr(&node.expr);
-            self.const_depth -= 1;
-        }
+        self.constant(&node.attrs, &node.expr);
     }
     fn visit_trait_item_const(&mut self, node: &'ast syn::TraitItemConst) {
-        if let Some((_, value)) = &node.default
-            && !is_test_only(&node.attrs)
-            && !is_skipped(&node.attrs)
-        {
-            self.const_depth += 1;
-            self.visit_expr(value);
-            self.const_depth -= 1;
+        if let Some((_, value)) = &node.default {
+            self.constant(&node.attrs, value);
         }
     }
     fn visit_expr_const(&mut self, _: &'ast syn::ExprConst) {}
@@ -3520,6 +3511,10 @@ mod tests {
                    const ONLY_IN_TESTS: u8 = 5 + 6;\n\
                    #[mutants::skip]\n\
                    const MARKED: u8 = 7 + 8;\n\
+                   #[cfg(test)]\n\
+                   static TEST_LIMIT: u8 = 9 + 1;\n\
+                   impl S { #[mutants::skip] const SKIPPED: u8 = 9 + 2; }\n\
+                   trait U { #[cfg(test)] const ONLY: u8 = 9 + 3; }\n\
                    fn f(x: u32) -> u32 { let _ = [0u8; 2 + 3]; x + 60 * 60 }\n\
                    fn one(s: &mut S) { s.go(); }\n\
                    fn two(s: &mut S) { s.go(); s.stop(); }\n\

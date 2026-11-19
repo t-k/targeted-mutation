@@ -1621,6 +1621,15 @@ mod tests {
             render_text(&slow, false)
         );
         assert!(!render_text(&one, false).contains("time limit"));
+        let once = Report {
+            mutants_timed_out: 1,
+            ..slow.clone()
+        };
+        assert!(
+            render_text(&once, false).contains("(4 killed, 1 of them by the time limit)"),
+            "{}",
+            render_text(&once, false)
+        );
         assert!(
             render_text(&one, false).contains(", 1 findings suppressed"),
             "{}",
