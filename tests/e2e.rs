@@ -250,6 +250,13 @@ fn awkward_constructs() {
         ["parses_numbers"]
     );
 
+    // Known limit: `max_of` returns the same value for `a >= b` and `a > b` when the two
+    // are equal, so this mutant is equivalent, and it is reported all the same.
+    assert_eq!(
+        strings(&at("a >= b", "assertion_gap")["survivors"]),
+        ["`a > b`"]
+    );
+
     let codes: Vec<&str> = all.iter().map(|f| f["code"].as_str().unwrap()).collect();
     // `x >= 0` on an unsigned value cannot be false: an equivalent mutant, not a gap.
     assert!(!codes.contains(&"x >= 0"), "{report:#}");
@@ -549,7 +556,13 @@ fn doc_tests_are_used_on_request() {
 fn files_ignored_by_git_stay_out_of_the_working_copy() {
     let dir = fixture("eligibility", "git-ignored");
     let git = |args: &[&str]| {
-        let status = Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap().status;
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(&dir)
+            .args(args)
+            .output()
+            .unwrap()
+            .status;
         assert!(status.success(), "git {args:?}");
     };
     git(&["init", "-q"]);
@@ -563,7 +576,10 @@ fn files_ignored_by_git_stay_out_of_the_working_copy() {
     let (code, report) = json(&dir);
     assert_eq!(code, 2, "{report:#}");
     assert!(copy.join("src/lib.rs").exists());
-    assert!(copy.join("untracked.txt").exists(), "untracked but not ignored files are part of the build");
+    assert!(
+        copy.join("untracked.txt").exists(),
+        "untracked but not ignored files are part of the build"
+    );
     assert!(!copy.join("secrets").exists());
     assert!(!copy.join("notes.local").exists());
     assert!(!copy.join(".git").exists());

@@ -275,15 +275,32 @@ fn rust_files(dir: &Path, skip: &dyn Fn(&Path) -> bool, out: &mut Vec<PathBuf>) 
 /// `None` when `dir` is not in a git work tree, or is itself ignored: then git has nothing
 /// to say about which files matter.
 fn git_visible_files(dir: &Path) -> Option<Vec<PathBuf>> {
-    let git = |args: &[&str]| Command::new("git").arg("-C").arg(dir).args(args).stderr(Stdio::null()).output().ok();
-    if !git(&["rev-parse", "--is-inside-work-tree"])?.status.success() {
+    let git = |args: &[&str]| {
+        Command::new("git")
+            .arg("-C")
+            .arg(dir)
+            .args(args)
+            .stderr(Stdio::null())
+            .output()
+            .ok()
+    };
+    if !git(&["rev-parse", "--is-inside-work-tree"])?
+        .status
+        .success()
+    {
         return None;
     }
     // Exit status 0 means "ignored".
     if git(&["check-ignore", "-q", "."])?.status.success() {
         return None;
     }
-    let listing = git(&["ls-files", "--cached", "--others", "--exclude-standard", "-z"])?;
+    let listing = git(&[
+        "ls-files",
+        "--cached",
+        "--others",
+        "--exclude-standard",
+        "-z",
+    ])?;
     if !listing.status.success() {
         return None;
     }
@@ -860,14 +877,20 @@ pub fn run(options: &Options) -> Result<Report> {
     let skip = |path: &Path| {
         path == target_dir
             || path == work
-            || path.file_name().is_some_and(|n| n == ".git" || n == "node_modules")
-            || (path.parent() == Some(workspace.as_path()) && path.file_name().is_some_and(|n| n == "target"))
+            || path
+                .file_name()
+                .is_some_and(|n| n == ".git" || n == "node_modules")
+            || (path.parent() == Some(workspace.as_path())
+                && path.file_name().is_some_and(|n| n == "target"))
     };
     match (options.all_files, git_visible_files(&workspace)) {
         // Only what git would not ignore: build output, caches, local notes and secrets
         // that are kept out of the repository stay out of the copy too.
         (false, Some(files)) => {
-            note(&format!("copying {} files (ignored files are left out)", files.len()));
+            note(&format!(
+                "copying {} files (ignored files are left out)",
+                files.len()
+            ));
             for relative in files {
                 let (src, dst) = (workspace.join(&relative), copy.join(&relative));
                 if skip(&src) || src.ancestors().any(|a| a != workspace && skip(a)) {
