@@ -2882,7 +2882,14 @@ serde = { path = "../../serde-fork" }
         let (workspace, work) = (dir.join("ws"), dir.join("work"));
         let copy = work.join("src");
         let hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
-        for name in ["same", "longer", "newer", "was_dir", "was_link"] {
+        for name in [
+            "same",
+            "longer",
+            "newer",
+            "was_dir",
+            "was_link",
+            "short_link",
+        ] {
             fs::write(workspace.join("src").join(name), "source").unwrap();
             set_modified(&workspace.join("src").join(name), hour_ago);
         }
@@ -2897,6 +2904,8 @@ serde = { path = "../../serde-fork" }
         let outside = dir.join("outside");
         fs::write(&outside, "keep").unwrap();
         std::os::unix::fs::symlink(&outside, copy.join("src/was_link")).unwrap();
+        // Not even one whose own size and time would pass for the file's.
+        std::os::unix::fs::symlink("abcdef", copy.join("src/short_link")).unwrap();
         // What the run does not want goes, with the directories it leaves empty.
         fs::create_dir_all(copy.join("old/deep")).unwrap();
         fs::write(copy.join("old/deep/x"), "x").unwrap();
@@ -2906,7 +2915,13 @@ serde = { path = "../../serde-fork" }
         copy_run(&dir, &[], true);
         let read = |name: &str| fs::read_to_string(copy.join(name)).unwrap();
         assert_eq!(read("src/same"), "SOURCE");
-        for name in ["src/longer", "src/newer", "src/was_dir", "src/was_link"] {
+        for name in [
+            "src/longer",
+            "src/newer",
+            "src/was_dir",
+            "src/was_link",
+            "src/short_link",
+        ] {
             assert_eq!(read(name), "source", "{name}");
         }
         assert!(
