@@ -52,21 +52,41 @@ Without the precondition check the commit still fails, but the first write of th
 
 ```text
 cargo install --path .
-tmt [DIR] [--package NAME] [--json] [--show-unreached] [--no-verify] [--quiet]
+tmt [DIR] [--package NAME] [--doc] [--work-dir DIR] [--json] [--show-unreached] [--no-verify] [--quiet]
 ```
+
+- `--package NAME`: the workspace member to analyse. Not needed when `DIR` is the member's own directory.
+- `--doc`: also run the doc tests. rustdoc recompiles them for every mutant they reach, so this is slow.
+- `--work-dir DIR`: where the working copy and its build go.
 
 Exit status: `0` no gaps, `2` gaps found, `1` the analysis could not run (tests fail on the unmutated code, the crate does not build, ...).
 
-Your source tree is never modified. The crate is copied to `<target dir>/tmt/src` and built in `<target dir>/tmt/target`.
+Your source tree is never modified. The workspace is copied to `<target dir>/tmt/src` (or `--work-dir`) and built in a `target` directory next to that copy. Path dependencies that point outside the workspace are rewritten to absolute paths in the copy.
 
 ## How it works
 
-1. **Instrument.** Every comparison and every deletable statement (a call, a `?` check, an assignment) in the crate is rewritten into a probe. All mutants are compiled into the same binary and switched on by an environment variable, so the crate is built once.
+1. **Instrument.** Every comparison, boolean operator, arithmetic operator and deletable statement (a call, a `?` check, an assignment) in the crate is rewritten into a probe. All mutants are compiled into the same binary and switched on by an environment variable, so the crate is built once.
 2. **Trace.** The tests run once. Each probe records, per test, what it saw. For integer comparisons this is the difference `lhs - rhs` nearest to zero on each side, and whether the operands were ever equal.
 3. **Plan.** An integer comparison is a threshold on `lhs - rhs`. Every threshold between the nearest observation below and the nearest observation above gives the same result on all observed values, so every test executes such a mutant exactly as it executes the original. Those mutants are input gaps, found by arithmetic. By default one of them is re-run to confirm (`--no-verify` skips that).
 4. **Run.** The remaining mutants change the outcome of some observation. Each is run only against the tests whose observations it changes. If they all pass, no assertion noticed: an assertion gap.
 
 Mutants that cannot differ from the original within the operand types (`x >= 0` for an unsigned `x`) are not reported.
+
+### What is mutated
+
+| Code | Mutants | Guaranteed to survive when |
+|---|---|---|
+| `a < b`, `a >= 18` on integers | the constant shifted by any amount, the operator negated | no test passes a value between the old and the new boundary |
+| `x > 30.5` on floats | `>=`, and any threshold between the two nearest observed values | the operands were never equal in a test |
+| comparisons of other types | `<` and `<=` swapped, negation | the operands were never equal in a test |
+| `a == b`, `a != b` | negation, `true` / `false` | the result is the same in every test |
+| `a && b`, `a \|\| b` | `a` alone, `b` alone, the other operator | the dropped operand never decided the result in a test |
+| `a + b`, `-`, `*`, `/`, `%` on primitive numbers | `+` and `-` swapped, `*` and `/` swapped, `%` to `/` | the two operators agree on every pair of operands the tests pass (`fee` is always 0, `factor` is always 1) |
+| `f(x);`, `check()?;`, `x += 1;`, `x = y;` | the statement deleted | never: these are always run |
+
+Arithmetic on other types (`String + &str`, `Duration + Duration`) is left as it is.
+
+Code in the arguments of `assert_eq!`, `assert_ne!`, `vec!`, `format!`, `print!`, `println!`, `eprint!`, `eprintln!`, `write!`, `writeln!`, `panic!`, `unreachable!`, `todo!`, `unimplemented!`, `format_args!` and `matches!` is mutated like any other code. `assert!`, `debug_assert!` and `dbg!` put the source text of their argument into their output, so their arguments are not touched.
 
 A probe that does not compile at some site (for example a guarded `let x; x = ...;`) is dropped and the build is retried; the summary line counts those sites.
 
@@ -84,14 +104,15 @@ java -jar tla2tools.jar formal/tla/RepairLoop.tla
 
 ## Limits
 
-- Rust only, `std` crates only, one package per run. Doc tests are not run.
-- Code inside macro invocations (`assert!(a < b)`, `matches!`), `const` contexts and test code is not mutated.
-- Mutations: comparison operators and constants, and statement deletion. Boolean and arithmetic operators are not mutated yet.
-- Float, string and other non-integer comparisons are tracked by ordering only (`<` versus `<=`), without a value range.
+- Rust only, one package per run.
+- Code in the arguments of macros other than the ones listed above, in `const` contexts and in test code is not mutated.
+- Bit operators, unary operators, compound assignment operators (`+=` is only deleted, not turned into `-=`) and return values are not mutated.
+- For floats, a gap is reported only while no test compares equal operands. After that, thresholds within rounding distance of the constant still survive and are not reported.
+- Strings and other non-numeric types have no notion of "next value": only `<` versus `<=` is checked.
 - The survivor prediction assumes deterministic tests. A wrong prediction shows up as `UNSTABLE`.
-- Equivalent mutants are not always detected. If `max(a, b)` is written with `a >= b`, then `a > b` is reported although it cannot be observed.
-- Observations made on threads that a test spawns cannot be attributed to a test; the mutant is then run against the whole test binary.
-- Path dependencies that point outside the workspace break in the copy.
+- Equivalent mutants are not always detected. If `max(a, b)` is written with `a >= b`, then `a > b` is reported although no test could observe it. The same goes for an operand that is constant by construction (`is_large(n) && FEATURE_ENABLED`).
+- Observations made on threads that a test spawns, and all observations of doc tests, cannot be attributed to a single test; the mutant is then run against the whole test binary.
+- Mutants are run one after another.
 
 ## Evaluating against other tools
 
