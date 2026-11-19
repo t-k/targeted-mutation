@@ -3220,6 +3220,14 @@ mod tests {
                 "field strict: true | strict | shorthand=false | (*other).strict",
             ]
         );
+        // A field is reported where its name stands.
+        let field = sites
+            .iter()
+            .find(|s| s.text == "depth: a")
+            .expect("the field is a site");
+        let line = src.lines().nth(field.line - 1).unwrap();
+        assert_eq!(line.find("depth: a"), Some(field.column - 1), "{line}");
+        assert_eq!(&src[field.start..field.end], "a");
         let out = render(src, &sites, &all).text;
         syn::parse_file(&out).expect("instrumented source parses");
         assert_eq!(out.lines().count(), src.lines().count());
