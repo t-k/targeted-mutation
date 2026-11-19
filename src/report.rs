@@ -699,8 +699,14 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
         .filter(|f| matches!(f, Finding::InputGap { .. }))
         .count();
     let assertion = report.findings.len() - input;
+    // A mutant stopped by the time limit costs the limit: worth knowing when a run is slow.
+    let by_time_limit = if report.mutants_timed_out > 0 {
+        format!(", {} of them by the time limit", report.mutants_timed_out)
+    } else {
+        String::new()
+    };
     out.push_str(&format!(
-        "{}: {} sites, {} input gaps, {} assertion gaps, {} mutants run ({} killed), {} sites unreached",
+        "{}: {} sites, {} input gaps, {} assertion gaps, {} mutants run ({} killed{by_time_limit}), {} sites unreached",
         report.package,
         report.sites,
         input,
@@ -1602,6 +1608,19 @@ mod tests {
             render_text(&one, false)
         );
         assert!(!render_text(&Report::default(), false).contains("left out"));
+        let slow = Report {
+            mutants_run: 5,
+            mutants_killed: 4,
+            mutants_timed_out: 2,
+            ..Report::default()
+        };
+        assert!(
+            render_text(&slow, false)
+                .contains("5 mutants run (4 killed, 2 of them by the time limit), 0 sites"),
+            "{}",
+            render_text(&slow, false)
+        );
+        assert!(!render_text(&one, false).contains("time limit"));
         assert!(
             render_text(&one, false).contains(", 1 findings suppressed"),
             "{}",

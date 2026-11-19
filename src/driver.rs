@@ -270,7 +270,10 @@ struct TestBinary {
     /// The tests the binary contains, by the name libtest selects them with.
     tests: BTreeSet<String>,
     runner: Runner,
+    /// How long the tests take when nothing is recorded: what a mutant is measured against.
     baseline: Duration,
+    /// How long they took while recording.
+    traced: Duration,
     trace: Trace,
 }
 
@@ -440,7 +443,7 @@ impl WorkCopy {
             }
             if self.visited.borrow().contains(path) {
                 let source = workspace.join(path.strip_prefix(&self.root).unwrap_or(path));
-                fs::copy(&source, path).with_context(|| format!("copying {}", source.display()))?;
+                copy_as_new(&source, path)?;
             }
         }
         let mut lines: Vec<&str> = written
@@ -492,8 +495,18 @@ fn sync_file(src: &Path, dst: &Path, state: &WorkCopy) -> Result<()> {
             fs::remove_file(dst)?;
         }
     }
+    copy_as_new(src, dst)
+}
+
+/// Copies a file and gives the copy the current time. Some systems copy the modification
+/// time along, and a file that changed in the working copy but looks older than the last
+/// build would not be rebuilt.
+fn copy_as_new(src: &Path, dst: &Path) -> Result<()> {
     fs::copy(src, dst).with_context(|| format!("copying {}", src.display()))?;
-    Ok(())
+    // Opened for reading: the copy of a read-only file is read-only too.
+    fs::File::open(dst)
+        .and_then(|file| file.set_modified(std::time::SystemTime::now()))
+        .with_context(|| format!("touching {}", dst.display()))
 }
 
 /// Removes from the working copy whatever the current run did not put there.
@@ -807,6 +820,9 @@ fn parse_test_list(stdout: &str) -> BTreeSet<String> {
         .map(str::to_string)
         .collect()
 }
+
+/// A trace run longer than this is followed by a run without recording, for the timing.
+const SLOW_TRACE: Duration = Duration::from_secs(2);
 
 fn mutant_timeout(baseline: Duration) -> Duration {
     Duration::from_secs(5) + baseline * 5
@@ -1509,7 +1525,7 @@ impl Session {
                 bin,
                 filter.as_deref(),
                 &[("TMT_MUTANT", &spec), ("TMT_TRACE", &trace_env)],
-                mutant_timeout(bin.baseline),
+                mutant_timeout(bin.traced),
                 false,
             )?;
             let text = fs::read_to_string(&path).unwrap_or_default();
@@ -1965,6 +1981,7 @@ pub fn run(options: &Options) -> Result<Report> {
             tests: BTreeSet::new(),
             runner,
             baseline: Duration::ZERO,
+            traced: Duration::ZERO,
             trace: Trace::default(),
         };
         session.note(&format!("tracing `{}`", bin.name));
@@ -1983,7 +2000,16 @@ pub fn run(options: &Options) -> Result<Report> {
                 bin.name
             );
         }
-        bin.baseline = started.elapsed();
+        bin.traced = started.elapsed();
+        bin.baseline = bin.traced;
+        // Recording slows code in loops down a lot, and the time limit of every mutant
+        // is a multiple of this: where it matters, time the tests as the mutants run them.
+        if bin.traced > SLOW_TRACE {
+            let started = Instant::now();
+            if run_binary(&bin, None, &[], bin.traced, false)? == Outcome::Pass {
+                bin.baseline = started.elapsed();
+            }
+        }
         // No file means no probe was reached. Anything else unreadable or malformed means
         // the evidence is incomplete, and conclusions drawn from it would be wrong.
         let text = match fs::read_to_string(&trace_path) {
@@ -2947,6 +2973,14 @@ serde = { path = "../../serde-fork" }
             if before == wanted && wanted.is_some() && earlier != "logged_only" {
                 assert_eq!(modified(&copied), hour_ago, "{line}");
             }
+            // What did change looks new to cargo, although its source is an hour old:
+            // a copy that kept the time of its source would not be rebuilt.
+            if before != wanted && wanted.is_some() {
+                assert!(
+                    modified(&copied) > hour_ago + Duration::from_secs(1800),
+                    "{line}"
+                );
+            }
             // A further run that instruments nothing leaves a plain copy.
             copy_run(&dir, &[], true);
             assert_eq!(
@@ -3106,6 +3140,12 @@ serde = { path = "../../serde-fork" }
             fs::write(workspace.join("src").join(name), "source").unwrap();
             set_modified(&workspace.join("src").join(name), hour_ago);
         }
+        // A file that cannot be written to is copied like any other.
+        let locked = workspace.join("src/locked");
+        fs::write(&locked, "read only").unwrap();
+        let mut permissions = fs::metadata(&locked).unwrap().permissions();
+        permissions.set_readonly(true);
+        fs::set_permissions(&locked, permissions).unwrap();
         fs::create_dir_all(copy.join("src/was_dir/inner")).unwrap();
         // Same size and not older: taken for a copy, whatever it holds.
         fs::write(copy.join("src/same"), "SOURCE").unwrap();
@@ -3128,6 +3168,7 @@ serde = { path = "../../serde-fork" }
         copy_run(&dir, &[], true);
         let read = |name: &str| fs::read_to_string(copy.join(name)).unwrap();
         assert_eq!(read("src/same"), "SOURCE");
+        assert_eq!(read("src/locked"), "read only");
         for name in [
             "src/longer",
             "src/newer",

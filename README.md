@@ -108,7 +108,7 @@ Your source tree is never modified. In a git repository only the files git does 
 3. **Plan.** An integer comparison is a threshold on `lhs - rhs`. Every threshold between the nearest observation below and the nearest observation above gives the same result on all observed values, so every test executes such a mutant exactly as it executes the original. Those mutants are input gaps, found by arithmetic. By default one of them is re-run to confirm (`--no-verify` skips that).
 4. **Run.** The remaining mutants change the outcome of some observation. Each is run only against the tests whose observations it changes. If they all pass, no assertion noticed: an assertion gap.
 
-5. **Build the rest one by one.** Some code cannot carry a probe: nothing in a `const fn` can ask at run time which mutant is on, a function that returns `impl Iterator` cannot return an iterator of another type beside its own, and for a compound assignment to more than a variable (`*map.entry(k).or_insert(0) += 1`) the order of evaluation depends on the type. The mutants of such code, and of every site whose probe did not compile, are written into the source, built and run against all tests, one after the other, the way cargo-mutants does it. This is the slow part; `--no-rebuild` skips it.
+5. **Build the rest one by one.** Some code cannot carry a probe: nothing in a `const fn` or in the value of a `const` or `static` can ask at run time which mutant is on, a function that returns `impl Iterator` cannot return an iterator of another type beside its own, two literals (`60 * 60`) have no type of their own for a probe to work with, and for a compound assignment to more than a variable (`*map.entry(k).or_insert(0) += 1`) the order of evaluation depends on the type. The mutants of such code, and of every site whose probe did not compile, are written into the source, built and run against all tests, one after the other, the way cargo-mutants does it. This is the slow part; `--no-rebuild` skips it.
 
 Mutants that cannot differ from the original within the operand types (`x >= 0` for an unsigned `x`) are not reported.
 
@@ -147,7 +147,7 @@ Functions, `impl` blocks and modules marked `#[mutants::skip]` (also inside `cfg
 
 ### Compared with cargo-mutants
 
-Every mutant that cargo-mutants 27.1.0 lists for the crates in `fixtures/` has a counterpart here: `tests/parity.rs` checks the stored lists (`tests/data/cargo-mutants`) against the sites this tool finds, and names the few exceptions with their reason (a `||` inside a let chain, which does not compile; an empty body where deleting the only statement is the same mutant). On top of those come the mutants that need the trace: shifted boundaries, an ignored operand of `&&` / `||`, a result replaced after the body ran, deleted statements, `min` / `max`, range ends.
+Every mutant that cargo-mutants 27.1.0 lists for the crates in `fixtures/` has a counterpart here: `tests/parity.rs` checks the stored lists (`tests/data/cargo-mutants`) against the sites this tool finds, and names the exceptions with their reason (a `||` inside a let chain, which does not compile). An empty body is not made for a function that consists of one statement, because deleting that statement is the same mutant. The same test checks any other crate on request (see its last function); that is how the table above was completed against real code. On top of those come the mutants that need the trace: shifted boundaries, an ignored operand of `&&` / `||`, a result replaced after the body ran, deleted statements, `min` / `max`, range ends.
 
 The difference is in how they are run. cargo-mutants builds every mutant and runs all tests against it. Here one build carries all mutants that a probe can carry, each is run only against the tests that execute it, and those that provably pass every test are not run at all but reported with the input that is missing. Only the rest (step 5) costs a build each.
 
@@ -185,7 +185,7 @@ java -jar tla2tools.jar formal/tla/RepairLoop.tla
 - A module that two targets of the package both declare (`mod common;` in `lib.rs` and in `main.rs`) cannot be probed; its sites are counted as skipped.
 - Source files that start with a byte order mark or a `#!` line are not instrumented.
 - A macro that shadows a standard one is only recognised when it is defined at the top level of the same file.
-- Code in the arguments of macros other than the ones listed above, in `const` and `static` items, array lengths and other constant expressions, and in test code is not mutated. (`const fn` is: step 5.)
+- Code in the arguments of macros other than the ones listed above, in array lengths, enum discriminants, `const { }` blocks and const generic arguments, and in test code is not mutated. (`const fn` and the values of constants are: step 5.)
 - Casts are not mutated. The result of a `bool` or `Option` function is replaced only at its normal exit, not at an early `return` (the replaced body covers that case).
 - The body of a function that returns an `impl Trait` other than an iterator is not replaced: no value of the hidden type can be made up.
 - Two mutants can be the same program: a body replaced by `true` and a result that is always `true`. Both are reported, on the same line.

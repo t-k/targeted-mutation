@@ -9,7 +9,7 @@ use crate::__tmt_std as std;
 use std::prelude::v1::*;
 use std::{format, thread_local};
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
@@ -360,6 +360,49 @@ fn test_name() -> String {
 
 thread_local! {
     static TEST_ID: Cell<Option<u32>> = const { Cell::new(None) };
+    // What this thread has already handed to the tracer. A test runs on a thread of
+    // its own, so a probe in a loop takes the tracer's lock once and then only when it
+    // sees something new.
+    static SEEN_BITS: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
+    static SEEN_CMP: RefCell<Vec<Option<Summary>>> = const { RefCell::new(Vec::new()) };
+}
+
+fn bits_slot(kind: u8, site: u32) -> usize {
+    let kind = match kind {
+        b'R' => 0,
+        b'L' => 1,
+        b'A' => 2,
+        _ => 3,
+    };
+    site as usize * 4 + kind
+}
+
+/// Whether this thread has recorded all of `bits` at the site before.
+fn bits_known(kind: u8, site: u32, bits: u8) -> bool {
+    let slot = bits_slot(kind, site);
+    SEEN_BITS
+        .try_with(|seen| {
+            seen.borrow()
+                .get(slot)
+                .is_some_and(|had| had & bits == bits)
+        })
+        .unwrap_or(false)
+}
+
+/// Notes `bits` as recorded by this thread; returns whether that was news.
+fn bits_are_news(kind: u8, site: u32, bits: u8) -> bool {
+    let slot = bits_slot(kind, site);
+    SEEN_BITS
+        .try_with(|seen| {
+            let mut seen = seen.borrow_mut();
+            if seen.len() <= slot {
+                seen.resize(slot + 1, 0);
+            }
+            let had = seen[slot];
+            seen[slot] |= bits;
+            had | bits != had
+        })
+        .unwrap_or(true)
 }
 
 fn with_tracer(f: impl FnOnce(&mut Tracer, u32)) {
@@ -393,7 +436,7 @@ fn with_tracer(f: impl FnOnce(&mut Tracer, u32)) {
 
 /// Records observation bits of a statement (`R`), logic (`L`) or arithmetic (`A`) site.
 fn record_bits(kind: u8, site: u32, bits: u8) {
-    if state().tracer.is_none() {
+    if state().tracer.is_none() || !bits_are_news(kind, site, bits) {
         return;
     }
     with_tracer(|t, test| {
@@ -410,6 +453,22 @@ fn record_bits(kind: u8, site: u32, bits: u8) {
 }
 
 fn record_cmp(site: u32, rel: u8, d: Diff, av: Val, bv: Val) {
+    // The summary this thread has built so far says whether the observation is news.
+    let news = SEEN_CMP
+        .try_with(|seen| {
+            let mut seen = seen.borrow_mut();
+            let slot = site as usize;
+            if seen.len() <= slot {
+                seen.resize(slot + 1, None);
+            }
+            seen[slot]
+                .get_or_insert_with(Summary::default)
+                .observe(rel, d)
+        })
+        .unwrap_or(true);
+    if !news {
+        return;
+    }
     with_tracer(|t, test| {
         if let (Val::Int(_, amin, amax), Val::Int(_, bmin, bmax)) = (av, bv) {
             if t.typed.insert(site) {
@@ -498,6 +557,10 @@ pub fn eq<A: ?Sized + PartialEq<B>, B: ?Sized>(
     bv: Val,
 ) -> bool {
     let orig = if op == EQ { a == b } else { a != b };
+    let st = state();
+    if st.mutant.is_none() && st.tracer.is_none() {
+        return orig;
+    }
     let equal = orig == (op == EQ);
     let rel = match (equal, diff(av, bv, equal)) {
         (true, _) => REL_EQ,
@@ -631,25 +694,39 @@ pub trait ArithNum: Copy {
     }
 
     fn tmt_run(site: u32, op: u8, a: Self, b: Self) -> Self {
+        let st = state();
+        if st.mutant.is_none() && st.tracer.is_none() {
+            return Self::tmt_real(op, a, b);
+        }
         let second = arith_swapped2(op);
         match (mutant_at(site), second) {
             (Some(Mutant::ArithSwap), _) => return Self::tmt_real(arith_swapped(op), a, b),
             (Some(Mutant::ArithSwap2), Some(other)) => return Self::tmt_real(other, a, b),
             _ => {}
         }
-        let mut bits = if Self::tmt_same(op, arith_swapped(op), a, b) {
-            ARITH_SAME
-        } else {
-            ARITH_DIFFERS
-        };
-        if let Some(other) = second {
-            bits |= if Self::tmt_same(op, other, a, b) {
-                ARITH_SAME2
+        // Nothing to learn where both answers were seen for every replacement.
+        let everything = ARITH_SAME
+            | ARITH_DIFFERS
+            | if second.is_some() {
+                ARITH_SAME2 | ARITH_DIFFERS2
             } else {
-                ARITH_DIFFERS2
+                0
             };
+        if st.tracer.is_some() && !bits_known(b'A', site, everything) {
+            let mut bits = if Self::tmt_same(op, arith_swapped(op), a, b) {
+                ARITH_SAME
+            } else {
+                ARITH_DIFFERS
+            };
+            if let Some(other) = second {
+                bits |= if Self::tmt_same(op, other, a, b) {
+                    ARITH_SAME2
+                } else {
+                    ARITH_DIFFERS2
+                };
+            }
+            record_bits(b'A', site, bits);
         }
-        record_bits(b'A', site, bits);
         Self::tmt_real(op, a, b)
     }
 }
