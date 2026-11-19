@@ -282,7 +282,18 @@ fn awkward_constructs() {
         .iter()
         .map(|u| u["code"].as_str().unwrap())
         .collect();
-    assert_eq!(unreached, ["x == 7"]);
+    assert_eq!(unreached, ["fn never_called(x: u8) -> bool", "x == 7"]);
+    // `unsigned_floor` is `x >= 0` on an unsigned value: constant for a reason no test can
+    // change, so neither the comparison nor the function is reported.
+    assert!(
+        !codes.contains(&"fn unsigned_floor(x: u32) -> bool"),
+        "{report:#}"
+    );
+
+    // Running mutants in parallel gives the same report.
+    let parallel = tmt(&dir, &["--json", "--quiet", "--jobs", "4"]);
+    let parallel: Value = serde_json::from_str(&parallel.stdout).unwrap();
+    assert_eq!(parallel, report);
     assert_eq!(
         report["unstable"].as_array().unwrap().len(),
         0,
@@ -346,8 +357,9 @@ fn endless_loop_mutant_is_killed_by_the_timeout() {
     let started = std::time::Instant::now();
     let (code, report) = json(&dir);
     assert_eq!(code, 0, "{report:#}");
-    assert_eq!(report["mutants_run"], 2, "{report:#}");
-    assert_eq!(report["mutants_killed"], 2, "{report:#}");
+    // Deleting `i += 1` loops forever; `i -= 1` and the negated condition fail quickly.
+    assert_eq!(report["mutants_run"], 3, "{report:#}");
+    assert_eq!(report["mutants_killed"], 3, "{report:#}");
     assert_eq!(report["mutants_timed_out"], 1, "{report:#}");
     assert!(
         started.elapsed() >= std::time::Duration::from_secs(5),
@@ -465,7 +477,35 @@ fn boolean_and_arithmetic_operators_and_macro_arguments() {
         ["`value / factor`"]
     );
 
+    // A compound assignment whose right side is always 0, and a function that only ever
+    // returned false.
+    assert_eq!(
+        strings(&gap("*position += step")["survivors"]),
+        ["`*position -= step`"]
+    );
+    let ret = gap("fn must_wait(ready: bool) -> bool");
+    assert_eq!(
+        strings(&ret["survivors"]),
+        ["`must_wait` returning `false`"]
+    );
+    assert_eq!(
+        strings(&ret["add_tests"]),
+        ["a case where `must_wait` returns true"]
+    );
+
     let codes: Vec<&str> = all.iter().map(|f| f["code"].as_str().unwrap()).collect();
+    // Killed: the bit test (`|` instead of `&`) and the negation (`ready` instead of `!ready`).
+    for quiet in [
+        "bits & flag",
+        "bits & flag != 0",
+        "!ready",
+        "fn has_flag(bits: u32, flag: u32) -> bool",
+    ] {
+        assert!(
+            !codes.contains(&quiet),
+            "`{quiet}` should have no finding: {report:#}"
+        );
+    }
     // Killed or fully pinned: the range check, the area, and the code inside `vec!` / `format!`.
     for quiet in [
         "lo <= x && x <= hi",
@@ -500,7 +540,11 @@ fn boolean_and_arithmetic_operators_and_macro_arguments() {
 fn closes_the_gaps() {
     assert!(can_edit(false, true));
     assert_eq!(total_with_fee(100, 5), 105);
-    assert_eq!(scale(2.5, 2.0), 5.0);
+        assert_eq!(scale(2.5, 2.0), 5.0);
+    let mut position = 7;
+    advance(&mut position, 3);
+    assert_eq!(position, 10);
+    assert!(must_wait(false));
 }
 "#,
     );
@@ -511,7 +555,13 @@ fn closes_the_gaps() {
         .iter()
         .map(|f| f["code"].as_str().unwrap())
         .collect();
-    for closed in ["is_owner || is_admin", "amount + fee", "value * factor"] {
+    for closed in [
+        "is_owner || is_admin",
+        "amount + fee",
+        "value * factor",
+        "*position += step",
+        "fn must_wait(ready: bool) -> bool",
+    ] {
         assert!(
             !codes.contains(&closed),
             "`{closed}` should be closed: {report:#}"
@@ -527,7 +577,7 @@ fn doc_tests_are_used_on_request() {
     assert_eq!(code, 0, "{report:#}");
     assert_eq!(
         report["unreached"].as_array().unwrap().len(),
-        3,
+        4,
         "{report:#}"
     );
     assert_eq!(report["mutants_run"], 0, "{report:#}");
@@ -542,9 +592,13 @@ fn doc_tests_are_used_on_request() {
     );
     // `double(2) == 4` kills `x / 2`; `is_even` is only ever called with an even number.
     let gaps = findings(&report, "input_gap");
-    assert_eq!(gaps.len(), 1, "{report:#}");
-    assert_eq!(gaps[0]["code"], "x % 2 == 0");
-    assert_eq!(strings(&gaps[0]["survivors"]), ["`true`"]);
+    let gap_codes: Vec<&str> = gaps.iter().map(|g| g["code"].as_str().unwrap()).collect();
+    assert_eq!(
+        gap_codes,
+        ["fn is_even(x: u32) -> bool", "x % 2 == 0"],
+        "{report:#}"
+    );
+    assert_eq!(strings(&gaps[1]["survivors"]), ["`true`"]);
     assert_eq!(findings(&report, "assertion_gap").len(), 0, "{report:#}");
     assert!(
         report["mutants_killed"].as_u64().unwrap() >= 2,

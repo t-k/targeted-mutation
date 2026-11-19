@@ -6,6 +6,7 @@
 //! - `R <site> <test> <bits>`: a statement site was executed
 //! - `L <site> <test> <bits>`: observations at `&&` / `||` (cumulative)
 //! - `A <site> <test> <bits>`: observations at an arithmetic operator (cumulative)
+//! - `B <site> <test> <bits>`: values a `-> bool` function returned (cumulative)
 //! - `T <site> <lhs_min> <lhs_max> <rhs_min> <rhs_max>`: integer type bounds of the operands
 //!
 //! A process killed mid-write can leave a truncated last line; malformed lines are skipped
@@ -13,7 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::plan::{ArithObs, LogicObs, Obs};
+use crate::plan::{ArithObs, LogicObs, Obs, ReturnObs};
 
 /// Test name used when the observing thread is not a libtest test thread.
 pub const UNKNOWN_TEST: &str = "?";
@@ -30,6 +31,7 @@ pub struct Trace {
     pub cmp: BTreeMap<u32, BTreeMap<String, Obs>>,
     pub logic: BTreeMap<u32, BTreeMap<String, LogicObs>>,
     pub arith: BTreeMap<u32, BTreeMap<String, ArithObs>>,
+    pub returns: BTreeMap<u32, BTreeMap<String, ReturnObs>>,
     /// site -> tests that executed the statement
     pub reach: BTreeMap<u32, BTreeSet<String>>,
     pub bounds: BTreeMap<u32, TypeBounds>,
@@ -100,15 +102,23 @@ impl Trace {
                     .or_default()
                     .merge(&obs);
             }
-            [kind @ ("R" | "L" | "A"), site, test, bits] => {
+            [kind @ ("R" | "L" | "A" | "B"), site, test, bits] => {
                 let site: u32 = site.parse().ok()?;
-                let bits: u8 = bits.parse().ok().filter(|b| (1..8).contains(b))?;
+                let limit = if kind == "B" { 4 } else { 8 };
+                let bits: u8 = bits.parse().ok().filter(|b| (1..limit).contains(b))?;
                 (!test.is_empty()).then_some(())?;
                 let test = test.to_string();
                 match kind {
                     "R" => {
                         self.reach.entry(site).or_default().insert(test);
                     }
+                    "B" => self
+                        .returns
+                        .entry(site)
+                        .or_default()
+                        .entry(test)
+                        .or_default()
+                        .merge(&ReturnObs::from_bits(bits)),
                     "L" => self
                         .logic
                         .entry(site)
@@ -599,6 +609,33 @@ mod tests {
             Trace::parse("O\t1\tt\t5\t1\t-\t-\t0\tx\t-\n").malformed_lines,
             1
         );
+    }
+
+    #[test]
+    fn return_lines() {
+        let returns = Trace::parse("B\t4\tt\t1\nB\t4\tt\t2\nB\t4\tu\t2\n");
+        assert_eq!(returns.malformed_lines, 0);
+        assert_eq!(
+            returns.returns[&4]["t"],
+            ReturnObs {
+                saw_true: true,
+                saw_false: true
+            }
+        );
+        assert_eq!(
+            returns.returns[&4]["u"],
+            ReturnObs {
+                saw_true: false,
+                saw_false: true
+            }
+        );
+        assert_eq!(
+            Trace::parse("B\t4\tt\t4\n").malformed_lines,
+            1,
+            "only two return bits exist"
+        );
+        assert_eq!(Trace::parse("B\t4\tt\t3\n").malformed_lines, 0);
+        assert_eq!(Trace::parse("A\t4\tt\t7\n").malformed_lines, 0);
     }
 
     #[test]

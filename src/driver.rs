@@ -28,6 +28,8 @@ pub struct Options {
     pub work_dir: Option<PathBuf>,
     /// Progress lines on stderr.
     pub progress: bool,
+    /// How many mutants to run at the same time.
+    pub jobs: usize,
     /// Copy every file of the workspace, including the ones git ignores.
     pub all_files: bool,
     /// Also run the doc tests (slow: rustdoc recompiles them for every mutant they reach).
@@ -552,57 +554,21 @@ struct Session {
     progress: bool,
     package_dir: PathBuf,
     binaries: Vec<TestBinary>,
-    mutants_run: usize,
-    mutants_killed: usize,
-    mutants_timed_out: usize,
 }
 
-impl Session {
-    fn note(&self, text: &str) {
-        if self.progress {
-            eprintln!("tmt: {text}");
-        }
-    }
+/// One mutant and the tests it has to face, per test binary.
+struct Job {
+    site: u32,
+    mutation: Mutation,
+    /// `(index of the binary, tests to run or None for all of them)`.
+    tests: Vec<(usize, Option<Vec<String>>)>,
+}
 
-    /// Runs one mutant against the given tests of each binary. Returns the tests it was
-    /// run against if every one of them passed (the mutant survived).
-    fn survives(
-        &mut self,
-        site: u32,
-        mutation: Mutation,
-        tests_of: &dyn Fn(&TestBinary) -> BTreeSet<String>,
-    ) -> Result<Option<Vec<String>>> {
-        let spec = format!("{site}:{}", mutation.encode());
-        let mut ran_against = vec![];
-        self.mutants_run += 1;
-        for bin in &self.binaries {
-            let tests = tests_of(bin);
-            if tests.is_empty() {
-                continue;
-            }
-            let filter = match bin.runner {
-                Runner::Exe(_) => test_filter(&tests),
-                Runner::Doc { .. } => None,
-            };
-            let outcome = run_binary(
-                bin,
-                &self.package_dir,
-                filter.as_deref(),
-                ("TMT_MUTANT", &spec),
-                mutant_timeout(bin.baseline),
-            )?;
-            if outcome != Outcome::Pass {
-                self.mutants_killed += 1;
-                self.mutants_timed_out += (outcome == Outcome::Timeout) as usize;
-                return Ok(None);
-            }
-            match filter {
-                Some(names) => ran_against.extend(names),
-                None => ran_against.push(format!("all tests of `{}`", bin.name)),
-            }
-        }
-        Ok(Some(ran_against))
-    }
+#[derive(Debug, Clone, PartialEq)]
+struct JobResult {
+    /// The tests the mutant passed, when it passed all of them.
+    survived: Option<Vec<String>>,
+    timed_out: bool,
 }
 
 /// The tests of one binary whose observations satisfy `pick`.
@@ -621,10 +587,16 @@ fn tests_where<T>(
 type InfectedTests<'a> = Box<dyn Fn(&TestBinary, Mutation) -> BTreeSet<String> + 'a>;
 type ReachingTests<'a> = Box<dyn Fn(&TestBinary) -> BTreeSet<String> + 'a>;
 
-/// What the planner decided for one site, in the form the session executes.
+/// What the planner decided for one site.
 struct SitePlan<'a> {
     /// Predicted survivors: the finding to report and the mutations to confirm it with.
     gaps: Vec<(Finding, Vec<Mutation>)>,
+    /// The comparison cannot have another outcome within its operand types. A function
+    /// or condition built on it is constant for a reason no test can change.
+    cannot_differ: bool,
+    /// Some gap says an expression had a single value in every test. An enclosing `&&` /
+    /// `||` then necessarily has an operand that never decides, which is not news.
+    constant: bool,
     /// Mutations some test observes differently.
     run: Vec<Mutation>,
     /// Tests of a binary whose execution the mutation can change.
@@ -633,37 +605,71 @@ struct SitePlan<'a> {
     reaching: ReachingTests<'a>,
 }
 
+enum Planned<'a> {
+    Unreached,
+    /// Reached, but nothing to mutate (operands that are not numbers).
+    Nothing,
+    Plan(SitePlan<'a>),
+}
+
+/// A site with its jobs: indices into the job list.
+struct SiteWork<'a> {
+    file: &'a str,
+    site: &'a Site,
+    gaps: Vec<(Finding, Vec<usize>)>,
+    constant: bool,
+    cannot_differ: bool,
+    runs: Vec<(Mutation, usize)>,
+}
+
 impl Session {
-    fn analyse(
-        &mut self,
-        report: &mut Report,
-        file: &str,
-        site: &Site,
-        verify: bool,
-    ) -> Result<()> {
-        let at = report::location(file, site);
+    fn note(&self, text: &str) {
+        if self.progress {
+            eprintln!("tmt: {text}");
+        }
+    }
+
+    fn merged<T: Default + Copy>(
+        &self,
+        select: impl Fn(&Trace) -> Option<&BTreeMap<String, T>>,
+        merge: impl Fn(&mut T, &T),
+    ) -> T {
+        let mut all = T::default();
+        for obs in self
+            .binaries
+            .iter()
+            .filter_map(|b| select(&b.trace))
+            .flat_map(|t| t.values())
+        {
+            merge(&mut all, obs);
+        }
+        all
+    }
+
+    fn plan<'a>(&'a self, file: &str, site: &'a Site, verify: bool) -> Planned<'a> {
         let id = site.id;
-        let plan = match &site.kind {
-            SiteKind::Stmt => {
-                if !self
-                    .binaries
-                    .iter()
-                    .any(|b| b.trace.reach.contains_key(&id))
-                {
-                    report.unreached.push(at);
-                    return Ok(());
-                }
-                SitePlan {
-                    gaps: vec![],
-                    run: vec![Mutation::Delete],
-                    infected: Box::new(move |bin, _| {
-                        bin.trace.reach.get(&id).cloned().unwrap_or_default()
-                    }),
-                    reaching: Box::new(move |bin| {
-                        bin.trace.reach.get(&id).cloned().unwrap_or_default()
-                    }),
-                }
-            }
+        let reach_plan = |mutation: Mutation| SitePlan {
+            gaps: vec![],
+            constant: false,
+            cannot_differ: false,
+            run: vec![mutation],
+            infected: Box::new(move |bin, _| bin.trace.reach.get(&id).cloned().unwrap_or_default()),
+            reaching: Box::new(move |bin| bin.trace.reach.get(&id).cloned().unwrap_or_default()),
+        };
+        let reached = self
+            .binaries
+            .iter()
+            .any(|b| b.trace.reach.contains_key(&id));
+        let opaque = self
+            .merged(|t| t.arith.get(&id), plan::ArithObs::merge)
+            .opaque;
+        Planned::Plan(match &site.kind {
+            SiteKind::Stmt if reached => reach_plan(Mutation::Delete),
+            SiteKind::Stmt => return Planned::Unreached,
+            SiteKind::Not { .. } if reached => reach_plan(Mutation::DropNot),
+            // `!` on an integer or a user type is not negation of a condition.
+            SiteKind::Not { .. } if opaque => return Planned::Nothing,
+            SiteKind::Not { .. } => return Planned::Unreached,
             SiteKind::Cmp { op, literal, .. } => {
                 let op = *op;
                 let mut merged = Obs::default();
@@ -673,12 +679,11 @@ impl Session {
                 let bounds = self.binaries.iter().find_map(|b| b.trace.bounds.get(&id));
                 let cmp_plan = plan::plan_cmp(op, &merged, domain_of(*literal, bounds));
                 let mut gaps = vec![];
+                let mut constant = false;
                 match &cmp_plan.gap {
-                    Some(plan::InputGap::Unreached) => {
-                        report.unreached.push(at);
-                        return Ok(());
-                    }
+                    Some(plan::InputGap::Unreached) => return Planned::Unreached,
                     Some(gap) => {
+                        constant = matches!(gap, plan::InputGap::OneSided { .. });
                         if let Some(finding) =
                             report::input_gap_finding(file, site, gap, &merged, verify)
                         {
@@ -689,6 +694,8 @@ impl Session {
                 }
                 SitePlan {
                     gaps,
+                    constant,
+                    cannot_differ: cmp_plan.cannot_differ,
                     run: cmp_plan.run,
                     infected: Box::new(move |bin, m| {
                         tests_where(bin.trace.cmp.get(&id), |obs| plan::infects(op, m, obs))
@@ -700,21 +707,12 @@ impl Session {
             }
             SiteKind::Logic { and, .. } => {
                 let and = *and;
-                let mut merged = plan::LogicObs::default();
-                for obs in self
-                    .binaries
-                    .iter()
-                    .filter_map(|b| b.trace.logic.get(&id))
-                    .flat_map(|t| t.values())
-                {
-                    merged.merge(obs);
-                }
+                let merged = self.merged(|t| t.logic.get(&id), plan::LogicObs::merge);
                 let logic_plan = plan::plan_logic(and, &merged);
                 if logic_plan.gaps.contains(&plan::LogicGap::Unreached) {
-                    report.unreached.push(at);
-                    return Ok(());
+                    return Planned::Unreached;
                 }
-                let gaps = logic_plan
+                let gaps: Vec<_> = logic_plan
                     .gaps
                     .iter()
                     .filter_map(|gap| {
@@ -729,6 +727,8 @@ impl Session {
                     })
                     .collect();
                 SitePlan {
+                    constant: !gaps.is_empty(),
+                    cannot_differ: false,
                     gaps,
                     run: logic_plan.run,
                     infected: Box::new(move |bin, m| {
@@ -742,22 +742,11 @@ impl Session {
                 }
             }
             SiteKind::Arith { .. } => {
-                let mut merged = plan::ArithObs::default();
-                for obs in self
-                    .binaries
-                    .iter()
-                    .filter_map(|b| b.trace.arith.get(&id))
-                    .flat_map(|t| t.values())
-                {
-                    merged.merge(obs);
-                }
+                let merged = self.merged(|t| t.arith.get(&id), plan::ArithObs::merge);
                 let (gaps, run) = match plan::plan_arith(&merged) {
-                    plan::ArithPlan::Unreached => {
-                        report.unreached.push(at);
-                        return Ok(());
-                    }
+                    plan::ArithPlan::Unreached => return Planned::Unreached,
                     // Not numbers (`String + &str`, `Duration + Duration`): nothing to mutate.
-                    plan::ArithPlan::Opaque => return Ok(()),
+                    plan::ArithPlan::Opaque => return Planned::Nothing,
                     plan::ArithPlan::NeverDiffers => (
                         report::arith_gap_finding(file, site, verify)
                             .map(|finding| (finding, vec![Mutation::ArithSwap]))
@@ -769,6 +758,8 @@ impl Session {
                 };
                 SitePlan {
                     gaps,
+                    constant: false,
+                    cannot_differ: false,
                     run,
                     infected: Box::new(move |bin, _| {
                         tests_where(bin.trace.arith.get(&id), |obs| obs.differs)
@@ -778,41 +769,144 @@ impl Session {
                     }),
                 }
             }
-        };
-
-        for (finding, survivors) in plan.gaps {
-            // The trace says no test can notice. Confirm by running every test that
-            // reaches the site against the listed survivors.
-            let mut confirmed = true;
-            if verify {
-                for m in survivors {
-                    confirmed &= self.survives(id, m, &*plan.reaching)?.is_some();
+            SiteKind::Return { .. } => {
+                let merged = self.merged(|t| t.returns.get(&id), plan::ReturnObs::merge);
+                let return_plan = plan::plan_return(&merged);
+                if return_plan.unreached {
+                    return Planned::Unreached;
+                }
+                let gaps: Vec<_> = return_plan
+                    .always
+                    .and_then(|always| {
+                        Some((
+                            report::return_gap_finding(file, site, always, verify)?,
+                            vec![Mutation::Const(always)],
+                        ))
+                    })
+                    .into_iter()
+                    .collect();
+                SitePlan {
+                    constant: !gaps.is_empty(),
+                    cannot_differ: false,
+                    gaps,
+                    run: return_plan.run,
+                    infected: Box::new(move |bin, m| {
+                        tests_where(bin.trace.returns.get(&id), |obs| match m {
+                            Mutation::Const(value) => obs.infected_by_const(value),
+                            _ => obs.reached(),
+                        })
+                    }),
+                    reaching: Box::new(move |bin| {
+                        tests_where(bin.trace.returns.get(&id), plan::ReturnObs::reached)
+                    }),
                 }
             }
-            if confirmed {
-                report.findings.push(finding);
-            } else {
-                report.unstable.push(at.clone());
-            }
-        }
-        let mut survivors = vec![];
-        let mut passing_tests = BTreeSet::new();
-        for m in plan.run {
-            let infected = &plan.infected;
-            if let Some(tests) = self.survives(id, m, &|bin| infected(bin, m))? {
-                survivors.push(report::describe(site, m));
-                passing_tests.extend(tests);
-            }
-        }
-        if !survivors.is_empty() {
-            report.findings.push(Finding::AssertionGap {
-                at,
-                survivors,
-                tests: passing_tests.into_iter().collect(),
-            });
-        }
-        Ok(())
+        })
     }
+
+    fn job(
+        &self,
+        site: u32,
+        mutation: Mutation,
+        tests_of: &dyn Fn(&TestBinary) -> BTreeSet<String>,
+    ) -> Job {
+        let tests = self
+            .binaries
+            .iter()
+            .enumerate()
+            .filter_map(|(index, bin)| {
+                let tests = tests_of(bin);
+                if tests.is_empty() {
+                    return None;
+                }
+                let filter = match bin.runner {
+                    Runner::Exe(_) => test_filter(&tests),
+                    Runner::Doc { .. } => None,
+                };
+                Some((index, filter))
+            })
+            .collect();
+        Job {
+            site,
+            mutation,
+            tests,
+        }
+    }
+
+    /// Runs one mutant against its tests, stopping at the first binary that fails.
+    fn run_job(&self, job: &Job) -> Result<JobResult> {
+        let spec = format!("{}:{}", job.site, job.mutation.encode());
+        let mut passed = vec![];
+        for (index, filter) in &job.tests {
+            let bin = &self.binaries[*index];
+            let outcome = run_binary(
+                bin,
+                &self.package_dir,
+                filter.as_deref(),
+                ("TMT_MUTANT", &spec),
+                mutant_timeout(bin.baseline),
+            )?;
+            if outcome != Outcome::Pass {
+                return Ok(JobResult {
+                    survived: None,
+                    timed_out: outcome == Outcome::Timeout,
+                });
+            }
+            match filter {
+                Some(names) => passed.extend(names.iter().cloned()),
+                None => passed.push(format!("all tests of `{}`", bin.name)),
+            }
+        }
+        Ok(JobResult {
+            survived: Some(passed),
+            timed_out: false,
+        })
+    }
+
+    /// Runs every job exactly once on `workers` threads (formal/tla/JobPool.tla) and
+    /// returns the results in job order.
+    fn run_jobs(&self, jobs: &[Job], workers: usize) -> Result<Vec<JobResult>> {
+        run_pool(jobs.len(), workers, |index| self.run_job(&jobs[index]))
+    }
+}
+
+/// Calls `work(i)` once for every `i < count`, on up to `workers` threads, and returns the
+/// results in index order. The first error wins.
+fn run_pool<T: Send>(
+    count: usize,
+    workers: usize,
+    work: impl Fn(usize) -> Result<T> + Sync,
+) -> Result<Vec<T>> {
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let done: Vec<Vec<(usize, Result<T>)>> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers.clamp(1, count.max(1)))
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut mine = vec![];
+                    loop {
+                        // Claiming is one atomic step: no two workers get the same index.
+                        let index = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                        if index >= count {
+                            return mine;
+                        }
+                        mine.push((index, work(index)));
+                    }
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().expect("worker panicked"))
+            .collect()
+    });
+    let mut slots: Vec<Option<T>> = (0..count).map(|_| None).collect();
+    for (index, result) in done.into_iter().flatten() {
+        slots[index] = Some(result?);
+    }
+    Ok(slots
+        .into_iter()
+        .map(|slot| slot.expect("every job ran"))
+        .collect())
 }
 
 pub fn run(options: &Options) -> Result<Report> {
@@ -1107,9 +1201,6 @@ pub fn run(options: &Options) -> Result<Report> {
         progress: options.progress,
         package_dir,
         binaries: vec![],
-        mutants_run: 0,
-        mutants_killed: 0,
-        mutants_timed_out: 0,
     };
     let mut runners: Vec<(String, Runner)> = build
         .test_binaries
@@ -1154,21 +1245,120 @@ pub fn run(options: &Options) -> Result<Report> {
         session.binaries.push(bin);
     }
 
-    // 6. Plan each site and run what has to be run.
+    // 6. Plan every site, run the mutants, and put the findings together.
     let mut report = Report {
         package: package.name.clone(),
         sites: total_sites,
         skipped_sites: disabled.len(),
         ..Report::default()
     };
+    let mut jobs: Vec<Job> = vec![];
+    let mut work: Vec<SiteWork> = vec![];
     for file in &files {
         for site in file.sites.iter().filter(|s| !disabled.contains(&s.id)) {
-            session.analyse(&mut report, &file.display, site, options.verify)?;
+            let plan = match session.plan(&file.display, site, options.verify) {
+                Planned::Unreached => {
+                    report.unreached.push(report::location(&file.display, site));
+                    continue;
+                }
+                Planned::Nothing => continue,
+                Planned::Plan(plan) => plan,
+            };
+            let mut add =
+                |mutation: Mutation, tests_of: &dyn Fn(&TestBinary) -> BTreeSet<String>| {
+                    jobs.push(session.job(site.id, mutation, tests_of));
+                    jobs.len() - 1
+                };
+            let gaps = plan
+                .gaps
+                .into_iter()
+                .map(|(finding, survivors)| {
+                    // The trace says no test can notice. Confirm by running every test
+                    // that reaches the site against the listed survivors.
+                    let confirm = if options.verify {
+                        survivors
+                            .into_iter()
+                            .map(|m| add(m, &*plan.reaching))
+                            .collect()
+                    } else {
+                        vec![]
+                    };
+                    (finding, confirm)
+                })
+                .collect();
+            let infected = &plan.infected;
+            let runs = plan
+                .run
+                .iter()
+                .map(|m| (*m, add(*m, &|bin| infected(bin, *m))))
+                .collect();
+            work.push(SiteWork {
+                file: &file.display,
+                site,
+                gaps,
+                constant: plan.constant,
+                cannot_differ: plan.cannot_differ,
+                runs,
+            });
         }
     }
-    report.mutants_run = session.mutants_run;
-    report.mutants_killed = session.mutants_killed;
-    report.mutants_timed_out = session.mutants_timed_out;
+    session.note(&format!(
+        "running {} mutants on {} thread(s)",
+        jobs.len(),
+        options.jobs.max(1)
+    ));
+    let results = session.run_jobs(&jobs, options.jobs)?;
+    report.mutants_run = results.len();
+    report.mutants_killed = results.iter().filter(|r| r.survived.is_none()).count();
+    report.mutants_timed_out = results.iter().filter(|r| r.timed_out).count();
+
+    // Sites whose expression had one value in every test (confirmed), and comparisons that
+    // cannot have another outcome at all.
+    let confirmed = |w: &SiteWork| {
+        w.gaps
+            .iter()
+            .all(|(_, confirm)| confirm.iter().all(|j| results[*j].survived.is_some()))
+    };
+    let nested_in = |outer: &SiteWork, inner: &SiteWork| {
+        inner.file == outer.file
+            && inner.site.id != outer.site.id
+            && outer.site.start <= inner.site.start
+            && inner.site.end <= outer.site.end
+    };
+    for item in &work {
+        let at = report::location(item.file, item.site);
+        // An enclosing condition or function repeats what its parts already say: if an
+        // operand is constant in the tests, "this operand never decides" follows from it.
+        let explained = match item.site.kind {
+            SiteKind::Logic { .. } => work
+                .iter()
+                .any(|w| nested_in(item, w) && ((w.constant && confirmed(w)) || w.cannot_differ)),
+            SiteKind::Return { .. } => work.iter().any(|w| nested_in(item, w) && w.cannot_differ),
+            _ => false,
+        };
+        for (finding, confirm) in &item.gaps {
+            if confirm.iter().any(|j| results[*j].survived.is_none()) {
+                report.unstable.push(at.clone());
+            } else if !explained {
+                report.findings.push(finding.clone());
+            }
+        }
+        let mut survivors = vec![];
+        let mut passing_tests = BTreeSet::new();
+        for (mutation, job) in &item.runs {
+            if let Some(tests) = &results[*job].survived {
+                survivors.push(report::describe(item.site, *mutation));
+                passing_tests.extend(tests.iter().cloned());
+            }
+        }
+        if !survivors.is_empty() {
+            report.findings.push(Finding::AssertionGap {
+                at,
+                survivors,
+                tests: passing_tests.into_iter().collect(),
+            });
+        }
+    }
     Ok(report)
 }
 
@@ -1378,6 +1568,39 @@ serde = { path = "../../serde-fork" }
             absolutize_path_dependencies("not [ toml", Path::new("/w"), Path::new("/w")).is_err()
         );
         assert_eq!(normalize(Path::new("/a/./b/../c")), PathBuf::from("/a/c"));
+    }
+
+    #[test]
+    fn pool_runs_every_job_once_and_keeps_the_order() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        for workers in [0, 1, 2, 3, 8, 100] {
+            for count in [0, 1, 2, 7, 50] {
+                let calls: Vec<AtomicUsize> = (0..count).map(|_| AtomicUsize::new(0)).collect();
+                let results = run_pool(count, workers, |i| {
+                    calls[i].fetch_add(1, Ordering::SeqCst);
+                    std::thread::yield_now();
+                    Ok(i * 10)
+                })
+                .unwrap();
+                assert_eq!(
+                    results,
+                    (0..count).map(|i| i * 10).collect::<Vec<_>>(),
+                    "workers={workers}"
+                );
+                assert!(
+                    calls.iter().all(|c| c.load(Ordering::SeqCst) == 1),
+                    "workers={workers} count={count}"
+                );
+            }
+        }
+        let failed = run_pool(5, 3, |i| {
+            if i == 3 {
+                Err(anyhow!("job {i} broke"))
+            } else {
+                Ok(i)
+            }
+        });
+        assert_eq!(failed.unwrap_err().to_string(), "job 3 broke");
     }
 
     #[test]

@@ -296,8 +296,10 @@ pub enum Mutation {
     LogicDropRhs,
     /// Ignore the value of the left operand of `&&` / `||`.
     LogicDropLhs,
-    /// `+` <-> `-`, `*` <-> `/`, `%` -> `/`.
+    /// `+` <-> `-`, `*` <-> `/`, `%` -> `/`, `&` <-> `|`, `^` -> `&`, `<<` <-> `>>`.
     ArithSwap,
+    /// `!x` becomes `x`.
+    DropNot,
 }
 
 impl Mutation {
@@ -314,6 +316,7 @@ impl Mutation {
             Mutation::LogicDropRhs => "ldr".to_string(),
             Mutation::LogicDropLhs => "ldl".to_string(),
             Mutation::ArithSwap => "asw".to_string(),
+            Mutation::DropNot => "unn".to_string(),
         }
     }
 }
@@ -392,6 +395,9 @@ pub enum InputGap {
 
 #[derive(Clone, PartialEq, Debug, Default)]
 pub struct CmpPlan {
+    /// The comparison had one outcome in every test and its operand types allow no other
+    /// (`x >= 0` for unsigned `x`): whatever encloses it is constant for the same reason.
+    pub cannot_differ: bool,
     pub gap: Option<InputGap>,
     /// Mutations that change the outcome of at least one test's observation. Only running
     /// the tests can tell whether an assertion notices.
@@ -452,6 +458,7 @@ impl InputGap {
 pub fn plan_cmp(op: CmpOp, obs: &Obs, domain: Option<(i128, i128)>) -> CmpPlan {
     if !obs.reached() {
         return CmpPlan {
+            cannot_differ: false,
             gap: Some(InputGap::Unreached),
             run: vec![],
         };
@@ -470,6 +477,7 @@ pub fn plan_cmp(op: CmpOp, obs: &Obs, domain: Option<(i128, i128)>) -> CmpPlan {
             _ => true,
         };
         return CmpPlan {
+            cannot_differ: !other_possible,
             gap: other_possible.then_some(InputGap::OneSided { always }),
             run: vec![Mutation::Negate],
         };
@@ -478,6 +486,7 @@ pub fn plan_cmp(op: CmpOp, obs: &Obs, domain: Option<(i128, i128)>) -> CmpPlan {
     let Some((up, t0)) = op.threshold() else {
         // `==` / `!=` with both outcomes observed: nothing to shift.
         return CmpPlan {
+            cannot_differ: false,
             gap: None,
             run: vec![Mutation::Negate],
         };
@@ -489,11 +498,13 @@ pub fn plan_cmp(op: CmpOp, obs: &Obs, domain: Option<(i128, i128)>) -> CmpPlan {
             .expect("ordering operators have a flipped form");
         return if obs.eq {
             CmpPlan {
+                cannot_differ: false,
                 gap: None,
                 run: vec![Mutation::Op(flipped), Mutation::Negate],
             }
         } else {
             CmpPlan {
+                cannot_differ: false,
                 gap: Some(InputGap::EqualNeverObserved {
                     flipped,
                     float_gap: obs.float_gap(),
@@ -535,7 +546,11 @@ pub fn plan_cmp(op: CmpOp, obs: &Obs, domain: Option<(i128, i128)>) -> CmpPlan {
         max_shift,
         missing,
     });
-    CmpPlan { gap, run }
+    CmpPlan {
+        cannot_differ: false,
+        gap,
+        run,
+    }
 }
 
 /// What the tests observed at `a && b` / `a || b`.
@@ -671,6 +686,62 @@ pub fn plan_arith(obs: &ArithObs) -> ArithPlan {
     }
 }
 
+/// What a `-> bool` function returned at its normal exit.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ReturnObs {
+    pub saw_true: bool,
+    pub saw_false: bool,
+}
+
+impl ReturnObs {
+    pub fn from_bits(bits: u8) -> ReturnObs {
+        ReturnObs {
+            saw_true: bits & 1 != 0,
+            saw_false: bits & 2 != 0,
+        }
+    }
+
+    pub fn merge(&mut self, other: &ReturnObs) {
+        self.saw_true |= other.saw_true;
+        self.saw_false |= other.saw_false;
+    }
+
+    pub fn reached(&self) -> bool {
+        self.saw_true || self.saw_false
+    }
+
+    /// Whether replacing the returned value by `value` changes anything for this test.
+    pub fn infected_by_const(&self, value: bool) -> bool {
+        if value { self.saw_false } else { self.saw_true }
+    }
+}
+
+#[derive(Clone, PartialEq, Debug, Default)]
+pub struct ReturnPlan {
+    pub unreached: bool,
+    /// The function returned only this value: `Const(value)` survives.
+    pub always: Option<bool>,
+    pub run: Vec<Mutation>,
+}
+
+pub fn plan_return(obs: &ReturnObs) -> ReturnPlan {
+    match (obs.saw_true, obs.saw_false) {
+        (false, false) => ReturnPlan {
+            unreached: true,
+            ..ReturnPlan::default()
+        },
+        (true, true) => ReturnPlan {
+            run: vec![Mutation::Const(true), Mutation::Const(false)],
+            ..ReturnPlan::default()
+        },
+        (always, _) => ReturnPlan {
+            unreached: false,
+            always: Some(always),
+            run: vec![Mutation::Const(!always)],
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -733,6 +804,7 @@ mod tests {
         assert_eq!(
             plan,
             CmpPlan {
+                cannot_differ: false,
                 gap: Some(InputGap::Unreached),
                 run: vec![]
             }
@@ -751,6 +823,9 @@ mod tests {
         // `x >= 0` for unsigned x: D ranges over 0..=MAX, the condition cannot be false.
         let plan = plan_cmp(CmpOp::Ge, &obs_of(&[0, 4]), Some((0, 255)));
         assert_eq!(plan.gap, None);
+        assert!(plan.cannot_differ);
+        assert!(!plan_cmp(CmpOp::Ge, &obs_of(&[0, 4]), Some((-1, 255))).cannot_differ);
+        assert!(!plan_cmp(CmpOp::Ge, &obs_of(&[-1, 4]), Some((-1, 255))).cannot_differ);
         // `x < 0` for unsigned x can never be true either.
         let plan = plan_cmp(CmpOp::Lt, &obs_of(&[0, 4]), Some((0, 255)));
         assert_eq!(plan.gap, None);
@@ -896,6 +971,72 @@ mod tests {
                 short: false,
                 rhs_true: true,
                 rhs_false: false
+            }
+        );
+    }
+
+    #[test]
+    fn return_plans() {
+        assert_eq!(
+            plan_return(&ReturnObs::from_bits(0)),
+            ReturnPlan {
+                unreached: true,
+                always: None,
+                run: vec![]
+            }
+        );
+        assert_eq!(
+            plan_return(&ReturnObs::from_bits(1)),
+            ReturnPlan {
+                unreached: false,
+                always: Some(true),
+                run: vec![Mutation::Const(false)]
+            }
+        );
+        assert_eq!(
+            plan_return(&ReturnObs::from_bits(2)),
+            ReturnPlan {
+                unreached: false,
+                always: Some(false),
+                run: vec![Mutation::Const(true)]
+            }
+        );
+        assert_eq!(
+            plan_return(&ReturnObs::from_bits(3)),
+            ReturnPlan {
+                unreached: false,
+                always: None,
+                run: vec![Mutation::Const(true), Mutation::Const(false)]
+            }
+        );
+        // Forcing the value a test already sees changes nothing for that test.
+        for bits in 0u8..4 {
+            let obs = ReturnObs::from_bits(bits);
+            assert_eq!(obs.infected_by_const(true), obs.saw_false);
+            assert_eq!(obs.infected_by_const(false), obs.saw_true);
+            assert_eq!(obs.reached(), bits != 0);
+            let plan = plan_return(&obs);
+            for m in &plan.run {
+                let Mutation::Const(value) = m else { panic!() };
+                assert!(
+                    obs.infected_by_const(*value),
+                    "a run mutant must change some test"
+                );
+            }
+            if let Some(always) = plan.always {
+                assert!(
+                    !obs.infected_by_const(always),
+                    "the survivor changes no test"
+                );
+            }
+        }
+        let mut merged = ReturnObs::from_bits(1);
+        merged.merge(&ReturnObs::from_bits(2));
+        assert_eq!(
+            merged,
+            ReturnObs {
+                saw_true: true,
+                saw_false: true
             }
         );
     }
@@ -1081,6 +1222,7 @@ mod tests {
         assert_eq!(
             plan,
             CmpPlan {
+                cannot_differ: false,
                 gap: None,
                 run: vec![Mutation::Negate]
             }
@@ -1142,6 +1284,7 @@ mod tests {
         assert_eq!(Mutation::LogicDropRhs.encode(), "ldr");
         assert_eq!(Mutation::LogicDropLhs.encode(), "ldl");
         assert_eq!(Mutation::ArithSwap.encode(), "asw");
+        assert_eq!(Mutation::DropNot.encode(), "unn");
     }
 
     fn candidate_mutations(op: CmpOp) -> Vec<Mutation> {

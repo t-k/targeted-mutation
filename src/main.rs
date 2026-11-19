@@ -31,6 +31,10 @@ struct Cli {
     /// untracked files). By default they are left out of the working copy.
     #[arg(long)]
     all_files: bool,
+    /// Mutants to run at the same time. Only raise it if the tests can run concurrently
+    /// with themselves (no fixed ports, no shared files).
+    #[arg(short, long, default_value_t = 1, value_name = "N")]
+    jobs: usize,
     /// Also list the code that no test executes.
     #[arg(long)]
     show_unreached: bool,
@@ -48,6 +52,7 @@ fn main() -> ExitCode {
         verify: !cli.no_verify,
         work_dir: cli.work_dir,
         progress: !cli.quiet,
+        jobs: cli.jobs,
         all_files: cli.all_files,
         doc: cli.doc,
     };

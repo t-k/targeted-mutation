@@ -47,10 +47,21 @@ pub enum SiteKind {
     /// types the probe performs the original operation and reports nothing.
     Arith {
         op: ArithOp,
+        /// `lhs op= rhs` rather than `lhs op rhs`.
+        assign: bool,
         lhs: String,
         rhs: String,
         gap: (usize, usize),
     },
+    /// `!operand`. Only `bool` is mutated (the `!` is dropped).
+    Not {
+        /// Byte range of the `!` and whatever separates it from the operand.
+        bang: (usize, usize),
+        operand: String,
+    },
+    /// The body of a function that returns `bool`. The site's range is the inside of the
+    /// body's braces and its text is the function signature.
+    Return { name: String },
     /// A call or assignment statement that can be deleted.
     Stmt,
 }
@@ -63,9 +74,27 @@ pub enum ArithOp {
     Mul,
     Div,
     Rem,
+    BitAnd,
+    BitOr,
+    BitXor,
+    Shl,
+    Shr,
 }
 
 impl ArithOp {
+    pub const ALL: [ArithOp; 10] = [
+        ArithOp::Add,
+        ArithOp::Sub,
+        ArithOp::Mul,
+        ArithOp::Div,
+        ArithOp::Rem,
+        ArithOp::BitAnd,
+        ArithOp::BitOr,
+        ArithOp::BitXor,
+        ArithOp::Shl,
+        ArithOp::Shr,
+    ];
+
     pub fn symbol(self) -> &'static str {
         match self {
             ArithOp::Add => "+",
@@ -73,6 +102,11 @@ impl ArithOp {
             ArithOp::Mul => "*",
             ArithOp::Div => "/",
             ArithOp::Rem => "%",
+            ArithOp::BitAnd => "&",
+            ArithOp::BitOr => "|",
+            ArithOp::BitXor => "^",
+            ArithOp::Shl => "<<",
+            ArithOp::Shr => ">>",
         }
     }
 
@@ -84,27 +118,59 @@ impl ArithOp {
             ArithOp::Mul => ArithOp::Div,
             ArithOp::Div => ArithOp::Mul,
             ArithOp::Rem => ArithOp::Div,
+            ArithOp::BitAnd => ArithOp::BitOr,
+            ArithOp::BitOr => ArithOp::BitAnd,
+            ArithOp::BitXor => ArithOp::BitAnd,
+            ArithOp::Shl => ArithOp::Shr,
+            ArithOp::Shr => ArithOp::Shl,
+        }
+    }
+
+    /// Bit operators exist for integers only, the others for floats too.
+    pub fn is_bitwise(self) -> bool {
+        matches!(
+            self,
+            ArithOp::BitAnd | ArithOp::BitOr | ArithOp::BitXor | ArithOp::Shl | ArithOp::Shr
+        )
+    }
+
+    /// The name the runtime uses for this operator in its probe methods and traits.
+    fn stem(self) -> (&'static str, &'static str) {
+        match self {
+            ArithOp::Add => ("add", "Add"),
+            ArithOp::Sub => ("sub", "Sub"),
+            ArithOp::Mul => ("mul", "Mul"),
+            ArithOp::Div => ("div", "Div"),
+            ArithOp::Rem => ("rem", "Rem"),
+            ArithOp::BitAnd => ("bitand", "BitAnd"),
+            ArithOp::BitOr => ("bitor", "BitOr"),
+            ArithOp::BitXor => ("bitxor", "BitXor"),
+            ArithOp::Shl => ("shl", "Shl"),
+            ArithOp::Shr => ("shr", "Shr"),
         }
     }
 
     /// Name of the probe method in the runtime.
-    fn method(self) -> &'static str {
-        match self {
-            ArithOp::Add => "tmt_add",
-            ArithOp::Sub => "tmt_sub",
-            ArithOp::Mul => "tmt_mul",
-            ArithOp::Div => "tmt_div",
-            ArithOp::Rem => "tmt_rem",
-        }
+    pub(crate) fn method(self, assign: bool) -> String {
+        format!(
+            "tmt_{}{}",
+            self.stem().0,
+            if assign { "_assign" } else { "" }
+        )
     }
 
-    fn fallback_trait(self) -> &'static str {
-        match self {
-            ArithOp::Add => "AnyAdd",
-            ArithOp::Sub => "AnySub",
-            ArithOp::Mul => "AnyMul",
-            ArithOp::Div => "AnyDiv",
-            ArithOp::Rem => "AnyRem",
+    /// Trait with the probe for every type that is not a primitive number.
+    pub(crate) fn fallback_trait(self, assign: bool) -> String {
+        format!("Any{}{}", self.stem().1, if assign { "Assign" } else { "" })
+    }
+
+    /// Trait with the probe for primitive numbers.
+    fn prim_trait(self, assign: bool) -> &'static str {
+        match (self.is_bitwise(), assign) {
+            (false, false) => "ArithPrim",
+            (true, false) => "BitPrim",
+            (false, true) => "ArithAssignPrim",
+            (true, true) => "BitAssignPrim",
         }
     }
 }
@@ -155,6 +221,36 @@ struct Finder<'s> {
 }
 
 impl Finder<'_> {
+    /// Registers the body of a `-> bool` function as a site.
+    fn bool_function(&mut self, sig: &syn::Signature, body: &syn::Block) {
+        if !returns_bool(sig) || body.stmts.is_empty() {
+            return;
+        }
+        let braces = body.brace_token.span;
+        let (Some((_, start)), Some((end, _)), Some((sig_start, sig_end))) = (
+            self.range(braces.open()),
+            self.range(braces.close()),
+            self.range(sig.span()),
+        ) else {
+            return;
+        };
+        if start > end {
+            return;
+        }
+        let at = sig.span().start();
+        self.found.sites.push(Site {
+            id: self.next_id,
+            kind: SiteKind::Return {
+                name: sig.ident.to_string(),
+            },
+            line: at.line,
+            column: at.column + 1,
+            start,
+            end,
+            text: self.source[sig_start..sig_end].to_string(),
+        });
+        self.next_id += 1;
+    }
     fn range(&self, span: Span) -> Option<(usize, usize)> {
         let range = span.byte_range();
         // Spans produced by macro hygiene tricks or empty token streams carry no location.
@@ -192,15 +288,41 @@ fn cmp_op(op: &syn::BinOp) -> Option<CmpOp> {
     })
 }
 
-fn arith_op(op: &syn::BinOp) -> Option<ArithOp> {
+/// The arithmetic or bit operator, and whether it is the compound assignment form.
+fn arith_op(op: &syn::BinOp) -> Option<(ArithOp, bool)> {
+    use syn::BinOp as B;
     Some(match op {
-        syn::BinOp::Add(_) => ArithOp::Add,
-        syn::BinOp::Sub(_) => ArithOp::Sub,
-        syn::BinOp::Mul(_) => ArithOp::Mul,
-        syn::BinOp::Div(_) => ArithOp::Div,
-        syn::BinOp::Rem(_) => ArithOp::Rem,
+        B::Add(_) => (ArithOp::Add, false),
+        B::Sub(_) => (ArithOp::Sub, false),
+        B::Mul(_) => (ArithOp::Mul, false),
+        B::Div(_) => (ArithOp::Div, false),
+        B::Rem(_) => (ArithOp::Rem, false),
+        B::BitAnd(_) => (ArithOp::BitAnd, false),
+        B::BitOr(_) => (ArithOp::BitOr, false),
+        B::BitXor(_) => (ArithOp::BitXor, false),
+        B::Shl(_) => (ArithOp::Shl, false),
+        B::Shr(_) => (ArithOp::Shr, false),
+        B::AddAssign(_) => (ArithOp::Add, true),
+        B::SubAssign(_) => (ArithOp::Sub, true),
+        B::MulAssign(_) => (ArithOp::Mul, true),
+        B::DivAssign(_) => (ArithOp::Div, true),
+        B::RemAssign(_) => (ArithOp::Rem, true),
+        B::BitAndAssign(_) => (ArithOp::BitAnd, true),
+        B::BitOrAssign(_) => (ArithOp::BitOr, true),
+        B::BitXorAssign(_) => (ArithOp::BitXor, true),
+        B::ShlAssign(_) => (ArithOp::Shl, true),
+        B::ShrAssign(_) => (ArithOp::Shr, true),
         _ => return None,
     })
+}
+
+fn returns_bool(sig: &syn::Signature) -> bool {
+    match &sig.output {
+        syn::ReturnType::Type(_, ty) => {
+            matches!(&**ty, syn::Type::Path(p) if p.qself.is_none() && p.path.is_ident("bool"))
+        }
+        syn::ReturnType::Default => false,
+    }
 }
 
 fn is_literal(expr: &syn::Expr) -> bool {
@@ -411,18 +533,23 @@ impl<'ast> Visit<'ast> for Finder<'_> {
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
         if !is_test_only(&node.attrs) && node.sig.constness.is_none() {
+            self.bool_function(&node.sig, &node.block);
             visit::visit_item_fn(self, node);
         }
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
         if !is_test_only(&node.attrs) && node.sig.constness.is_none() {
+            self.bool_function(&node.sig, &node.block);
             visit::visit_impl_item_fn(self, node);
         }
     }
 
     fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
         if !is_test_only(&node.attrs) && node.sig.constness.is_none() {
+            if let Some(body) = &node.default {
+                self.bool_function(&node.sig, body);
+            }
             visit::visit_trait_item_fn(self, node);
         }
     }
@@ -451,6 +578,22 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             }
         }
         visit::visit_block(self, node);
+    }
+
+    fn visit_expr_unary(&mut self, node: &'ast syn::ExprUnary) {
+        if let syn::UnOp::Not(bang) = &node.op
+            && node.attrs.is_empty()
+            && let (Some((start, _)), Some((operand_start, end))) =
+                (self.range(bang.span()), self.range(node.expr.span()))
+            && start < operand_start
+        {
+            let kind = SiteKind::Not {
+                bang: (start, operand_start),
+                operand: self.source[operand_start..end].to_string(),
+            };
+            self.push(kind, start, end, bang.span());
+        }
+        visit::visit_expr_unary(self, node);
     }
 
     fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
@@ -495,11 +638,17 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                         node.left.span(),
                     );
                 }
-            } else if let Some(op) = arith_op(&node.op)
+            } else if let Some((op, assign)) = arith_op(&node.op)
                 && !(is_literal(&node.left) && is_literal(&node.right))
             {
                 self.push(
-                    SiteKind::Arith { op, lhs, rhs, gap },
+                    SiteKind::Arith {
+                        op,
+                        assign,
+                        lhs,
+                        rhs,
+                        gap,
+                    },
                     start,
                     end,
                     node.left.span(),
@@ -585,22 +734,51 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     ") } else { __tmt_c == 1u8 } })".to_string(),
                 )
             }
-            SiteKind::Arith { op, gap, .. } => {
+            SiteKind::Arith {
+                op, assign, gap, ..
+            } => {
+                // A compound assignment hands the probe the place to update.
+                let (holder, lhs_open, lhs_close) = if *assign {
+                    ("Aa", "&mut (", ")")
+                } else {
+                    ("Ar", "", "")
+                };
                 edits.push(Edit {
                     pos: gap.0,
                     end: gap.1,
                     phase: 1,
                     order: 0,
-                    text: ", ".into(),
+                    text: format!("{lhs_close}, "),
                 });
                 (
                     format!(
-                        "({{ #[allow(unused_imports)] use {rt}::{{{any} as _, ArithPrim as _}}; (&{rt}::Ar::new(",
-                        any = op.fallback_trait()
+                        "({{ #[allow(unused_imports)] use {rt}::{{{any} as _, {prim} as _}}; (&{rt}::{holder}::new({lhs_open}",
+                        any = op.fallback_trait(*assign),
+                        prim = op.prim_trait(*assign),
                     ),
-                    format!(")).{}({}u32) }})", op.method(), site.id),
+                    format!(")).{}({}u32) }})", op.method(*assign), site.id),
                 )
             }
+            SiteKind::Not { bang, .. } => {
+                // Drop the `!`; the probe applies it (or not).
+                edits.push(Edit {
+                    pos: bang.0,
+                    end: bang.1,
+                    phase: 1,
+                    order: 0,
+                    text: String::new(),
+                });
+                (
+                    format!(
+                        "({{ #[allow(unused_imports)] use {rt}::{{AnyNot as _, NotPrim as _}}; (&{rt}::Un::new("
+                    ),
+                    format!(")).tmt_not({}u32) }})", site.id),
+                )
+            }
+            SiteKind::Return { .. } => (
+                " let __tmt_v: bool = {".to_string(),
+                format!("}}; {rt}::ret({}u32, __tmt_v) ", site.id),
+            ),
             SiteKind::Stmt => (
                 format!("if {rt}::live({}u32) {{ ", site.id),
                 " }".to_string(),
@@ -665,10 +843,22 @@ mod tests {
         true
     }
 
+    /// The sites of `src` without the function-level `Return` sites, numbered from
+    /// `first_id`: most tests are about one expression inside a small function.
+    fn found(src: &str, first_id: u32) -> Result<Discovery> {
+        let mut all = discover(src, 0)?;
+        all.sites
+            .retain(|s| !matches!(s.kind, SiteKind::Return { .. }));
+        for (index, site) in all.sites.iter_mut().enumerate() {
+            site.id = first_id + index as u32;
+        }
+        Ok(all)
+    }
+
     #[test]
     fn finds_a_comparison_with_a_literal() {
         let src = "pub fn is_eligible(age: u32) -> bool {\n    age >= 18\n}\n";
-        let found = discover(src, 5).unwrap();
+        let found = found(src, 5).unwrap();
         assert_eq!(found.sites.len(), 1);
         let site = &found.sites[0];
         assert_eq!(
@@ -695,7 +885,7 @@ mod tests {
     fn literal_sides() {
         let src =
             "fn f(x: i32, y: i32) { let _ = (-5 < x, x == (3), 1 < 2, x <= y, x > 1.5 as i32); }";
-        let literals: Vec<LiteralSide> = discover(src, 0)
+        let literals: Vec<LiteralSide> = found(src, 0)
             .unwrap()
             .sites
             .iter()
@@ -719,7 +909,7 @@ mod tests {
     #[test]
     fn renders_a_comparison_probe() {
         let src = "fn f(a: u8) -> bool { a  >=  18 }";
-        let sites = discover(src, 3).unwrap().sites;
+        let sites = found(src, 3).unwrap().sites;
         let out = render(src, &sites, &all);
         assert_eq!(
             out.text,
@@ -733,7 +923,7 @@ mod tests {
     #[test]
     fn renders_statement_guards_and_nested_sites() {
         let src = "fn f(v: &mut Vec<u8>, a: u8) -> Result<(), ()> {\n    check((a < 3) == true)?;\n    v.push(a);v.clear();\n    Ok(())\n}";
-        let sites = discover(src, 0).unwrap().sites;
+        let sites = found(src, 0).unwrap().sites;
         let kinds: Vec<&str> = sites.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(
             kinds,
@@ -800,7 +990,7 @@ mod tests {
             fn also_real(a: u8) -> bool { a == 101 }
             fn pat(a: u8) -> bool { matches!(a, 1..=2) || match a { 0..=9 => a == 102, _ => false } }
         "#;
-        let found = discover(src, 0).unwrap();
+        let found = found(src, 0).unwrap();
         let texts: Vec<&str> = found.sites.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(
             texts,
@@ -842,7 +1032,7 @@ mod tests {
                 s.done()
             }
         "#;
-        let texts: Vec<String> = discover(src, 0)
+        let texts: Vec<String> = found(src, 0)
             .unwrap()
             .sites
             .into_iter()
@@ -865,7 +1055,7 @@ mod tests {
     #[test]
     fn maps_offsets_back_and_blames_the_innermost_site() {
         let src = "fn f(a: u8, b: u8) -> bool { g(a < b); a > 1 }";
-        let sites = discover(src, 0).unwrap().sites;
+        let sites = found(src, 0).unwrap().sites;
         let out = render(src, &sites, &all);
         // Every original character keeps its identity through the mapping.
         for (orig, ch) in src.char_indices().filter(|(_, c)| c.is_alphanumeric()) {
@@ -897,7 +1087,7 @@ mod tests {
     #[test]
     fn blame_is_inclusive_at_both_ends() {
         let src = "fn f(a: u8) -> bool { a > 1 }";
-        let sites = discover(src, 0).unwrap().sites;
+        let sites = found(src, 0).unwrap().sites;
         let (start, end) = (sites[0].start, sites[0].end);
         assert_eq!(blame(&sites, &all, start - 1), Vec::<u32>::new());
         assert_eq!(blame(&sites, &all, start), [0]);
@@ -927,7 +1117,7 @@ mod tests {
             fn arr(a: u8) -> [bool; 2] { [a < 6; 2] }
             fn closure(a: u8) -> bool { (|| a < 7)() }
         "#;
-        let texts: Vec<String> = discover(src, 0)
+        let texts: Vec<String> = found(src, 0)
             .unwrap()
             .sites
             .into_iter()
@@ -939,7 +1129,7 @@ mod tests {
     #[test]
     fn logic_and_arithmetic_sites() {
         let src = "fn f(a: bool, b: bool, x: u32, y: u32) -> u32 { if a && b || !a { x + y * 2 } else { x - 1 % y } }";
-        let found = discover(src, 0).unwrap().sites;
+        let found = found(src, 0).unwrap().sites;
         let kinds: Vec<String> = found
             .iter()
             .map(|s| match &s.kind {
@@ -947,6 +1137,7 @@ mod tests {
                 SiteKind::Arith { op, lhs, rhs, .. } => {
                     format!("arith {} [{lhs}] [{rhs}]", op.symbol())
                 }
+                SiteKind::Not { operand, .. } => format!("not [{operand}]"),
                 other => format!("{other:?}"),
             })
             .collect();
@@ -955,6 +1146,7 @@ mod tests {
             [
                 "logic and=false [a && b] [!a]",
                 "logic and=true [a] [b]",
+                "not [a]",
                 "arith + [x] [y * 2]",
                 "arith * [y] [2]",
                 "arith - [x] [1 % y]",
@@ -964,32 +1156,28 @@ mod tests {
         let out = render(src, &found, &all).text;
         syn::parse_file(&out).expect("instrumented source parses");
         assert!(out.contains("({ let __tmt_c = crate::__tmt_rt::lhs(1u32, true, a); if __tmt_c == 2u8 { crate::__tmt_rt::rhs(1u32, true, b) } else { __tmt_c == 1u8 } })"), "{out}");
-        assert!(out.contains("use crate::__tmt_rt::{AnyMul as _, ArithPrim as _}; (&crate::__tmt_rt::Ar::new(y, 2)).tmt_mul(3u32) })"), "{out}");
-        for op in [
-            ArithOp::Add,
-            ArithOp::Sub,
-            ArithOp::Mul,
-            ArithOp::Div,
-            ArithOp::Rem,
-        ] {
+        assert!(out.contains("use crate::__tmt_rt::{AnyMul as _, ArithPrim as _}; (&crate::__tmt_rt::Ar::new(y, 2)).tmt_mul(4u32) })"), "{out}");
+        // Every probe the renderer can emit exists in the runtime under that name.
+        for op in ArithOp::ALL {
             assert_ne!(op.swapped(), op);
-            assert!(
-                crate::RUNTIME_SOURCE.contains(&format!("fn {}(", op.method())),
-                "{op:?}"
-            );
-            assert!(
-                crate::RUNTIME_SOURCE.contains(&format!(
-                    "{} {} ",
-                    op.fallback_trait(),
-                    op.method()
-                )),
-                "{op:?}"
-            );
+            for assign in [false, true] {
+                let method = op.method(assign);
+                let fallback = format!("{} {method} ", op.fallback_trait(assign));
+                assert!(
+                    crate::RUNTIME_SOURCE.contains(&format!("fn {method}(")),
+                    "{method}"
+                );
+                assert!(crate::RUNTIME_SOURCE.contains(&fallback), "{fallback}");
+                assert!(
+                    crate::RUNTIME_SOURCE.contains(&format!("trait {} ", op.prim_trait(assign))),
+                    "{op:?}"
+                );
+            }
         }
     }
 
     #[test]
-    fn let_chains_literal_arithmetic_and_bit_operators_are_left_alone() {
+    fn let_chains_and_literal_arithmetic_are_left_alone() {
         let src = r#"
             fn f(o: Option<u8>, a: bool, n: u32) -> u32 {
                 if let Some(x) = o && a && x > 1 { return 1; }
@@ -997,13 +1185,22 @@ mod tests {
                 (n & 3) | (n << 1) ^ k
             }
         "#;
-        let texts: Vec<String> = discover(src, 0)
+        let texts: Vec<String> = found(src, 0)
             .unwrap()
             .sites
             .into_iter()
             .map(|s| s.text)
             .collect();
-        assert_eq!(texts, ["x > 1"]);
+        assert_eq!(
+            texts,
+            [
+                "x > 1",
+                "(n & 3) | (n << 1) ^ k",
+                "n & 3",
+                "(n << 1) ^ k",
+                "n << 1"
+            ]
+        );
     }
 
     #[test]
@@ -1034,7 +1231,7 @@ mod tests {
                 Ok(())
             }
         "#;
-        let texts: Vec<String> = discover(src, 0)
+        let texts: Vec<String> = found(src, 0)
             .unwrap()
             .sites
             .into_iter()
@@ -1048,11 +1245,114 @@ mod tests {
                 "self.0 < 3",
                 "#[allow(unused)]\n                s.total += 1;",
                 "s.plain();",
+                "#[allow(unused)]\n                s.total += 1",
                 "s.use_it(v);"
             ]
         );
-        let found = discover(src, 0).unwrap().sites;
+        let found = found(src, 0).unwrap().sites;
         syn::parse_file(&render(src, &found, &all).text).expect("instrumented source parses");
+    }
+
+    #[test]
+    fn compound_assignment_negation_and_bit_operators() {
+        let src = "fn f(total: &mut u32, n: u32, ok: bool, m: Mask) -> u32 { *total += n; *total <<= 1; if !ok { return !n; } let _ = !m; n & 7 }";
+        let sites = found(src, 0).unwrap().sites;
+        let kinds: Vec<String> = sites
+            .iter()
+            .map(|s| match &s.kind {
+                SiteKind::Arith {
+                    op,
+                    assign,
+                    lhs,
+                    rhs,
+                    ..
+                } => format!(
+                    "{lhs} {}{} {rhs}",
+                    op.symbol(),
+                    if *assign { "=" } else { "" }
+                ),
+                SiteKind::Not { operand, .. } => format!("!{operand}"),
+                SiteKind::Stmt => "stmt".to_string(),
+                other => format!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "stmt",
+                "stmt",
+                "*total += n",
+                "*total <<= 1",
+                "!ok",
+                "!n",
+                "!m",
+                "n & 7"
+            ]
+        );
+        let out = render(src, &sites, &all).text;
+        syn::parse_file(&out).expect("instrumented source parses");
+        assert!(out.contains("use crate::__tmt_rt::{AnyAddAssign as _, ArithAssignPrim as _}; (&crate::__tmt_rt::Aa::new(&mut (*total), n)).tmt_add_assign(2u32) })"), "{out}");
+        assert!(out.contains("use crate::__tmt_rt::{AnyShlAssign as _, BitAssignPrim as _}; (&crate::__tmt_rt::Aa::new(&mut (*total), 1)).tmt_shl_assign(3u32) })"), "{out}");
+        assert!(out.contains("if ({ #[allow(unused_imports)] use crate::__tmt_rt::{AnyNot as _, NotPrim as _}; (&crate::__tmt_rt::Un::new(ok)).tmt_not(4u32) }) {"), "{out}");
+        assert!(out.contains("use crate::__tmt_rt::{AnyBitAnd as _, BitPrim as _}; (&crate::__tmt_rt::Ar::new(n, 7)).tmt_bitand(7u32) })"), "{out}");
+        // `!a && b`: the negation and the conjunction start at the same character.
+        let nested = "fn f(a: bool, b: bool) -> bool { !a && b }";
+        let sites = found(nested, 0).unwrap().sites;
+        let out = render(nested, &sites, &all).text;
+        syn::parse_file(&out).expect("instrumented source parses");
+        assert!(out.contains("lhs(0u32, true, ({ #[allow(unused_imports)] use crate::__tmt_rt::{AnyNot as _, NotPrim as _}; (&crate::__tmt_rt::Un::new(a)).tmt_not(1u32) }));"), "{out}");
+    }
+
+    #[test]
+    fn bool_functions_are_return_sites() {
+        let src = r#"
+            pub fn is_ok(a: u8) -> bool { let b = a; b > 1 }
+            fn count(a: u8) -> u8 { a }
+            fn unit(a: u8) { let _ = a; }
+            const fn in_const(a: u8) -> bool { a > 2 }
+            #[test]
+            fn a_test() -> bool { true }
+            struct T;
+            impl T { fn method(&self) -> bool { true } }
+            trait Tr { fn required(&self) -> bool; fn provided(&self) -> bool { false } }
+            fn boxed() -> Box<bool> { Box::new(true) }
+            fn qualified() -> core::primitive::bool { true }
+        "#;
+        let sites = discover(src, 0).unwrap().sites;
+        let returns: Vec<(&str, &str, usize)> = sites
+            .iter()
+            .filter_map(|s| match &s.kind {
+                SiteKind::Return { name } => Some((name.as_str(), s.text.as_str(), s.line)),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            returns,
+            [
+                ("is_ok", "fn is_ok(a: u8) -> bool", 2),
+                ("method", "fn method(&self) -> bool", 9),
+                ("provided", "fn provided(&self) -> bool", 10),
+            ]
+        );
+        let out = render(src, &sites, &all).text;
+        syn::parse_file(&out).expect("instrumented source parses");
+        assert!(
+            out.contains("pub fn is_ok(a: u8) -> bool { let __tmt_v: bool = { let b = a; (match"),
+            "{out}"
+        );
+        assert!(
+            out.contains("}) }; crate::__tmt_rt::ret(0u32, __tmt_v) }"),
+            "{out}"
+        );
+        assert_eq!(
+            out.lines().count(),
+            src.lines().count(),
+            "line numbers are preserved"
+        );
+        // A compile error in the wrapper is blamed on the function's site.
+        let rendered = render(src, &sites, &all);
+        let wrapper = rendered.text.find("ret(0u32").unwrap();
+        assert_eq!(blame(&sites, &all, rendered.to_original(wrapper)), [0]);
     }
 
     #[test]
@@ -1070,7 +1370,7 @@ mod tests {
                 vec![a + b, (a < 12) as u32]
             }
         "#;
-        let texts: Vec<String> = discover(src, 0)
+        let texts: Vec<String> = found(src, 0)
             .unwrap()
             .sites
             .into_iter()
@@ -1084,14 +1384,14 @@ mod tests {
                 "a < 12"
             ]
         );
-        let found = discover(src, 0).unwrap().sites;
+        let found = found(src, 0).unwrap().sites;
         syn::parse_file(&render(src, &found, &all).text).expect("instrumented source parses");
     }
 
     #[test]
     fn non_ascii_source_keeps_byte_offsets() {
         let src = "fn f(a: u8) -> bool { let s = \"日本語\"; s.len() > 3 && a < 2 }";
-        let sites = discover(src, 0).unwrap().sites;
+        let sites = found(src, 0).unwrap().sites;
         let texts: Vec<&str> = sites.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(texts, ["s.len() > 3 && a < 2", "s.len() > 3", "a < 2"]);
         syn::parse_file(&render(src, &sites, &all).text).unwrap();

@@ -63,6 +63,21 @@ fn eligible(price: u32) -> Result<bool, String> {
     if price > 1000 { Err("too expensive".into()) } else { Ok(price % 2 == 0) }
 }
 
+/// Only tested with a step of zero.
+pub fn advance(position: &mut u64, step: u64) {
+    *position += step;
+}
+
+/// Tested with a flag that is set and one that is not.
+pub fn has_flag(bits: u32, flag: u32) -> bool {
+    bits & flag != 0
+}
+
+/// Only tested when ready.
+pub fn must_wait(ready: bool) -> bool {
+    !ready
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -102,6 +117,16 @@ mod tests {
         assert_eq!(flags(-1), [false, false]);
         assert_eq!(first_positive(&[-1, 0, 1, 5]), Some(1));
         assert_eq!(first_positive(&[-1]), None);
+    }
+
+    #[test]
+    fn positions_flags_and_waiting() {
+        let mut position = 7;
+        advance(&mut position, 0);
+        assert_eq!(position, 7);
+        assert!(has_flag(0b101, 0b100));
+        assert!(!has_flag(0b101, 0b010));
+        assert!(!must_wait(true));
     }
 
     #[test]

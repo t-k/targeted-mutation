@@ -110,6 +110,11 @@ fn show_float(v: f64) -> String {
 pub fn describe(site: &Site, m: Mutation) -> String {
     match &site.kind {
         SiteKind::Stmt => format!("delete `{}`", one_line(&site.text)),
+        SiteKind::Not { operand, .. } => format!("`{}`", one_line(operand)),
+        SiteKind::Return { name } => match m {
+            Mutation::Const(value) => format!("`{name}` returning `{value}`"),
+            _ => format!("`{name}` returning something else"),
+        },
         SiteKind::Logic { and, lhs, rhs, .. } => {
             let (lhs, rhs) = (one_line(lhs), one_line(rhs));
             match m {
@@ -118,9 +123,16 @@ pub fn describe(site: &Site, m: Mutation) -> String {
                 _ => format!("`{lhs} {} {rhs}`", if *and { "||" } else { "&&" }),
             }
         }
-        SiteKind::Arith { op, lhs, rhs, .. } => {
+        SiteKind::Arith {
+            op,
+            assign,
+            lhs,
+            rhs,
+            ..
+        } => {
+            let eq = if *assign { "=" } else { "" };
             format!(
-                "`{} {} {}`",
+                "`{} {}{eq} {}`",
                 one_line(lhs),
                 op.swapped().symbol(),
                 one_line(rhs)
@@ -334,17 +346,45 @@ pub fn logic_gap_finding(
     })
 }
 
+/// Input gap at a `-> bool` function that returned the same value in every test.
+pub fn return_gap_finding(
+    file: &str,
+    site: &Site,
+    always: bool,
+    verified: bool,
+) -> Option<Finding> {
+    let SiteKind::Return { name } = &site.kind else {
+        return None;
+    };
+    Some(Finding::InputGap {
+        at: location(file, site),
+        survivors: vec![describe(site, Mutation::Const(always))],
+        survivor_count: 1,
+        add_tests: vec![format!("a case where `{name}` returns {}", !always)],
+        observed: None,
+        verified,
+    })
+}
+
 /// Input gap at an arithmetic operator: the swapped operator computes the same value on
 /// every pair of operands the tests pass.
 pub fn arith_gap_finding(file: &str, site: &Site, verified: bool) -> Option<Finding> {
-    let SiteKind::Arith { op, lhs, rhs, .. } = &site.kind else {
+    let SiteKind::Arith {
+        op,
+        assign,
+        lhs,
+        rhs,
+        ..
+    } = &site.kind
+    else {
         return None;
     };
     let (lhs, rhs) = (one_line(lhs), one_line(rhs));
+    let eq = if *assign { "=" } else { "" };
     let add = match op {
         ArithOp::Add | ArithOp::Sub => format!("`{rhs}` other than 0"),
         _ => format!(
-            "operands for which `{lhs} {} {rhs}` and `{lhs} {} {rhs}` differ",
+            "operands for which `{lhs} {}{eq} {rhs}` and `{lhs} {}{eq} {rhs}` differ",
             op.symbol(),
             op.swapped().symbol()
         ),
@@ -477,8 +517,23 @@ mod tests {
     use super::*;
     use crate::instrument::discover;
 
+    fn assign_kind() -> SiteKind {
+        SiteKind::Arith {
+            op: ArithOp::Add,
+            assign: true,
+            lhs: "*total".into(),
+            rhs: "fee".into(),
+            gap: (0, 0),
+        }
+    }
+
     fn site_of(src: &str) -> Site {
-        discover(src, 0).unwrap().sites.into_iter().next().unwrap()
+        discover(src, 0)
+            .unwrap()
+            .sites
+            .into_iter()
+            .find(|s| !matches!(s.kind, SiteKind::Return { .. }))
+            .unwrap()
     }
 
     #[test]
@@ -789,6 +844,66 @@ mod tests {
             add_tests[0],
             "operands for which `n * scale` and `n / scale` differ"
         );
+        let assign = Site {
+            kind: assign_kind(),
+            ..add.clone()
+        };
+        assert_eq!(describe(&assign, Mutation::ArithSwap), "`*total -= fee`");
+        let Some(Finding::InputGap { add_tests, .. }) = arith_gap_finding("f.rs", &assign, true)
+        else {
+            panic!()
+        };
+        assert_eq!(add_tests[0], "`fee` other than 0");
+        let shift = Site {
+            kind: SiteKind::Arith {
+                op: ArithOp::Shl,
+                assign: true,
+                lhs: "bits".into(),
+                rhs: "n".into(),
+                gap: (0, 0),
+            },
+            ..assign.clone()
+        };
+        assert_eq!(describe(&shift, Mutation::ArithSwap), "`bits >>= n`");
+        let Some(Finding::InputGap { add_tests, .. }) = arith_gap_finding("f.rs", &shift, true)
+        else {
+            panic!()
+        };
+        assert_eq!(
+            add_tests[0],
+            "operands for which `bits <<= n` and `bits >>= n` differ"
+        );
+
+        let not = Site {
+            kind: SiteKind::Not {
+                bang: (0, 1),
+                operand: "is_ready(x)".into(),
+            },
+            ..assign.clone()
+        };
+        assert_eq!(describe(&not, Mutation::DropNot), "`is_ready(x)`");
+        let ret = Site {
+            kind: SiteKind::Return {
+                name: "is_ready".into(),
+            },
+            ..assign.clone()
+        };
+        assert_eq!(
+            describe(&ret, Mutation::Const(true)),
+            "`is_ready` returning `true`"
+        );
+        let Some(Finding::InputGap {
+            survivors,
+            add_tests,
+            ..
+        }) = return_gap_finding("f.rs", &ret, false, true)
+        else {
+            panic!()
+        };
+        assert_eq!(survivors[0], "`is_ready` returning `false`");
+        assert_eq!(add_tests[0], "a case where `is_ready` returns true");
+        assert_eq!(return_gap_finding("f.rs", &not, false, true), None);
+
         let rem = site_of("fn f(n: u32, k: u32) -> u32 { n % k }");
         assert_eq!(describe(&rem, Mutation::ArithSwap), "`n / k`");
         assert_eq!(

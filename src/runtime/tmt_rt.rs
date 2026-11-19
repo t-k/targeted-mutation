@@ -91,6 +91,15 @@ pub const SUB: u8 = 1;
 pub const MUL: u8 = 2;
 pub const DIV: u8 = 3;
 pub const REM: u8 = 4;
+pub const BITAND: u8 = 5;
+pub const BITOR: u8 = 6;
+pub const BITXOR: u8 = 7;
+pub const SHL: u8 = 8;
+pub const SHR: u8 = 9;
+
+/// Observations at the exit of a `-> bool` function.
+pub const RET_TRUE: u8 = 1;
+pub const RET_FALSE: u8 = 2;
 
 /// Logic observations: the left operand decided alone, the right operand was true / false.
 pub const LOGIC_SHORT: u8 = 1;
@@ -118,8 +127,10 @@ pub enum Mutant {
     LogicDropRhs,
     /// The left operand is evaluated but its value is ignored.
     LogicDropLhs,
-    /// `+` <-> `-`, `*` <-> `/`, `%` -> `/`.
+    /// `+` <-> `-`, `*` <-> `/`, `%` -> `/`, `&` <-> `|`, `^` -> `&`, `<<` <-> `>>`.
     ArithSwap,
+    /// `!x` becomes `x`.
+    DropNot,
 }
 
 pub fn parse_mutant(spec: &str) -> Option<(u32, Mutant)> {
@@ -134,6 +145,7 @@ pub fn parse_mutant(spec: &str) -> Option<(u32, Mutant)> {
         "ldr" => Mutant::LogicDropRhs,
         "ldl" => Mutant::LogicDropLhs,
         "asw" => Mutant::ArithSwap,
+        "unn" => Mutant::DropNot,
         _ if m.starts_with("op") => Mutant::Op(m[2..].parse().ok().filter(|c| *c <= NE)?),
         _ if m.starts_with("shf") => {
             Mutant::ShiftF(m[3..].parse().ok().filter(|s: &f64| s.is_finite())?)
@@ -547,7 +559,12 @@ pub fn arith_swapped(op: u8) -> u8 {
         SUB => ADD,
         MUL => DIV,
         DIV => MUL,
-        _ => DIV,
+        REM => DIV,
+        BITAND => BITOR,
+        BITOR => BITAND,
+        BITXOR => BITAND,
+        SHL => SHR,
+        _ => SHL,
     }
 }
 
@@ -575,15 +592,60 @@ pub trait ArithNum: Copy {
     }
 }
 
-macro_rules! tmt_arith_prim {
-    ($($t:ty)*) => {$(
+/// Probe for bit operators on integers.
+pub trait BitPrim {
+    type O;
+    fn tmt_bitand(&self, site: u32) -> Self::O;
+    fn tmt_bitor(&self, site: u32) -> Self::O;
+    fn tmt_bitxor(&self, site: u32) -> Self::O;
+    fn tmt_shl(&self, site: u32) -> Self::O;
+    fn tmt_shr(&self, site: u32) -> Self::O;
+}
+
+/// The place and the right operand of a compound assignment, taken out once.
+pub struct Aa<'p, L, R>(Cell<Option<(&'p mut L, R)>>);
+
+impl<'p, L, R> Aa<'p, L, R> {
+    pub fn new(l: &'p mut L, r: R) -> Self {
+        Aa(Cell::new(Some((l, r))))
+    }
+
+    fn take(&self) -> (&'p mut L, R) {
+        self.0.take().expect("operands are taken once")
+    }
+}
+
+pub trait ArithAssignPrim {
+    fn tmt_add_assign(&self, site: u32);
+    fn tmt_sub_assign(&self, site: u32);
+    fn tmt_mul_assign(&self, site: u32);
+    fn tmt_div_assign(&self, site: u32);
+    fn tmt_rem_assign(&self, site: u32);
+}
+
+pub trait BitAssignPrim {
+    fn tmt_bitand_assign(&self, site: u32);
+    fn tmt_bitor_assign(&self, site: u32);
+    fn tmt_bitxor_assign(&self, site: u32);
+    fn tmt_shl_assign(&self, site: u32);
+    fn tmt_shr_assign(&self, site: u32);
+}
+
+macro_rules! tmt_arith_prim {($($t:ty)*) => {$(
         impl ArithPrim for Ar<$t, $t> {
             type O = $t;
             fn tmt_add(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, ADD, a, b) }
             fn tmt_sub(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, SUB, a, b) }
             fn tmt_mul(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, MUL, a, b) }
             fn tmt_div(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, DIV, a, b) }
-            fn tmt_rem(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, REM, a, b) }
+                        fn tmt_rem(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, REM, a, b) }
+        }
+        impl<'p> ArithAssignPrim for Aa<'p, $t, $t> {
+            fn tmt_add_assign(&self, site: u32) { let (l, r) = self.take(); *l = <$t>::tmt_run(site, ADD, *l, r) }
+            fn tmt_sub_assign(&self, site: u32) { let (l, r) = self.take(); *l = <$t>::tmt_run(site, SUB, *l, r) }
+            fn tmt_mul_assign(&self, site: u32) { let (l, r) = self.take(); *l = <$t>::tmt_run(site, MUL, *l, r) }
+            fn tmt_div_assign(&self, site: u32) { let (l, r) = self.take(); *l = <$t>::tmt_run(site, DIV, *l, r) }
+            fn tmt_rem_assign(&self, site: u32) { let (l, r) = self.take(); *l = <$t>::tmt_run(site, REM, *l, r) }
         }
     )*};
 }
@@ -592,18 +654,51 @@ macro_rules! tmt_arith_ints {
     ($($t:ty)*) => {$(
         impl ArithNum for $t {
             fn tmt_real(op: u8, a: $t, b: $t) -> $t {
-                match op { ADD => a + b, SUB => a - b, MUL => a * b, DIV => a / b, _ => a % b }
+                match op {
+                    ADD => a + b,
+                    SUB => a - b,
+                    MUL => a * b,
+                    DIV => a / b,
+                    REM => a % b,
+                    BITAND => a & b,
+                    BITOR => a | b,
+                    BITXOR => a ^ b,
+                    SHL => a << b,
+                    _ => a >> b,
+                }
             }
             fn tmt_safe(op: u8, a: $t, b: $t) -> Option<u64> {
+                // A shift amount that does not fit is an overflow like any other.
+                let amount = u32::try_from(b).ok();
                 match op {
                     ADD => a.checked_add(b),
                     SUB => a.checked_sub(b),
                     MUL => a.checked_mul(b),
                     DIV => a.checked_div(b),
-                    _ => a.checked_rem(b),
+                    REM => a.checked_rem(b),
+                    BITAND => Some(a & b),
+                    BITOR => Some(a | b),
+                    BITXOR => Some(a ^ b),
+                    SHL => amount.and_then(|n| a.checked_shl(n)),
+                    _ => amount.and_then(|n| a.checked_shr(n)),
                 }
                 .map(|v| v as u64)
             }
+        }
+        impl BitPrim for Ar<$t, $t> {
+            type O = $t;
+            fn tmt_bitand(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, BITAND, a, b) }
+            fn tmt_bitor(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, BITOR, a, b) }
+            fn tmt_bitxor(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, BITXOR, a, b) }
+            fn tmt_shl(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, SHL, a, b) }
+            fn tmt_shr(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, SHR, a, b) }
+        }
+        impl<'p> BitAssignPrim for Aa<'p, $t, $t> {
+            fn tmt_bitand_assign(&self, site: u32) { let (l, r) = self.take(); *l = <$t>::tmt_run(site, BITAND, *l, r) }
+            fn tmt_bitor_assign(&self, site: u32) { let (l, r) = self.take(); *l = <$t>::tmt_run(site, BITOR, *l, r) }
+            fn tmt_bitxor_assign(&self, site: u32) { let (l, r) = self.take(); *l = <$t>::tmt_run(site, BITXOR, *l, r) }
+            fn tmt_shl_assign(&self, site: u32) { let (l, r) = self.take(); *l = <$t>::tmt_run(site, SHL, *l, r) }
+            fn tmt_shr_assign(&self, site: u32) { let (l, r) = self.take(); *l = <$t>::tmt_run(site, SHR, *l, r) }
         }
     )*};
 }
@@ -649,3 +744,86 @@ tmt_arith_any!(
     AnyDiv tmt_div Div div
     AnyRem tmt_rem Rem rem
 );
+tmt_arith_any!(
+    AnyBitAnd tmt_bitand BitAnd bitand
+    AnyBitOr tmt_bitor BitOr bitor
+    AnyBitXor tmt_bitxor BitXor bitxor
+    AnyShl tmt_shl Shl shl
+    AnyShr tmt_shr Shr shr
+);
+
+macro_rules! tmt_assign_any {
+    ($($name:ident $method:ident $bound:ident $call:ident)*) => {$(
+        pub trait $name {
+            fn $method(&self, site: u32);
+        }
+        impl<'r, 'p, L: std::ops::$bound<R>, R> $name for &'r Aa<'p, L, R> {
+            fn $method(&self, site: u32) {
+                let (l, r) = self.take();
+                record_bits(b'A', site, ARITH_OPAQUE);
+                std::ops::$bound::$call(l, r)
+            }
+        }
+    )*};
+}
+tmt_assign_any!(
+    AnyAddAssign tmt_add_assign AddAssign add_assign
+    AnySubAssign tmt_sub_assign SubAssign sub_assign
+    AnyMulAssign tmt_mul_assign MulAssign mul_assign
+    AnyDivAssign tmt_div_assign DivAssign div_assign
+    AnyRemAssign tmt_rem_assign RemAssign rem_assign
+    AnyBitAndAssign tmt_bitand_assign BitAndAssign bitand_assign
+    AnyBitOrAssign tmt_bitor_assign BitOrAssign bitor_assign
+    AnyBitXorAssign tmt_bitxor_assign BitXorAssign bitxor_assign
+    AnyShlAssign tmt_shl_assign ShlAssign shl_assign
+    AnyShrAssign tmt_shr_assign ShrAssign shr_assign
+);
+
+/// Operand of `!`, taken out once.
+pub struct Un<T>(Cell<Option<T>>);
+
+impl<T> Un<T> {
+    pub fn new(value: T) -> Self {
+        Un(Cell::new(Some(value)))
+    }
+}
+
+/// `!x` on a `bool`: the `DropNot` mutant returns `x`.
+pub trait NotPrim {
+    fn tmt_not(&self, site: u32) -> bool;
+}
+
+impl NotPrim for Un<bool> {
+    fn tmt_not(&self, site: u32) -> bool {
+        let value = self.0.take().expect("the operand is taken once");
+        if mutant_at(site) == Some(Mutant::DropNot) {
+            return value;
+        }
+        record_bits(b'R', site, 1);
+        !value
+    }
+}
+
+/// `!x` on anything else (integers, user types): untouched.
+pub trait AnyNot {
+    type O;
+    fn tmt_not(&self, site: u32) -> Self::O;
+}
+
+impl<'r, T: std::ops::Not> AnyNot for &'r Un<T> {
+    type O = T::Output;
+    fn tmt_not(&self, site: u32) -> T::Output {
+        let value = self.0.take().expect("the operand is taken once");
+        record_bits(b'A', site, ARITH_OPAQUE);
+        !value
+    }
+}
+
+/// Normal exit of a `-> bool` function: `Const` replaces the value.
+pub fn ret(site: u32, value: bool) -> bool {
+    if let Some(Mutant::Const(c)) = mutant_at(site) {
+        return c;
+    }
+    record_bits(b'B', site, if value { RET_TRUE } else { RET_FALSE });
+    value
+}
