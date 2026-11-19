@@ -2036,6 +2036,13 @@ mod tests {
             labelled("fn f(a: u8, o: Option<u8>) { if a > 1 && let Some(b) = o { g(b); } }"),
             ["cmp a > 1", "stmt g(b);"]
         );
+        // And so is everything joined to one.
+        assert_eq!(
+            labelled(
+                "fn f(a: u8, o: Option<u8>) { if a > 1 && let Some(b) = o && b > 2 { g(b); } }"
+            ),
+            ["cmp a > 1", "cmp b > 2", "stmt g(b);"]
+        );
         // A macro of this file under a standard name takes anything as its arguments.
         assert_eq!(
             labelled(
@@ -2063,7 +2070,7 @@ mod tests {
         );
         // One literal end is enough to fix the type; the ends are searched for sites.
         let src = "fn f(a: usize, b: usize, v: &[u8]) { let _ = &v[a..10]; let _ = &v[1..b]; \
-                   let _ = (a + 1)..(b * 2); let _ = 3..4; }";
+                   let _ = (a + 1)..(b * 2); let _ = 3..4; let _ = (5)..(-6); }";
         assert_eq!(
             labelled(src),
             [
@@ -2078,7 +2085,7 @@ mod tests {
         // The `..` itself is gone: the ends are the two arguments of the probe.
         assert!(out.contains("&v[(match (a, 10) {"), "{out}");
         assert!(!out.contains("a..10") && !out.contains("1..b"), "{out}");
-        assert!(out.contains("3..4"), "{out}");
+        assert!(out.contains("3..4") && out.contains("(5)..(-6)"), "{out}");
     }
 
     #[test]

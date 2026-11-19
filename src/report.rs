@@ -1491,6 +1491,25 @@ mod tests {
                 2
             )
         );
+        // With the literal on the left, the nearest values are those of the other side.
+        let site = site_of("fn f(x: f64) -> bool { 1.5 > x }");
+        let mut obs = Obs::of_f(-1.0);
+        obs.merge(&Obs::of_f(2.0));
+        let gap = InputGap::EqualNeverObserved {
+            flipped: CmpOp::Ge,
+            float_gap: obs.float_gap(),
+        };
+        let Some(Finding::InputGap { observed, .. }) =
+            input_gap_finding("f.rs", &site, &gap, &obs, true)
+        else {
+            panic!()
+        };
+        assert_eq!(
+            observed.as_deref(),
+            Some(
+                "nearest values the tests passed: `x` = -0.5, 2.5; any threshold between them passes"
+            )
+        );
         // Far above, neither does.
         assert_eq!(
             survivors_of("fn f(x: f64) -> bool { x > 1e30 }"),
