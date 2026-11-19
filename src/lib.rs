@@ -8,7 +8,9 @@ pub mod trace;
 
 /// The runtime injected into the crate under test, compiled here so that its logic can be
 /// checked against the planner.
-#[cfg(test)]
+// The runtime reaches `std` through this alias (see `runtime/tmt_rt.rs`). It is declared
+// unconditionally so that the tool can also be run on itself.
+#[doc(hidden)]
 extern crate std as __tmt_std;
 
 #[cfg(test)]

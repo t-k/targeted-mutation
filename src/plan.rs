@@ -993,6 +993,63 @@ mod tests {
     }
 
     #[test]
+    fn single_observation_summaries() {
+        let bits = |o: Obs| (o.lt, o.eq, o.gt, o.un);
+        assert_eq!(bits(Obs::of_f(-0.5)), (true, false, false, false));
+        assert_eq!(bits(Obs::of_f(0.0)), (false, true, false, false));
+        assert_eq!(bits(Obs::of_f(0.5)), (false, false, true, false));
+        assert_eq!(
+            (Obs::of_f(-0.5).f_max_neg, Obs::of_f(-0.5).f_min_pos),
+            (Some(-0.5), None)
+        );
+        assert_eq!(
+            (Obs::of_f(0.5).f_max_neg, Obs::of_f(0.5).f_min_pos),
+            (None, Some(0.5))
+        );
+        assert_eq!(
+            (Obs::of_f(0.0).f_max_neg, Obs::of_f(0.0).f_min_pos),
+            (None, None)
+        );
+        assert!(Obs::of_f(1.0).unvalued && !Obs::of_f(1.0).unfloat);
+        assert!(Obs::of_d(1).unfloat && !Obs::of_d(1).unvalued);
+
+        // Reached through any one relation, including "unordered" alone.
+        assert!(Obs::of_rel(Rel::Unordered).reached());
+        assert!(!Obs::default().reached());
+        // An unreached site has no values, even though nothing contradicts having them.
+        assert!(!Obs::default().valued());
+        assert!(Obs::of_d(0).valued());
+        assert!(!Obs::of_rel(Rel::Equal).valued());
+
+        // A NaN comparison among floats spoils the float gap.
+        let mut nan = Obs::of_f(-1.0);
+        nan.merge(&Obs::of_f(1.0));
+        assert_eq!(nan.float_gap(), Some((-1.0, 1.0)));
+        nan.un = true;
+        assert_eq!(nan.float_gap(), None);
+        assert_eq!(Obs::default().float_gap(), None);
+        assert_eq!(Obs::of_f(-1.0).float_gap(), None, "one side only");
+    }
+
+    #[test]
+    fn interval_queries_look_at_the_right_side_of_zero() {
+        // Only positives were observed: an interval of negatives is empty, and vice versa.
+        assert!(!obs_of(&[2]).saw_any_in(-3, -1));
+        assert!(!obs_of(&[-2]).saw_any_in(1, 3));
+        assert!(obs_of(&[-2]).saw_any_in(-3, -1));
+        assert!(obs_of(&[2]).saw_any_in(1, 3));
+        assert!(!obs_of(&[-4]).saw_any_in(-3, 0));
+        assert!(!obs_of(&[4]).saw_any_in(0, 3));
+        // A stray value on the far side must not leak into the answer.
+        let mut odd = obs_of(&[3]);
+        odd.max_neg = Some(5);
+        assert!(!odd.saw_any_in(0, 2));
+        let mut odd = obs_of(&[-3]);
+        odd.min_pos = Some(-5);
+        assert!(!odd.saw_any_in(-2, 0));
+    }
+
+    #[test]
     fn empty_interval_has_no_observations() {
         assert!(!obs_of(&[-1, 0, 1]).saw_any_in(1, 0));
         assert!(obs_of(&[0]).saw_any_in(0, 0));

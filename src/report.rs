@@ -709,6 +709,10 @@ mod tests {
         assert_eq!(float_literal("-1e3"), Some(-1000.0));
         assert_eq!(float_literal("1_000.5f64"), Some(1000.5));
         assert_eq!(float_literal("limit"), None);
+        assert_eq!(float_literal("x1"), None);
+        assert_eq!(float_literal("1x"), None);
+        assert_eq!(float_literal("-x"), None);
+        assert_eq!(float_literal("-2.5"), Some(-2.5));
         assert_eq!(float_literal("e"), None);
         assert_eq!(show_float(0.1 + 0.2), "0.3");
     }
@@ -942,7 +946,14 @@ mod tests {
             "{text}"
         );
         assert!(text.contains("--show-unreached"), "{text}");
-        assert!(render_text(&report, true).contains("UNREACHED  src/lib.rs:3:9"));
+        let listed = render_text(&report, true);
+        assert!(listed.contains("UNREACHED  src/lib.rs:3:9"));
+        assert!(!listed.contains("--show-unreached"), "{listed}");
+        let nothing_unreached = Report {
+            unreached: vec![],
+            ..report.clone()
+        };
+        assert!(!render_text(&nothing_unreached, false).contains("--show-unreached"));
         assert!(!Report::default().has_gaps());
     }
 }

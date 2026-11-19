@@ -1007,6 +1007,55 @@ mod tests {
     }
 
     #[test]
+    fn attributes_const_methods_and_let_on_the_right() {
+        let src = r#"
+            struct T(u8);
+            impl T {
+                const fn in_const(&self) -> bool { self.0 < 1 }
+                #[test]
+                fn test_method(&self) -> bool { self.0 < 2 }
+                fn real(&self) -> bool { self.0 < 3 }
+            }
+            trait Tr {
+                #[cfg(test)]
+                fn only_in_tests(&self, a: u8) -> bool { a < 4 }
+            }
+            fn f(s: &mut S, o: Option<u8>, a: bool) -> Result<(), E> {
+                #[cfg(feature = "x")]
+                s.guarded();
+                #[allow(unused)]
+                s.total += 1;
+                #[allow(unused)]
+                s.check()?;
+                #[allow(unused)]
+                s.sync().await;
+                s.plain();
+                if a && let Some(v) = o { s.use_it(v); }
+                Ok(())
+            }
+        "#;
+        let texts: Vec<String> = discover(src, 0)
+            .unwrap()
+            .sites
+            .into_iter()
+            .map(|s| s.text)
+            .collect();
+        // syn attaches the attribute of `#[a] x += 1;` to the left operand, so that statement
+        // is guarded together with its attribute; the guard is valid around it either way.
+        assert_eq!(
+            texts,
+            [
+                "self.0 < 3",
+                "#[allow(unused)]\n                s.total += 1;",
+                "s.plain();",
+                "s.use_it(v);"
+            ]
+        );
+        let found = discover(src, 0).unwrap().sites;
+        syn::parse_file(&render(src, &found, &all).text).expect("instrumented source parses");
+    }
+
+    #[test]
     fn macro_arguments() {
         let src = r#"
             fn f(a: u32, b: u32, out: &mut String) -> Vec<u32> {

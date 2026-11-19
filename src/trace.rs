@@ -574,6 +574,34 @@ mod tests {
     }
 
     #[test]
+    fn float_columns_are_validated() {
+        let gap = |line: &str| {
+            let trace = Trace::parse(line);
+            assert_eq!(trace.malformed_lines, 0, "{line:?}");
+            let o = trace.cmp[&1]["t"];
+            (o.f_max_neg, o.f_min_pos)
+        };
+        assert_eq!(
+            gap("O\t1\tt\t5\t1\t-\t-\t0\t-2.5\t0.5\n"),
+            (Some(-2.5), Some(0.5))
+        );
+        // Wrong sign, zero, or not finite: dropped.
+        assert_eq!(gap("O\t1\tt\t5\t1\t-\t-\t0\t2.5\t-0.5\n"), (None, None));
+        assert_eq!(gap("O\t1\tt\t5\t1\t-\t-\t0\t0.0\t0.0\n"), (None, None));
+        assert_eq!(gap("O\t1\tt\t5\t1\t-\t-\t0\t-inf\tinf\n"), (None, None));
+        assert_eq!(gap("O\t1\tt\t5\t1\t-\t-\t0\tNaN\tNaN\n"), (None, None));
+        assert_eq!(
+            Trace::parse("O\t1\tt\t5\t1\t-\t-\t2\t-\t-\n").malformed_lines,
+            1,
+            "bad flag"
+        );
+        assert_eq!(
+            Trace::parse("O\t1\tt\t5\t1\t-\t-\t0\tx\t-\n").malformed_lines,
+            1
+        );
+    }
+
+    #[test]
     fn logic_arithmetic_and_reach_lines() {
         let trace = Trace::parse(
             "L\t1\tt\t1\nL\t1\tt\t5\nL\t1\tu\t2\nA\t2\tt\t1\nA\t2\tu\t6\nR\t3\tt\t1\n",

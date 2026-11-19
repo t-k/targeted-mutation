@@ -233,6 +233,10 @@ fn copy_tree(from: &Path, to: &Path, skip: &dyn Fn(&Path) -> bool) -> Result<()>
         }
         let dst = to.join(entry.file_name());
         let kind = entry.file_type()?;
+        // Build output and other caches (cargo marks its target directories this way).
+        if kind.is_dir() && src.join("CACHEDIR.TAG").exists() {
+            continue;
+        }
         if kind.is_dir() {
             copy_tree(&src, &dst, skip)?;
         } else if kind.is_symlink() {
@@ -936,9 +940,12 @@ pub fn run(options: &Options) -> Result<Report> {
         source_dir.join(format!("{RUNTIME_MOD}.rs")),
         crate::RUNTIME_SOURCE,
     )?;
-    let root_suffix = format!(
-        "\n#[doc(hidden)]\nextern crate std as {STD_ALIAS};\n#[doc(hidden)]\nmod {RUNTIME_MOD};\n"
-    );
+    let std_alias = format!("extern crate std as {STD_ALIAS};");
+    let root_suffix = if root_source.contains(&std_alias) {
+        format!("\n#[doc(hidden)]\nmod {RUNTIME_MOD};\n")
+    } else {
+        format!("\n#[doc(hidden)]\n{std_alias}\n#[doc(hidden)]\nmod {RUNTIME_MOD};\n")
+    };
 
     // 4. Build, disabling the sites whose probe does not compile (formal/tla/RepairLoop.tla).
     let mut disabled: HashSet<u32> = HashSet::new();
