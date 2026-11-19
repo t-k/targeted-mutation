@@ -11,7 +11,6 @@ use anyhow::{Context, Result};
 use proc_macro2::{Span, TokenStream, TokenTree};
 use quote::ToTokens;
 use serde::Serialize;
-use std::collections::HashSet;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
@@ -209,6 +208,16 @@ impl ArithOp {
             ArithOp::BitXor => ArithOp::BitOr,
             ArithOp::Shl | ArithOp::Shr => return None,
         })
+    }
+
+    /// The second replacement where the operator is written as an assignment or not.
+    /// Bits collected with `|=` from zero are the same bits with `^=`, and `&=` with
+    /// `^=` is rarely a slip of the pen: as in cargo-mutants, those two are left out.
+    pub fn second(self, assign: bool) -> Option<ArithOp> {
+        if assign && matches!(self, ArithOp::BitAnd | ArithOp::BitOr) {
+            return None;
+        }
+        self.swapped2()
     }
 
     /// Bit operators exist for integers only, the others for floats too.
@@ -715,7 +724,7 @@ pub fn source_mutants(site: &Site) -> Vec<SourceMutant> {
             op, assign, gap, ..
         } => {
             let eq = if *assign { "=" } else { "" };
-            [Some(op.swapped()), op.swapped2()]
+            [Some(op.swapped()), op.second(*assign)]
                 .into_iter()
                 .flatten()
                 .map(|other| {
@@ -835,10 +844,7 @@ pub fn body_values(output: &syn::ReturnType) -> Vec<String> {
             if has_ident(ty.to_token_stream(), "impl") {
                 return vec![];
             }
-            let mut values = values_of(ty);
-            let mut seen = HashSet::new();
-            values.retain(|value| seen.insert(value.clone()));
-            values
+            values_of(ty)
         }
     }
 }
@@ -865,7 +871,7 @@ fn values_of(ty: &syn::Type) -> Vec<String> {
         syn::Type::Paren(t) => values_of(&t.elem),
         syn::Type::Group(t) => values_of(&t.elem),
         syn::Type::Never(_) => vec![],
-        syn::Type::Tuple(t) if t.elems.is_empty() => vec!["()".to_string()],
+        // Also the empty one: one row of no values, written `()`.
         syn::Type::Tuple(t) => {
             let parts: Vec<Vec<String>> = t.elems.iter().map(values_of).collect();
             product(&parts)
@@ -1513,6 +1519,7 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                 | SiteKind::Guard { .. }
                 | SiteKind::Field { .. }
         );
+        // tmt:ignore `2 +` orders the same: nothing longer starts or ends where a wrapping site does
         let len = 2 * (site.end - site.start) as i64 + wraps as i64;
         let (open, close) = match &site.kind {
             SiteKind::Cmp { op, gap, .. } => {
@@ -1771,8 +1778,9 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
     }
     edits.sort_by_key(|e| (e.pos, e.phase, e.order));
 
-    let mut text =
-        String::with_capacity(source.len() + edits.iter().map(|e| e.text.len()).sum::<usize>());
+    // tmt:ignore the capacity is a hint: any number gives the same text
+    let capacity = source.len() + edits.iter().map(|e| e.text.len()).sum::<usize>();
+    let mut text = String::with_capacity(capacity);
     let mut segments = vec![];
     let mut inserted = vec![];
     let mut cursor = 0;
@@ -1960,6 +1968,9 @@ mod tests {
             #[cfg(test)]
             mod more_tests;
             #[cfg(test)]
+            #[doc = "not a path"]
+            mod documented;
+            #[cfg(test)]
             #[path = "support/helpers.rs"]
             mod helpers;
             #[cfg(all(test, feature = "x"))]
@@ -1991,6 +2002,10 @@ mod tests {
             [
                 TestModule {
                     name: "more_tests".into(),
+                    path: None
+                },
+                TestModule {
+                    name: "documented".into(),
                     path: None
                 },
                 TestModule {
@@ -2843,6 +2858,14 @@ mod tests {
         // The text of a probe knows its site without going through the original.
         assert_eq!(out.inserted_by(inner_probe), Some(arith.id));
         assert_eq!(out.inserted_by(out.text.find("b, 1").unwrap()), None);
+        // From its first to its last byte, and not one further.
+        let opening = "(match (b, ";
+        let (first, last) = (inner_probe, inner_probe + "(match (".len() - 1);
+        assert!(out.text[inner_probe..].starts_with(opening));
+        assert_eq!(out.inserted_by(first), Some(arith.id));
+        assert_eq!(out.inserted_by(last), Some(arith.id));
+        assert_eq!(out.inserted_by(last + 1), None);
+        assert_eq!(out.inserted_by(0), None);
     }
     fn values(ty: &str) -> Vec<String> {
         let function: syn::ItemFn = syn::parse_str(&format!("fn f() -> {ty} {{ todo!() }}"))
@@ -2877,6 +2900,8 @@ mod tests {
             ("String", &["String::new()", "\"xyzzy\".into()"]),
             ("&str", &["\"\"", "\"xyzzy\""]),
             ("&'static str", &["\"\"", "\"xyzzy\""]),
+            // A `str` that can be written to is not a literal.
+            ("&mut str", &["Box::leak(Box::new(Default::default()))"]),
             ("&u8", &["Box::leak(Box::new(0))", "Box::leak(Box::new(1))"]),
             (
                 "&mut bool",
@@ -2976,6 +3001,9 @@ mod tests {
             ("Config", &["Default::default()"]),
             ("Self", &["Default::default()"]),
             ("<T as Tr>::Out", &["Default::default()"]),
+            // Not the `String` everyone knows.
+            ("<T as Tr>::String", &["Default::default()"]),
+            ("<T>::bool", &["Default::default()"]),
             ("fn(u8) -> u8", &["Default::default()"]),
             ("*const u8", &["Default::default()"]),
             // Nested: every value of the inner type, wrapped.
@@ -3014,6 +3042,14 @@ mod tests {
             fn empty() {}
             fn one_call(s: &mut S) { s.go(); }
             fn two_calls(s: &mut S) { s.go(); s.stop(); }
+            fn typed(s: &mut S) -> u8 { s.exit(); }
+            fn tight() -> bool {true}
+            #[rustfmt::skip]
+            fn formatted(a: u8) -> u8 { a + 6 }
+            #[mutants::timeout(5)]
+            fn slow(a: u8) -> u8 { a + 7 }
+            impl S { #[mutants::skip] fn marked_method(&self, a: u8) -> u8 { a + 8 } }
+            trait U { #[mutants::skip] fn marked_default(&self, a: u8) -> u8 { a + 9 } }
             fn one_let(a: u8) { let _ = a; }
             fn never() -> ! { loop {} }
             fn hidden() -> impl Sized { 1 }
@@ -3050,6 +3086,15 @@ mod tests {
                 "spaced (1, false)",
                 // One statement that can be deleted is the same mutant as no body.
                 "two_calls ()",
+                // With a result to return, one statement is not the whole of it.
+                "typed 0",
+                "typed 1",
+                "tight false",
+                // Other attributes with `skip` or `mutants` in them do not mark anything.
+                "formatted 0",
+                "formatted 1",
+                "slow 0",
+                "slow 1",
                 "one_let ()",
                 "provided 0",
                 "provided 1",
@@ -3059,10 +3104,12 @@ mod tests {
         );
         // Nothing at all is mutated in what is marked to be skipped.
         let texts: Vec<&str> = sites.iter().map(|s| s.text.as_str()).collect();
-        for skipped in ["a + 2", "a + 3", "a + 4", "a + 5"] {
+        for skipped in ["a + 2", "a + 3", "a + 4", "a + 5", "a + 8", "a + 9"] {
             assert!(!texts.contains(&skipped), "{skipped}");
         }
-        assert!(texts.contains(&"a + 1"));
+        for mutated in ["a + 1", "a + 6", "a + 7"] {
+            assert!(texts.contains(&mutated), "{mutated}");
+        }
         let unsafe_sites: Vec<&Site> = sites.iter().filter(|s| s.text.contains("raw")).collect();
         assert!(unsafe_sites.is_empty(), "{unsafe_sites:?}");
 
@@ -3123,6 +3170,8 @@ mod tests {
                 let third = Wrap::<u8> { 0: c, ..Wrap::new() };
                 let _ = Options { depth: 1, ..base.clone() };
                 let _ = Options { depth: 2, ..make(3) };
+                let _ = Options { depth: 6, ..(pick())() };
+                let _ = -2.5 + y;
                 let _ = Options { #[cfg(any())] depth: 4, strict: true, ..*other };
                 let _ = Options { depth: 5, name: n, strict: false };
                 first
@@ -3165,8 +3214,9 @@ mod tests {
                 "field depth: -b | depth | shorthand=false | (Options { ..Default::default() }).depth",
                 "neg -b | b | literal=false",
                 "field 0: c | 0 | shorthand=false | (Wrap::<u8> { ..Wrap::new() }).0",
-                // Not with a base that has arguments or a receiver, not a field with an
-                // attribute, and not without a base.
+                "neg -2.5 | 2.5 | literal=true",
+                // Not with a base that has arguments, a receiver or a computed function,
+                // not a field with an attribute, and not without a base.
                 "field strict: true | strict | shorthand=false | (*other).strict",
             ]
         );
@@ -3193,6 +3243,7 @@ mod tests {
             "0: if crate::__tmt_rt::live(",
             "Options { depth: 1, ..base.clone() }",
             "Options { depth: 2, ..make(3) }",
+            "Options { depth: 6, ..(pick())() }",
             "Options { depth: 5, name: n, strict: false }",
         ] {
             assert!(out.contains(expected), "{expected}\n{out}");
@@ -3227,6 +3278,29 @@ mod tests {
                    trait T { const fn d(a: u8) -> u8 { a } }\n";
         let found = discover(src, 0).unwrap();
         assert!(found.rebuild_sites.iter().all(|s| s.id == NO_ID));
+        let places: Vec<(usize, usize, &str)> = found
+            .rebuild_sites
+            .iter()
+            .filter(|s| !matches!(s.kind, SiteKind::Return { .. }))
+            .map(|s| (s.line, s.column, s.text.as_str()))
+            .collect();
+        assert_eq!(
+            places,
+            [
+                (1, 1, "const fn c(a: u8, b: u8) -> bool"),
+                (1, 1, "const fn c(a: u8, b: u8) -> bool"),
+                (1, 36, "a < b"),
+                (2, 28, "*m.entry(k).or_insert(0) += 1"),
+                (3, 1, "fn evens(n: u8) -> impl Iterator<Item = u8> + '_"),
+                (3, 1, "fn evens(n: u8) -> impl Iterator<Item = u8> + '_"),
+                (3, 1, "fn evens(n: u8) -> impl Iterator<Item = u8> + '_"),
+                (4, 10, "const fn k(&self) -> u8"),
+                (4, 10, "const fn k(&self) -> u8"),
+                (4, 36, "-self.0"),
+                (5, 11, "const fn d(a: u8) -> u8"),
+                (5, 11, "const fn d(a: u8) -> u8"),
+            ]
+        );
         assert_eq!(
             found.sites.iter().map(|s| s.id).collect::<Vec<_>>(),
             (0..found.sites.len() as u32).collect::<Vec<_>>()
@@ -3361,6 +3435,11 @@ mod tests {
         assert_eq!(
             values("impl std::iter::Iterator<Item = String> + Send + 'a").len(),
             3
+        );
+        // The item is the binding called `Item`, wherever it stands.
+        assert_eq!(
+            values("impl Iterator<Extra = u8, Item = ()>"),
+            ["::core::iter::empty()", "::core::iter::once(())"]
         );
         // An item that is itself opaque has no value to make up.
         assert_eq!(

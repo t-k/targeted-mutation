@@ -867,6 +867,15 @@ mod tests {
         let mut merged = both;
         merged.merge(&other);
         assert!(merged.same && merged.differs && merged.same2 && merged.differs2);
+        let mut merged = other;
+        merged.merge(&both);
+        assert!(merged.same && merged.differs && merged.same2 && merged.differs2);
+        // An assignment that collects bits has one replacement, as in cargo-mutants.
+        assert_eq!(ArithOp::BitOr.second(true), None);
+        assert_eq!(ArithOp::BitAnd.second(true), None);
+        assert_eq!(ArithOp::BitXor.second(true), Some(ArithOp::BitOr));
+        assert_eq!(ArithOp::BitOr.second(false), Some(ArithOp::BitXor));
+        assert_eq!(ArithOp::Add.second(true), Some(ArithOp::Mul));
         // Operands that are not numbers stay that for both.
         assert_eq!(
             crate::plan::plan_arith(&seen(tmt_rt::ARITH_OPAQUE).second()),

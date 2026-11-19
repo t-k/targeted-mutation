@@ -505,7 +505,7 @@ pub fn arith_gap_finding(
     let (lhs, rhs) = (one_line(lhs), one_line(rhs));
     let eq = if *assign { "=" } else { "" };
     let other = match mutation {
-        Mutation::ArithSwap2 => op.swapped2()?,
+        Mutation::ArithSwap2 => op.second(*assign)?,
         _ => op.swapped(),
     };
     let add = match (op, other) {
@@ -1593,8 +1593,15 @@ mod tests {
         let one = Report {
             package: "p".into(),
             suppressed: 1,
+            unviable_mutants: 1,
             ..Report::default()
         };
+        assert!(
+            render_text(&one, false).contains(", 1 replaced bodies left out"),
+            "{}",
+            render_text(&one, false)
+        );
+        assert!(!render_text(&Report::default(), false).contains("left out"));
         assert!(
             render_text(&one, false).contains(", 1 findings suppressed"),
             "{}",
@@ -1666,6 +1673,11 @@ mod tests {
             .collect();
         assert_eq!(describe(arith[0], Mutation::ArithSwap), "`*bits &= mask`");
         assert_eq!(describe(arith[0], Mutation::ArithSwap2), "`*bits |= mask`");
+        let collect = site_of("fn f(bits: &mut u8, mask: u8) { *bits |= mask }");
+        assert_eq!(
+            arith_gap_finding("f.rs", &collect, Mutation::ArithSwap2, true),
+            None
+        );
         // A shift has one replacement: no second finding.
         assert_eq!(
             arith_gap_finding("f.rs", arith[1], Mutation::ArithSwap2, true),

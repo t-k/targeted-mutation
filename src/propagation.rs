@@ -56,6 +56,7 @@ fn per_test(trace: &Trace) -> BTreeMap<(&str, u32), Seen> {
             let Obs { lt, eq, gt, un, .. } = *obs;
             let seen = all.entry((test, *site)).or_default();
             seen.reached |= obs.reached();
+            // tmt:ignore the bits do not overlap, so `^` joins them just as well
             seen.outcomes |= lt as u8 | (eq as u8) << 1 | (gt as u8) << 2 | (un as u8) << 3;
         }
     }
@@ -68,6 +69,7 @@ fn per_test(trace: &Trace) -> BTreeMap<(&str, u32), Seen> {
             } = *obs;
             let seen = all.entry((test, *site)).or_default();
             seen.reached |= obs.reached();
+            // tmt:ignore the bits do not overlap, so `^` joins them just as well
             seen.outcomes |= short as u8 | (rhs_true as u8) << 1 | (rhs_false as u8) << 2;
         }
     }

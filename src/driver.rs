@@ -1351,7 +1351,7 @@ impl Session {
                 let merged = self.merged(|t| t.arith.get(&id), plan::ArithObs::merge);
                 let mutations: Vec<(Mutation, plan::ArithObs)> = match &site.kind {
                     SiteKind::MinMax { .. } => vec![(Mutation::MinMax, merged)],
-                    SiteKind::Arith { op, .. } if op.swapped2().is_some() => vec![
+                    SiteKind::Arith { op, assign, .. } if op.second(*assign).is_some() => vec![
                         (Mutation::ArithSwap, merged),
                         (Mutation::ArithSwap2, merged.second()),
                     ],
@@ -2318,7 +2318,6 @@ fn mutation_of(site: &Site, mutant: &instrument::SourceMutant) -> Mutation {
             .into_iter()
             .find(|op| op.symbol() == mutant.into)
             .map_or(Mutation::Negate, Mutation::Op),
-        SiteKind::Logic { .. } => Mutation::LogicSwap,
         SiteKind::Arith { op, .. } => {
             if mutant.into.trim_end_matches('=') == op.swapped().symbol() {
                 Mutation::ArithSwap
@@ -2326,8 +2325,8 @@ fn mutation_of(site: &Site, mutant: &instrument::SourceMutant) -> Mutation {
                 Mutation::ArithSwap2
             }
         }
-        SiteKind::Not { .. } => Mutation::DropNot,
         SiteKind::Guard { .. } => Mutation::Const(mutant.into == "true"),
+        // The other kinds have one mutant of the source, described whatever it is called.
         _ => Mutation::Delete,
     }
 }
@@ -2793,6 +2792,23 @@ serde = { path = "../../serde-fork" }
                 "(and 1 more such changes)",
             ]
         );
+        // What is not listed is counted.
+        let mut many = BTreeMap::new();
+        many.insert(
+            "tests::a".to_string(),
+            set(&[
+                Change::NowRuns { site: 0 },
+                Change::NowRuns { site: 1 },
+                Change::NowRuns { site: 2 },
+                Change::NoLongerRuns { site: 0 },
+                Change::NoLongerRuns { site: 1 },
+                Change::NoLongerRuns { site: 2 },
+            ]),
+        );
+        assert_eq!(
+            describe_effects(&many, &sites).last().map(String::as_str),
+            Some("(and 3 more such changes)")
+        );
         // Up to three changes are all listed, with nothing after them.
         let mut few = BTreeMap::new();
         few.insert(
@@ -3169,6 +3185,24 @@ serde = { path = "../../serde-fork" }
                 "`-a / b`",
                 "`-a + b`",
                 "`a`",
+            ]
+        );
+        // Without a catch-all arm the guard can be `false` in its own right.
+        let source = "fn f(k: K) -> u8 { match k { K::A(n) if n > 1 => 1, K::A(_) => 2 } }";
+        let found = instrument::discover(source, 0).unwrap().sites;
+        let guard = found
+            .iter()
+            .find(|s| matches!(s.kind, SiteKind::Guard { .. }))
+            .unwrap();
+        let described: Vec<String> = instrument::source_mutants(guard)
+            .iter()
+            .map(|mutant| report::describe(guard, mutation_of(guard, mutant)))
+            .collect();
+        assert_eq!(
+            described,
+            [
+                "the guard `n > 1` replaced by `true`",
+                "the guard `n > 1` replaced by `false`"
             ]
         );
     }
