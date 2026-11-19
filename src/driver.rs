@@ -1961,6 +1961,8 @@ pub fn run(options: &Options) -> Result<Report> {
         }
     }
 
+    report.sort_findings();
+
     // 8. Findings the user has already dealt with.
     let ignored: BTreeMap<&str, BTreeMap<usize, String>> = files
         .iter()

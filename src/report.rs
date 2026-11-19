@@ -65,6 +65,18 @@ pub struct Report {
 }
 
 impl Report {
+    /// Puts the findings in reading order. Sites are numbered as they are discovered, and
+    /// a statement is discovered before the expressions of the statements above it.
+    pub fn sort_findings(&mut self) {
+        self.findings.sort_by(|a, b| {
+            let key = |finding: &Finding| {
+                let (Finding::InputGap { at, .. } | Finding::AssertionGap { at, .. }) = finding;
+                (at.file.clone(), at.line, at.column)
+            };
+            key(a).cmp(&key(b))
+        });
+    }
+
     /// Whether the run found something to act on: a gap, or a prediction that did not
     /// hold (which means the report cannot be trusted as it stands).
     pub fn has_gaps(&self) -> bool {
@@ -1503,5 +1515,44 @@ mod tests {
             render_text(&one, false)
         );
         assert!(!render_text(&Report::default(), false).contains("suppressed"));
+    }
+
+    #[test]
+    fn findings_are_put_in_reading_order() {
+        let gap = |file: &str, line: usize, column: usize, survivor: &str| Finding::AssertionGap {
+            at: Location {
+                file: file.into(),
+                line,
+                column,
+                code: "x".into(),
+            },
+            survivors: vec![survivor.into()],
+            tests: vec![],
+            effects: vec![],
+        };
+        let mut report = Report {
+            findings: vec![
+                gap("src/b.rs", 1, 1, "b"),
+                gap("src/a.rs", 9, 5, "statement"),
+                gap("src/a.rs", 7, 2, "above it"),
+                gap("src/a.rs", 9, 5, "its operator"),
+                gap("src/a.rs", 9, 3, "left of both"),
+            ],
+            ..Report::default()
+        };
+        report.sort_findings();
+        let order: Vec<&str> = report
+            .findings
+            .iter()
+            .map(|f| match f {
+                Finding::AssertionGap { survivors, .. } => survivors[0].as_str(),
+                _ => panic!(),
+            })
+            .collect();
+        // Findings at one position keep the order they were made in.
+        assert_eq!(
+            order,
+            ["above it", "left of both", "statement", "its operator", "b"]
+        );
     }
 }
