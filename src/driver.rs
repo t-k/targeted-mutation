@@ -28,6 +28,8 @@ pub struct Options {
     pub work_dir: Option<PathBuf>,
     /// Progress lines on stderr.
     pub progress: bool,
+    /// Copy every file of the workspace, including the ones git ignores.
+    pub all_files: bool,
     /// Also run the doc tests (slow: rustdoc recompiles them for every mutant they reach).
     pub doc: bool,
 }
@@ -267,6 +269,32 @@ fn rust_files(dir: &Path, skip: &dyn Fn(&Path) -> bool, out: &mut Vec<PathBuf>) 
         }
     }
     Ok(())
+}
+
+/// The files under `dir` that git tracks or would track (not ignored), relative to `dir`.
+/// `None` when `dir` is not in a git work tree, or is itself ignored: then git has nothing
+/// to say about which files matter.
+fn git_visible_files(dir: &Path) -> Option<Vec<PathBuf>> {
+    let git = |args: &[&str]| Command::new("git").arg("-C").arg(dir).args(args).stderr(Stdio::null()).output().ok();
+    if !git(&["rev-parse", "--is-inside-work-tree"])?.status.success() {
+        return None;
+    }
+    // Exit status 0 means "ignored".
+    if git(&["check-ignore", "-q", "."])?.status.success() {
+        return None;
+    }
+    let listing = git(&["ls-files", "--cached", "--others", "--exclude-standard", "-z"])?;
+    if !listing.status.success() {
+        return None;
+    }
+    let files: Vec<PathBuf> = listing
+        .stdout
+        .split(|b| *b == 0)
+        .filter(|name| !name.is_empty())
+        .filter_map(|name| std::str::from_utf8(name).ok())
+        .map(PathBuf::from)
+        .collect();
+    (!files.is_empty()).then_some(files)
 }
 
 /// Where the out-of-line module `module` declared in `file` lives.
@@ -829,15 +857,42 @@ pub fn run(options: &Options) -> Result<Report> {
         fs::remove_dir_all(&copy).with_context(|| format!("clearing {}", copy.display()))?;
     }
     let target_dir = metadata.target_directory.clone();
-    copy_tree(&workspace, &copy, &|path| {
+    let skip = |path: &Path| {
         path == target_dir
             || path == work
-            || path
-                .file_name()
-                .is_some_and(|n| n == ".git" || n == "node_modules")
-            || (path.parent() == Some(workspace.as_path())
-                && path.file_name().is_some_and(|n| n == "target"))
-    })?;
+            || path.file_name().is_some_and(|n| n == ".git" || n == "node_modules")
+            || (path.parent() == Some(workspace.as_path()) && path.file_name().is_some_and(|n| n == "target"))
+    };
+    match (options.all_files, git_visible_files(&workspace)) {
+        // Only what git would not ignore: build output, caches, local notes and secrets
+        // that are kept out of the repository stay out of the copy too.
+        (false, Some(files)) => {
+            note(&format!("copying {} files (ignored files are left out)", files.len()));
+            for relative in files {
+                let (src, dst) = (workspace.join(&relative), copy.join(&relative));
+                if skip(&src) || src.ancestors().any(|a| a != workspace && skip(a)) {
+                    continue;
+                }
+                let Ok(kind) = fs::symlink_metadata(&src).map(|m| m.file_type()) else {
+                    continue; // deleted in the working tree
+                };
+                if let Some(parent) = dst.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                if kind.is_dir() {
+                    copy_tree(&src, &dst, &skip)?; // a submodule
+                } else if kind.is_symlink() {
+                    #[cfg(unix)]
+                    std::os::unix::fs::symlink(fs::read_link(&src)?, &dst)?;
+                    #[cfg(not(unix))]
+                    fs::copy(&src, &dst).map(|_| ())?;
+                } else {
+                    fs::copy(&src, &dst).with_context(|| format!("copying {}", src.display()))?;
+                }
+            }
+        }
+        _ => copy_tree(&workspace, &copy, &skip)?,
+    }
     // Relative path dependencies that leave the workspace would point nowhere from the copy.
     let mut manifests: Vec<&Path> = metadata
         .packages

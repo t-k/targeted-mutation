@@ -27,6 +27,10 @@ struct Cli {
     /// Also run the doc tests. They are recompiled for every mutant they reach.
     #[arg(long)]
     doc: bool,
+    /// Copy files that git ignores as well (needed when the build reads generated,
+    /// untracked files). By default they are left out of the working copy.
+    #[arg(long)]
+    all_files: bool,
     /// Also list the code that no test executes.
     #[arg(long)]
     show_unreached: bool,
@@ -44,6 +48,7 @@ fn main() -> ExitCode {
         verify: !cli.no_verify,
         work_dir: cli.work_dir,
         progress: !cli.quiet,
+        all_files: cli.all_files,
         doc: cli.doc,
     };
     match driver::run(&options) {

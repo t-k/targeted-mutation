@@ -544,3 +544,35 @@ fn doc_tests_are_used_on_request() {
         "{report:#}"
     );
 }
+
+#[test]
+fn files_ignored_by_git_stay_out_of_the_working_copy() {
+    let dir = fixture("eligibility", "git-ignored");
+    let git = |args: &[&str]| {
+        let status = Command::new("git").arg("-C").arg(&dir).args(args).output().unwrap().status;
+        assert!(status.success(), "git {args:?}");
+    };
+    git(&["init", "-q"]);
+    fs::write(dir.join(".gitignore"), "target/\nsecrets/\n*.local\n").unwrap();
+    fs::create_dir_all(dir.join("secrets")).unwrap();
+    fs::write(dir.join("secrets/api-key.txt"), "not for copying").unwrap();
+    fs::write(dir.join("notes.local"), "not for copying").unwrap();
+    fs::write(dir.join("untracked.txt"), "new file, not ignored").unwrap();
+
+    let copy = dir.join("target/tmt/src");
+    let (code, report) = json(&dir);
+    assert_eq!(code, 2, "{report:#}");
+    assert!(copy.join("src/lib.rs").exists());
+    assert!(copy.join("untracked.txt").exists(), "untracked but not ignored files are part of the build");
+    assert!(!copy.join("secrets").exists());
+    assert!(!copy.join("notes.local").exists());
+    assert!(!copy.join(".git").exists());
+
+    // On request everything is copied (except .git and build output).
+    let run = tmt(&dir, &["--json", "--quiet", "--all-files"]);
+    assert_eq!(run.code, 2, "{}", run.stderr);
+    assert!(copy.join("secrets/api-key.txt").exists());
+    assert!(copy.join("notes.local").exists());
+    assert!(!copy.join(".git").exists());
+    assert!(!copy.join("target").exists());
+}
