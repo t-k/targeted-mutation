@@ -48,18 +48,53 @@ Without the precondition check the commit still fails, but the first write of th
 | `UNREACHED` (`--show-unreached`) | No test executes the code. | A test. |
 | `UNSTABLE` | The trace predicted a survivor, but the re-run failed. | The tests are not deterministic; fix that first. |
 
+For an assertion gap the tool runs the surviving mutant once more with tracing on and compares the trace with the original run. The lines starting with `with the mutant,` say what changed in the tests that let it through:
+
+```text
+ASSERTION GAP  src/lib.rs:33:9
+    self.check_preconditions(batch)?;
+  passes every test as: delete `self.check_preconditions(batch)?;`
+  these tests run the changed code and still pass: tests::batch_writes_are_visible_after_commit, tests::commit_fails_when_an_update_target_is_missing
+  with the mutant, `tests::commit_fails_when_an_update_target_is_missing` now runs `self.docs.insert(key.clone(), value.clone());` (src/lib.rs:59)
+```
+
+The failing commit now gets as far as inserting a document: that is the state to assert on. When the trace shows no change at all, the tests reach the same code with the same outcomes, which means they do not use the result of the mutated code (or the mutant is equivalent).
+
+Findings on the same source line are printed as one block.
+
 ## Usage
 
 ```text
 cargo install --path .
-tmt [DIR] [--package NAME] [--jobs N] [--doc] [--work-dir DIR] [--all-files] [--json] [--show-unreached] [--no-verify] [--quiet]
+tmt [DIR] [OPTIONS]
 ```
 
+What to analyse:
+
 - `--package NAME`: the workspace member to analyse. Not needed when `DIR` is the member's own directory.
-- `--jobs N`: run N mutants at the same time (default 1). Raise it only if the tests can run concurrently with themselves: no fixed ports, no shared files.
+- `--since REV`: only the code changed since a git revision, plus untracked files. This is the mode for a pull request: `tmt --since origin/main`.
+- `--lines FILE:FROM-TO`: only these lines (repeatable; `FILE` is relative to the package).
+
+Which tests to use:
+
+- `--also-test PACKAGE`: also run the tests of another workspace package (repeatable).
+- `--dependents`: also run the tests of every workspace package that depends on the analysed one. A gap that an integration test elsewhere closes is then not reported.
 - `--doc`: also run the doc tests. rustdoc recompiles them for every mutant they reach, so this is slow.
-- `--work-dir DIR`: where the working copy and its build go. It must be a directory of its own: the copy inside it is deleted and rebuilt on every run, and the tool refuses a directory that contains the workspace or a `src` it did not create.
+
+Findings you have already dealt with:
+
+- A comment `// tmt:ignore <reason>` on the line, or on the line above, silences the findings of that line.
+- `--write-baseline FILE` records the findings of a run; `--baseline FILE` leaves the recorded ones out. Entries do not contain line numbers, so they survive code moving around. Suppressed findings are counted in the summary and do not affect the exit status.
+
+Running:
+
+- `--jobs N`: run N mutants at the same time (default 1). Raise it only if the tests can run concurrently with themselves: no fixed ports, no shared files.
+- `--work-dir DIR`: where the working copy and its build go. It must be a directory of its own: the tool deletes files from the copy inside it, and refuses a directory that contains the workspace or a `src` it did not create.
 - `--all-files`: copy files that git ignores too. Use it when the build needs generated files that are not tracked.
+- `--no-verify`: trust the trace; do not re-run tests against predicted survivors.
+- `--no-effects`: do not trace surviving mutants to say what they change.
+
+Output: text by default, `--json`, or `--sarif` (SARIF 2.1.0 for code scanning). `--show-unreached` lists the code no test executes, `--quiet` drops the progress lines.
 
 Exit status: `0` no gaps, `2` gaps found or a prediction failed its re-run (`UNSTABLE`), `1` the analysis could not run (tests fail on the unmutated code, the crate does not build, ...).
 
@@ -87,6 +122,10 @@ Mutants that cannot differ from the original within the operand types (`x >= 0` 
 | `a & b`, `\|`, `^`, `<<`, `>>` on integers, and `&=` etc. | `&` and `\|` swapped, `^` to `&`, `<<` and `>>` swapped | as above |
 | `!x` on `bool` | `x` | never: always run |
 | a function returning `bool` | the value at its normal exit replaced by `true` / `false` | the function returned the same value in every test |
+| `a.max(b)`, `a.min(b)` on numbers | the other of the two | the operands were equal in every test |
+| `a..b`, `a..=b` on integers | the end included or excluded | never: always run |
+| a function returning `Option<T>` | `None` at its normal exit | the function returned `None` in every test |
+| an arm of a `match` that ends in a catch-all | the arm removed, so the value falls through | never: always run |
 | `f(x);`, `check()?;`, `x += 1;`, `x = y;` | the statement deleted | never: these are always run |
 
 Arithmetic on other types (`String + &str`, `Duration + Duration`) and `!` on anything but `bool` are left as they are.
@@ -130,13 +169,20 @@ java -jar tla2tools.jar formal/tla/RepairLoop.tla
 - Source files that start with a byte order mark or a `#!` line are not instrumented.
 - A macro that shadows a standard one is only recognised when it is defined at the top level of the same file.
 - Code in the arguments of macros other than the ones listed above, in `const` contexts and in test code is not mutated.
-- Unary minus, casts, and return values other than `bool` are not mutated. A `bool` result is replaced only at the function's normal exit, not at an early `return`.
+- Unary minus, casts, and return values other than `bool` and `Option` are not mutated. A result is replaced only at the function's normal exit, not at an early `return`.
 - For floats, a gap is reported only while no test compares equal operands. After that, thresholds within rounding distance of the constant still survive and are not reported.
 - Strings and other non-numeric types have no notion of "next value": only `<` versus `<=` is checked.
 - The survivor prediction assumes deterministic tests. A wrong prediction shows up as `UNSTABLE`.
 - Equivalent mutants are not always detected. If `max(a, b)` is written with `a >= b`, then `a > b` is reported although no test could observe it. The same goes for an operand that is constant by construction (`is_large(n) && FEATURE_ENABLED`).
 - Observations made on threads that a test spawns, and all observations of doc tests, cannot be attributed to a single test; the mutant is then run against the whole test binary.
 - With `--jobs`, a mutant's time limit is still derived from the unloaded test run, so a heavily loaded machine can turn a slow mutant into a timeout (counted as killed).
+
+## Speed
+
+- The crate is built once; mutants are switched on by an environment variable.
+- A mutant is run only against the tests whose observations it changes, and the run stops at the first test that fails.
+- The working copy is kept between runs and only changed files are rewritten, so cargo rebuilds the analysed crate and nothing else.
+- `--since` and `--lines` cut the work down to the code under review.
 
 ## Evaluating against other tools
 
