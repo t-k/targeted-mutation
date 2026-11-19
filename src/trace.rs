@@ -889,4 +889,35 @@ mod tests {
         assert!(trace.arith.contains_key(&2) && !trace.arith.contains_key(&3));
         assert_eq!(trace.malformed_lines, 1);
     }
+
+    /// A probe in a loop asks the tracer only when it has something new to say.
+    #[test]
+    fn a_thread_remembers_what_it_recorded() {
+        // Sites of their own, far from the ones other tests of this binary use.
+        let site = 900_000;
+        assert!(!tmt_rt::bits_known(b'A', site, 1));
+        assert!(tmt_rt::bits_are_news(b'A', site, 1));
+        assert!(!tmt_rt::bits_are_news(b'A', site, 1));
+        assert!(tmt_rt::bits_known(b'A', site, 1));
+        // Another bit of the same site is news once, and then both are known.
+        assert!(!tmt_rt::bits_known(b'A', site, 3));
+        assert!(tmt_rt::bits_are_news(b'A', site, 3));
+        assert!(!tmt_rt::bits_are_news(b'A', site, 2));
+        assert!(tmt_rt::bits_known(b'A', site, 3));
+        // Each kind of record and each site has its own memory.
+        for kind in [b'R', b'L', b'B'] {
+            assert!(!tmt_rt::bits_known(kind, site, 1), "{}", kind as char);
+            assert!(tmt_rt::bits_are_news(kind, site, 1), "{}", kind as char);
+            assert!(!tmt_rt::bits_are_news(kind, site, 1), "{}", kind as char);
+        }
+        assert!(tmt_rt::bits_are_news(b'A', site + 1, 1));
+        assert!(!tmt_rt::bits_known(b'A', site - 1, 1));
+        // And each thread: a test is a thread.
+        std::thread::spawn(move || {
+            assert!(!tmt_rt::bits_known(b'A', site, 1));
+            assert!(tmt_rt::bits_are_news(b'A', site, 1));
+        })
+        .join()
+        .unwrap();
+    }
 }

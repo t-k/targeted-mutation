@@ -200,6 +200,8 @@ java -jar tla2tools.jar formal/tla/RepairLoop.tla
 
 - The crate is built once; mutants are switched on by an environment variable.
 - A mutant is run only against the tests whose observations it changes, and the run stops at the first test that fails.
+- A mutant that makes a loop endless is stopped after 5 seconds plus five times what its test binary takes without recording. The summary says how many were stopped that way; each of them costs that limit.
+- Probes cost time, most of all while recording: a test that spends its time in arithmetic loops can take ten times as long in the trace run. A probe that sees nothing new does not take the recorder's lock.
 - The working copy is kept between runs. A file is rewritten only when its instrumented text changed, so cargo rebuilds what changed and nothing else.
 - Mutants that need a build of their own (step 5) cost a build and a full test run each. Their number is printed before they start.
 - `--since` and `--lines` cut the work down to the code under review.

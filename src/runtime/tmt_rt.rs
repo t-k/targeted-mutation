@@ -378,7 +378,7 @@ fn bits_slot(kind: u8, site: u32) -> usize {
 }
 
 /// Whether this thread has recorded all of `bits` at the site before.
-fn bits_known(kind: u8, site: u32, bits: u8) -> bool {
+pub fn bits_known(kind: u8, site: u32, bits: u8) -> bool {
     let slot = bits_slot(kind, site);
     SEEN_BITS
         .try_with(|seen| {
@@ -390,7 +390,7 @@ fn bits_known(kind: u8, site: u32, bits: u8) -> bool {
 }
 
 /// Notes `bits` as recorded by this thread; returns whether that was news.
-fn bits_are_news(kind: u8, site: u32, bits: u8) -> bool {
+pub fn bits_are_news(kind: u8, site: u32, bits: u8) -> bool {
     let slot = bits_slot(kind, site);
     SEEN_BITS
         .try_with(|seen| {
