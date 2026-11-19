@@ -45,6 +45,8 @@ pub struct Options {
     pub dependents: bool,
     /// Trace surviving mutants to say what they change in the tests.
     pub effects: bool,
+    /// Build and run, one by one, the mutants that cannot be switched at run time.
+    pub rebuild: bool,
     /// How many mutants to run at the same time.
     pub jobs: usize,
     /// Copy every file of the workspace, including the ones git ignores.
@@ -243,6 +245,8 @@ struct SourceFile {
     path: PathBuf,
     original: String,
     sites: Vec<Site>,
+    /// Sites whose mutants are built one by one.
+    rebuild_sites: Vec<Site>,
     rendered: Option<Rendered>,
 }
 
@@ -1789,6 +1793,7 @@ pub fn run(options: &Options) -> Result<Report> {
                     path,
                     original,
                     sites: found.sites,
+                    rebuild_sites: found.rebuild_sites,
                     rendered: None,
                 });
             }
@@ -1808,15 +1813,20 @@ pub fn run(options: &Options) -> Result<Report> {
                 .to_string_lossy()
                 .into_owned();
             let original = &file.original;
-            file.sites.retain(|site| {
+            let in_scope = |site: &Site| {
                 scope.touches(&relative, scope::line_of(original, site.start), scope::line_of(original, site.end))
                     // A function is in scope by its signature line too.
                     || scope.touches(&relative, site.line, site.line)
-            });
+            };
+            file.sites.retain(in_scope);
+            file.rebuild_sites.retain(in_scope);
         }
-        files.retain(|f| !f.sites.is_empty() || f.path == root_file);
+        files.retain(|f| !f.sites.is_empty() || !f.rebuild_sites.is_empty() || f.path == root_file);
     }
-    let total_sites: usize = files.iter().map(|f| f.sites.len()).sum();
+    let total_sites: usize = files
+        .iter()
+        .map(|f| f.sites.len() + f.rebuild_sites.len())
+        .sum();
     note(&format!("{} sites in {} files", total_sites, files.len()));
 
     let root_source = state
@@ -1836,6 +1846,16 @@ pub fn run(options: &Options) -> Result<Report> {
     // 4. Build, disabling the sites whose probe does not compile (formal/tla/RepairLoop.tla).
     let mut disabled: HashSet<u32> = HashSet::new();
     let build_target = work.join("target");
+    let cargo_build = || {
+        Command::new("cargo")
+            .args(["test", "--no-run", "--message-format=json"])
+            .args(test_packages.iter().flat_map(|p| ["-p", p.name.as_str()]))
+            .current_dir(&copy)
+            .env("CARGO_TARGET_DIR", &build_target)
+            .stderr(Stdio::piped())
+            .output()
+            .context("running cargo test --no-run")
+    };
     let mut rounds = 0;
     let build = loop {
         for file in &mut files {
@@ -1859,14 +1879,7 @@ pub fn run(options: &Options) -> Result<Report> {
         } else {
             "rebuilding without the sites that failed to compile"
         });
-        let output = Command::new("cargo")
-            .args(["test", "--no-run", "--message-format=json"])
-            .args(test_packages.iter().flat_map(|p| ["-p", p.name.as_str()]))
-            .current_dir(&copy)
-            .env("CARGO_TARGET_DIR", &build_target)
-            .stderr(Stdio::piped())
-            .output()
-            .context("running cargo test --no-run")?;
+        let output = cargo_build()?;
         let names: Vec<&str> = test_packages.iter().map(|p| p.name.as_str()).collect();
         let build = parse_build_output(&String::from_utf8_lossy(&output.stdout), &names);
         if output.status.success() {
@@ -2009,6 +2022,8 @@ pub fn run(options: &Options) -> Result<Report> {
         if disabled.contains(&site.id) {
             match site.kind {
                 SiteKind::Body { .. } => report.unviable_mutants += 1,
+                // Mutated below by building it, where that is possible.
+                _ if options.rebuild && !instrument::source_mutants(site).is_empty() => {}
                 _ => report.skipped_sites += 1,
             }
         }
@@ -2176,6 +2191,84 @@ pub fn run(options: &Options) -> Result<Report> {
         }
     }
 
+    // 7b. What a probe cannot be put in is mutated in the source, built and run: code in
+    // a `const fn`, and the sites whose probe did not compile.
+    let mut built: Vec<(&SourceFile, &Site, instrument::SourceMutant)> = vec![];
+    for file in &files {
+        let retried = file.sites.iter().filter(|site| {
+            disabled.contains(&site.id) && !matches!(site.kind, SiteKind::Body { .. })
+        });
+        for site in file.rebuild_sites.iter().chain(retried) {
+            built.extend(
+                instrument::source_mutants(site)
+                    .into_iter()
+                    .map(|mutant| (file, site, mutant)),
+            );
+        }
+    }
+    if options.rebuild && !built.is_empty() {
+        session.note(&format!(
+            "building {} mutants one by one (code a probe cannot be put in)",
+            built.len()
+        ));
+        let instrumented = |file: &SourceFile, text: &str| {
+            if file.path == root_file {
+                format!("{text}{root_suffix}")
+            } else {
+                text.to_string()
+            }
+        };
+        let mut survivors: Vec<(report::Location, Vec<String>)> = vec![];
+        for (file, site, mutant) in &built {
+            let mutated = format!(
+                "{}{}{}",
+                &file.original[..mutant.start],
+                mutant.replacement,
+                &file.original[mutant.end..]
+            );
+            state.write(&file.path, &instrumented(file, &mutated))?;
+            let viable = cargo_build()?.status.success();
+            let mut survived = viable;
+            if viable {
+                report.mutants_run += 1;
+                for bin in &session.binaries {
+                    let outcome = run_binary(bin, None, &[], mutant_timeout(bin.baseline), true)?;
+                    if outcome != Outcome::Pass {
+                        survived = false;
+                        report.mutants_killed += 1;
+                        report.mutants_timed_out += (outcome == Outcome::Timeout) as usize;
+                        break;
+                    }
+                }
+            } else {
+                report.unviable_mutants += 1;
+            }
+            // The file as it was, before another one is changed.
+            let rendered = file.rendered.as_ref().expect("rendered before building");
+            state.write(&file.path, &instrumented(file, &rendered.text))?;
+            if survived {
+                let at = report::location(&file.display, site);
+                let text = report::describe(site, mutation_of(site, mutant));
+                match survivors.last_mut() {
+                    Some((last, texts)) if *last == at => texts.push(text),
+                    _ => survivors.push((at, vec![text])),
+                }
+            }
+        }
+        report
+            .findings
+            .extend(
+                survivors
+                    .into_iter()
+                    .map(|(at, survivors)| Finding::AssertionGap {
+                        at,
+                        survivors,
+                        tests: vec![],
+                        effects: vec![],
+                    }),
+            );
+    }
+
     report.sort_findings();
 
     // 8. Findings the user has already dealt with.
@@ -2212,6 +2305,27 @@ pub fn run(options: &Options) -> Result<Report> {
         .retain(|finding| !known.contains(&crate::baseline::fingerprint(finding)));
     report.suppressed = before - report.findings.len();
     Ok(report)
+}
+
+/// The mutation that a change of the source text is, to describe it in the same words.
+fn mutation_of(site: &Site, mutant: &instrument::SourceMutant) -> Mutation {
+    match &site.kind {
+        SiteKind::Cmp { .. } => plan::CmpOp::ALL
+            .into_iter()
+            .find(|op| op.symbol() == mutant.into)
+            .map_or(Mutation::Negate, Mutation::Op),
+        SiteKind::Logic { .. } => Mutation::LogicSwap,
+        SiteKind::Arith { op, .. } => {
+            if mutant.into.trim_end_matches('=') == op.swapped().symbol() {
+                Mutation::ArithSwap
+            } else {
+                Mutation::ArithSwap2
+            }
+        }
+        SiteKind::Not { .. } => Mutation::DropNot,
+        SiteKind::Guard { .. } => Mutation::Const(mutant.into == "true"),
+        _ => Mutation::Delete,
+    }
 }
 
 /// The changes a surviving mutant causes, as up to three sentences. Changes that many
@@ -3012,5 +3126,46 @@ serde = { path = "../../serde-fork" }
         assert!(!copy.join("old").exists());
         assert_eq!(read("keep/deep/y"), "y");
         fs::remove_dir_all(&dir).unwrap();
+    }
+    #[test]
+    fn source_mutants_are_described_like_the_others() {
+        let source = "fn f(a: i32, b: i32, k: Option<i32>) -> bool { \
+                      match k { Some(n) if n > 1 => !(a < b) || a + b == 0, _ => -a * b > 1 } }";
+        let found = instrument::discover(source, 0).unwrap().sites;
+        let described: Vec<String> = found
+            .iter()
+            .flat_map(|site| {
+                instrument::source_mutants(site)
+                    .into_iter()
+                    .map(|mutant| report::describe(site, mutation_of(site, &mutant)))
+            })
+            .collect();
+        assert_eq!(
+            described,
+            [
+                "the body of `f` replaced by `true`",
+                "the body of `f` replaced by `false`",
+                // The arm can be removed, which is its guard being `false`.
+                "remove the arm `Some(n) if n > 1 => ..`",
+                "the guard `n > 1` replaced by `true`",
+                "`n == 1`",
+                "`n < 1`",
+                "`n >= 1`",
+                "`!(a < b) && a + b == 0`",
+                "`(a < b)`",
+                "`a == b`",
+                "`a > b`",
+                "`a <= b`",
+                "`a + b != 0`",
+                "`a - b`",
+                "`a * b`",
+                "`-a * b == 1`",
+                "`-a * b < 1`",
+                "`-a * b >= 1`",
+                "`-a / b`",
+                "`-a + b`",
+                "`a`",
+            ]
+        );
     }
 }

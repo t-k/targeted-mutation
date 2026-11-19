@@ -623,10 +623,15 @@ fn finding_body(finding: &Finding) -> Vec<String> {
             ..
         } => {
             lines.push(format!("passes every test as: {}", survivors.join(", ")));
-            lines.push(format!(
-                "these tests run the changed code and still pass: {}",
-                list(tests, 5)
-            ));
+            lines.push(if tests.is_empty() {
+                // Built on its own: nothing recorded which tests run this code.
+                "no test fails with it".to_string()
+            } else {
+                format!(
+                    "these tests run the changed code and still pass: {}",
+                    list(tests, 5)
+                )
+            });
             if effects.is_empty() {
                 lines.push("add an assertion on what this code is responsible for".to_string());
             } else {

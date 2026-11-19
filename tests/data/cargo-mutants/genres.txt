@@ -1,0 +1,73 @@
+src/lib.rs:7:5: replace opposite -> i32 with 0
+src/lib.rs:7:5: replace opposite -> i32 with 1
+src/lib.rs:7:5: replace opposite -> i32 with -1
+src/lib.rs:7:5: delete - in opposite
+src/lib.rs:11:5: replace freezing -> i32 with 0
+src/lib.rs:11:5: replace freezing -> i32 with 1
+src/lib.rs:11:5: replace freezing -> i32 with -1
+src/lib.rs:11:5: delete - in freezing
+src/lib.rs:15:5: replace tripled -> i32 with 0
+src/lib.rs:15:5: replace tripled -> i32 with 1
+src/lib.rs:15:5: replace tripled -> i32 with -1
+src/lib.rs:15:7: replace * with + in tripled
+src/lib.rs:15:7: replace * with / in tripled
+src/lib.rs:19:5: replace sign -> &'static str with ""
+src/lib.rs:19:5: replace sign -> &'static str with "xyzzy"
+src/lib.rs:21:9: delete match arm 0 in sign
+src/lib.rs:20:14: replace match guard n < 0 with true in sign
+src/lib.rs:20:14: replace match guard n < 0 with false in sign
+src/lib.rs:20:16: replace < with == in sign
+src/lib.rs:20:16: replace < with > in sign
+src/lib.rs:20:16: replace < with <= in sign
+src/lib.rs:32:5: replace is_big -> bool with true
+src/lib.rs:32:5: replace is_big -> bool with false
+src/lib.rs:33:32: replace match guard *side > 10 with true in is_big
+src/lib.rs:33:32: replace match guard *side > 10 with false in is_big
+src/lib.rs:33:38: replace > with == in is_big
+src/lib.rs:33:38: replace > with < in is_big
+src/lib.rs:33:38: replace > with >= in is_big
+src/lib.rs:35:42: replace > with == in is_big
+src/lib.rs:35:42: replace > with < in is_big
+src/lib.rs:35:42: replace > with >= in is_big
+src/lib.rs:47:5: replace strict -> Options with Default::default()
+src/lib.rs:48:9: delete field depth from struct Options expression in strict
+src/lib.rs:49:9: delete field strict from struct Options expression in strict
+src/lib.rs:55:5: replace renamed -> Options with Default::default()
+src/lib.rs:56:9: delete field name from struct Options expression in renamed
+src/lib.rs:62:5: replace count -> usize with 0
+src/lib.rs:62:5: replace count -> usize with 1
+src/lib.rs:66:5: replace label -> String with String::new()
+src/lib.rs:66:5: replace label -> String with "xyzzy".into()
+src/lib.rs:70:5: replace lengths -> HashMap<String, usize> with HashMap::new()
+src/lib.rs:70:5: replace lengths -> HashMap<String, usize> with HashMap::from_iter([(String::new(), 0)])
+src/lib.rs:70:5: replace lengths -> HashMap<String, usize> with HashMap::from_iter([(String::new(), 1)])
+src/lib.rs:70:5: replace lengths -> HashMap<String, usize> with HashMap::from_iter([("xyzzy".into(), 0)])
+src/lib.rs:70:5: replace lengths -> HashMap<String, usize> with HashMap::from_iter([("xyzzy".into(), 1)])
+src/lib.rs:74:5: replace longest -> Option<&'a str> with None
+src/lib.rs:74:5: replace longest -> Option<&'a str> with Some("")
+src/lib.rs:74:5: replace longest -> Option<&'a str> with Some("xyzzy")
+src/lib.rs:78:5: replace parse -> Result<u32, String> with Ok(0)
+src/lib.rs:78:5: replace parse -> Result<u32, String> with Ok(1)
+src/lib.rs:82:5: replace pair -> (u32, bool) with (0, true)
+src/lib.rs:82:5: replace pair -> (u32, bool) with (0, false)
+src/lib.rs:82:5: replace pair -> (u32, bool) with (1, true)
+src/lib.rs:82:5: replace pair -> (u32, bool) with (1, false)
+src/lib.rs:82:8: replace + with - in pair
+src/lib.rs:82:8: replace + with * in pair
+src/lib.rs:82:15: replace > with == in pair
+src/lib.rs:82:15: replace > with < in pair
+src/lib.rs:82:15: replace > with >= in pair
+src/lib.rs:86:5: replace record with ()
+src/lib.rs:86:8: delete ! in record
+src/lib.rs:95:5: replace token -> Token with Default::default()
+src/lib.rs:100:5: replace untouched -> i32 with 0
+src/lib.rs:100:5: replace untouched -> i32 with 1
+src/lib.rs:100:5: replace untouched -> i32 with -1
+src/lib.rs:100:7: replace + with - in untouched
+src/lib.rs:100:7: replace + with * in untouched
+src/lib.rs:104:5: replace evens -> impl Iterator<Item = u32> with ::std::iter::empty()
+src/lib.rs:104:5: replace evens -> impl Iterator<Item = u32> with ::std::iter::once(0)
+src/lib.rs:104:5: replace evens -> impl Iterator<Item = u32> with ::std::iter::once(1)
+src/lib.rs:104:33: replace == with != in evens
+src/lib.rs:104:29: replace % with / in evens
+src/lib.rs:104:29: replace % with + in evens

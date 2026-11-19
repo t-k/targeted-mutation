@@ -1,0 +1,46 @@
+src/lib.rs:16:5: replace spelled -> &'static str with ""
+src/lib.rs:16:5: replace spelled -> &'static str with "xyzzy"
+src/lib.rs:28:9: replace <impl PartialEq for Counted<'_>>::eq -> bool with true
+src/lib.rs:28:9: replace <impl PartialEq for Counted<'_>>::eq -> bool with false
+src/lib.rs:28:20: replace == with != in <impl PartialEq for Counted<'_>>::eq
+src/lib.rs:34:9: replace <impl PartialOrd for Counted<'_>>::partial_cmp -> Option<Ordering> with None
+src/lib.rs:34:9: replace <impl PartialOrd for Counted<'_>>::partial_cmp -> Option<Ordering> with Some(Default::default())
+src/lib.rs:34:53: replace + with - in <impl PartialOrd for Counted<'_>>::partial_cmp
+src/lib.rs:34:53: replace + with * in <impl PartialOrd for Counted<'_>>::partial_cmp
+src/lib.rs:40:5: replace is_smaller -> bool with true
+src/lib.rs:40:5: replace is_smaller -> bool with false
+src/lib.rs:40:7: replace < with == in is_smaller
+src/lib.rs:40:7: replace < with > in is_smaller
+src/lib.rs:40:7: replace < with <= in is_smaller
+src/lib.rs:46:5: replace borrow_state -> (usize, bool) with (0, true)
+src/lib.rs:46:5: replace borrow_state -> (usize, bool) with (0, false)
+src/lib.rs:46:5: replace borrow_state -> (usize, bool) with (1, true)
+src/lib.rs:46:5: replace borrow_state -> (usize, bool) with (1, false)
+src/lib.rs:46:37: replace + with - in borrow_state
+src/lib.rs:46:37: replace + with * in borrow_state
+src/lib.rs:53:5: replace released_between_operands -> bool with true
+src/lib.rs:53:5: replace released_between_operands -> bool with false
+src/lib.rs:53:41: replace && with || in released_between_operands
+src/lib.rs:59:5: replace shadowing -> bool with true
+src/lib.rs:59:5: replace shadowing -> bool with false
+src/lib.rs:59:48: replace && with || in shadowing
+src/lib.rs:59:23: replace && with || in shadowing
+src/lib.rs:59:7: replace && with || in shadowing
+src/lib.rs:59:18: replace == with != in shadowing
+src/lib.rs:59:44: replace > with == in shadowing
+src/lib.rs:59:44: replace > with < in shadowing
+src/lib.rs:59:44: replace > with >= in shadowing
+src/lib.rs:59:34: replace + with - in shadowing
+src/lib.rs:59:34: replace + with * in shadowing
+src/lib.rs:59:51: delete ! in shadowing
+src/lib.rs:64:5: replace audited -> bool with true
+src/lib.rs:64:5: replace audited -> bool with false
+src/lib.rs:64:11: replace && with || in audited
+src/lib.rs:65:33: replace + with - in audited
+src/lib.rs:65:33: replace + with * in audited
+src/lib.rs:72:5: replace accumulate -> u32 with 0
+src/lib.rs:72:5: replace accumulate -> u32 with 1
+src/lib.rs:77:8: replace += with -= in accumulate
+src/lib.rs:77:8: replace += with *= in accumulate
+src/lib.rs:81:11: replace += with -= in accumulate
+src/lib.rs:81:11: replace += with *= in accumulate

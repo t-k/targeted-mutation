@@ -1,0 +1,26 @@
+src/lib.rs:5:5: replace sum_first -> u32 with 0
+src/lib.rs:5:5: replace sum_first -> u32 with 1
+src/lib.rs:7:15: replace += with -= in sum_first
+src/lib.rs:7:15: replace += with *= in sum_first
+src/lib.rs:14:5: replace clamp_level -> u32 with 0
+src/lib.rs:14:5: replace clamp_level -> u32 with 1
+src/lib.rs:19:5: replace at_least -> u32 with 0
+src/lib.rs:19:5: replace at_least -> u32 with 1
+src/lib.rs:24:5: replace first_even -> Option<u32> with None
+src/lib.rs:24:5: replace first_even -> Option<u32> with Some(0)
+src/lib.rs:24:5: replace first_even -> Option<u32> with Some(1)
+src/lib.rs:24:43: replace == with != in first_even
+src/lib.rs:24:39: replace % with / in first_even
+src/lib.rs:24:39: replace % with + in first_even
+src/lib.rs:29:5: replace position_of -> Option<usize> with None
+src/lib.rs:29:5: replace position_of -> Option<usize> with Some(0)
+src/lib.rs:29:5: replace position_of -> Option<usize> with Some(1)
+src/lib.rs:29:35: replace == with != in position_of
+src/lib.rs:34:5: replace bucket -> &'static str with ""
+src/lib.rs:34:5: replace bucket -> &'static str with "xyzzy"
+src/lib.rs:35:9: delete match arm 0 in bucket
+src/lib.rs:36:16: replace match guard few < 10 with true in bucket
+src/lib.rs:36:16: replace match guard few < 10 with false in bucket
+src/lib.rs:36:20: replace < with == in bucket
+src/lib.rs:36:20: replace < with > in bucket
+src/lib.rs:36:20: replace < with <= in bucket

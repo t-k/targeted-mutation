@@ -1,0 +1,8 @@
+src/lib.rs:29:9: replace Store::get -> Option<&str> with None
+src/lib.rs:29:9: replace Store::get -> Option<&str> with Some("")
+src/lib.rs:29:9: replace Store::get -> Option<&str> with Some("xyzzy")
+src/lib.rs:33:9: replace Store::commit -> Result<(), CommitError> with Ok(())
+src/lib.rs:42:9: replace Store::check_preconditions -> Result<(), CommitError> with Ok(())
+src/lib.rs:47:24: delete ! in Store::check_preconditions
+src/lib.rs:57:9: replace Store::apply -> Result<(), CommitError> with Ok(())
+src/lib.rs:62:20: delete ! in Store::apply

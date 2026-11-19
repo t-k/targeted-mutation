@@ -56,6 +56,10 @@ struct Cli {
     /// Do not trace surviving mutants to say what they change.
     #[arg(long)]
     no_effects: bool,
+    /// Leave out the mutants that need a build of their own (code in a `const fn` and
+    /// other places a probe cannot be put in).
+    #[arg(long)]
+    no_rebuild: bool,
     /// Print the report as SARIF 2.1.0.
     #[arg(long, conflicts_with = "json")]
     sarif: bool,
@@ -83,6 +87,7 @@ fn main() -> ExitCode {
         also_test: cli.also_test,
         dependents: cli.dependents,
         effects: !cli.no_effects,
+        rebuild: !cli.no_rebuild,
         jobs: cli.jobs,
         all_files: cli.all_files,
         doc: cli.doc,

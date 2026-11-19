@@ -283,6 +283,11 @@ pub struct TestModule {
 #[derive(Debug, Default)]
 pub struct Discovery {
     pub sites: Vec<Site>,
+    /// Sites that cannot be switched while the program runs: inside a `const fn`, the
+    /// body of a function that returns `impl Iterator`, a compound assignment to a place
+    /// that is more than a variable. Their mutants are built one by one
+    /// (`source_mutants`). They have no number.
+    pub rebuild_sites: Vec<Site>,
     /// Out-of-line modules that only exist under `cfg(test)` (`#[cfg(test)] mod tests;`).
     pub test_modules: Vec<TestModule>,
 }
@@ -310,6 +315,7 @@ pub fn discover(source: &str, first_id: u32) -> Result<Discovery> {
         next_id: first_id,
         found: Discovery::default(),
         local_macros,
+        const_depth: 0,
     };
     finder.visit_file(&file);
     Ok(finder.found)
@@ -321,6 +327,8 @@ struct Finder<'s> {
     source: &'s str,
     next_id: u32,
     found: Discovery,
+    /// How many `const fn` the visitor is inside of.
+    const_depth: usize,
 }
 
 impl Finder<'_> {
@@ -348,8 +356,8 @@ impl Finder<'_> {
             _ => None,
         };
         let push = |finder: &mut Self, kind: SiteKind| {
-            finder.found.sites.push(Site {
-                id: finder.next_id,
+            finder.add(Site {
+                id: 0,
                 kind,
                 line: at.line,
                 column: at.column + 1,
@@ -357,7 +365,6 @@ impl Finder<'_> {
                 end,
                 text: text.clone(),
             });
-            finder.next_id += 1;
         };
         let name = sig.ident.to_string();
         if let Some(option) = self.result_kind(&sig.output) {
@@ -376,6 +383,22 @@ impl Finder<'_> {
             return;
         }
         let written = sole_expr.map(|(from, to)| squeezed(&self.source[from..to]));
+        // An iterator of another type cannot be returned beside the body's own.
+        for value in iterator_values(&sig.output) {
+            self.found.rebuild_sites.push(Site {
+                id: NO_ID,
+                kind: SiteKind::Body {
+                    name: name.clone(),
+                    value,
+                    sole_expr,
+                },
+                line: at.line,
+                column: at.column + 1,
+                start,
+                end,
+                text: text.clone(),
+            });
+        }
         for value in body_values(&sig.output) {
             if written.as_deref() != Some(squeezed(&value).as_str()) {
                 push(
@@ -428,8 +451,8 @@ impl Finder<'_> {
 
     fn push(&mut self, kind: SiteKind, start: usize, end: usize, span: Span) {
         let at = span.start();
-        self.found.sites.push(Site {
-            id: self.next_id,
+        self.add(Site {
+            id: 0,
             kind,
             line: at.line,
             column: at.column + 1,
@@ -437,7 +460,18 @@ impl Finder<'_> {
             end,
             text: self.source[start..end].to_string(),
         });
-        self.next_id += 1;
+    }
+
+    /// Registers a site: numbered, or among those that need a build of their own.
+    fn add(&mut self, mut site: Site) {
+        if self.const_depth > 0 {
+            site.id = NO_ID;
+            self.found.rebuild_sites.push(site);
+        } else {
+            site.id = self.next_id;
+            self.found.sites.push(site);
+            self.next_id += 1;
+        }
     }
 }
 
@@ -625,6 +659,164 @@ fn has_ident(tokens: TokenStream, name: &str) -> bool {
         TokenTree::Group(group) => has_ident(group.stream(), name),
         _ => false,
     })
+}
+
+/// The number of a site that has none.
+pub const NO_ID: u32 = u32::MAX;
+
+/// A mutant as a change of the source text: `replacement` in place of `start..end`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SourceMutant {
+    pub start: usize,
+    pub end: usize,
+    pub replacement: String,
+    /// What is replaced and by what, in the words of cargo-mutants: (`<`, `==`),
+    /// (`-`, ``) for a deleted minus, (`guard`, `true`), (`body`, `0`).
+    pub what: String,
+    pub into: String,
+}
+
+/// The mutants of a site as changes of the source, for the sites that are mutated by
+/// building them. The replacements of an operator are those of cargo-mutants. Sites that
+/// only exist as probes (a result replaced after the body ran, a deleted statement, the
+/// other of `min` / `max`, the end of a range) have none.
+pub fn source_mutants(site: &Site) -> Vec<SourceMutant> {
+    let change =
+        |start: usize, end: usize, replacement: String, what: &str, into: &str| SourceMutant {
+            start,
+            end,
+            replacement,
+            what: what.to_string(),
+            into: into.to_string(),
+        };
+    let operator = |gap: &(usize, usize), from: String, to: String| {
+        change(gap.0, gap.1, format!(" {to} "), &from, &to)
+    };
+    match &site.kind {
+        SiteKind::Cmp { op, gap, .. } => {
+            let others: &[CmpOp] = match op {
+                CmpOp::Lt => &[CmpOp::Eq, CmpOp::Gt, CmpOp::Le],
+                CmpOp::Gt => &[CmpOp::Eq, CmpOp::Lt, CmpOp::Ge],
+                CmpOp::Le => &[CmpOp::Gt],
+                CmpOp::Ge => &[CmpOp::Lt],
+                CmpOp::Eq => &[CmpOp::Ne],
+                CmpOp::Ne => &[CmpOp::Eq],
+            };
+            others
+                .iter()
+                .map(|other| operator(gap, op.symbol().into(), other.symbol().into()))
+                .collect()
+        }
+        SiteKind::Logic { and, gap, .. } => {
+            let (from, to) = if *and { ("&&", "||") } else { ("||", "&&") };
+            vec![operator(gap, from.into(), to.into())]
+        }
+        SiteKind::Arith {
+            op, assign, gap, ..
+        } => {
+            let eq = if *assign { "=" } else { "" };
+            [Some(op.swapped()), op.swapped2()]
+                .into_iter()
+                .flatten()
+                .map(|other| {
+                    operator(
+                        gap,
+                        format!("{}{eq}", op.symbol()),
+                        format!("{}{eq}", other.symbol()),
+                    )
+                })
+                .collect()
+        }
+        SiteKind::Not { bang, .. } => vec![change(bang.0, bang.1, String::new(), "!", "")],
+        SiteKind::Neg { minus, .. } => vec![change(minus.0, minus.1, String::new(), "-", "")],
+        SiteKind::Body { value, .. } => {
+            vec![change(
+                site.start,
+                site.end,
+                format!(" {value} "),
+                "body",
+                value,
+            )]
+        }
+        // An arm whose guard is `false` is an arm that is not there.
+        SiteKind::Arm { pattern, guard } => vec![match guard {
+            ArmGuard::None(arrow) => change(*arrow, *arrow, "if false ".into(), "arm", pattern),
+            ArmGuard::Existing(from, to) => change(*from, *to, "false".into(), "arm", pattern),
+        }],
+        SiteKind::Guard { can_be_false } => [true, false]
+            .into_iter()
+            .filter(|value| *value || *can_be_false)
+            .map(|value| {
+                change(
+                    site.start,
+                    site.end,
+                    value.to_string(),
+                    "guard",
+                    &value.to_string(),
+                )
+            })
+            .collect(),
+        SiteKind::Field {
+            name,
+            shorthand,
+            from_base,
+        } => {
+            let prefix = if *shorthand {
+                format!("{name}: ")
+            } else {
+                String::new()
+            };
+            vec![change(
+                site.start,
+                site.end,
+                format!("{prefix}{from_base}"),
+                "field",
+                name,
+            )]
+        }
+        SiteKind::Return { .. }
+        | SiteKind::MinMax { .. }
+        | SiteKind::Range { .. }
+        | SiteKind::Stmt => vec![],
+    }
+}
+
+/// The iterators to return in place of the body of a function that returns
+/// `impl Iterator<Item = T>`: an empty one, and one of each value of `T`.
+pub fn iterator_values(output: &syn::ReturnType) -> Vec<String> {
+    let syn::ReturnType::Type(_, ty) = output else {
+        return vec![];
+    };
+    let syn::Type::ImplTrait(opaque) = &**ty else {
+        return vec![];
+    };
+    let item = opaque.bounds.iter().find_map(|bound| {
+        let syn::TypeParamBound::Trait(bound) = bound else {
+            return None;
+        };
+        let last = bound.path.segments.last()?;
+        let syn::PathArguments::AngleBracketed(list) = &last.arguments else {
+            return None;
+        };
+        (last.ident == "Iterator").then_some(())?;
+        list.args.iter().find_map(|arg| match arg {
+            syn::GenericArgument::AssocType(item) if item.ident == "Item" => Some(&item.ty),
+            _ => None,
+        })
+    });
+    let Some(item) = item else {
+        return vec![];
+    };
+    if has_ident(item.to_token_stream(), "impl") {
+        return vec!["::core::iter::empty()".to_string()];
+    }
+    let mut values = vec!["::core::iter::empty()".to_string()];
+    values.extend(
+        values_of(item)
+            .iter()
+            .map(|value| format!("::core::iter::once({value})")),
+    );
+    values
 }
 
 /// Text without its white space, to compare two ways of writing one expression.
@@ -896,25 +1088,36 @@ impl<'ast> Visit<'ast> for Finder<'_> {
     }
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) && node.sig.constness.is_none() {
+        if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) {
+            // Nothing in a `const fn` can ask at run time which mutant is on.
+            let constant = node.sig.constness.is_some() as usize;
+            self.const_depth += constant;
             self.function_sites(&node.sig, &node.block);
             visit::visit_item_fn(self, node);
+            self.const_depth -= constant;
         }
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) && node.sig.constness.is_none() {
+        if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) {
+            // Nothing in a `const fn` can ask at run time which mutant is on.
+            let constant = node.sig.constness.is_some() as usize;
+            self.const_depth += constant;
             self.function_sites(&node.sig, &node.block);
             visit::visit_impl_item_fn(self, node);
+            self.const_depth -= constant;
         }
     }
 
     fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
-        if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) && node.sig.constness.is_none() {
+        if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) {
+            let constant = node.sig.constness.is_some() as usize;
+            self.const_depth += constant;
             if let Some(body) = &node.default {
                 self.function_sites(&node.sig, body);
             }
             visit::visit_trait_item_fn(self, node);
+            self.const_depth -= constant;
         }
     }
 
@@ -1011,6 +1214,8 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                     _ => false,
                 }
         };
+        // Where the arms that can be removed start.
+        let mut removable: Vec<usize> = vec![];
         if let Some((last, others)) = node.arms.split_last()
             && catches_all(last)
         {
@@ -1043,8 +1248,9 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                     ArmGuard::None(_) => self.source[start..pat_end].to_string(),
                 };
                 let at = arm.pat.span().start();
-                self.found.sites.push(Site {
-                    id: self.next_id,
+                removable.push(start);
+                self.add(Site {
+                    id: 0,
                     kind: SiteKind::Arm {
                         pattern: pattern.clone(),
                         guard,
@@ -1055,18 +1261,10 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                     end,
                     text: format!("{pattern} => .."),
                 });
-                self.next_id += 1;
             }
         }
         // Any guard can be `true` or `false` instead: a guarded arm never counts for
         // the match being exhaustive. A `let` in a guard binds names for the arm.
-        let removable: Vec<usize> = self
-            .found
-            .sites
-            .iter()
-            .filter(|s| matches!(s.kind, SiteKind::Arm { .. }))
-            .map(|s| s.start)
-            .collect();
         for arm in node.arms.iter().filter(|arm| arm.attrs.is_empty()) {
             if let Some((_, guard)) = &arm.guard
                 && !matches!(**guard, syn::Expr::Let(_))
@@ -1125,8 +1323,8 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                     shorthand,
                 };
                 let at = field.member.span().start();
-                self.found.sites.push(Site {
-                    id: self.next_id,
+                self.add(Site {
+                    id: 0,
                     kind,
                     line: at.line,
                     column: at.column + 1,
@@ -1135,7 +1333,6 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                     end,
                     text: self.source[start..end].to_string(),
                 });
-                self.next_id += 1;
             }
         }
         visit::visit_expr_struct(self, node);
@@ -1227,20 +1424,30 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                 }
             } else if let Some((op, assign)) = arith_op(&node.op)
                 && !(is_literal(&node.left) && is_literal(&node.right))
-                && (!assign || is_plain_place(&node.left))
             {
-                self.push(
-                    SiteKind::Arith {
-                        op,
-                        assign,
-                        lhs,
-                        rhs,
-                        gap,
-                    },
-                    start,
-                    end,
-                    node.left.span(),
-                );
+                let kind = SiteKind::Arith {
+                    op,
+                    assign,
+                    lhs,
+                    rhs,
+                    gap,
+                };
+                if !assign || is_plain_place(&node.left) {
+                    self.push(kind, start, end, node.left.span());
+                } else {
+                    // Which of the place and the value is evaluated first depends on
+                    // the type, which a probe would have to know.
+                    let at = node.left.span().start();
+                    self.found.rebuild_sites.push(Site {
+                        id: NO_ID,
+                        kind,
+                        line: at.line,
+                        column: at.column + 1,
+                        start,
+                        end,
+                        text: self.source[start..end].to_string(),
+                    });
+                }
             }
         }
         visit::visit_expr_binary(self, node);
@@ -2994,5 +3201,183 @@ mod tests {
             !out.contains("{ -0 }") && !out.contains("{ -0.0 }"),
             "{out}"
         );
+    }
+    /// The source with each mutant of each site applied, as `what -> into: text`.
+    fn mutated(src: &str, sites: &[Site]) -> Vec<String> {
+        sites
+            .iter()
+            .flat_map(|site| {
+                source_mutants(site).into_iter().map(|m| {
+                    let text = format!("{}{}{}", &src[..m.start], m.replacement, &src[m.end..]);
+                    syn::parse_file(&text).unwrap_or_else(|e| panic!("{text}: {e}"));
+                    format!("{} -> {}: {}", m.what, m.into, text.trim())
+                })
+            })
+            .collect()
+    }
+
+    #[test]
+    fn what_cannot_be_probed_is_mutated_in_the_source() {
+        // Everything in a `const fn`, a compound assignment to more than a variable,
+        // and the body of a function that returns an iterator.
+        let src = "const fn c(a: u8, b: u8) -> bool { a < b }\n\
+                   fn f(m: &mut Map, k: u8) { *m.entry(k).or_insert(0) += 1; m.total -= 1; }\n\
+                   fn evens(n: u8) -> impl Iterator<Item = u8> + '_ { (0..n).step_by(2) }\n\
+                   impl S { const fn k(&self) -> u8 { -self.0 } }\n\
+                   trait T { const fn d(a: u8) -> u8 { a } }\n";
+        let found = discover(src, 0).unwrap();
+        assert!(found.rebuild_sites.iter().all(|s| s.id == NO_ID));
+        assert_eq!(
+            found.sites.iter().map(|s| s.id).collect::<Vec<_>>(),
+            (0..found.sites.len() as u32).collect::<Vec<_>>()
+        );
+        let numbered: Vec<&str> = found.sites.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(
+            numbered,
+            [
+                "fn f(m: &mut Map, k: u8)",
+                "*m.entry(k).or_insert(0) += 1;",
+                "m.total -= 1;",
+                "m.total -= 1",
+                "0..n"
+            ]
+        );
+        assert_eq!(
+            mutated(src, &found.rebuild_sites)
+                .iter()
+                .map(|line| line.lines().next().unwrap().to_string())
+                .take(5)
+                .collect::<Vec<_>>(),
+            [
+                "body -> true: const fn c(a: u8, b: u8) -> bool { true }",
+                "body -> false: const fn c(a: u8, b: u8) -> bool { false }",
+                "< -> ==: const fn c(a: u8, b: u8) -> bool { a == b }",
+                "< -> >: const fn c(a: u8, b: u8) -> bool { a > b }",
+                "< -> <=: const fn c(a: u8, b: u8) -> bool { a <= b }",
+            ]
+        );
+        let whats: Vec<String> = found
+            .rebuild_sites
+            .iter()
+            .flat_map(|site| {
+                source_mutants(site)
+                    .into_iter()
+                    .map(|m| format!("{}: {} -> {}", site.text, m.what, m.into))
+            })
+            .skip(5)
+            .collect();
+        assert_eq!(
+            whats,
+            [
+                "*m.entry(k).or_insert(0) += 1: += -> -=",
+                "*m.entry(k).or_insert(0) += 1: += -> *=",
+                "fn evens(n: u8) -> impl Iterator<Item = u8> + '_: body -> ::core::iter::empty()",
+                "fn evens(n: u8) -> impl Iterator<Item = u8> + '_: body -> ::core::iter::once(0)",
+                "fn evens(n: u8) -> impl Iterator<Item = u8> + '_: body -> ::core::iter::once(1)",
+                "const fn k(&self) -> u8: body -> 0",
+                "const fn k(&self) -> u8: body -> 1",
+                "-self.0: - -> ",
+                "const fn d(a: u8) -> u8: body -> 0",
+                "const fn d(a: u8) -> u8: body -> 1",
+            ]
+        );
+    }
+
+    #[test]
+    fn source_mutants_of_every_kind() {
+        let src = "fn f(a: i32, b: i32, k: K, base: O) -> O { \
+                   let x = match k { K::A(n) if n >= 1 => !(a != b) || a <= -b, K::B => a % b > 0 && a == b, _ => false }; \
+                   O { on: x, a, ..base } }";
+        let sites = found(src, 0).unwrap().sites;
+        // Every one of them is still a source file.
+        assert_eq!(mutated(src, &sites).len(), 18);
+        let changes: Vec<String> = sites
+            .iter()
+            .flat_map(source_mutants)
+            .map(|m| {
+                format!(
+                    "{} -> {} | `{}` becomes `{}`",
+                    m.what,
+                    m.into,
+                    &src[m.start..m.end],
+                    m.replacement
+                )
+            })
+            .collect();
+        assert_eq!(
+            changes,
+            [
+                // An arm goes by a guard that is never true.
+                "arm -> K::A(n) if n >= 1 | `n >= 1` becomes `false`",
+                "arm -> K::B | `` becomes `if false `",
+                "guard -> true | `n >= 1` becomes `true`",
+                ">= -> < | ` >= ` becomes ` < `",
+                "|| -> && | ` || ` becomes ` && `",
+                "! ->  | `!` becomes ``",
+                "!= -> == | ` != ` becomes ` == `",
+                "<= -> > | ` <= ` becomes ` > `",
+                "- ->  | `-` becomes ``",
+                "&& -> || | ` && ` becomes ` || `",
+                "> -> == | ` > ` becomes ` == `",
+                "> -> < | ` > ` becomes ` < `",
+                "> -> >= | ` > ` becomes ` >= `",
+                "% -> / | ` % ` becomes ` / `",
+                "% -> + | ` % ` becomes ` + `",
+                "== -> != | ` == ` becomes ` != `",
+                "field -> on | `x` becomes `(base).on`",
+                "field -> a | `a` becomes `a: (base).a`",
+            ]
+        );
+        // What exists only as a probe has no mutant of the source.
+        let src = "fn f(a: u8, b: u8) -> bool { g(); for _ in a..b {} a.max(b) > 1 }";
+        let sites = discover(src, 0).unwrap().sites;
+        for site in &sites {
+            let none = matches!(
+                site.kind,
+                SiteKind::Return { .. }
+                    | SiteKind::Stmt
+                    | SiteKind::Range { .. }
+                    | SiteKind::MinMax { .. }
+            );
+            assert_eq!(source_mutants(site).is_empty(), none, "{:?}", site.kind);
+        }
+    }
+
+    #[test]
+    fn iterators_to_return_instead() {
+        let values = |ty: &str| {
+            let function: syn::ItemFn =
+                syn::parse_str(&format!("fn f() -> {ty} {{ todo!() }}")).unwrap();
+            iterator_values(&function.sig.output)
+        };
+        assert_eq!(
+            values("impl Iterator<Item = bool>"),
+            [
+                "::core::iter::empty()",
+                "::core::iter::once(true)",
+                "::core::iter::once(false)"
+            ]
+        );
+        assert_eq!(
+            values("impl std::iter::Iterator<Item = String> + Send + 'a").len(),
+            3
+        );
+        // An item that is itself opaque has no value to make up.
+        assert_eq!(
+            values("impl Iterator<Item = impl Sized>"),
+            ["::core::iter::empty()"]
+        );
+        for other in [
+            "impl Sized",
+            "impl Iterator",
+            "impl IntoIterator<Item = u8>",
+            "Box<dyn Iterator<Item = u8>>",
+            "u8",
+            "()",
+        ] {
+            assert!(values(other).is_empty(), "{other}");
+        }
+        let unit: syn::ItemFn = syn::parse_str("fn f() {}").unwrap();
+        assert!(iterator_values(&unit.sig.output).is_empty());
     }
 }

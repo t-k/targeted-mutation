@@ -279,8 +279,25 @@ fn awkward_constructs() {
             "`{quiet}` should have no finding: {report:#}"
         );
     }
-    // `const fn` bodies and test modules are not sites.
-    assert!(!codes.contains(&"a < 10"), "{report:#}");
+    // No probe can be put in a `const fn`: its mutants are built one by one. The tests
+    // only ask for a number below 10.
+    let in_const = |code: &str| -> Vec<&str> {
+        all.iter()
+            .filter(|f| f["code"] == code)
+            .flat_map(|f| strings(&f["survivors"]))
+            .collect()
+    };
+    assert_eq!(in_const("a < 10"), ["`a <= 10`"], "{report:#}");
+    assert_eq!(
+        in_const("const fn const_limit(a: u32) -> bool"),
+        ["the body of `const_limit` replaced by `true`"],
+        "{report:#}"
+    );
+    // A compound assignment to more than a variable is built too: the test counts hits.
+    assert!(
+        !codes.contains(&"*self.hits.entry(key.to_string()).or_insert(0) += 1"),
+        "{report:#}"
+    );
     let unreached: Vec<&str> = report["unreached"]
         .as_array()
         .unwrap()
@@ -1251,4 +1268,20 @@ fn the_mutants_of_cargo_mutants() {
         assert!(!codes.contains(&killed), "`{killed}`: {report:#}");
     }
     assert_eq!(report["unreached"].as_array().unwrap().len(), 1);
+
+    // An iterator of another type cannot be returned beside the body's own, so the
+    // three replacements of `evens` are built one by one. They can be left out.
+    let run = tmt(&dir, &["--json", "--quiet", "--no-rebuild"]);
+    let quick: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(
+        report["mutants_run"].as_u64().unwrap(),
+        quick["mutants_run"].as_u64().unwrap() + 3,
+        "{quick:#}"
+    );
+    assert_eq!(
+        report["mutants_killed"].as_u64().unwrap(),
+        quick["mutants_killed"].as_u64().unwrap() + 3,
+        "{quick:#}"
+    );
+    assert_eq!(quick["findings"], report["findings"]);
 }

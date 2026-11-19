@@ -1,0 +1,3 @@
+src/lib.rs:4:5: replace is_eligible -> bool with true
+src/lib.rs:4:5: replace is_eligible -> bool with false
+src/lib.rs:4:9: replace >= with < in is_eligible

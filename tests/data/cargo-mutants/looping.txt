@@ -1,0 +1,5 @@
+src/lib.rs:4:5: replace count_up -> u32 with 0
+src/lib.rs:4:5: replace count_up -> u32 with 1
+src/lib.rs:5:13: replace != with == in count_up
+src/lib.rs:6:11: replace += with -= in count_up
+src/lib.rs:6:11: replace += with *= in count_up

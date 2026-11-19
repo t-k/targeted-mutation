@@ -1,0 +1,64 @@
+src/lib.rs:7:5: replace can_edit -> bool with true
+src/lib.rs:7:5: replace can_edit -> bool with false
+src/lib.rs:7:14: replace || with && in can_edit
+src/lib.rs:12:5: replace in_range -> bool with true
+src/lib.rs:12:5: replace in_range -> bool with false
+src/lib.rs:12:13: replace && with || in in_range
+src/lib.rs:12:8: replace <= with > in in_range
+src/lib.rs:12:18: replace <= with > in in_range
+src/lib.rs:17:5: replace total_with_fee -> u64 with 0
+src/lib.rs:17:5: replace total_with_fee -> u64 with 1
+src/lib.rs:17:12: replace + with - in total_with_fee
+src/lib.rs:17:12: replace + with * in total_with_fee
+src/lib.rs:22:5: replace area -> u32 with 0
+src/lib.rs:22:5: replace area -> u32 with 1
+src/lib.rs:22:11: replace * with + in area
+src/lib.rs:22:11: replace * with / in area
+src/lib.rs:27:5: replace scale -> f64 with 0.0
+src/lib.rs:27:5: replace scale -> f64 with 1.0
+src/lib.rs:27:5: replace scale -> f64 with -1.0
+src/lib.rs:27:11: replace * with + in scale
+src/lib.rs:27:11: replace * with / in scale
+src/lib.rs:32:5: replace label -> String with String::new()
+src/lib.rs:32:5: replace label -> String with "xyzzy".into()
+src/lib.rs:36:5: replace total_time -> Duration with Default::default()
+src/lib.rs:36:7: replace + with - in total_time
+src/lib.rs:36:7: replace + with * in total_time
+src/lib.rs:41:5: replace flags -> Vec<bool> with vec![]
+src/lib.rs:41:5: replace flags -> Vec<bool> with vec![true]
+src/lib.rs:41:5: replace flags -> Vec<bool> with vec![false]
+src/lib.rs:46:5: replace first_positive -> Option<i32> with None
+src/lib.rs:46:5: replace first_positive -> Option<i32> with Some(0)
+src/lib.rs:46:5: replace first_positive -> Option<i32> with Some(1)
+src/lib.rs:46:5: replace first_positive -> Option<i32> with Some(-1)
+src/lib.rs:48:13: replace && with || in first_positive
+src/lib.rs:48:18: replace > with == in first_positive
+src/lib.rs:48:18: replace > with < in first_positive
+src/lib.rs:48:18: replace > with >= in first_positive
+src/lib.rs:58:5: replace discounted -> Result<u32, String> with Ok(0)
+src/lib.rs:58:5: replace discounted -> Result<u32, String> with Ok(1)
+src/lib.rs:59:21: replace && with || in discounted
+src/lib.rs:59:17: replace > with == in discounted
+src/lib.rs:59:17: replace > with < in discounted
+src/lib.rs:59:17: replace > with >= in discounted
+src/lib.rs:59:49: replace - with + in discounted
+src/lib.rs:59:49: replace - with / in discounted
+src/lib.rs:63:5: replace eligible -> Result<bool, String> with Ok(true)
+src/lib.rs:63:5: replace eligible -> Result<bool, String> with Ok(false)
+src/lib.rs:63:14: replace > with == in eligible
+src/lib.rs:63:14: replace > with < in eligible
+src/lib.rs:63:14: replace > with >= in eligible
+src/lib.rs:63:73: replace == with != in eligible
+src/lib.rs:63:69: replace % with / in eligible
+src/lib.rs:63:69: replace % with + in eligible
+src/lib.rs:68:5: replace advance with ()
+src/lib.rs:68:15: replace += with -= in advance
+src/lib.rs:68:15: replace += with *= in advance
+src/lib.rs:73:5: replace has_flag -> bool with true
+src/lib.rs:73:5: replace has_flag -> bool with false
+src/lib.rs:73:17: replace != with == in has_flag
+src/lib.rs:73:10: replace & with | in has_flag
+src/lib.rs:73:10: replace & with ^ in has_flag
+src/lib.rs:78:5: replace must_wait -> bool with true
+src/lib.rs:78:5: replace must_wait -> bool with false
+src/lib.rs:78:5: delete ! in must_wait
