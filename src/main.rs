@@ -21,6 +21,9 @@ struct Cli {
     /// Trust the trace: do not re-run tests against predicted survivors.
     #[arg(long)]
     no_verify: bool,
+    /// Directory for the working copy and its build (default: <target dir>/tmt).
+    #[arg(long, value_name = "DIR")]
+    work_dir: Option<PathBuf>,
     /// Also list the code that no test executes.
     #[arg(long)]
     show_unreached: bool,
@@ -36,6 +39,7 @@ fn main() -> ExitCode {
         dir: cli.dir,
         package: cli.package,
         verify: !cli.no_verify,
+        work_dir: cli.work_dir,
         progress: !cli.quiet,
     };
     match driver::run(&options) {

@@ -9,6 +9,9 @@ pub mod trace;
 /// The runtime injected into the crate under test, compiled here so that its logic can be
 /// checked against the planner.
 #[cfg(test)]
+extern crate std as __tmt_std;
+
+#[cfg(test)]
 #[path = "runtime/tmt_rt.rs"]
 mod tmt_rt;
 

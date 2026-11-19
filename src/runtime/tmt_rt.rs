@@ -3,6 +3,12 @@
 // instrumented site (TMT_TRACE=<file>) and switches one mutant on (TMT_MUTANT=<site>:<mutation>).
 #![allow(dead_code, unused, missing_docs, clippy::all)]
 
+// `std` is reached through an alias declared in the crate root, so that this module also
+// works in a `#![no_std]` crate (whose tests still link std).
+use crate::__tmt_std as std;
+use std::prelude::v1::*;
+use std::{format, thread_local};
+
 use std::cell::Cell;
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};

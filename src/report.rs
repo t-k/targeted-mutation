@@ -50,6 +50,8 @@ pub struct Report {
     pub skipped_sites: usize,
     pub mutants_run: usize,
     pub mutants_killed: usize,
+    /// Killed mutants that were stopped by the timeout (typically an endless loop).
+    pub mutants_timed_out: usize,
     pub findings: Vec<Finding>,
     /// Code no test executes.
     pub unreached: Vec<Location>,
@@ -643,6 +645,7 @@ mod tests {
             skipped_sites: 1,
             mutants_run: 3,
             mutants_killed: 2,
+            mutants_timed_out: 0,
             findings: vec![Finding::AssertionGap {
                 at: at.clone(),
                 survivors: vec!["delete `s.check()?;`".into()],

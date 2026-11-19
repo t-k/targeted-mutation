@@ -323,3 +323,59 @@ fn broken_source_stops_the_analysis() {
         missing.stderr
     );
 }
+
+#[test]
+fn endless_loop_mutant_is_killed_by_the_timeout() {
+    let dir = fixture("looping", "looping");
+    let started = std::time::Instant::now();
+    let (code, report) = json(&dir);
+    assert_eq!(code, 0, "{report:#}");
+    assert_eq!(report["mutants_run"], 2, "{report:#}");
+    assert_eq!(report["mutants_killed"], 2, "{report:#}");
+    assert_eq!(report["mutants_timed_out"], 1, "{report:#}");
+    assert!(started.elapsed() >= std::time::Duration::from_secs(5), "the timeout was waited for");
+    assert!(started.elapsed() < std::time::Duration::from_secs(120), "and the mutant was stopped");
+}
+
+#[test]
+fn no_std_crate_and_custom_work_dir() {
+    let dir = fixture("no-std", "no-std");
+    let work = Path::new(env!("CARGO_TARGET_TMPDIR")).join("no-std-work");
+    let _ = fs::remove_dir_all(&work);
+    let run = tmt(&dir, &["--json", "--quiet", "--work-dir", work.to_str().unwrap()]);
+    assert_eq!(run.code, 2, "{}{}", run.stdout, run.stderr);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    let gaps = findings(&report, "input_gap");
+    assert_eq!(gaps.len(), 1, "{report:#}");
+    assert_eq!(gaps[0]["code"], "raw > 255");
+    assert_eq!(report["skipped_sites"], 0, "{report:#}");
+    // Everything the run produced is in the work directory, nothing in the package.
+    assert!(work.join("src/src/lib.rs").exists());
+    assert!(work.join("target").exists());
+    assert!(!dir.join("target").exists());
+}
+
+#[test]
+fn workspace_member_by_name_and_by_directory() {
+    // `ws/app` depends on `../../outside`, which is not part of the workspace.
+    let root = fixture("multi", "multi");
+    let ws = root.join("ws");
+
+    let run = tmt(&ws, &["--json", "--quiet", "--package", "ws-core"]);
+    assert_eq!(run.code, 2, "{}{}", run.stdout, run.stderr);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(report["package"], "ws-core");
+    assert_eq!(findings(&report, "input_gap")[0]["code"], "size > 1000");
+    assert_eq!(findings(&report, "input_gap")[0]["file"], "src/lib.rs");
+
+    let (code, report) = json(&ws.join("app"));
+    assert_eq!(code, 0, "{report:#}");
+    assert_eq!(report["package"], "ws-app");
+    assert_eq!(report["sites"], 1, "only the member's own code is mutated: {report:#}");
+
+    let ambiguous = tmt(&ws, &["--quiet"]);
+    assert_eq!(ambiguous.code, 1);
+    assert!(ambiguous.stderr.contains("--package"), "{}", ambiguous.stderr);
+    let unknown = tmt(&ws, &["--quiet", "--package", "nope"]);
+    assert_eq!(unknown.code, 1);
+}

@@ -24,10 +24,14 @@ pub struct Options {
     pub package: Option<String>,
     /// Re-run the tests against one survivor per input gap to confirm the prediction.
     pub verify: bool,
+    /// Where to put the copy and its build. Default: `<target dir>/tmt`.
+    pub work_dir: Option<PathBuf>,
     /// Progress lines on stderr.
     pub progress: bool,
 }
 
+/// Name under which the crate root re-declares `std` for the runtime module.
+const STD_ALIAS: &str = "__tmt_std";
 /// More rebuilds than this means the blame logic is not converging.
 const MAX_REPAIR_ROUNDS: usize = 40;
 /// Above this many tests, run the whole binary instead of passing names.
@@ -259,6 +263,66 @@ fn module_paths(file: &Path, module: &instrument::TestModule) -> Vec<PathBuf> {
     vec![base.join(format!("{name}.rs")), base.join(name)]
 }
 
+/// Resolves `.` and `..` without touching the file system.
+fn normalize(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out
+}
+
+/// Rewrites `path = "../outside"` dependencies of a manifest to absolute paths when they
+/// point outside `workspace`. Returns `None` when nothing has to change.
+fn absolutize_path_dependencies(manifest: &str, manifest_dir: &Path, workspace: &Path) -> Result<Option<String>> {
+    use toml_edit::{DocumentMut, Item, TableLike, value};
+
+    fn fix(deps: &mut dyn TableLike, manifest_dir: &Path, workspace: &Path, changed: &mut bool) {
+        for (_, dep) in deps.iter_mut() {
+            let Some(dep) = dep.as_table_like_mut() else { continue };
+            let Some(path) = dep.get("path").and_then(Item::as_str) else { continue };
+            let target = normalize(&manifest_dir.join(path));
+            if !target.starts_with(workspace) {
+                dep.insert("path", value(target.to_string_lossy().into_owned()));
+                *changed = true;
+            }
+        }
+    }
+    const SECTIONS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
+    fn fix_sections(table: &mut dyn TableLike, manifest_dir: &Path, workspace: &Path, changed: &mut bool) {
+        for section in SECTIONS {
+            if let Some(deps) = table.get_mut(section).and_then(Item::as_table_like_mut) {
+                fix(deps, manifest_dir, workspace, changed);
+            }
+        }
+    }
+
+    let mut doc: DocumentMut = manifest.parse().context("parsing Cargo.toml")?;
+    let mut changed = false;
+    fix_sections(doc.as_table_mut(), manifest_dir, workspace, &mut changed);
+    if let Some(ws) = doc.get_mut("workspace").and_then(Item::as_table_like_mut) {
+        fix_sections(ws, manifest_dir, workspace, &mut changed);
+    }
+    for per_key in ["target", "patch"] {
+        let Some(outer) = doc.get_mut(per_key).and_then(Item::as_table_like_mut) else { continue };
+        for (_, inner) in outer.iter_mut() {
+            let Some(inner) = inner.as_table_like_mut() else { continue };
+            if per_key == "target" {
+                fix_sections(inner, manifest_dir, workspace, &mut changed);
+            } else {
+                fix(inner, manifest_dir, workspace, &mut changed);
+            }
+        }
+    }
+    Ok(changed.then(|| doc.to_string()))
+}
+
 /// Tests to pass to the binary, or `None` for "run everything".
 fn test_filter(tests: &BTreeSet<String>) -> Option<Vec<String>> {
     if tests.contains(UNKNOWN_TEST) || tests.len() > MAX_TEST_FILTERS {
@@ -390,6 +454,7 @@ struct Session {
     binaries: Vec<TestBinary>,
     mutants_run: usize,
     mutants_killed: usize,
+    mutants_timed_out: usize,
 }
 
 impl Session {
@@ -425,6 +490,7 @@ impl Session {
             )?;
             if outcome != Outcome::Pass {
                 self.mutants_killed += 1;
+                self.mutants_timed_out += (outcome == Outcome::Timeout) as usize;
                 return Ok(None);
             }
             match filter {
@@ -483,7 +549,13 @@ pub fn run(options: &Options) -> Result<Report> {
 
     // 2. Copy the workspace.
     let workspace = metadata.workspace_root.canonicalize()?;
-    let work = metadata.target_directory.join("tmt");
+    let work = match &options.work_dir {
+        Some(dir) => {
+            fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+            dir.canonicalize()?
+        }
+        None => metadata.target_directory.join("tmt"),
+    };
     let copy = work.join("src");
     if copy.exists() {
         fs::remove_dir_all(&copy).with_context(|| format!("clearing {}", copy.display()))?;
@@ -491,12 +563,28 @@ pub fn run(options: &Options) -> Result<Report> {
     let target_dir = metadata.target_directory.clone();
     copy_tree(&workspace, &copy, &|path| {
         path == target_dir
+            || path == work
             || path
                 .file_name()
                 .is_some_and(|n| n == ".git" || n == "node_modules")
             || (path.parent() == Some(workspace.as_path())
                 && path.file_name().is_some_and(|n| n == "target"))
     })?;
+    // Relative path dependencies that leave the workspace would point nowhere from the copy.
+    let mut manifests: Vec<&Path> = metadata.packages.iter().map(|p| p.manifest_path.as_path()).collect();
+    let root_manifest = metadata.workspace_root.join("Cargo.toml");
+    manifests.push(&root_manifest);
+    for manifest in manifests {
+        let Ok(canonical) = manifest.canonicalize() else { continue };
+        let (Some(manifest_dir), Ok(relative)) = (canonical.parent(), canonical.strip_prefix(&workspace)) else {
+            continue;
+        };
+        let text = fs::read_to_string(&canonical)?;
+        if let Some(rewritten) = absolutize_path_dependencies(&text, manifest_dir, &workspace)? {
+            fs::write(copy.join(relative), rewritten)?;
+        }
+    }
+
     let in_copy = |path: &Path| -> Result<PathBuf> {
         let canonical = path.canonicalize()?;
         let relative = canonical
@@ -572,14 +660,13 @@ pub fn run(options: &Options) -> Result<Report> {
     note(&format!("{} sites in {} files", total_sites, files.len()));
 
     let root_source = fs::read_to_string(&root_file)?;
-    if root_source.contains("#![no_std]") {
-        bail!("`{}` is no_std; the probes need std", package.name);
-    }
     fs::write(
         source_dir.join(format!("{RUNTIME_MOD}.rs")),
         crate::RUNTIME_SOURCE,
     )?;
-    let root_suffix = format!("\n#[doc(hidden)]\nmod {RUNTIME_MOD};\n");
+    let root_suffix = format!(
+        "\n#[doc(hidden)]\nextern crate std as {STD_ALIAS};\n#[doc(hidden)]\nmod {RUNTIME_MOD};\n"
+    );
 
     // 4. Build, disabling the sites whose probe does not compile (formal/tla/RepairLoop.tla).
     let mut disabled: HashSet<u32> = HashSet::new();
@@ -665,6 +752,7 @@ pub fn run(options: &Options) -> Result<Report> {
         binaries: vec![],
         mutants_run: 0,
         mutants_killed: 0,
+        mutants_timed_out: 0,
     };
     for (index, (name, exe)) in build.test_binaries.into_iter().enumerate() {
         let trace_path = work.join(format!("trace-{index}.tsv"));
@@ -794,6 +882,7 @@ pub fn run(options: &Options) -> Result<Report> {
     }
     report.mutants_run = session.mutants_run;
     report.mutants_killed = session.mutants_killed;
+    report.mutants_timed_out = session.mutants_timed_out;
     Ok(report)
 }
 
@@ -947,6 +1036,44 @@ mod tests {
             module_paths(Path::new("src/lib.rs"), &with_path),
             [PathBuf::from("src/runtime/rt.rs")]
         );
+    }
+
+    #[test]
+    fn path_dependencies_outside_the_workspace_become_absolute() {
+        let manifest = r#"[package]
+name = "app"
+
+[dependencies]
+serde = "1"
+core = { path = "../core" }          # inside the workspace: kept
+outside = { path = "../../outside", version = "1" }
+
+[dev-dependencies.helper]
+path = "../../../far/helper"
+
+[target.'cfg(unix)'.dependencies]
+unix-only = { path = "../../unix" }
+
+[patch.crates-io]
+serde = { path = "../../serde-fork" }
+"#;
+        let out = absolutize_path_dependencies(manifest, Path::new("/w/ws/app"), Path::new("/w/ws"))
+            .unwrap()
+            .expect("something to rewrite");
+        assert!(out.contains(r#"core = { path = "../core" }          # inside the workspace: kept"#), "{out}");
+        assert!(out.contains(r#"outside = { path = "/w/outside", version = "1" }"#), "{out}");
+        assert!(out.contains("path = \"/far/helper\""), "{out}");
+        assert!(out.contains(r#"unix-only = { path = "/w/unix" }"#), "{out}");
+        assert!(out.contains(r#"serde = { path = "/w/serde-fork" }"#), "{out}");
+        assert!(out.contains("serde = \"1\""), "{out}");
+
+        let inside = "[dependencies]\ncore = { path = \"../core\" }\n[workspace.dependencies]\nx = { path = \"x\" }\n";
+        assert_eq!(absolutize_path_dependencies(inside, Path::new("/w/ws/app"), Path::new("/w/ws")).unwrap(), None);
+        let ws = "[workspace.dependencies]\nshared = { path = \"../shared\" }\n";
+        let out = absolutize_path_dependencies(ws, Path::new("/w/ws"), Path::new("/w/ws")).unwrap().unwrap();
+        assert!(out.contains(r#"shared = { path = "/w/shared" }"#), "{out}");
+        assert!(absolutize_path_dependencies("not [ toml", Path::new("/w"), Path::new("/w")).is_err());
+        assert_eq!(normalize(Path::new("/a/./b/../c")), PathBuf::from("/a/c"));
     }
 
     #[test]
