@@ -54,6 +54,8 @@ pub struct Report {
     /// Values a function's body was to be replaced by that do not have its type
     /// (`Default::default()` for a type without a default): those mutants do not exist.
     pub unviable_mutants: usize,
+    /// Mutants that need a build of their own and were not asked for (`--rebuild`).
+    pub mutants_not_built: usize,
     pub mutants_run: usize,
     pub mutants_killed: usize,
     /// Killed mutants that were stopped by the timeout (typically an endless loop).
@@ -731,6 +733,12 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
         ));
     }
     out.push('\n');
+    if report.mutants_not_built > 0 {
+        out.push_str(&format!(
+            "({} more mutants need a build of their own: --rebuild runs them)\n",
+            report.mutants_not_built
+        ));
+    }
     if !show_unreached && !report.unreached.is_empty() {
         out.push_str("(--show-unreached lists the code no test executes)\n");
     }
@@ -1428,6 +1436,7 @@ mod tests {
             sites: 4,
             skipped_sites: 1,
             unviable_mutants: 2,
+            mutants_not_built: 0,
             mutants_run: 3,
             mutants_killed: 2,
             mutants_timed_out: 0,
@@ -1608,6 +1617,17 @@ mod tests {
             render_text(&one, false)
         );
         assert!(!render_text(&Report::default(), false).contains("left out"));
+        assert!(!render_text(&one, false).contains("--rebuild"));
+        let quick = Report {
+            mutants_not_built: 3,
+            ..Report::default()
+        };
+        assert!(
+            render_text(&quick, false)
+                .ends_with("\n(3 more mutants need a build of their own: --rebuild runs them)\n"),
+            "{}",
+            render_text(&quick, false)
+        );
         let slow = Report {
             mutants_run: 5,
             mutants_killed: 4,

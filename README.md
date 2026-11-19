@@ -93,7 +93,7 @@ Running:
 - `--all-files`: copy files that git ignores too. Use it when the build needs generated files that are not tracked.
 - `--no-verify`: trust the trace; do not re-run tests against predicted survivors.
 - `--no-effects`: do not trace surviving mutants to say what they change.
-- `--no-rebuild`: leave out the mutants that need a build of their own (see "How it works", step 5).
+- `--rebuild`: also run the mutants that need a build of their own (see "How it works", step 5). Without it the summary says how many were left out.
 
 Output: text by default, `--json`, or `--sarif` (SARIF 2.1.0 for code scanning). `--show-unreached` lists the code no test executes, `--quiet` drops the progress lines.
 
@@ -108,7 +108,7 @@ Your source tree is never modified. In a git repository only the files git does 
 3. **Plan.** An integer comparison is a threshold on `lhs - rhs`. Every threshold between the nearest observation below and the nearest observation above gives the same result on all observed values, so every test executes such a mutant exactly as it executes the original. Those mutants are input gaps, found by arithmetic. By default one of them is re-run to confirm (`--no-verify` skips that).
 4. **Run.** The remaining mutants change the outcome of some observation. Each is run only against the tests whose observations it changes. If they all pass, no assertion noticed: an assertion gap.
 
-5. **Build the rest one by one.** Some code cannot carry a probe: nothing in a `const fn` or in the value of a `const` or `static` can ask at run time which mutant is on, a function that returns `impl Iterator` cannot return an iterator of another type beside its own, two literals (`60 * 60`) have no type of their own for a probe to work with, and for a compound assignment to more than a variable (`*map.entry(k).or_insert(0) += 1`) the order of evaluation depends on the type. The mutants of such code, and of every site whose probe did not compile, are written into the source, built and run against all tests, one after the other, the way cargo-mutants does it. This is the slow part; `--no-rebuild` skips it.
+5. **Build the rest one by one.** Some code cannot carry a probe: nothing in a `const fn` or in the value of a `const` or `static` can ask at run time which mutant is on, a function that returns `impl Iterator` cannot return an iterator of another type beside its own, two literals (`60 * 60`) have no type of their own for a probe to work with, and for a compound assignment to more than a variable (`*map.entry(k).or_insert(0) += 1`) the order of evaluation depends on the type. The mutants of such code, and of every site whose probe did not compile, are written into the source, built and run against all tests, one after the other, the way cargo-mutants does it. This is the slow part, so it is done only with `--rebuild`; without it the summary says how many mutants were left out.
 
 Mutants that cannot differ from the original within the operand types (`x >= 0` for an unsigned `x`) are not reported.
 
@@ -141,7 +141,7 @@ A finding is not repeated by what encloses it: if `a > 0` is true in every test,
 
 Code in the arguments of `assert_eq!`, `assert_ne!`, `vec!`, `format!`, `print!`, `println!`, `eprint!`, `eprintln!`, `write!`, `writeln!`, `panic!`, `unreachable!`, `todo!`, `unimplemented!`, `format_args!` and `matches!` is mutated like any other code. `assert!`, `debug_assert!` and `dbg!` put the source text of their argument into their output, so their arguments are not touched.
 
-A probe that does not compile at some site is dropped and the build is retried. The mutants of that site are then built one by one (step 5); only a site that has no mutant in source form (a deleted `let x; x = ...;`) is counted as skipped in the summary line. A value that does not have the function's return type (`Default::default()` for a type without a default) is not a mutant; the summary counts those as left out.
+A probe that does not compile at some site is dropped and the build is retried. With `--rebuild` the mutants of that site are then built one by one (step 5), and only a site that has no mutant in source form (a deleted `let x; x = ...;`) is counted as skipped in the summary line; without it every such site is. A value that does not have the function's return type (`Default::default()` for a type without a default) is not a mutant; the summary counts those as left out.
 
 Functions, `impl` blocks and modules marked `#[mutants::skip]` (also inside `cfg_attr`) are not mutated.
 
@@ -149,7 +149,7 @@ Functions, `impl` blocks and modules marked `#[mutants::skip]` (also inside `cfg
 
 Every mutant that cargo-mutants 27.1.0 lists for the crates in `fixtures/` has a counterpart here: `tests/parity.rs` checks the stored lists (`tests/data/cargo-mutants`) against the sites this tool finds, and names the exceptions with their reason (a `||` inside a let chain, which does not compile). An empty body is not made for a function that consists of one statement, because deleting that statement is the same mutant. The same test checks any other crate on request (see its last function); that is how the table above was completed against real code. On top of those come the mutants that need the trace: shifted boundaries, an ignored operand of `&&` / `||`, a result replaced after the body ran, deleted statements, `min` / `max`, range ends.
 
-The difference is in how they are run. cargo-mutants builds every mutant and runs all tests against it. Here one build carries all mutants that a probe can carry, each is run only against the tests that execute it, and those that provably pass every test are not run at all but reported with the input that is missing. Only the rest (step 5) costs a build each.
+The difference is in how they are run. cargo-mutants builds every mutant and runs all tests against it. Here one build carries all mutants that a probe can carry, each is run only against the tests that execute it, and those that provably pass every test are not run at all but reported with the input that is missing. Only the rest (step 5) costs a build each, and is run when `--rebuild` asks for it: with that option every mutant of cargo-mutants is run, without it the summary says how many were not.
 
 ## What "guaranteed to survive" rests on
 

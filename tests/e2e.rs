@@ -198,7 +198,11 @@ fn failed_batch_writes_nothing() {
 #[test]
 fn awkward_constructs() {
     let dir = fixture("kitchen-sink", "kitchen-sink");
-    let (code, report) = json(&dir);
+    let run = tmt(&dir, &["--json", "--quiet", "--rebuild"]);
+    let (code, report) = (
+        run.code,
+        serde_json::from_str::<Value>(&run.stdout).unwrap(),
+    );
     assert_eq!(code, 2, "{report:#}");
     let all = report["findings"].as_array().unwrap();
     let at = |code: &str, kind: &str| {
@@ -321,7 +325,7 @@ fn awkward_constructs() {
     );
 
     // Running mutants in parallel gives the same report.
-    let parallel = tmt(&dir, &["--json", "--quiet", "--jobs", "4"]);
+    let parallel = tmt(&dir, &["--json", "--quiet", "--rebuild", "--jobs", "4"]);
     let parallel: Value = serde_json::from_str(&parallel.stdout).unwrap();
     assert_eq!(parallel, report);
     assert_eq!(
@@ -1172,9 +1176,14 @@ fn closes_the_gaps() {
 #[test]
 fn the_mutants_of_cargo_mutants() {
     let dir = fixture("genres", "genres");
-    let (code, report) = json(&dir);
+    let run = tmt(&dir, &["--json", "--quiet", "--rebuild"]);
+    let (code, report) = (
+        run.code,
+        serde_json::from_str::<Value>(&run.stdout).unwrap(),
+    );
     assert_eq!(code, 2, "{report:#}");
     assert_eq!(report["skipped_sites"], 0, "{report:#}");
+    assert_eq!(report["mutants_not_built"], 0, "{report:#}");
     // `Default::default()` for a type without a default is not a mutant: `Token`, and
     // the three functions that return a `Below`.
     assert_eq!(report["unviable_mutants"], 4, "{report:#}");
@@ -1277,9 +1286,10 @@ fn the_mutants_of_cargo_mutants() {
     assert_eq!(built["tests"].as_array().unwrap().len(), 0, "{built:#}");
 
     // An iterator of another type cannot be returned beside the body's own, so the
-    // three replacements of `evens` are built one by one. They can be left out.
-    let run = tmt(&dir, &["--json", "--quiet", "--no-rebuild"]);
-    let quick: Value = serde_json::from_str(&run.stdout).unwrap();
+    // three replacements of `evens` are built one by one. Unless asked for they are
+    // left out, and the report says how many there are.
+    let (_, quick) = json(&dir);
+    assert_eq!(quick["mutants_not_built"], 4, "{quick:#}");
     assert_eq!(
         report["mutants_run"].as_u64().unwrap(),
         quick["mutants_run"].as_u64().unwrap() + 4,

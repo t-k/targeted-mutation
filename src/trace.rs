@@ -905,7 +905,7 @@ mod tests {
         assert!(!tmt_rt::bits_are_news(b'A', site, 2));
         assert!(tmt_rt::bits_known(b'A', site, 3));
         // Each kind of record and each site has its own memory.
-        for kind in [b'R', b'L', b'B'] {
+        for kind in *b"RLB" {
             assert!(!tmt_rt::bits_known(kind, site, 1), "{}", kind as char);
             assert!(tmt_rt::bits_are_news(kind, site, 1), "{}", kind as char);
             assert!(!tmt_rt::bits_are_news(kind, site, 1), "{}", kind as char);

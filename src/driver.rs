@@ -2232,6 +2232,9 @@ pub fn run(options: &Options) -> Result<Report> {
             );
         }
     }
+    if !options.rebuild {
+        report.mutants_not_built = built.len();
+    }
     if options.rebuild && !built.is_empty() {
         session.note(&format!(
             "building {} mutants one by one (code a probe cannot be put in)",
