@@ -565,7 +565,11 @@ pub trait ArithNum: Copy {
         if mutant_at(site) == Some(Mutant::ArithSwap) {
             return Self::tmt_real(arith_swapped(op), a, b);
         }
-        let bits = if Self::tmt_same(op, a, b) { ARITH_SAME } else { ARITH_DIFFERS };
+        let bits = if Self::tmt_same(op, a, b) {
+            ARITH_SAME
+        } else {
+            ARITH_DIFFERS
+        };
         record_bits(b'A', site, bits);
         Self::tmt_real(op, a, b)
     }

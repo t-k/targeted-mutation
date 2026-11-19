@@ -86,10 +86,19 @@ fn one_line(code: &str) -> String {
 /// Value of a float literal such as `30.5`, `1e3` or `2.5_f32`.
 fn float_literal(text: &str) -> Option<f64> {
     let text = text.trim().replace('_', "");
-    let text = text.strip_suffix("f32").or(text.strip_suffix("f64")).unwrap_or(&text);
+    let text = text
+        .strip_suffix("f32")
+        .or(text.strip_suffix("f64"))
+        .unwrap_or(&text);
     let looks_numeric = text.starts_with(|c: char| c.is_ascii_digit() || c == '-')
-        && text.chars().all(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E'));
-    if looks_numeric { text.parse().ok() } else { None }
+        && text
+            .chars()
+            .all(|c| c.is_ascii_digit() || matches!(c, '.' | '-' | '+' | 'e' | 'E'));
+    if looks_numeric {
+        text.parse().ok()
+    } else {
+        None
+    }
 }
 
 /// Floats in reports: enough digits to tell values apart, without rounding noise.
@@ -110,9 +119,20 @@ pub fn describe(site: &Site, m: Mutation) -> String {
             }
         }
         SiteKind::Arith { op, lhs, rhs, .. } => {
-            format!("`{} {} {}`", one_line(lhs), op.swapped().symbol(), one_line(rhs))
+            format!(
+                "`{} {} {}`",
+                one_line(lhs),
+                op.swapped().symbol(),
+                one_line(rhs)
+            )
         }
-        SiteKind::Cmp { op, lhs, rhs, literal, .. } => {
+        SiteKind::Cmp {
+            op,
+            lhs,
+            rhs,
+            literal,
+            ..
+        } => {
             let (lhs, rhs) = (one_line(lhs), one_line(rhs));
             let sym = op.symbol();
             match m {
@@ -190,15 +210,33 @@ pub fn input_gap_finding(
     obs: &Obs,
     verified: bool,
 ) -> Option<Finding> {
-    let SiteKind::Cmp { op, lhs, rhs, literal, .. } = &site.kind else { return None };
+    let SiteKind::Cmp {
+        op,
+        lhs,
+        rhs,
+        literal,
+        ..
+    } = &site.kind
+    else {
+        return None;
+    };
     let (lhs_text, rhs_text) = (one_line(lhs), one_line(rhs));
-    let survivors: Vec<String> = gap.survivors().into_iter().map(|m| describe(site, m)).collect();
+    let survivors: Vec<String> = gap
+        .survivors()
+        .into_iter()
+        .map(|m| describe(site, m))
+        .collect();
     let mut observed = observed_values(&lhs_text, &rhs_text, *literal, obs);
     let (survivor_count, add_tests) = match gap {
         InputGap::Unreached => return None,
-        InputGap::OneSided { always } => {
-            (1, vec![format!("an input that makes `{}` {}", one_line(&site.text), !always)])
-        }
+        InputGap::OneSided { always } => (
+            1,
+            vec![format!(
+                "an input that makes `{}` {}",
+                one_line(&site.text),
+                !always
+            )],
+        ),
         InputGap::EqualNeverObserved { flipped, float_gap } => {
             if let Some((lo, hi)) = float_gap {
                 observed = Some(match (float_literal(&lhs_text), float_literal(&rhs_text)) {
@@ -228,7 +266,11 @@ pub fn input_gap_finding(
                 )],
             )
         }
-        InputGap::Boundary { min_shift, max_shift, missing } => {
+        InputGap::Boundary {
+            min_shift,
+            max_shift,
+            missing,
+        } => {
             let add = missing
                 .iter()
                 .map(|d| {
@@ -253,19 +295,34 @@ pub fn input_gap_finding(
 }
 
 /// Input gap at `a && b` / `a || b`: one operand never decides the result in any test.
-pub fn logic_gap_finding(file: &str, site: &Site, gap: LogicGap, verified: bool) -> Option<Finding> {
-    let SiteKind::Logic { and, lhs, rhs, .. } = &site.kind else { return None };
+pub fn logic_gap_finding(
+    file: &str,
+    site: &Site,
+    gap: LogicGap,
+    verified: bool,
+) -> Option<Finding> {
+    let SiteKind::Logic { and, lhs, rhs, .. } = &site.kind else {
+        return None;
+    };
     let (lhs, rhs) = (one_line(lhs), one_line(rhs));
     let (mutation, add) = match (gap, and) {
         (LogicGap::Unreached, _) => return None,
-        (LogicGap::RhsNeverDecides, true) => {
-            (Mutation::LogicDropRhs, format!("a case where `{lhs}` is true and `{rhs}` is false"))
-        }
-        (LogicGap::RhsNeverDecides, false) => {
-            (Mutation::LogicDropRhs, format!("a case where `{lhs}` is false and `{rhs}` is true"))
-        }
-        (LogicGap::LhsNeverDecides, true) => (Mutation::LogicDropLhs, format!("a case where `{lhs}` is false")),
-        (LogicGap::LhsNeverDecides, false) => (Mutation::LogicDropLhs, format!("a case where `{lhs}` is true")),
+        (LogicGap::RhsNeverDecides, true) => (
+            Mutation::LogicDropRhs,
+            format!("a case where `{lhs}` is true and `{rhs}` is false"),
+        ),
+        (LogicGap::RhsNeverDecides, false) => (
+            Mutation::LogicDropRhs,
+            format!("a case where `{lhs}` is false and `{rhs}` is true"),
+        ),
+        (LogicGap::LhsNeverDecides, true) => (
+            Mutation::LogicDropLhs,
+            format!("a case where `{lhs}` is false"),
+        ),
+        (LogicGap::LhsNeverDecides, false) => (
+            Mutation::LogicDropLhs,
+            format!("a case where `{lhs}` is true"),
+        ),
     };
     Some(Finding::InputGap {
         at: location(file, site),
@@ -280,7 +337,9 @@ pub fn logic_gap_finding(file: &str, site: &Site, gap: LogicGap, verified: bool)
 /// Input gap at an arithmetic operator: the swapped operator computes the same value on
 /// every pair of operands the tests pass.
 pub fn arith_gap_finding(file: &str, site: &Site, verified: bool) -> Option<Finding> {
-    let SiteKind::Arith { op, lhs, rhs, .. } = &site.kind else { return None };
+    let SiteKind::Arith { op, lhs, rhs, .. } = &site.kind else {
+        return None;
+    };
     let (lhs, rhs) = (one_line(lhs), one_line(rhs));
     let add = match op {
         ArithOp::Add | ArithOp::Sub => format!("`{rhs}` other than 0"),
@@ -541,7 +600,10 @@ mod tests {
         let site = site_of("fn f(a: f64, b: f64) -> bool { a < b }");
         let mut obs = Obs::of_rel(crate::plan::Rel::Less);
         obs.merge(&Obs::of_rel(crate::plan::Rel::Greater));
-        let gap = InputGap::EqualNeverObserved { flipped: CmpOp::Le, float_gap: None };
+        let gap = InputGap::EqualNeverObserved {
+            flipped: CmpOp::Le,
+            float_gap: None,
+        };
         let Some(Finding::InputGap {
             survivors,
             add_tests,
@@ -586,18 +648,38 @@ mod tests {
         let site = site_of("fn f(celsius: f64) -> bool { celsius > 30.5 }");
         let mut obs = Obs::of_f(-20.5);
         obs.merge(&Obs::of_f(9.5));
-        let gap = InputGap::EqualNeverObserved { flipped: CmpOp::Ge, float_gap: obs.float_gap() };
-        let Some(Finding::InputGap { survivors, add_tests, observed, survivor_count, .. }) =
-            input_gap_finding("f.rs", &site, &gap, &obs, true)
+        let gap = InputGap::EqualNeverObserved {
+            flipped: CmpOp::Ge,
+            float_gap: obs.float_gap(),
+        };
+        let Some(Finding::InputGap {
+            survivors,
+            add_tests,
+            observed,
+            survivor_count,
+            ..
+        }) = input_gap_finding("f.rs", &site, &gap, &obs, true)
         else {
             panic!()
         };
-        assert_eq!(survivors, ["`celsius >= 30.5`", "`celsius > 35.25`", "`celsius > 20.25`"]);
+        assert_eq!(
+            survivors,
+            [
+                "`celsius >= 30.5`",
+                "`celsius > 35.25`",
+                "`celsius > 20.25`"
+            ]
+        );
         assert_eq!(survivor_count, 3);
-        assert_eq!(add_tests, ["`celsius` equal to `30.5` (the original gives false, the mutant true)"]);
+        assert_eq!(
+            add_tests,
+            ["`celsius` equal to `30.5` (the original gives false, the mutant true)"]
+        );
         assert_eq!(
             observed.as_deref(),
-            Some("nearest values the tests passed: `celsius` = 10, 40; any threshold between them passes")
+            Some(
+                "nearest values the tests passed: `celsius` = 10, 40; any threshold between them passes"
+            )
         );
 
         let lhs = site_of("fn f(x: f32) -> bool { 1.5_f32 <= x }");
@@ -608,12 +690,20 @@ mod tests {
         let finding = input_gap_finding(
             "f.rs",
             &none,
-            &InputGap::EqualNeverObserved { flipped: CmpOp::Le, float_gap: Some((-1.0, 2.0)) },
+            &InputGap::EqualNeverObserved {
+                flipped: CmpOp::Le,
+                float_gap: Some((-1.0, 2.0)),
+            },
             &obs,
             false,
         );
-        let Some(Finding::InputGap { observed, .. }) = finding else { panic!() };
-        assert_eq!(observed.as_deref(), Some("nearest values the tests passed: `x` - `y` = -1, 2"));
+        let Some(Finding::InputGap { observed, .. }) = finding else {
+            panic!()
+        };
+        assert_eq!(
+            observed.as_deref(),
+            Some("nearest values the tests passed: `x` - `y` = -1, 2")
+        );
 
         assert_eq!(float_literal("30.5"), Some(30.5));
         assert_eq!(float_literal("-1e3"), Some(-1000.0));
@@ -632,27 +722,75 @@ mod tests {
         let or = site_of("fn f(a: bool, b: bool) -> bool { a || b }");
         assert_eq!(describe(&or, Mutation::LogicSwap), "`a && b`");
         let advice = |site: &Site, gap| match logic_gap_finding("f.rs", site, gap, true) {
-            Some(Finding::InputGap { survivors, add_tests, .. }) => (survivors[0].clone(), add_tests[0].clone()),
+            Some(Finding::InputGap {
+                survivors,
+                add_tests,
+                ..
+            }) => (survivors[0].clone(), add_tests[0].clone()),
             _ => panic!(),
         };
-        assert_eq!(advice(&and, LogicGap::RhsNeverDecides), ("`a`".into(), "a case where `a` is true and `b` is false".into()));
-        assert_eq!(advice(&and, LogicGap::LhsNeverDecides), ("`b`".into(), "a case where `a` is false".into()));
-        assert_eq!(advice(&or, LogicGap::RhsNeverDecides), ("`a`".into(), "a case where `a` is false and `b` is true".into()));
-        assert_eq!(advice(&or, LogicGap::LhsNeverDecides), ("`b`".into(), "a case where `a` is true".into()));
-        assert_eq!(logic_gap_finding("f.rs", &and, LogicGap::Unreached, true), None);
+        assert_eq!(
+            advice(&and, LogicGap::RhsNeverDecides),
+            (
+                "`a`".into(),
+                "a case where `a` is true and `b` is false".into()
+            )
+        );
+        assert_eq!(
+            advice(&and, LogicGap::LhsNeverDecides),
+            ("`b`".into(), "a case where `a` is false".into())
+        );
+        assert_eq!(
+            advice(&or, LogicGap::RhsNeverDecides),
+            (
+                "`a`".into(),
+                "a case where `a` is false and `b` is true".into()
+            )
+        );
+        assert_eq!(
+            advice(&or, LogicGap::LhsNeverDecides),
+            ("`b`".into(), "a case where `a` is true".into())
+        );
+        assert_eq!(
+            logic_gap_finding("f.rs", &and, LogicGap::Unreached, true),
+            None
+        );
         assert_eq!(arith_gap_finding("f.rs", &and, true), None);
 
         let add = site_of("fn f(total: u32, fee: u32) -> u32 { total + fee }");
         assert_eq!(describe(&add, Mutation::ArithSwap), "`total - fee`");
-        let Some(Finding::InputGap { survivors, add_tests, .. }) = arith_gap_finding("f.rs", &add, true) else { panic!() };
-        assert_eq!((survivors[0].as_str(), add_tests[0].as_str()), ("`total - fee`", "`fee` other than 0"));
+        let Some(Finding::InputGap {
+            survivors,
+            add_tests,
+            ..
+        }) = arith_gap_finding("f.rs", &add, true)
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (survivors[0].as_str(), add_tests[0].as_str()),
+            ("`total - fee`", "`fee` other than 0")
+        );
         let mul = site_of("fn f(n: u32, scale: u32) -> u32 { n * scale }");
-        let Some(Finding::InputGap { survivors, add_tests, .. }) = arith_gap_finding("f.rs", &mul, true) else { panic!() };
+        let Some(Finding::InputGap {
+            survivors,
+            add_tests,
+            ..
+        }) = arith_gap_finding("f.rs", &mul, true)
+        else {
+            panic!()
+        };
         assert_eq!(survivors[0], "`n / scale`");
-        assert_eq!(add_tests[0], "operands for which `n * scale` and `n / scale` differ");
+        assert_eq!(
+            add_tests[0],
+            "operands for which `n * scale` and `n / scale` differ"
+        );
         let rem = site_of("fn f(n: u32, k: u32) -> u32 { n % k }");
         assert_eq!(describe(&rem, Mutation::ArithSwap), "`n / k`");
-        assert_eq!(logic_gap_finding("f.rs", &add, LogicGap::RhsNeverDecides, true), None);
+        assert_eq!(
+            logic_gap_finding("f.rs", &add, LogicGap::RhsNeverDecides, true),
+            None
+        );
     }
 
     #[test]

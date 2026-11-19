@@ -384,7 +384,10 @@ pub enum InputGap {
     /// The operands were never equal (and carry no integer values); `Op(flipped)` survives.
     /// For floats, `float_gap` is the range of differences no test observed: every
     /// `ShiftF(d)` strictly inside it survives too.
-    EqualNeverObserved { flipped: CmpOp, float_gap: Option<(f64, f64)> },
+    EqualNeverObserved {
+        flipped: CmpOp,
+        float_gap: Option<(f64, f64)>,
+    },
 }
 
 #[derive(Clone, PartialEq, Debug, Default)]
@@ -421,7 +424,11 @@ impl InputGap {
     /// Up to three concrete mutations the gap lets through, nearest to the original first.
     pub fn survivors(&self) -> Vec<Mutation> {
         match self {
-            InputGap::Boundary { min_shift, max_shift, .. } => (1..=3)
+            InputGap::Boundary {
+                min_shift,
+                max_shift,
+                ..
+            } => (1..=3)
                 .flat_map(|n| [n, -n])
                 .filter(|s| min_shift <= s && s <= max_shift)
                 .take(3)
@@ -487,7 +494,10 @@ pub fn plan_cmp(op: CmpOp, obs: &Obs, domain: Option<(i128, i128)>) -> CmpPlan {
             }
         } else {
             CmpPlan {
-                gap: Some(InputGap::EqualNeverObserved { flipped, float_gap: obs.float_gap() }),
+                gap: Some(InputGap::EqualNeverObserved {
+                    flipped,
+                    float_gap: obs.float_gap(),
+                }),
                 run: vec![Mutation::Negate],
             }
         };
@@ -539,7 +549,11 @@ pub struct LogicObs {
 
 impl LogicObs {
     pub fn from_bits(bits: u8) -> LogicObs {
-        LogicObs { short: bits & 1 != 0, rhs_true: bits & 2 != 0, rhs_false: bits & 4 != 0 }
+        LogicObs {
+            short: bits & 1 != 0,
+            rhs_true: bits & 2 != 0,
+            rhs_false: bits & 4 != 0,
+        }
     }
 
     pub fn merge(&mut self, other: &LogicObs) {
@@ -587,7 +601,10 @@ pub fn logic_infects(and: bool, m: Mutation, obs: &LogicObs) -> bool {
 
 pub fn plan_logic(and: bool, obs: &LogicObs) -> LogicPlan {
     if !obs.reached() {
-        return LogicPlan { gaps: vec![LogicGap::Unreached], run: vec![] };
+        return LogicPlan {
+            gaps: vec![LogicGap::Unreached],
+            run: vec![],
+        };
     }
     let mut plan = LogicPlan::default();
     for (m, gap) in [
@@ -617,7 +634,11 @@ pub struct ArithObs {
 
 impl ArithObs {
     pub fn from_bits(bits: u8) -> ArithObs {
-        ArithObs { same: bits & 1 != 0, differs: bits & 2 != 0, opaque: bits & 4 != 0 }
+        ArithObs {
+            same: bits & 1 != 0,
+            differs: bits & 2 != 0,
+            opaque: bits & 4 != 0,
+        }
     }
 
     pub fn merge(&mut self, other: &ArithObs) {
@@ -778,7 +799,11 @@ mod tests {
             Some(Mutation::Const(false))
         );
         assert_eq!(
-            InputGap::EqualNeverObserved { flipped: CmpOp::Ge, float_gap: None }.representative(),
+            InputGap::EqualNeverObserved {
+                flipped: CmpOp::Ge,
+                float_gap: None
+            }
+            .representative(),
             Some(Mutation::Op(CmpOp::Ge))
         );
     }
@@ -788,8 +813,20 @@ mod tests {
     fn eval_logic(and: bool, m: Option<Mutation>, a: bool, b: bool) -> (bool, bool) {
         let decided = |and: bool| if and { !a } else { a };
         match m {
-            None => if decided(and) { (a, false) } else { (b, true) },
-            Some(Mutation::LogicSwap) => if decided(!and) { (a, false) } else { (b, true) },
+            None => {
+                if decided(and) {
+                    (a, false)
+                } else {
+                    (b, true)
+                }
+            }
+            Some(Mutation::LogicSwap) => {
+                if decided(!and) {
+                    (a, false)
+                } else {
+                    (b, true)
+                }
+            }
             // The right operand is evaluated as in the original, but its value is ignored.
             Some(Mutation::LogicDropRhs) => (a, !decided(and)),
             Some(Mutation::LogicDropLhs) => (b, true),
@@ -802,8 +839,11 @@ mod tests {
         let cases = [(false, false), (false, true), (true, false), (true, true)];
         for and in [true, false] {
             for mask in 0u32..16 {
-                let seen: Vec<(bool, bool)> =
-                    cases.iter().enumerate().filter_map(|(i, c)| (mask & (1 << i) != 0).then_some(*c)).collect();
+                let seen: Vec<(bool, bool)> = cases
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, c)| (mask & (1 << i) != 0).then_some(*c))
+                    .collect();
                 let mut obs = LogicObs::default();
                 for (a, b) in &seen {
                     let (_, evaluated) = eval_logic(and, None, *a, *b);
@@ -812,10 +852,20 @@ mod tests {
                     obs.rhs_false |= evaluated && !*b;
                 }
                 let ctx = format!("and={and} seen={seen:?}");
-                let differs = |m: Mutation| seen.iter().any(|(a, b)| eval_logic(and, None, *a, *b) != eval_logic(and, Some(m), *a, *b));
+                let differs = |m: Mutation| {
+                    seen.iter().any(|(a, b)| {
+                        eval_logic(and, None, *a, *b) != eval_logic(and, Some(m), *a, *b)
+                    })
+                };
                 let plan = plan_logic(and, &obs);
                 if seen.is_empty() {
-                    assert_eq!(plan, LogicPlan { gaps: vec![LogicGap::Unreached], run: vec![] });
+                    assert_eq!(
+                        plan,
+                        LogicPlan {
+                            gaps: vec![LogicGap::Unreached],
+                            run: vec![]
+                        }
+                    );
                     continue;
                 }
                 for (m, gap) in [
@@ -832,8 +882,22 @@ mod tests {
                 assert!(logic_infects(and, Mutation::LogicSwap, &obs), "{ctx}");
             }
         }
-        assert_eq!(LogicObs::from_bits(5), LogicObs { short: true, rhs_true: false, rhs_false: true });
-        assert_eq!(LogicObs::from_bits(2), LogicObs { short: false, rhs_true: true, rhs_false: false });
+        assert_eq!(
+            LogicObs::from_bits(5),
+            LogicObs {
+                short: true,
+                rhs_true: false,
+                rhs_false: true
+            }
+        );
+        assert_eq!(
+            LogicObs::from_bits(2),
+            LogicObs {
+                short: false,
+                rhs_true: true,
+                rhs_false: false
+            }
+        );
     }
 
     #[test]
@@ -853,7 +917,14 @@ mod tests {
         }
         let mut merged = ArithObs::from_bits(1);
         merged.merge(&ArithObs::from_bits(4));
-        assert_eq!(merged, ArithObs { same: true, differs: false, opaque: true });
+        assert_eq!(
+            merged,
+            ArithObs {
+                same: true,
+                differs: false,
+                opaque: true
+            }
+        );
     }
 
     #[test]
@@ -863,10 +934,20 @@ mod tests {
         obs.merge(&Obs::of_f(9.5));
         let plan = plan_cmp(CmpOp::Gt, &obs, None);
         let gap = plan.gap.expect("a gap");
-        assert_eq!(gap, InputGap::EqualNeverObserved { flipped: CmpOp::Ge, float_gap: Some((-20.5, 9.5)) });
+        assert_eq!(
+            gap,
+            InputGap::EqualNeverObserved {
+                flipped: CmpOp::Ge,
+                float_gap: Some((-20.5, 9.5))
+            }
+        );
         assert_eq!(
             gap.survivors(),
-            vec![Mutation::Op(CmpOp::Ge), Mutation::ShiftF(4.75), Mutation::ShiftF(-10.25)]
+            vec![
+                Mutation::Op(CmpOp::Ge),
+                Mutation::ShiftF(4.75),
+                Mutation::ShiftF(-10.25)
+            ]
         );
         // Shifts inside the unobserved gap infect nothing; outside it, or once equality
         // has been observed, they do.
@@ -890,11 +971,24 @@ mod tests {
 
     #[test]
     fn survivors_are_listed_nearest_first() {
-        let boundary = |min_shift, max_shift| InputGap::Boundary { min_shift, max_shift, missing: vec![0] };
-        assert_eq!(boundary(-9, 9).survivors(), vec![Mutation::Shift(1), Mutation::Shift(-1), Mutation::Shift(2)]);
+        let boundary = |min_shift, max_shift| InputGap::Boundary {
+            min_shift,
+            max_shift,
+            missing: vec![0],
+        };
+        assert_eq!(
+            boundary(-9, 9).survivors(),
+            vec![Mutation::Shift(1), Mutation::Shift(-1), Mutation::Shift(2)]
+        );
         assert_eq!(boundary(-1, 0).survivors(), vec![Mutation::Shift(-1)]);
-        assert_eq!(boundary(0, 2).survivors(), vec![Mutation::Shift(1), Mutation::Shift(2)]);
-        assert_eq!(InputGap::OneSided { always: true }.survivors(), vec![Mutation::Const(true)]);
+        assert_eq!(
+            boundary(0, 2).survivors(),
+            vec![Mutation::Shift(1), Mutation::Shift(2)]
+        );
+        assert_eq!(
+            InputGap::OneSided { always: true }.survivors(),
+            vec![Mutation::Const(true)]
+        );
         assert_eq!(InputGap::Unreached.survivors(), vec![]);
     }
 
@@ -911,7 +1005,10 @@ mod tests {
         let plan = plan_cmp(CmpOp::Lt, &obs, None);
         assert_eq!(
             plan.gap,
-            Some(InputGap::EqualNeverObserved { flipped: CmpOp::Le, float_gap: None })
+            Some(InputGap::EqualNeverObserved {
+                flipped: CmpOp::Le,
+                float_gap: None
+            })
         );
         assert_eq!(plan.run, vec![Mutation::Negate]);
 

@@ -223,7 +223,11 @@ fn awkward_constructs() {
     let float = at("celsius > 30.5", "input_gap");
     assert_eq!(
         strings(&float["survivors"]),
-        ["`celsius >= 30.5`", "`celsius > 35.25`", "`celsius > 20.25`"]
+        [
+            "`celsius >= 30.5`",
+            "`celsius > 35.25`",
+            "`celsius > 20.25`"
+        ]
     );
     assert_eq!(
         float["observed"],
@@ -338,8 +342,14 @@ fn endless_loop_mutant_is_killed_by_the_timeout() {
     assert_eq!(report["mutants_run"], 2, "{report:#}");
     assert_eq!(report["mutants_killed"], 2, "{report:#}");
     assert_eq!(report["mutants_timed_out"], 1, "{report:#}");
-    assert!(started.elapsed() >= std::time::Duration::from_secs(5), "the timeout was waited for");
-    assert!(started.elapsed() < std::time::Duration::from_secs(120), "and the mutant was stopped");
+    assert!(
+        started.elapsed() >= std::time::Duration::from_secs(5),
+        "the timeout was waited for"
+    );
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(120),
+        "and the mutant was stopped"
+    );
 }
 
 #[test]
@@ -347,7 +357,10 @@ fn no_std_crate_and_custom_work_dir() {
     let dir = fixture("no-std", "no-std");
     let work = Path::new(env!("CARGO_TARGET_TMPDIR")).join("no-std-work");
     let _ = fs::remove_dir_all(&work);
-    let run = tmt(&dir, &["--json", "--quiet", "--work-dir", work.to_str().unwrap()]);
+    let run = tmt(
+        &dir,
+        &["--json", "--quiet", "--work-dir", work.to_str().unwrap()],
+    );
     assert_eq!(run.code, 2, "{}{}", run.stdout, run.stderr);
     let report: Value = serde_json::from_str(&run.stdout).unwrap();
     let gaps = findings(&report, "input_gap");
@@ -375,17 +388,30 @@ fn workspace_member_by_name_and_by_directory() {
 
     let (code, report) = json(&ws.join("app"));
     assert_eq!(report["package"], "ws-app");
-    assert_eq!(report["sites"], 2, "only the member's own code is mutated: {report:#}");
+    assert_eq!(
+        report["sites"], 2,
+        "only the member's own code is mutated: {report:#}"
+    );
     // The dependency outside the workspace always answers true, so it never decides.
     assert_eq!(code, 2, "{report:#}");
     let gaps = findings(&report, "input_gap");
     assert_eq!(gaps.len(), 1, "{report:#}");
-    assert_eq!(gaps[0]["code"], "ws_core::is_large(size) && outside::enabled()");
-    assert_eq!(strings(&gaps[0]["survivors"]), ["`ws_core::is_large(size)`"]);
+    assert_eq!(
+        gaps[0]["code"],
+        "ws_core::is_large(size) && outside::enabled()"
+    );
+    assert_eq!(
+        strings(&gaps[0]["survivors"]),
+        ["`ws_core::is_large(size)`"]
+    );
 
     let ambiguous = tmt(&ws, &["--quiet"]);
     assert_eq!(ambiguous.code, 1);
-    assert!(ambiguous.stderr.contains("--package"), "{}", ambiguous.stderr);
+    assert!(
+        ambiguous.stderr.contains("--package"),
+        "{}",
+        ambiguous.stderr
+    );
     let unknown = tmt(&ws, &["--quiet", "--package", "nope"]);
     assert_eq!(unknown.code, 1);
 }
@@ -395,8 +421,15 @@ fn boolean_and_arithmetic_operators_and_macro_arguments() {
     let dir = fixture("operators", "operators");
     let (code, report) = json(&dir);
     assert_eq!(code, 2, "{report:#}");
-    assert_eq!(report["skipped_sites"], 0, "every probe compiles: {report:#}");
-    assert_eq!(report["unstable"].as_array().unwrap().len(), 0, "{report:#}");
+    assert_eq!(
+        report["skipped_sites"], 0,
+        "every probe compiles: {report:#}"
+    );
+    assert_eq!(
+        report["unstable"].as_array().unwrap().len(),
+        0,
+        "{report:#}"
+    );
     let all = report["findings"].as_array().unwrap();
     let gap = |code: &str| {
         all.iter()
@@ -407,22 +440,50 @@ fn boolean_and_arithmetic_operators_and_macro_arguments() {
     // The right operand of `||` never decides.
     let or = gap("is_owner || is_admin");
     assert_eq!(strings(&or["survivors"]), ["`is_owner`"]);
-    assert_eq!(strings(&or["add_tests"]), ["a case where `is_owner` is false and `is_admin` is true"]);
+    assert_eq!(
+        strings(&or["add_tests"]),
+        ["a case where `is_owner` is false and `is_admin` is true"]
+    );
     // `+` and `-` agree when the right operand is always 0; `*` and `/` when it is always 1.
-    assert_eq!(strings(&gap("amount + fee")["survivors"]), ["`amount - fee`"]);
-    assert_eq!(strings(&gap("amount + fee")["add_tests"]), ["`fee` other than 0"]);
-    assert_eq!(strings(&gap("value * factor")["survivors"]), ["`value / factor`"]);
+    assert_eq!(
+        strings(&gap("amount + fee")["survivors"]),
+        ["`amount - fee`"]
+    );
+    assert_eq!(
+        strings(&gap("amount + fee")["add_tests"]),
+        ["`fee` other than 0"]
+    );
+    assert_eq!(
+        strings(&gap("value * factor")["survivors"]),
+        ["`value / factor`"]
+    );
 
     let codes: Vec<&str> = all.iter().map(|f| f["code"].as_str().unwrap()).collect();
     // Killed or fully pinned: the range check, the area, and the code inside `vec!` / `format!`.
-    for quiet in ["lo <= x && x <= hi", "lo <= x", "x <= hi", "width * height", "n > 0", "n % 2 == 0", "n % 2", "index + 1"] {
-        assert!(!codes.contains(&quiet), "`{quiet}` should have no finding: {report:#}");
+    for quiet in [
+        "lo <= x && x <= hi",
+        "lo <= x",
+        "x <= hi",
+        "width * height",
+        "n > 0",
+        "n % 2 == 0",
+        "n % 2",
+        "index + 1",
+    ] {
+        assert!(
+            !codes.contains(&quiet),
+            "`{quiet}` should have no finding: {report:#}"
+        );
     }
     // Not numbers: neither a finding nor "unreached".
     for opaque in ["name.to_owned() + \"!\"", "a + b"] {
         assert!(!codes.contains(&opaque), "{report:#}");
     }
-    assert_eq!(report["unreached"].as_array().unwrap().len(), 0, "{report:#}");
+    assert_eq!(
+        report["unreached"].as_array().unwrap().len(),
+        0,
+        "{report:#}"
+    );
 
     // Take the advice for the three input gaps above.
     append(
@@ -437,9 +498,49 @@ fn closes_the_gaps() {
 "#,
     );
     let (_, report) = json(&dir);
-    let codes: Vec<&str> =
-        report["findings"].as_array().unwrap().iter().map(|f| f["code"].as_str().unwrap()).collect();
+    let codes: Vec<&str> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["code"].as_str().unwrap())
+        .collect();
     for closed in ["is_owner || is_admin", "amount + fee", "value * factor"] {
-        assert!(!codes.contains(&closed), "`{closed}` should be closed: {report:#}");
+        assert!(
+            !codes.contains(&closed),
+            "`{closed}` should be closed: {report:#}"
+        );
     }
+}
+
+#[test]
+fn doc_tests_are_used_on_request() {
+    let dir = fixture("doc-tested", "doc-tested");
+    // Without --doc nothing executes the code.
+    let (code, report) = json(&dir);
+    assert_eq!(code, 0, "{report:#}");
+    assert_eq!(
+        report["unreached"].as_array().unwrap().len(),
+        3,
+        "{report:#}"
+    );
+    assert_eq!(report["mutants_run"], 0, "{report:#}");
+
+    let run = tmt(&dir, &["--json", "--quiet", "--doc"]);
+    assert_eq!(run.code, 2, "{}{}", run.stdout, run.stderr);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(
+        report["unreached"].as_array().unwrap().len(),
+        0,
+        "{report:#}"
+    );
+    // `double(2) == 4` kills `x / 2`; `is_even` is only ever called with an even number.
+    let gaps = findings(&report, "input_gap");
+    assert_eq!(gaps.len(), 1, "{report:#}");
+    assert_eq!(gaps[0]["code"], "x % 2 == 0");
+    assert_eq!(strings(&gaps[0]["survivors"]), ["`true`"]);
+    assert_eq!(findings(&report, "assertion_gap").len(), 0, "{report:#}");
+    assert!(
+        report["mutants_killed"].as_u64().unwrap() >= 2,
+        "{report:#}"
+    );
 }

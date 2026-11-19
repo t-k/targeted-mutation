@@ -45,7 +45,11 @@ fn flag(text: &str) -> Option<bool> {
 }
 
 fn optional<T: std::str::FromStr>(text: &str) -> Option<Option<T>> {
-    if text == "-" { Some(None) } else { text.parse().ok().map(Some) }
+    if text == "-" {
+        Some(None)
+    } else {
+        text.parse().ok().map(Some)
+    }
 }
 
 impl Trace {
@@ -62,7 +66,18 @@ impl Trace {
     fn parse_line(&mut self, line: &str) -> Option<()> {
         let cols: Vec<&str> = line.split('\t').collect();
         match cols[..] {
-            ["O", site, test, rels, unvalued, max_neg, min_pos, unfloat, f_max_neg, f_min_pos] => {
+            [
+                "O",
+                site,
+                test,
+                rels,
+                unvalued,
+                max_neg,
+                min_pos,
+                unfloat,
+                f_max_neg,
+                f_min_pos,
+            ] => {
                 let rels: u8 = rels.parse().ok().filter(|r| *r < 16)?;
                 let obs = Obs {
                     lt: rels & 1 != 0,
@@ -78,7 +93,12 @@ impl Trace {
                 };
                 let site = site.parse().ok()?;
                 (!test.is_empty()).then_some(())?;
-                self.cmp.entry(site).or_default().entry(test.to_string()).or_default().merge(&obs);
+                self.cmp
+                    .entry(site)
+                    .or_default()
+                    .entry(test.to_string())
+                    .or_default()
+                    .merge(&obs);
             }
             [kind @ ("R" | "L" | "A"), site, test, bits] => {
                 let site: u32 = site.parse().ok()?;
@@ -120,7 +140,12 @@ impl Trace {
     /// Everything any test observed at a comparison site.
     pub fn merged(&self, site: u32) -> Obs {
         let mut all = Obs::default();
-        for obs in self.cmp.get(&site).into_iter().flat_map(|tests| tests.values()) {
+        for obs in self
+            .cmp
+            .get(&site)
+            .into_iter()
+            .flat_map(|tests| tests.values())
+        {
             all.merge(obs);
         }
         all
@@ -187,8 +212,14 @@ mod tests {
             assert!(o.unvalued);
         }
         // 15 is every relation, 16 is not a relation mask.
-        assert_eq!(Trace::parse("O\t1\tt\t15\t0\t-\t-\t1\t-\t-\n").malformed_lines, 0);
-        assert_eq!(Trace::parse("O\t1\tt\t16\t0\t-\t-\t1\t-\t-\n").malformed_lines, 1);
+        assert_eq!(
+            Trace::parse("O\t1\tt\t15\t0\t-\t-\t1\t-\t-\n").malformed_lines,
+            0
+        );
+        assert_eq!(
+            Trace::parse("O\t1\tt\t16\t0\t-\t-\t1\t-\t-\n").malformed_lines,
+            1
+        );
         // A comparison line needs a test name too.
         let nameless = Trace::parse("O\t1\t\t1\t0\t-\t-\t1\t-\t-\n");
         assert_eq!((nameless.malformed_lines, nameless.cmp.len()), (1, 0));
@@ -217,16 +248,32 @@ mod tests {
     #[test]
     fn runtime_agrees_with_the_planner() {
         for op in CmpOp::ALL {
-            let mut ms = vec![Mutation::Const(true), Mutation::Const(false), Mutation::Negate];
+            let mut ms = vec![
+                Mutation::Const(true),
+                Mutation::Const(false),
+                Mutation::Negate,
+            ];
             ms.extend(CmpOp::ALL.into_iter().map(Mutation::Op));
             if op.is_ordering() {
                 ms.extend((-4..=4).filter(|s| *s != 0).map(Mutation::Shift));
             }
             for m in ms {
                 for d in -6..=6i128 {
-                    let rel = if d < 0 { 1 } else if d == 0 { 2 } else { 4 };
+                    let rel = if d < 0 {
+                        1
+                    } else if d == 0 {
+                        2
+                    } else {
+                        4
+                    };
                     assert_eq!(
-                        tmt_rt::apply(rt_op(op), rt_mutant(m), op.eval_d(d), rel, tmt_rt::Diff::Int(d)),
+                        tmt_rt::apply(
+                            rt_op(op),
+                            rt_mutant(m),
+                            op.eval_d(d),
+                            rel,
+                            tmt_rt::Diff::Int(d)
+                        ),
                         eval_mutated_d(op, m, d),
                         "{op:?} {m:?} d={d}"
                     );
@@ -234,17 +281,53 @@ mod tests {
             }
             // Unordered operands (NaN): only `!=` is true.
             assert_eq!(
-                tmt_rt::apply(rt_op(op), tmt_rt::Mutant::Op(rt_op(op)), false, 8, tmt_rt::Diff::None),
+                tmt_rt::apply(
+                    rt_op(op),
+                    tmt_rt::Mutant::Op(rt_op(op)),
+                    false,
+                    8,
+                    tmt_rt::Diff::None
+                ),
                 op.eval_rel(Rel::Unordered)
             );
             // A shift needs values of its own kind; without them the original result stands.
             for orig in [true, false] {
-                assert_eq!(tmt_rt::apply(rt_op(op), tmt_rt::Mutant::Shift(1), orig, 2, tmt_rt::Diff::None), orig);
-                assert_eq!(tmt_rt::apply(rt_op(op), tmt_rt::Mutant::ShiftF(1.0), orig, 2, tmt_rt::Diff::Int(0)), orig);
-                assert_eq!(tmt_rt::apply(rt_op(op), tmt_rt::Mutant::Delete, orig, 2, tmt_rt::Diff::Int(0)), orig);
+                assert_eq!(
+                    tmt_rt::apply(
+                        rt_op(op),
+                        tmt_rt::Mutant::Shift(1),
+                        orig,
+                        2,
+                        tmt_rt::Diff::None
+                    ),
+                    orig
+                );
+                assert_eq!(
+                    tmt_rt::apply(
+                        rt_op(op),
+                        tmt_rt::Mutant::ShiftF(1.0),
+                        orig,
+                        2,
+                        tmt_rt::Diff::Int(0)
+                    ),
+                    orig
+                );
+                assert_eq!(
+                    tmt_rt::apply(
+                        rt_op(op),
+                        tmt_rt::Mutant::Delete,
+                        orig,
+                        2,
+                        tmt_rt::Diff::Int(0)
+                    ),
+                    orig
+                );
             }
         }
-        assert_eq!(tmt_rt::parse_mutant("12:del"), Some((12, tmt_rt::Mutant::Delete)));
+        assert_eq!(
+            tmt_rt::parse_mutant("12:del"),
+            Some((12, tmt_rt::Mutant::Delete))
+        );
         for (m, expected) in [
             (Mutation::LogicSwap, tmt_rt::Mutant::LogicSwap),
             (Mutation::LogicDropRhs, tmt_rt::Mutant::LogicDropRhs),
@@ -255,7 +338,9 @@ mod tests {
         ] {
             assert_eq!(rt_mutant(m), expected);
         }
-        for bad in ["", "x:neg", "1:", "1:op9", "1:shx", "1:zzz", "neg", "1:shfnan", "1:shfinf", "1:shf"] {
+        for bad in [
+            "", "x:neg", "1:", "1:op9", "1:shx", "1:zzz", "neg", "1:shfnan", "1:shfinf", "1:shf",
+        ] {
             assert_eq!(tmt_rt::parse_mutant(bad), None, "{bad:?}");
         }
     }
@@ -274,7 +359,13 @@ mod tests {
                 let changes_something = observed.iter().any(|d| {
                     let rel = if *d < 0.0 { 1 } else { 4 };
                     let orig = op.eval_d(if *d < 0.0 { -1 } else { 1 });
-                    tmt_rt::apply(rt_op(op), tmt_rt::Mutant::ShiftF(shift), orig, rel, tmt_rt::Diff::Float(*d)) != orig
+                    tmt_rt::apply(
+                        rt_op(op),
+                        tmt_rt::Mutant::ShiftF(shift),
+                        orig,
+                        rel,
+                        tmt_rt::Diff::Float(*d),
+                    ) != orig
                 });
                 let predicted = crate::plan::infects(op, Mutation::ShiftF(shift), &obs);
                 // Safe by the planner implies unchanged at run time (the converse need not hold
@@ -284,12 +375,30 @@ mod tests {
         }
         // Equal floats are reported as a zero difference even where subtraction is not finite.
         use tmt_rt::{Diff, Val};
-        assert_eq!(tmt_rt::diff(Val::Float(f64::INFINITY), Val::Float(f64::INFINITY), true), Diff::Float(0.0));
-        assert_eq!(tmt_rt::diff(Val::Float(f64::INFINITY), Val::Float(1.0), false), Diff::None);
-        assert_eq!(tmt_rt::diff(Val::Float(f64::NAN), Val::Float(1.0), false), Diff::None);
-        assert_eq!(tmt_rt::diff(Val::Float(1.5), Val::Float(1.0), false), Diff::Float(0.5));
-        assert_eq!(tmt_rt::diff(Val::Int(3, 0, 9), Val::Int(5, 0, 9), false), Diff::Int(-2));
-        assert_eq!(tmt_rt::diff(Val::Int(3, 0, 9), Val::Float(5.0), false), Diff::None);
+        assert_eq!(
+            tmt_rt::diff(Val::Float(f64::INFINITY), Val::Float(f64::INFINITY), true),
+            Diff::Float(0.0)
+        );
+        assert_eq!(
+            tmt_rt::diff(Val::Float(f64::INFINITY), Val::Float(1.0), false),
+            Diff::None
+        );
+        assert_eq!(
+            tmt_rt::diff(Val::Float(f64::NAN), Val::Float(1.0), false),
+            Diff::None
+        );
+        assert_eq!(
+            tmt_rt::diff(Val::Float(1.5), Val::Float(1.0), false),
+            Diff::Float(0.5)
+        );
+        assert_eq!(
+            tmt_rt::diff(Val::Int(3, 0, 9), Val::Int(5, 0, 9), false),
+            Diff::Int(-2)
+        );
+        assert_eq!(
+            tmt_rt::diff(Val::Int(3, 0, 9), Val::Float(5.0), false),
+            Diff::None
+        );
         assert_eq!(tmt_rt::diff(Val::None, Val::None, true), Diff::None);
     }
 
@@ -309,22 +418,38 @@ mod tests {
                     let swapped = if and { a || b } else { a && b };
                     assert_eq!(run(and, None, a, b).0, real);
                     assert_eq!(run(and, Some(tmt_rt::Mutant::LogicSwap), a, b).0, swapped);
-                    assert_eq!(run(and, Some(tmt_rt::Mutant::LogicDropLhs), a, b), (b, true));
+                    assert_eq!(
+                        run(and, Some(tmt_rt::Mutant::LogicDropLhs), a, b),
+                        (b, true)
+                    );
                     // The right operand is evaluated exactly when the original evaluates it.
-                    assert_eq!(run(and, Some(tmt_rt::Mutant::LogicDropRhs), a, b), (a, run(and, None, a, b).1));
+                    assert_eq!(
+                        run(and, Some(tmt_rt::Mutant::LogicDropRhs), a, b),
+                        (a, run(and, None, a, b).1)
+                    );
                     // Short-circuiting: the right operand is skipped exactly as in Rust.
                     assert_eq!(run(and, None, a, b).1, if and { a } else { !a });
 
                     // What the planner predicts from the observation bits is what changes.
                     let (_, evaluated) = run(and, None, a, b);
-                    let bits = if !evaluated { tmt_rt::LOGIC_SHORT } else if b { tmt_rt::LOGIC_RHS_TRUE } else { tmt_rt::LOGIC_RHS_FALSE };
+                    let bits = if !evaluated {
+                        tmt_rt::LOGIC_SHORT
+                    } else if b {
+                        tmt_rt::LOGIC_RHS_TRUE
+                    } else {
+                        tmt_rt::LOGIC_RHS_FALSE
+                    };
                     let obs = crate::plan::LogicObs::from_bits(bits);
                     for (m, rt) in [
                         (Mutation::LogicDropRhs, tmt_rt::Mutant::LogicDropRhs),
                         (Mutation::LogicDropLhs, tmt_rt::Mutant::LogicDropLhs),
                     ] {
                         let changed = run(and, Some(rt), a, b) != run(and, None, a, b);
-                        assert_eq!(crate::plan::logic_infects(and, m, &obs), changed, "and={and} a={a} b={b} {m:?}");
+                        assert_eq!(
+                            crate::plan::logic_infects(and, m, &obs),
+                            changed,
+                            "and={and} a={a} b={b} {m:?}"
+                        );
                     }
                 }
             }
@@ -373,7 +498,11 @@ mod tests {
                         tmt_rt::DIV => a.checked_div(b),
                         _ => a.checked_rem(b),
                     };
-                    assert_eq!(i32::tmt_same(op, a, b), real(op) == real(swapped), "op={op} {a} {b}");
+                    assert_eq!(
+                        i32::tmt_same(op, a, b),
+                        real(op) == real(swapped),
+                        "op={op} {a} {b}"
+                    );
                     if let Some(value) = real(op) {
                         assert_eq!(i32::tmt_real(op, a, b), value);
                     }
@@ -381,11 +510,20 @@ mod tests {
             }
         }
         assert!(u8::tmt_same(tmt_rt::ADD, 9, 0));
-        assert!(!u8::tmt_same(tmt_rt::ADD, 250, 9), "overflow in one of the two counts as different");
-        assert!(!u8::tmt_same(tmt_rt::MUL, 4, 0), "division by zero counts as different");
+        assert!(
+            !u8::tmt_same(tmt_rt::ADD, 250, 9),
+            "overflow in one of the two counts as different"
+        );
+        assert!(
+            !u8::tmt_same(tmt_rt::MUL, 4, 0),
+            "division by zero counts as different"
+        );
         assert!(f64::tmt_same(tmt_rt::MUL, 4.0, 1.0));
         assert!(!f64::tmt_same(tmt_rt::ADD, 4.0, 0.5));
-        assert!(!f32::tmt_same(tmt_rt::MUL, 4.0, 0.0), "4*0 is 0, 4/0 is infinite");
+        assert!(
+            !f32::tmt_same(tmt_rt::MUL, 4.0, 0.0),
+            "4*0 is 0, 4/0 is infinite"
+        );
     }
 
     #[test]
@@ -407,8 +545,14 @@ mod tests {
         let mut text = String::new();
         for (rel, d) in observations {
             let changed = summary.observe(rel, d);
-            assert!(changed, "each of these observations adds information: {d:?}");
-            assert!(!summary.observe(rel, d), "repeating an observation changes nothing");
+            assert!(
+                changed,
+                "each of these observations adds information: {d:?}"
+            );
+            assert!(
+                !summary.observe(rel, d),
+                "repeating an observation changes nothing"
+            );
             text.push_str(&summary.line(4, "tests::t"));
             expected.merge(&match d {
                 Diff::Int(d) => Obs::of_d(d),
@@ -431,14 +575,51 @@ mod tests {
 
     #[test]
     fn logic_arithmetic_and_reach_lines() {
-        let trace = Trace::parse("L\t1\tt\t1\nL\t1\tt\t5\nL\t1\tu\t2\nA\t2\tt\t1\nA\t2\tu\t6\nR\t3\tt\t1\n");
+        let trace = Trace::parse(
+            "L\t1\tt\t1\nL\t1\tt\t5\nL\t1\tu\t2\nA\t2\tt\t1\nA\t2\tu\t6\nR\t3\tt\t1\n",
+        );
         assert_eq!(trace.malformed_lines, 0);
-        assert_eq!(trace.logic[&1]["t"], crate::plan::LogicObs { short: true, rhs_true: false, rhs_false: true });
-        assert_eq!(trace.logic[&1]["u"], crate::plan::LogicObs { short: false, rhs_true: true, rhs_false: false });
-        assert_eq!(trace.arith[&2]["t"], crate::plan::ArithObs { same: true, differs: false, opaque: false });
-        assert_eq!(trace.arith[&2]["u"], crate::plan::ArithObs { same: false, differs: true, opaque: true });
+        assert_eq!(
+            trace.logic[&1]["t"],
+            crate::plan::LogicObs {
+                short: true,
+                rhs_true: false,
+                rhs_false: true
+            }
+        );
+        assert_eq!(
+            trace.logic[&1]["u"],
+            crate::plan::LogicObs {
+                short: false,
+                rhs_true: true,
+                rhs_false: false
+            }
+        );
+        assert_eq!(
+            trace.arith[&2]["t"],
+            crate::plan::ArithObs {
+                same: true,
+                differs: false,
+                opaque: false
+            }
+        );
+        assert_eq!(
+            trace.arith[&2]["u"],
+            crate::plan::ArithObs {
+                same: false,
+                differs: true,
+                opaque: true
+            }
+        );
         assert!(trace.reach[&3].contains("t"));
-        for bad in ["L\t1\tt\t0\n", "L\t1\tt\t8\n", "A\t1\t\t1\n", "R\t1\tt\n", "L\tx\tt\t1\n", "Z\t1\tt\t1\n"] {
+        for bad in [
+            "L\t1\tt\t0\n",
+            "L\t1\tt\t8\n",
+            "A\t1\t\t1\n",
+            "R\t1\tt\n",
+            "L\tx\tt\t1\n",
+            "Z\t1\tt\t1\n",
+        ] {
             assert_eq!(Trace::parse(bad).malformed_lines, 1, "{bad:?}");
         }
     }
@@ -449,21 +630,49 @@ mod tests {
         use tmt_rt::{Val, ValAny as _, ValNum as _};
         // Autoref specialisation: numbers carry values, everything else does not.
         assert_eq!((&tmt_rt::W(&7u8)).tmt_val(), Val::Int(7, 0, 255));
-        assert_eq!((&tmt_rt::W(&&-3i64)).tmt_val(), Val::Int(-3, i64::MIN as i128, i64::MAX as i128));
+        assert_eq!(
+            (&tmt_rt::W(&&-3i64)).tmt_val(),
+            Val::Int(-3, i64::MIN as i128, i64::MAX as i128)
+        );
         assert_eq!((&tmt_rt::W(&1.5f64)).tmt_val(), Val::Float(1.5));
         assert_eq!((&tmt_rt::W(&&2.5f32)).tmt_val(), Val::Float(2.5));
         assert_eq!((&tmt_rt::W("text")).tmt_val(), Val::None);
         assert_eq!((&tmt_rt::W(&'c')).tmt_val(), Val::None);
 
         for (a, b) in [(1, 2), (2, 2), (3, 2)] {
-            assert_eq!(tmt_rt::ord(0, tmt_rt::LT, &a, &b, Val::None, Val::None), a < b);
-            assert_eq!(tmt_rt::ord(0, tmt_rt::LE, &a, &b, Val::None, Val::None), a <= b);
-            assert_eq!(tmt_rt::ord(0, tmt_rt::GT, &a, &b, Val::None, Val::None), a > b);
-            assert_eq!(tmt_rt::ord(0, tmt_rt::GE, &a, &b, Val::None, Val::None), a >= b);
-            assert_eq!(tmt_rt::eq(0, tmt_rt::EQ, &a, &b, Val::None, Val::None), a == b);
-            assert_eq!(tmt_rt::eq(0, tmt_rt::NE, &a, &b, Val::None, Val::None), a != b);
+            assert_eq!(
+                tmt_rt::ord(0, tmt_rt::LT, &a, &b, Val::None, Val::None),
+                a < b
+            );
+            assert_eq!(
+                tmt_rt::ord(0, tmt_rt::LE, &a, &b, Val::None, Val::None),
+                a <= b
+            );
+            assert_eq!(
+                tmt_rt::ord(0, tmt_rt::GT, &a, &b, Val::None, Val::None),
+                a > b
+            );
+            assert_eq!(
+                tmt_rt::ord(0, tmt_rt::GE, &a, &b, Val::None, Val::None),
+                a >= b
+            );
+            assert_eq!(
+                tmt_rt::eq(0, tmt_rt::EQ, &a, &b, Val::None, Val::None),
+                a == b
+            );
+            assert_eq!(
+                tmt_rt::eq(0, tmt_rt::NE, &a, &b, Val::None, Val::None),
+                a != b
+            );
         }
-        assert!(!tmt_rt::ord(0, tmt_rt::GE, &f64::NAN, &1.0, Val::None, Val::None));
+        assert!(!tmt_rt::ord(
+            0,
+            tmt_rt::GE,
+            &f64::NAN,
+            &1.0,
+            Val::None,
+            Val::None
+        ));
         assert!(tmt_rt::eq(0, tmt_rt::NE, "a", "b", Val::None, Val::None));
         assert!(tmt_rt::live(0));
     }

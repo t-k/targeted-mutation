@@ -208,7 +208,11 @@ fn is_literal(expr: &syn::Expr) -> bool {
         syn::Expr::Paren(e) => is_literal(&e.expr),
         syn::Expr::Group(e) => is_literal(&e.expr),
         syn::Expr::Lit(_) => true,
-        syn::Expr::Unary(syn::ExprUnary { op: syn::UnOp::Neg(_), expr, .. }) => is_literal(expr),
+        syn::Expr::Unary(syn::ExprUnary {
+            op: syn::UnOp::Neg(_),
+            expr,
+            ..
+        }) => is_literal(expr),
         _ => false,
     }
 }
@@ -217,9 +221,12 @@ fn is_literal(expr: &syn::Expr) -> bool {
 fn in_let_chain(expr: &syn::Expr) -> bool {
     match expr {
         syn::Expr::Let(_) => true,
-        syn::Expr::Binary(syn::ExprBinary { op: syn::BinOp::And(_), left, right, .. }) => {
-            in_let_chain(left) || matches!(**right, syn::Expr::Let(_))
-        }
+        syn::Expr::Binary(syn::ExprBinary {
+            op: syn::BinOp::And(_),
+            left,
+            right,
+            ..
+        }) => in_let_chain(left) || matches!(**right, syn::Expr::Let(_)),
         _ => false,
     }
 }
@@ -228,9 +235,24 @@ fn in_let_chain(expr: &syn::Expr) -> bool {
 /// their argument into text (`assert!`, `debug_assert!`, `dbg!`, `stringify!`) are left
 /// alone: rewriting the argument would change the message a test may expect.
 const EXPR_MACROS: [&str; 18] = [
-    "assert_eq", "assert_ne", "debug_assert_eq", "debug_assert_ne", "vec", "format", "print",
-    "println", "eprint", "eprintln", "write", "writeln", "panic", "unreachable", "todo",
-    "unimplemented", "format_args", "matches",
+    "assert_eq",
+    "assert_ne",
+    "debug_assert_eq",
+    "debug_assert_ne",
+    "vec",
+    "format",
+    "print",
+    "println",
+    "eprint",
+    "eprintln",
+    "write",
+    "writeln",
+    "panic",
+    "unreachable",
+    "todo",
+    "unimplemented",
+    "format_args",
+    "matches",
 ];
 
 fn is_assign_op(op: &syn::BinOp) -> bool {
@@ -328,7 +350,9 @@ impl<'ast> Visit<'ast> for Finder<'_> {
     fn visit_expr_const(&mut self, _: &'ast syn::ExprConst) {}
 
     fn visit_macro(&mut self, node: &'ast syn::Macro) {
-        let Some(name) = node.path.segments.last().map(|s| s.ident.to_string()) else { return };
+        let Some(name) = node.path.segments.last().map(|s| s.ident.to_string()) else {
+            return;
+        };
         if !EXPR_MACROS.contains(&name.as_str()) {
             return;
         }
@@ -464,12 +488,22 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             };
             if let Some(and) = logic {
                 if !in_let_chain(&node.left) && !matches!(*node.right, syn::Expr::Let(_)) {
-                    self.push(SiteKind::Logic { and, lhs, rhs, gap }, start, end, node.left.span());
+                    self.push(
+                        SiteKind::Logic { and, lhs, rhs, gap },
+                        start,
+                        end,
+                        node.left.span(),
+                    );
                 }
             } else if let Some(op) = arith_op(&node.op)
                 && !(is_literal(&node.left) && is_literal(&node.right))
             {
-                self.push(SiteKind::Arith { op, lhs, rhs, gap }, start, end, node.left.span());
+                self.push(
+                    SiteKind::Arith { op, lhs, rhs, gap },
+                    start,
+                    end,
+                    node.left.span(),
+                );
             }
         }
         visit::visit_expr_binary(self, node);
@@ -770,7 +804,12 @@ mod tests {
         let texts: Vec<&str> = found.sites.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(
             texts,
-            ["a == 100", "a == 101", "matches!(a, 1..=2) || match a { 0..=9 => a == 102, _ => false }", "a == 102"]
+            [
+                "a == 100",
+                "a == 101",
+                "matches!(a, 1..=2) || match a { 0..=9 => a == 102, _ => false }",
+                "a == 102"
+            ]
         );
         assert_eq!(
             found.test_modules,
@@ -905,7 +944,9 @@ mod tests {
             .iter()
             .map(|s| match &s.kind {
                 SiteKind::Logic { and, lhs, rhs, .. } => format!("logic and={and} [{lhs}] [{rhs}]"),
-                SiteKind::Arith { op, lhs, rhs, .. } => format!("arith {} [{lhs}] [{rhs}]", op.symbol()),
+                SiteKind::Arith { op, lhs, rhs, .. } => {
+                    format!("arith {} [{lhs}] [{rhs}]", op.symbol())
+                }
                 other => format!("{other:?}"),
             })
             .collect();
@@ -924,10 +965,26 @@ mod tests {
         syn::parse_file(&out).expect("instrumented source parses");
         assert!(out.contains("({ let __tmt_c = crate::__tmt_rt::lhs(1u32, true, a); if __tmt_c == 2u8 { crate::__tmt_rt::rhs(1u32, true, b) } else { __tmt_c == 1u8 } })"), "{out}");
         assert!(out.contains("use crate::__tmt_rt::{AnyMul as _, ArithPrim as _}; (&crate::__tmt_rt::Ar::new(y, 2)).tmt_mul(3u32) })"), "{out}");
-        for op in [ArithOp::Add, ArithOp::Sub, ArithOp::Mul, ArithOp::Div, ArithOp::Rem] {
+        for op in [
+            ArithOp::Add,
+            ArithOp::Sub,
+            ArithOp::Mul,
+            ArithOp::Div,
+            ArithOp::Rem,
+        ] {
             assert_ne!(op.swapped(), op);
-            assert!(crate::RUNTIME_SOURCE.contains(&format!("fn {}(", op.method())), "{op:?}");
-            assert!(crate::RUNTIME_SOURCE.contains(&format!("{} {} ", op.fallback_trait(), op.method())), "{op:?}");
+            assert!(
+                crate::RUNTIME_SOURCE.contains(&format!("fn {}(", op.method())),
+                "{op:?}"
+            );
+            assert!(
+                crate::RUNTIME_SOURCE.contains(&format!(
+                    "{} {} ",
+                    op.fallback_trait(),
+                    op.method()
+                )),
+                "{op:?}"
+            );
         }
     }
 
@@ -940,7 +997,12 @@ mod tests {
                 (n & 3) | (n << 1) ^ k
             }
         "#;
-        let texts: Vec<String> = discover(src, 0).unwrap().sites.into_iter().map(|s| s.text).collect();
+        let texts: Vec<String> = discover(src, 0)
+            .unwrap()
+            .sites
+            .into_iter()
+            .map(|s| s.text)
+            .collect();
         assert_eq!(texts, ["x > 1"]);
     }
 
@@ -966,7 +1028,13 @@ mod tests {
             .filter(|s| matches!(s.kind, SiteKind::Cmp { .. } | SiteKind::Arith { .. }))
             .map(|s| s.text)
             .collect();
-        assert_eq!(texts, ["a < 1", "b < 2", "a + 3", "a < 4", "b < 5", "a < 6", "a < 8", "a < 9", "a + b", "a < 12"]);
+        assert_eq!(
+            texts,
+            [
+                "a < 1", "b < 2", "a + 3", "a < 4", "b < 5", "a < 6", "a < 8", "a < 9", "a + b",
+                "a < 12"
+            ]
+        );
         let found = discover(src, 0).unwrap().sites;
         syn::parse_file(&render(src, &found, &all).text).expect("instrumented source parses");
     }

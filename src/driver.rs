@@ -28,6 +28,8 @@ pub struct Options {
     pub work_dir: Option<PathBuf>,
     /// Progress lines on stderr.
     pub progress: bool,
+    /// Also run the doc tests (slow: rustdoc recompiles them for every mutant they reach).
+    pub doc: bool,
 }
 
 /// How far from an error to look for the probe that caused it (a probe can break type
@@ -194,9 +196,22 @@ struct SourceFile {
     rendered: Option<Rendered>,
 }
 
+/// How a group of tests is started.
+enum Runner {
+    /// A libtest executable.
+    Exe(PathBuf),
+    /// The package's doc tests, through `cargo test --doc` in the working copy. rustdoc
+    /// compiles them on every run, and they cannot be selected by name.
+    Doc {
+        copy: PathBuf,
+        target_dir: PathBuf,
+        package: String,
+    },
+}
+
 struct TestBinary {
     name: String,
-    exe: PathBuf,
+    runner: Runner,
     baseline: Duration,
     trace: Trace,
 }
@@ -283,13 +298,21 @@ fn normalize(path: &Path) -> PathBuf {
 
 /// Rewrites `path = "../outside"` dependencies of a manifest to absolute paths when they
 /// point outside `workspace`. Returns `None` when nothing has to change.
-fn absolutize_path_dependencies(manifest: &str, manifest_dir: &Path, workspace: &Path) -> Result<Option<String>> {
+fn absolutize_path_dependencies(
+    manifest: &str,
+    manifest_dir: &Path,
+    workspace: &Path,
+) -> Result<Option<String>> {
     use toml_edit::{DocumentMut, Item, TableLike, value};
 
     fn fix(deps: &mut dyn TableLike, manifest_dir: &Path, workspace: &Path, changed: &mut bool) {
         for (_, dep) in deps.iter_mut() {
-            let Some(dep) = dep.as_table_like_mut() else { continue };
-            let Some(path) = dep.get("path").and_then(Item::as_str) else { continue };
+            let Some(dep) = dep.as_table_like_mut() else {
+                continue;
+            };
+            let Some(path) = dep.get("path").and_then(Item::as_str) else {
+                continue;
+            };
             let target = normalize(&manifest_dir.join(path));
             if !target.starts_with(workspace) {
                 dep.insert("path", value(target.to_string_lossy().into_owned()));
@@ -298,7 +321,12 @@ fn absolutize_path_dependencies(manifest: &str, manifest_dir: &Path, workspace: 
         }
     }
     const SECTIONS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
-    fn fix_sections(table: &mut dyn TableLike, manifest_dir: &Path, workspace: &Path, changed: &mut bool) {
+    fn fix_sections(
+        table: &mut dyn TableLike,
+        manifest_dir: &Path,
+        workspace: &Path,
+        changed: &mut bool,
+    ) {
         for section in SECTIONS {
             if let Some(deps) = table.get_mut(section).and_then(Item::as_table_like_mut) {
                 fix(deps, manifest_dir, workspace, changed);
@@ -313,9 +341,13 @@ fn absolutize_path_dependencies(manifest: &str, manifest_dir: &Path, workspace: 
         fix_sections(ws, manifest_dir, workspace, &mut changed);
     }
     for per_key in ["target", "patch"] {
-        let Some(outer) = doc.get_mut(per_key).and_then(Item::as_table_like_mut) else { continue };
+        let Some(outer) = doc.get_mut(per_key).and_then(Item::as_table_like_mut) else {
+            continue;
+        };
         for (_, inner) in outer.iter_mut() {
-            let Some(inner) = inner.as_table_like_mut() else { continue };
+            let Some(inner) = inner.as_table_like_mut() else {
+                continue;
+            };
             if per_key == "target" {
                 fix_sections(inner, manifest_dir, workspace, &mut changed);
             } else {
@@ -349,16 +381,31 @@ fn run_binary(
     let threads = std::thread::available_parallelism()
         .map_or(2, |n| n.get())
         .max(2);
-    let mut cmd = Command::new(&bin.exe);
-    // With one test thread libtest runs tests on the main thread, and the runtime could
-    // no longer tell which test it is in.
-    cmd.arg(format!("--test-threads={threads}"));
-    if let Some(tests) = tests {
-        cmd.arg("--exact").args(tests);
-    }
-    cmd.current_dir(cwd)
-        .env("CARGO_MANIFEST_DIR", cwd)
-        .env_remove("TMT_TRACE")
+    let mut cmd = match &bin.runner {
+        Runner::Exe(exe) => {
+            let mut cmd = Command::new(exe);
+            // With one test thread libtest runs tests on the main thread, and the runtime
+            // could no longer tell which test it is in.
+            cmd.arg(format!("--test-threads={threads}"));
+            if let Some(tests) = tests {
+                cmd.arg("--exact").args(tests);
+            }
+            cmd.current_dir(cwd).env("CARGO_MANIFEST_DIR", cwd);
+            cmd
+        }
+        Runner::Doc {
+            copy,
+            target_dir,
+            package,
+        } => {
+            let mut cmd = Command::new("cargo");
+            cmd.args(["test", "--doc", "-p", package])
+                .current_dir(copy)
+                .env("CARGO_TARGET_DIR", target_dir);
+            cmd
+        }
+    };
+    cmd.env_remove("TMT_TRACE")
         .env_remove("TMT_MUTANT")
         .env(env.0, env.1)
         .stdin(Stdio::null())
@@ -366,7 +413,7 @@ fn run_binary(
         .stderr(Stdio::null());
     let mut child = cmd
         .spawn()
-        .with_context(|| format!("starting {}", bin.exe.display()))?;
+        .with_context(|| format!("starting the tests of `{}`", bin.name))?;
     let started = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
@@ -484,7 +531,10 @@ impl Session {
             if tests.is_empty() {
                 continue;
             }
-            let filter = test_filter(&tests);
+            let filter = match bin.runner {
+                Runner::Exe(_) => test_filter(&tests),
+                Runner::Doc { .. } => None,
+            };
             let outcome = run_binary(
                 bin,
                 &self.package_dir,
@@ -507,7 +557,10 @@ impl Session {
 }
 
 /// The tests of one binary whose observations satisfy `pick`.
-fn tests_where<T>(per_test: Option<&BTreeMap<String, T>>, pick: impl Fn(&T) -> bool) -> BTreeSet<String> {
+fn tests_where<T>(
+    per_test: Option<&BTreeMap<String, T>>,
+    pick: impl Fn(&T) -> bool,
+) -> BTreeSet<String> {
     per_test
         .into_iter()
         .flatten()
@@ -516,6 +569,9 @@ fn tests_where<T>(per_test: Option<&BTreeMap<String, T>>, pick: impl Fn(&T) -> b
         .collect()
 }
 
+type InfectedTests<'a> = Box<dyn Fn(&TestBinary, Mutation) -> BTreeSet<String> + 'a>;
+type ReachingTests<'a> = Box<dyn Fn(&TestBinary) -> BTreeSet<String> + 'a>;
+
 /// What the planner decided for one site, in the form the session executes.
 struct SitePlan<'a> {
     /// Predicted survivors: the finding to report and the mutations to confirm it with.
@@ -523,26 +579,40 @@ struct SitePlan<'a> {
     /// Mutations some test observes differently.
     run: Vec<Mutation>,
     /// Tests of a binary whose execution the mutation can change.
-    infected: Box<dyn Fn(&TestBinary, Mutation) -> BTreeSet<String> + 'a>,
+    infected: InfectedTests<'a>,
     /// Tests of a binary that execute the site at all.
-    reaching: Box<dyn Fn(&TestBinary) -> BTreeSet<String> + 'a>,
+    reaching: ReachingTests<'a>,
 }
 
 impl Session {
-    fn analyse(&mut self, report: &mut Report, file: &str, site: &Site, verify: bool) -> Result<()> {
+    fn analyse(
+        &mut self,
+        report: &mut Report,
+        file: &str,
+        site: &Site,
+        verify: bool,
+    ) -> Result<()> {
         let at = report::location(file, site);
         let id = site.id;
         let plan = match &site.kind {
             SiteKind::Stmt => {
-                if !self.binaries.iter().any(|b| b.trace.reach.contains_key(&id)) {
+                if !self
+                    .binaries
+                    .iter()
+                    .any(|b| b.trace.reach.contains_key(&id))
+                {
                     report.unreached.push(at);
                     return Ok(());
                 }
                 SitePlan {
                     gaps: vec![],
                     run: vec![Mutation::Delete],
-                    infected: Box::new(move |bin, _| bin.trace.reach.get(&id).cloned().unwrap_or_default()),
-                    reaching: Box::new(move |bin| bin.trace.reach.get(&id).cloned().unwrap_or_default()),
+                    infected: Box::new(move |bin, _| {
+                        bin.trace.reach.get(&id).cloned().unwrap_or_default()
+                    }),
+                    reaching: Box::new(move |bin| {
+                        bin.trace.reach.get(&id).cloned().unwrap_or_default()
+                    }),
                 }
             }
             SiteKind::Cmp { op, literal, .. } => {
@@ -560,7 +630,9 @@ impl Session {
                         return Ok(());
                     }
                     Some(gap) => {
-                        if let Some(finding) = report::input_gap_finding(file, site, gap, &merged, verify) {
+                        if let Some(finding) =
+                            report::input_gap_finding(file, site, gap, &merged, verify)
+                        {
                             gaps.push((finding, gap.survivors()));
                         }
                     }
@@ -572,13 +644,20 @@ impl Session {
                     infected: Box::new(move |bin, m| {
                         tests_where(bin.trace.cmp.get(&id), |obs| plan::infects(op, m, obs))
                     }),
-                    reaching: Box::new(move |bin| tests_where(bin.trace.cmp.get(&id), Obs::reached)),
+                    reaching: Box::new(move |bin| {
+                        tests_where(bin.trace.cmp.get(&id), Obs::reached)
+                    }),
                 }
             }
             SiteKind::Logic { and, .. } => {
                 let and = *and;
                 let mut merged = plan::LogicObs::default();
-                for obs in self.binaries.iter().filter_map(|b| b.trace.logic.get(&id)).flat_map(|t| t.values()) {
+                for obs in self
+                    .binaries
+                    .iter()
+                    .filter_map(|b| b.trace.logic.get(&id))
+                    .flat_map(|t| t.values())
+                {
                     merged.merge(obs);
                 }
                 let logic_plan = plan::plan_logic(and, &merged);
@@ -594,21 +673,33 @@ impl Session {
                             plan::LogicGap::RhsNeverDecides => Mutation::LogicDropRhs,
                             _ => Mutation::LogicDropLhs,
                         };
-                        Some((report::logic_gap_finding(file, site, *gap, verify)?, vec![mutation]))
+                        Some((
+                            report::logic_gap_finding(file, site, *gap, verify)?,
+                            vec![mutation],
+                        ))
                     })
                     .collect();
                 SitePlan {
                     gaps,
                     run: logic_plan.run,
                     infected: Box::new(move |bin, m| {
-                        tests_where(bin.trace.logic.get(&id), |obs| plan::logic_infects(and, m, obs))
+                        tests_where(bin.trace.logic.get(&id), |obs| {
+                            plan::logic_infects(and, m, obs)
+                        })
                     }),
-                    reaching: Box::new(move |bin| tests_where(bin.trace.logic.get(&id), plan::LogicObs::reached)),
+                    reaching: Box::new(move |bin| {
+                        tests_where(bin.trace.logic.get(&id), plan::LogicObs::reached)
+                    }),
                 }
             }
             SiteKind::Arith { .. } => {
                 let mut merged = plan::ArithObs::default();
-                for obs in self.binaries.iter().filter_map(|b| b.trace.arith.get(&id)).flat_map(|t| t.values()) {
+                for obs in self
+                    .binaries
+                    .iter()
+                    .filter_map(|b| b.trace.arith.get(&id))
+                    .flat_map(|t| t.values())
+                {
                     merged.merge(obs);
                 }
                 let (gaps, run) = match plan::plan_arith(&merged) {
@@ -630,8 +721,12 @@ impl Session {
                 SitePlan {
                     gaps,
                     run,
-                    infected: Box::new(move |bin, _| tests_where(bin.trace.arith.get(&id), |obs| obs.differs)),
-                    reaching: Box::new(move |bin| tests_where(bin.trace.arith.get(&id), |obs| obs.same || obs.differs)),
+                    infected: Box::new(move |bin, _| {
+                        tests_where(bin.trace.arith.get(&id), |obs| obs.differs)
+                    }),
+                    reaching: Box::new(move |bin| {
+                        tests_where(bin.trace.arith.get(&id), |obs| obs.same || obs.differs)
+                    }),
                 }
             }
         };
@@ -740,12 +835,20 @@ pub fn run(options: &Options) -> Result<Report> {
                 && path.file_name().is_some_and(|n| n == "target"))
     })?;
     // Relative path dependencies that leave the workspace would point nowhere from the copy.
-    let mut manifests: Vec<&Path> = metadata.packages.iter().map(|p| p.manifest_path.as_path()).collect();
+    let mut manifests: Vec<&Path> = metadata
+        .packages
+        .iter()
+        .map(|p| p.manifest_path.as_path())
+        .collect();
     let root_manifest = metadata.workspace_root.join("Cargo.toml");
     manifests.push(&root_manifest);
     for manifest in manifests {
-        let Ok(canonical) = manifest.canonicalize() else { continue };
-        let (Some(manifest_dir), Ok(relative)) = (canonical.parent(), canonical.strip_prefix(&workspace)) else {
+        let Ok(canonical) = manifest.canonicalize() else {
+            continue;
+        };
+        let (Some(manifest_dir), Ok(relative)) =
+            (canonical.parent(), canonical.strip_prefix(&workspace))
+        else {
             continue;
         };
         let text = fs::read_to_string(&canonical)?;
@@ -923,12 +1026,25 @@ pub fn run(options: &Options) -> Result<Report> {
         mutants_killed: 0,
         mutants_timed_out: 0,
     };
-    for (index, (name, exe)) in build.test_binaries.into_iter().enumerate() {
+    let mut runners: Vec<(String, Runner)> = build
+        .test_binaries
+        .into_iter()
+        .map(|(name, exe)| (name, Runner::Exe(exe)))
+        .collect();
+    if options.doc && is_kind(root_target, &["lib", "rlib", "proc-macro"]) {
+        let doc = Runner::Doc {
+            copy: copy.clone(),
+            target_dir: build_target.clone(),
+            package: package.name.clone(),
+        };
+        runners.push(("doc tests".to_string(), doc));
+    }
+    for (index, (name, runner)) in runners.into_iter().enumerate() {
         let trace_path = work.join(format!("trace-{index}.tsv"));
         let _ = fs::remove_file(&trace_path);
         let mut bin = TestBinary {
             name,
-            exe,
+            runner,
             baseline: Duration::ZERO,
             trace: Trace::default(),
         };
@@ -1142,22 +1258,40 @@ unix-only = { path = "../../unix" }
 [patch.crates-io]
 serde = { path = "../../serde-fork" }
 "#;
-        let out = absolutize_path_dependencies(manifest, Path::new("/w/ws/app"), Path::new("/w/ws"))
-            .unwrap()
-            .expect("something to rewrite");
-        assert!(out.contains(r#"core = { path = "../core" }          # inside the workspace: kept"#), "{out}");
-        assert!(out.contains(r#"outside = { path = "/w/outside", version = "1" }"#), "{out}");
+        let out =
+            absolutize_path_dependencies(manifest, Path::new("/w/ws/app"), Path::new("/w/ws"))
+                .unwrap()
+                .expect("something to rewrite");
+        assert!(
+            out.contains(r#"core = { path = "../core" }          # inside the workspace: kept"#),
+            "{out}"
+        );
+        assert!(
+            out.contains(r#"outside = { path = "/w/outside", version = "1" }"#),
+            "{out}"
+        );
         assert!(out.contains("path = \"/far/helper\""), "{out}");
         assert!(out.contains(r#"unix-only = { path = "/w/unix" }"#), "{out}");
-        assert!(out.contains(r#"serde = { path = "/w/serde-fork" }"#), "{out}");
+        assert!(
+            out.contains(r#"serde = { path = "/w/serde-fork" }"#),
+            "{out}"
+        );
         assert!(out.contains("serde = \"1\""), "{out}");
 
         let inside = "[dependencies]\ncore = { path = \"../core\" }\n[workspace.dependencies]\nx = { path = \"x\" }\n";
-        assert_eq!(absolutize_path_dependencies(inside, Path::new("/w/ws/app"), Path::new("/w/ws")).unwrap(), None);
+        assert_eq!(
+            absolutize_path_dependencies(inside, Path::new("/w/ws/app"), Path::new("/w/ws"))
+                .unwrap(),
+            None
+        );
         let ws = "[workspace.dependencies]\nshared = { path = \"../shared\" }\n";
-        let out = absolutize_path_dependencies(ws, Path::new("/w/ws"), Path::new("/w/ws")).unwrap().unwrap();
+        let out = absolutize_path_dependencies(ws, Path::new("/w/ws"), Path::new("/w/ws"))
+            .unwrap()
+            .unwrap();
         assert!(out.contains(r#"shared = { path = "/w/shared" }"#), "{out}");
-        assert!(absolutize_path_dependencies("not [ toml", Path::new("/w"), Path::new("/w")).is_err());
+        assert!(
+            absolutize_path_dependencies("not [ toml", Path::new("/w"), Path::new("/w")).is_err()
+        );
         assert_eq!(normalize(Path::new("/a/./b/../c")), PathBuf::from("/a/c"));
     }
 
