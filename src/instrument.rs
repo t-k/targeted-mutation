@@ -284,7 +284,8 @@ impl Finder<'_> {
             return;
         };
         let option = match &**ty {
-            syn::Type::Path(p) if p.qself.is_none() && p.path.is_ident("bool") => None,
+            // `<T>::bool` and `<T as Tr>::bool` are not a single identifier either.
+            syn::Type::Path(p) if p.path.is_ident("bool") => None,
             syn::Type::Path(p)
                 if p.qself.is_none()
                     && p.path.segments.last().is_some_and(|s| {
@@ -292,11 +293,12 @@ impl Finder<'_> {
                             && matches!(s.arguments, syn::PathArguments::AngleBracketed(_))
                     }) =>
             {
-                match self.range(ty.span()) {
+                match self
+                    .range(ty.span())
+                    .map(|(from, to)| &self.source[from..to])
+                {
                     // `impl Trait` cannot be written in a `let`.
-                    Some((from, to)) if !self.source[from..to].contains("impl ") => {
-                        Some(self.source[from..to].to_string())
-                    }
+                    Some(written) if !written.contains("impl ") => Some(written.to_string()),
                     _ => return,
                 }
             }
@@ -313,7 +315,7 @@ impl Finder<'_> {
         ) else {
             return;
         };
-        if start > end {
+        if !in_order(start, end) {
             return;
         }
         let at = sig.span().start();
@@ -338,11 +340,9 @@ impl Finder<'_> {
     fn range(&self, span: Span) -> Option<(usize, usize)> {
         let range = span.byte_range();
         // Spans produced by macro hygiene tricks or empty token streams carry no location.
-        (range.start < range.end
-            && range.end <= self.source.len()
-            && self.source.is_char_boundary(range.start)
-            && self.source.is_char_boundary(range.end))
-        .then_some((range.start, range.end))
+        // tmt:ignore defensive: every span of a file parsed from `source` lies inside it
+        let located = !range.is_empty() && self.source.get(range.clone()).is_some();
+        located.then_some((range.start, range.end))
     }
 
     fn push(&mut self, kind: SiteKind, start: usize, end: usize, span: Span) {
@@ -437,6 +437,13 @@ fn is_literal(expr: &syn::Expr) -> bool {
     }
 }
 
+/// The spans of the parts of one parsed expression come in source order. The edits are
+/// built on that, so it is checked rather than assumed; no source makes it false.
+// tmt:ignore defensive: never false, so no test can make it return false
+fn in_order(earlier: usize, later: usize) -> bool {
+    earlier <= later // tmt:ignore defensive: as above
+}
+
 /// `if let P = e && cond` is a let chain, not a boolean expression: it cannot be wrapped.
 fn in_let_chain(expr: &syn::Expr) -> bool {
     match expr {
@@ -515,7 +522,8 @@ fn deletable(expr: &syn::Expr) -> bool {
         syn::Expr::Call(e) => e.attrs.is_empty(),
         syn::Expr::MethodCall(e) => e.attrs.is_empty(),
         syn::Expr::Assign(e) => e.attrs.is_empty(),
-        syn::Expr::Binary(e) => e.attrs.is_empty() && is_assign_op(&e.op),
+        // An attribute in front of `a += 1` belongs to `a`, never to the operation.
+        syn::Expr::Binary(e) => is_assign_op(&e.op),
         syn::Expr::Try(e) => e.attrs.is_empty() && deletable_call(&e.expr),
         syn::Expr::Await(e) => e.attrs.is_empty() && deletable_call(&e.base),
         _ => false,
@@ -593,11 +601,9 @@ impl<'ast> Visit<'ast> for Finder<'_> {
         // as a plain argument list: skipped.
         if let Ok(args) = node.parse_body_with(Args::parse_terminated) {
             for arg in &args {
-                match arg {
-                    // `name = value` in a format string is not an assignment.
-                    syn::Expr::Assign(assign) => self.visit_expr(&assign.right),
-                    other => self.visit_expr(other),
-                }
+                // `name = value` in a format string parses as an assignment; nothing
+                // treats it as one here, and only its value holds sites.
+                self.visit_expr(arg);
             }
         }
     }
@@ -670,7 +676,7 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                 && deletable(expr)
                 && let (Some((start, _)), Some((_, end))) =
                     (self.range(expr.span()), self.range(semi.span()))
-                && start < end
+                && in_order(start, end)
             {
                 self.push(SiteKind::Stmt, start, end, expr.span());
             }
@@ -693,8 +699,8 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                 self.range(node.args[0].span()),
                 self.range(node.paren_token.span.close()),
             )
-            && receiver_end <= argument_start
-            && argument_end < end
+            && in_order(receiver_end, argument_start)
+            && in_order(argument_end, end)
         {
             let kind = SiteKind::MinMax {
                 max: name == "max",
@@ -716,7 +722,7 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             && !(is_literal(from) && is_literal(to))
             && let (Some((start, lhs_end)), Some((rhs_start, end))) =
                 (self.range(from.span()), self.range(to.span()))
-            && lhs_end <= rhs_start
+            && in_order(lhs_end, rhs_start)
         {
             let kind = SiteKind::Range {
                 inclusive: matches!(node.limits, syn::RangeLimits::Closed(_)),
@@ -800,7 +806,7 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             && node.attrs.is_empty()
             && let (Some((start, _)), Some((operand_start, end))) =
                 (self.range(bang.span()), self.range(node.expr.span()))
-            && start < operand_start
+            && in_order(start, operand_start)
         {
             let kind = SiteKind::Not {
                 bang: (start, operand_start),
@@ -816,7 +822,7 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             && node.attrs.is_empty()
             && let (Some((start, lhs_end)), Some((rhs_start, end))) =
                 (self.range(node.left.span()), self.range(node.right.span()))
-            && lhs_end <= rhs_start
+            && in_order(lhs_end, rhs_start)
         {
             let literal = match (int_literal(&node.left), int_literal(&node.right)) {
                 (None, Some(k)) => LiteralSide::Rhs(k),
@@ -834,7 +840,7 @@ impl<'ast> Visit<'ast> for Finder<'_> {
         } else if node.attrs.is_empty()
             && let (Some((start, lhs_end)), Some((rhs_start, end))) =
                 (self.range(node.left.span()), self.range(node.right.span()))
-            && lhs_end <= rhs_start
+            && in_order(lhs_end, rhs_start)
         {
             let lhs = self.source[start..lhs_end].to_string();
             let rhs = self.source[rhs_start..end].to_string();
@@ -1117,7 +1123,9 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
     let mut segments = vec![];
     let mut cursor = 0;
     for edit in edits {
-        if edit.pos > cursor {
+        // Also when nothing lies between two edits: text inserted right after a replaced
+        // stretch then maps to where it was inserted, not to where the stretch began.
+        if edit.pos >= cursor {
             segments.push((text.len(), cursor, edit.pos - cursor));
             text.push_str(&source[cursor..edit.pos]);
         }
@@ -1934,5 +1942,203 @@ mod tests {
     #[test]
     fn unparseable_source_is_an_error() {
         assert!(discover("fn f( {", 0).is_err());
+    }
+    /// Every site as `kind text`, in discovery order.
+    fn labelled(src: &str) -> Vec<String> {
+        discover(src, 0)
+            .unwrap()
+            .sites
+            .iter()
+            .map(|s| {
+                let kind = match &s.kind {
+                    SiteKind::Cmp { .. } => "cmp",
+                    SiteKind::Logic { .. } => "logic",
+                    SiteKind::Arith { .. } => "arith",
+                    SiteKind::Not { .. } => "not",
+                    SiteKind::Return { .. } => "return",
+                    SiteKind::MinMax { .. } => "minmax",
+                    SiteKind::Range { .. } => "range",
+                    SiteKind::Arm { .. } => "arm",
+                    SiteKind::Stmt => "stmt",
+                };
+                format!("{kind} {}", s.text)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn byte_order_mark_and_interpreter_line_are_refused() {
+        let body = "fn f(a: u8) -> bool { a > 1 }";
+        assert!(discover(&format!("\u{feff}{body}"), 0).is_err());
+        assert!(discover(&format!("#!/usr/bin/env run\n{body}"), 0).is_err());
+        // An inner attribute starts with the same two characters and is fine.
+        assert_eq!(
+            labelled(&format!("#![allow(dead_code)]\n{body}")),
+            ["return fn f(a: u8) -> bool", "cmp a > 1"]
+        );
+    }
+
+    #[test]
+    fn which_result_types_make_a_return_site() {
+        let src = "fn a() -> <S as Tr>::Option<u8> { g() }\n\
+                   fn b() -> Option { g() }\n\
+                   fn c() -> Vec<u8> { g() }\n\
+                   fn d() -> std::option::Option<u8> { g() }\n\
+                   fn e() -> <S>::bool { g() }\n\
+                   fn e2() -> <S as Tr>::bool { g() }\n\
+                   fn one(a: u8) -> bool { a > 1 }\n\
+                   fn two(a: u8) -> bool { let b = a; b > 1 }\n\
+                   fn early(a: u8) -> bool { return a > 1; }\n";
+        let returns: Vec<(String, Option<String>, Option<&str>)> = discover(src, 0)
+            .unwrap()
+            .sites
+            .into_iter()
+            .filter_map(|s| match s.kind {
+                SiteKind::Return {
+                    name,
+                    option,
+                    sole_expr,
+                } => Some((name, option, sole_expr.map(|(from, to)| &src[from..to]))),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            returns,
+            [
+                (
+                    "d".to_string(),
+                    Some("std::option::Option<u8>".to_string()),
+                    Some("g()")
+                ),
+                // Only a body that is one expression has a "sole expression".
+                ("one".to_string(), None, Some("a > 1")),
+                ("two".to_string(), None, None),
+                ("early".to_string(), None, None),
+            ]
+        );
+    }
+
+    #[test]
+    fn places_chains_attributes_and_shadowed_macros() {
+        // A parenthesised variable is still a plain place. An attribute on a statement
+        // belongs to its leftmost operand, which is then not probed; the statement can
+        // still be deleted.
+        assert_eq!(
+            labelled("fn f(mut x: i32) -> i32 { #[allow(unused)] x += 1; (x) += 2; x }"),
+            [
+                "stmt #[allow(unused)] x += 1;",
+                "stmt (x) += 2;",
+                "arith (x) += 2"
+            ]
+        );
+        // `cond && let ..` is a let chain as much as `let .. && cond`.
+        assert_eq!(
+            labelled("fn f(a: u8, o: Option<u8>) { if a > 1 && let Some(b) = o { g(b); } }"),
+            ["cmp a > 1", "stmt g(b);"]
+        );
+        // A macro of this file under a standard name takes anything as its arguments.
+        assert_eq!(
+            labelled(
+                "macro_rules! vec { ($($t:tt)*) => {} }\n\
+                 fn f(a: u8) { let _ = vec![a > 1]; let _ = format!(\"{}\", a > 2); }"
+            ),
+            ["cmp a > 2"]
+        );
+        assert_eq!(
+            labelled(
+                "trait T { const fn f(a: u8) -> bool { a > 1 } fn g(a: u8) -> bool { a > 2 } }"
+            ),
+            ["return fn g(a: u8) -> bool", "cmp a > 2"]
+        );
+    }
+
+    #[test]
+    fn min_max_and_ranges_that_are_left_alone() {
+        assert_eq!(
+            labelled(
+                "fn f(a: u8, b: u8) -> u8 { let _ = a.max::<u8>(b); \
+                 let _ = #[allow(unused)] a.min(b); let _ = a.max(b, 1); a.max(b) }"
+            ),
+            ["minmax a.max(b)"]
+        );
+        // One literal end is enough to fix the type; the ends are searched for sites.
+        let src = "fn f(a: usize, b: usize, v: &[u8]) { let _ = &v[a..10]; let _ = &v[1..b]; \
+                   let _ = (a + 1)..(b * 2); let _ = 3..4; }";
+        assert_eq!(
+            labelled(src),
+            [
+                "range a..10",
+                "range 1..b",
+                "range (a + 1)..(b * 2)",
+                "arith a + 1",
+                "arith b * 2"
+            ]
+        );
+        let out = render(src, &discover(src, 0).unwrap().sites, &all).text;
+        // The `..` itself is gone: the ends are the two arguments of the probe.
+        assert!(out.contains("&v[(match (a, 10) {"), "{out}");
+        assert!(!out.contains("a..10") && !out.contains("1..b"), "{out}");
+        assert!(out.contains("3..4"), "{out}");
+    }
+
+    #[test]
+    fn which_arms_can_be_removed() {
+        let src = "fn f(k: u8) -> u8 {\n\
+                   \x20   let a = match k { 1 => 1, x => x, 2 => 2, #[cfg(any())] 3 => 3, _rest => 0 };\n\
+                   \x20   let b = match k { 1 => 1, NONE => 0 };\n\
+                   \x20   let c = match k { 1 => 1, n @ 0..=9 => n };\n\
+                   \x20   let d = match k {\n\
+                   \x20       1 => 1,\n\
+                   \x20       _ => 0,\n\
+                   \x20   };\n\
+                   \x20   a + b + c + d\n\
+                   }\n";
+        let arms: Vec<(u32, usize, usize, String)> = discover(src, 7)
+            .unwrap()
+            .sites
+            .into_iter()
+            .filter(|s| matches!(s.kind, SiteKind::Arm { .. }))
+            .map(|s| (s.id, s.line, s.column, s.text))
+            .collect();
+        // Neither a catch-all arm in the middle nor an arm with an attribute; and no arm
+        // at all when the last one is a constant or binds only part of the values.
+        assert_eq!(
+            arms,
+            [
+                (7, 2, 23, "1 => ..".to_string()),
+                (8, 2, 39, "2 => ..".to_string()),
+                (9, 6, 9, "1 => ..".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn offsets_around_inserted_text() {
+        let src = "fn f(a: u8) -> bool { a > 1 }";
+        let sites = found(src, 0).unwrap().sites;
+        let out = render(src, &sites, &all);
+        let start = sites[0].start;
+        // `a` is copied right after the opening text of the probe: the last inserted
+        // character before it still maps to the point of insertion.
+        let copied_a = out.text.find("a), &(").unwrap();
+        assert_eq!(out.to_original(copied_a), start);
+        assert_eq!(out.to_original(copied_a - 1), start);
+        assert_eq!(out.to_original(copied_a + 1), start + 1);
+        // Past the end is the end.
+        assert_eq!(out.to_original(out.text.len() + 10), src.len());
+
+        // The probe of `b + 1` opens right after the replaced `..`: an error there is
+        // inside `b + 1`, not in front of the `..`.
+        let src = "fn f(a: usize, b: usize) { let _ = a..b + 1; }";
+        let sites = discover(src, 0).unwrap().sites;
+        let out = render(src, &sites, &all);
+        let inner_probe = out.text.find("(match (a, ").unwrap() + "(match (a, ".len();
+        assert!(
+            out.text[inner_probe..].starts_with("(match (b, 1)"),
+            "{}",
+            out.text
+        );
+        assert_eq!(out.to_original(inner_probe), src.find("b + 1").unwrap());
+        assert_eq!(blame(&sites, &all, out.to_original(inner_probe)), [1]);
     }
 }
