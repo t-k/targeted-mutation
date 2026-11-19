@@ -594,8 +594,18 @@ pub trait ArithNum: Copy {
     fn tmt_safe(op: u8, a: Self, b: Self) -> Option<u64>;
 
     /// Whether the swapped operator gives the same result on these operands.
+    ///
+    /// An overflow or a division by zero on either side counts as different: what such
+    /// an operation does (panic or wrap, and with which message) is not modelled here, so
+    /// only running the tests can tell.
     fn tmt_same(op: u8, a: Self, b: Self) -> bool {
-        Self::tmt_safe(op, a, b) == Self::tmt_safe(arith_swapped(op), a, b)
+        match (
+            Self::tmt_safe(op, a, b),
+            Self::tmt_safe(arith_swapped(op), a, b),
+        ) {
+            (Some(x), Some(y)) => x == y,
+            _ => false,
+        }
     }
 
     fn tmt_run(site: u32, op: u8, a: Self, b: Self) -> Self {

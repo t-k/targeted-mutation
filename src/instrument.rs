@@ -61,7 +61,12 @@ pub enum SiteKind {
     },
     /// The body of a function that returns `bool`. The site's range is the inside of the
     /// body's braces and its text is the function signature.
-    Return { name: String },
+    Return {
+        name: String,
+        /// Byte range of the body when it is a single expression: the function's result
+        /// is then exactly that expression's value.
+        sole_expr: Option<(usize, usize)>,
+    },
     /// A call or assignment statement that can be deleted.
     Stmt,
 }
@@ -204,17 +209,35 @@ pub struct Discovery {
 
 /// Finds the sites in one source file, numbering them from `first_id`.
 pub fn discover(source: &str, first_id: u32) -> Result<Discovery> {
+    // The parser drops a byte order mark and a `#!` line before it numbers bytes, so its
+    // offsets would not be offsets into `source`.
+    if source.starts_with('\u{feff}') || (source.starts_with("#!") && !source.starts_with("#![")) {
+        anyhow::bail!("starts with a byte order mark or a `#!` line");
+    }
     let file = syn::parse_file(source).context("not parseable as a Rust source file")?;
+    // A macro defined here under the name of a standard one (`macro_rules! vec`) can do
+    // anything with its arguments.
+    let local_macros = file
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            syn::Item::Macro(m) => m.ident.as_ref().map(|i| i.to_string()),
+            _ => None,
+        })
+        .collect();
     let mut finder = Finder {
         source,
         next_id: first_id,
         found: Discovery::default(),
+        local_macros,
     };
     finder.visit_file(&file);
     Ok(finder.found)
 }
 
 struct Finder<'s> {
+    /// Names of the macros this file defines at its top level.
+    local_macros: Vec<String>,
     source: &'s str,
     next_id: u32,
     found: Discovery,
@@ -242,6 +265,10 @@ impl Finder<'_> {
             id: self.next_id,
             kind: SiteKind::Return {
                 name: sig.ident.to_string(),
+                sole_expr: match &body.stmts[..] {
+                    [syn::Stmt::Expr(expr, None)] => self.range(expr.span()),
+                    _ => None,
+                },
             },
             line: at.line,
             column: at.column + 1,
@@ -498,7 +525,7 @@ impl<'ast> Visit<'ast> for Finder<'_> {
         let Some(name) = node.path.segments.last().map(|s| s.ident.to_string()) else {
             return;
         };
-        if !EXPR_MACROS.contains(&name.as_str()) {
+        if !EXPR_MACROS.contains(&name.as_str()) || self.local_macros.contains(&name) {
             return;
         }
         if name == "matches" {
@@ -742,6 +769,10 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     ),
                 )
             }
+            // In the probes below the user's operands are evaluated where no name the probe
+            // introduces is in scope: in the scrutinee of a `match`, in the initialiser of a
+            // `let`, or in an arm that binds nothing. A scrutinee keeps its temporaries
+            // until the end of the enclosing statement, as an arithmetic operator does.
             SiteKind::Logic { and, gap, .. } => {
                 // The right operand stays in place, so it is evaluated exactly when the
                 // (possibly mutated) left operand asks for it.
@@ -751,11 +782,13 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     end: gap.1,
                     phase: 1,
                     order: 0,
-                    text: format!("); if __tmt_c == 2u8 {{ {rt}::rhs({id}u32, {and}, "),
+                    text: format!("); __tmt_c }} {{ 2u8 => {rt}::rhs({id}u32, {and}, "),
                 });
                 (
-                    format!("({{ let __tmt_c = {rt}::lhs({id}u32, {and}, "),
-                    ") } else { __tmt_c == 1u8 } })".to_string(),
+                    // Each operand of `&&` / `||` drops its temporaries when it is done.
+                    // The `let` ends the left operand's; the arm ends the right one's.
+                    format!("(match {{ let __tmt_c: u8 = {rt}::lhs({id}u32, {and}, "),
+                    "), __tmt_c => __tmt_c == 1u8 })".to_string(),
                 )
             }
             SiteKind::Arith {
@@ -775,12 +808,15 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     text: format!("{lhs_close}, "),
                 });
                 (
+                    format!("(match ({lhs_open}"),
                     format!(
-                        "({{ #[allow(unused_imports)] use {rt}::{{{any} as _, {prim} as _}}; (&{rt}::{holder}::new({lhs_open}",
+                        ") {{ (__tmt_a, __tmt_b) => {{ #[allow(unused_imports)] use {rt}::{{{any} as _, {prim} as _}}; \
+                         (&{rt}::{holder}::new(__tmt_a, __tmt_b)).{method}({id}u32) }} }})",
                         any = op.fallback_trait(*assign),
                         prim = op.prim_trait(*assign),
+                        method = op.method(*assign),
+                        id = site.id,
                     ),
-                    format!(")).{}({}u32) }})", op.method(*assign), site.id),
                 )
             }
             SiteKind::Not { bang, .. } => {
@@ -793,10 +829,12 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     text: String::new(),
                 });
                 (
+                    "(match (".to_string(),
                     format!(
-                        "({{ #[allow(unused_imports)] use {rt}::{{AnyNot as _, NotPrim as _}}; (&{rt}::Un::new("
+                        ") {{ __tmt_a => {{ #[allow(unused_imports)] use {rt}::{{AnyNot as _, NotPrim as _}}; \
+                         (&{rt}::Un::new(__tmt_a)).tmt_not({}u32) }} }})",
+                        site.id
                     ),
-                    format!(")).tmt_not({}u32) }})", site.id),
                 )
             }
             SiteKind::Return { .. } => (
@@ -1179,8 +1217,14 @@ mod tests {
         );
         let out = render(src, &found, &all).text;
         syn::parse_file(&out).expect("instrumented source parses");
-        assert!(out.contains("({ let __tmt_c = crate::__tmt_rt::lhs(1u32, true, a); if __tmt_c == 2u8 { crate::__tmt_rt::rhs(1u32, true, b) } else { __tmt_c == 1u8 } })"), "{out}");
-        assert!(out.contains("use crate::__tmt_rt::{AnyMul as _, ArithPrim as _}; (&crate::__tmt_rt::Ar::new(y, 2)).tmt_mul(4u32) })"), "{out}");
+        assert!(
+            out.contains("(match { let __tmt_c: u8 = crate::__tmt_rt::lhs(1u32, true, a); __tmt_c } { 2u8 => crate::__tmt_rt::rhs(1u32, true, b), __tmt_c => __tmt_c == 1u8 })"),
+            "{out}"
+        );
+        assert!(
+            out.contains("(match (y, 2) { (__tmt_a, __tmt_b) => { #[allow(unused_imports)] use crate::__tmt_rt::{AnyMul as _, ArithPrim as _}; (&crate::__tmt_rt::Ar::new(__tmt_a, __tmt_b)).tmt_mul(4u32) } })"),
+            "{out}"
+        );
         // Every probe the renderer can emit exists in the runtime under that name.
         for op in ArithOp::ALL {
             assert_ne!(op.swapped(), op);
@@ -1315,16 +1359,38 @@ mod tests {
         );
         let out = render(src, &sites, &all).text;
         syn::parse_file(&out).expect("instrumented source parses");
-        assert!(out.contains("use crate::__tmt_rt::{AnyAddAssign as _, ArithAssignPrim as _}; (&crate::__tmt_rt::Aa::new(&mut (*total), n)).tmt_add_assign(2u32) })"), "{out}");
-        assert!(out.contains("use crate::__tmt_rt::{AnyShlAssign as _, BitAssignPrim as _}; (&crate::__tmt_rt::Aa::new(&mut (*total), 1)).tmt_shl_assign(3u32) })"), "{out}");
-        assert!(out.contains("if ({ #[allow(unused_imports)] use crate::__tmt_rt::{AnyNot as _, NotPrim as _}; (&crate::__tmt_rt::Un::new(ok)).tmt_not(4u32) }) {"), "{out}");
-        assert!(out.contains("use crate::__tmt_rt::{AnyBitAnd as _, BitPrim as _}; (&crate::__tmt_rt::Ar::new(n, 7)).tmt_bitand(7u32) })"), "{out}");
+        for expected in [
+            "(match (&mut (*total), n) { (__tmt_a, __tmt_b) => { #[allow(unused_imports)] use crate::__tmt_rt::{AnyAddAssign as _, ArithAssignPrim as _}; (&crate::__tmt_rt::Aa::new(__tmt_a, __tmt_b)).tmt_add_assign(2u32) } });",
+            "use crate::__tmt_rt::{AnyShlAssign as _, BitAssignPrim as _}; (&crate::__tmt_rt::Aa::new(__tmt_a, __tmt_b)).tmt_shl_assign(3u32) } });",
+            "if (match (ok) { __tmt_a => { #[allow(unused_imports)] use crate::__tmt_rt::{AnyNot as _, NotPrim as _}; (&crate::__tmt_rt::Un::new(__tmt_a)).tmt_not(4u32) } }) {",
+            "(match (n, 7) { (__tmt_a, __tmt_b) => { #[allow(unused_imports)] use crate::__tmt_rt::{AnyBitAnd as _, BitPrim as _}; (&crate::__tmt_rt::Ar::new(__tmt_a, __tmt_b)).tmt_bitand(7u32) } })",
+        ] {
+            assert!(out.contains(expected), "missing {expected}\nin {out}");
+        }
         // `!a && b`: the negation and the conjunction start at the same character.
         let nested = "fn f(a: bool, b: bool) -> bool { !a && b }";
         let sites = found(nested, 0).unwrap().sites;
         let out = render(nested, &sites, &all).text;
         syn::parse_file(&out).expect("instrumented source parses");
-        assert!(out.contains("lhs(0u32, true, ({ #[allow(unused_imports)] use crate::__tmt_rt::{AnyNot as _, NotPrim as _}; (&crate::__tmt_rt::Un::new(a)).tmt_not(1u32) }));"), "{out}");
+        assert!(
+            out.contains("(match { let __tmt_c: u8 = crate::__tmt_rt::lhs(0u32, true, (match (a) { __tmt_a => {"),
+            "{out}"
+        );
+        // Names the probes introduce are never in scope where user code runs.
+        let capture = "fn f(a: bool, __tmt_c: u8, __tmt_a: u8) -> bool { a && __tmt_c == 2 && __tmt_a + 1 > 0 }";
+        let sites = found(capture, 0).unwrap().sites;
+        let out = render(capture, &sites, &all).text;
+        syn::parse_file(&out).expect("instrumented source parses");
+        // The arms that bind a probe variable contain only probe code.
+        for arm in out.split("__tmt_c => ").skip(1) {
+            assert!(arm.starts_with("__tmt_c == 1u8 })"), "{arm}");
+        }
+        for arm in out.split("(__tmt_a, __tmt_b) => ").skip(1) {
+            assert!(
+                arm.starts_with("{ #[allow(unused_imports)] use crate::__tmt_rt::"),
+                "{arm}"
+            );
+        }
     }
 
     #[test]
@@ -1389,7 +1455,7 @@ mod tests {
         let returns: Vec<(&str, &str, usize)> = sites
             .iter()
             .filter_map(|s| match &s.kind {
-                SiteKind::Return { name } => Some((name.as_str(), s.text.as_str(), s.line)),
+                SiteKind::Return { name, .. } => Some((name.as_str(), s.text.as_str(), s.line)),
                 _ => None,
             })
             .collect();

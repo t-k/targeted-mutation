@@ -231,6 +231,34 @@ enum Outcome {
     Timeout,
 }
 
+/// Keeps two runs from rebuilding the same working copy under each other.
+struct WorkLock(PathBuf);
+
+impl WorkLock {
+    fn take(work: &Path) -> Result<WorkLock> {
+        let path = work.join(".tmt-lock");
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => Ok(WorkLock(path)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => bail!(
+                "another tmt run is using {}. If none is running, delete {}.",
+                work.display(),
+                path.display()
+            ),
+            Err(err) => Err(err).with_context(|| format!("creating {}", path.display())),
+        }
+    }
+}
+
+impl Drop for WorkLock {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
+
 /// Copies one file, directory or symbolic link into the working copy.
 ///
 /// The copy never contains a symbolic link: instrumented sources are written into it, and
@@ -328,7 +356,7 @@ fn rust_files(dir: &Path, skip: &dyn Fn(&Path) -> bool, out: &mut Vec<PathBuf>) 
 /// The files under `dir` that git tracks or would track (not ignored), relative to `dir`.
 /// `None` when `dir` is not in a git work tree, or is itself ignored: then git has nothing
 /// to say about which files matter.
-fn git_visible_files(dir: &Path) -> Option<Vec<PathBuf>> {
+fn git_visible_files(dir: &Path) -> Result<Option<Vec<PathBuf>>> {
     let git = |args: &[&str]| {
         Command::new("git")
             .arg("-C")
@@ -336,18 +364,20 @@ fn git_visible_files(dir: &Path) -> Option<Vec<PathBuf>> {
             .args(args)
             .stderr(Stdio::null())
             .output()
-            .ok()
     };
-    if !git(&["rev-parse", "--is-inside-work-tree"])?
-        .status
-        .success()
-    {
-        return None;
+    // No git, not a work tree, or a directory git ignores: nothing to go by.
+    let Ok(inside) = git(&["rev-parse", "--is-inside-work-tree"]) else {
+        return Ok(None);
+    };
+    if !inside.status.success() {
+        return Ok(None);
     }
     // Exit status 0 means "ignored".
     if git(&["check-ignore", "-q", "."])?.status.success() {
-        return None;
+        return Ok(None);
     }
+    // From here on a failure must not turn into "copy everything": that would copy the
+    // very files the ignore rules keep out.
     let listing = git(&[
         "ls-files",
         "--cached",
@@ -356,16 +386,58 @@ fn git_visible_files(dir: &Path) -> Option<Vec<PathBuf>> {
         "-z",
     ])?;
     if !listing.status.success() {
-        return None;
+        bail!(
+            "git could not list the files of {}; pass --all-files to copy everything",
+            dir.display()
+        );
     }
-    let files: Vec<PathBuf> = listing
-        .stdout
-        .split(|b| *b == 0)
-        .filter(|name| !name.is_empty())
-        .filter_map(|name| std::str::from_utf8(name).ok())
-        .map(PathBuf::from)
-        .collect();
-    (!files.is_empty()).then_some(files)
+    Ok(Some(
+        listing
+            .stdout
+            .split(|b| *b == 0)
+            .filter(|name| !name.is_empty())
+            .filter_map(|name| std::str::from_utf8(name).ok())
+            .map(PathBuf::from)
+            .collect(),
+    ))
+}
+
+/// Copies the files of `from` that git does not ignore. A submodule is listed by its
+/// parent as one directory and has ignore rules of its own, so it is copied the same way.
+fn copy_git_visible(
+    from: &Path,
+    to: &Path,
+    files: Vec<PathBuf>,
+    workspace: &Path,
+    skip: &dyn Fn(&Path) -> bool,
+) -> Result<usize> {
+    let mut copied = 0;
+    for relative in files {
+        let (src, dst) = (from.join(&relative), to.join(&relative));
+        if skip(&src)
+            || src
+                .ancestors()
+                .any(|a| a != from && a.starts_with(from) && skip(a))
+        {
+            continue;
+        }
+        let Ok(kind) = fs::symlink_metadata(&src).map(|m| m.file_type()) else {
+            continue; // deleted in the working tree
+        };
+        if let Some(parent) = dst.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        if kind.is_dir() {
+            match git_visible_files(&src)? {
+                Some(inner) => copied += copy_git_visible(&src, &dst, inner, workspace, skip)?,
+                None => copy_tree(&src, &dst, workspace, skip)?,
+            }
+        } else {
+            copy_entry(&src, &dst, workspace, skip)?;
+            copied += 1;
+        }
+    }
+    Ok(copied)
 }
 
 /// Where the out-of-line module `module` declared in `file` lives.
@@ -405,10 +477,12 @@ fn absolutize_path_dependencies(
     manifest: &str,
     manifest_dir: &Path,
     workspace: &Path,
+    copy: &Path,
 ) -> Result<Option<String>> {
     use toml_edit::{DocumentMut, Item, TableLike, value};
 
-    fn fix(deps: &mut dyn TableLike, manifest_dir: &Path, workspace: &Path, changed: &mut bool) {
+    fn fix(deps: &mut dyn TableLike, dirs: (&Path, &Path, &Path), changed: &mut bool) {
+        let (manifest_dir, workspace, copy) = dirs;
         for (_, dep) in deps.iter_mut() {
             let Some(dep) = dep.as_table_like_mut() else {
                 continue;
@@ -416,32 +490,35 @@ fn absolutize_path_dependencies(
             let Some(path) = dep.get("path").and_then(Item::as_str) else {
                 continue;
             };
+            let absolute = Path::new(path).is_absolute();
             let target = normalize(&manifest_dir.join(path));
-            if !target.starts_with(workspace) {
-                dep.insert("path", value(target.to_string_lossy().into_owned()));
-                *changed = true;
-            }
+            let rewritten = match target.strip_prefix(workspace) {
+                // Outside the workspace: not copied, so point at the original.
+                Err(_) => target,
+                // Inside, but spelled as an absolute path: that is the original too, and
+                // the build has to use the copy.
+                Ok(inside) if absolute => copy.join(inside),
+                Ok(_) => continue,
+            };
+            dep.insert("path", value(rewritten.to_string_lossy().into_owned()));
+            *changed = true;
         }
     }
     const SECTIONS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
-    fn fix_sections(
-        table: &mut dyn TableLike,
-        manifest_dir: &Path,
-        workspace: &Path,
-        changed: &mut bool,
-    ) {
+    fn fix_sections(table: &mut dyn TableLike, dirs: (&Path, &Path, &Path), changed: &mut bool) {
         for section in SECTIONS {
             if let Some(deps) = table.get_mut(section).and_then(Item::as_table_like_mut) {
-                fix(deps, manifest_dir, workspace, changed);
+                fix(deps, dirs, changed);
             }
         }
     }
 
     let mut doc: DocumentMut = manifest.parse().context("parsing Cargo.toml")?;
     let mut changed = false;
-    fix_sections(doc.as_table_mut(), manifest_dir, workspace, &mut changed);
+    let dirs = (manifest_dir, workspace, copy);
+    fix_sections(doc.as_table_mut(), dirs, &mut changed);
     if let Some(ws) = doc.get_mut("workspace").and_then(Item::as_table_like_mut) {
-        fix_sections(ws, manifest_dir, workspace, &mut changed);
+        fix_sections(ws, dirs, &mut changed);
     }
     for per_key in ["target", "patch"] {
         let Some(outer) = doc.get_mut(per_key).and_then(Item::as_table_like_mut) else {
@@ -452,9 +529,9 @@ fn absolutize_path_dependencies(
                 continue;
             };
             if per_key == "target" {
-                fix_sections(inner, manifest_dir, workspace, &mut changed);
+                fix_sections(inner, dirs, &mut changed);
             } else {
-                fix(inner, manifest_dir, workspace, &mut changed);
+                fix(inner, dirs, &mut changed);
             }
         }
     }
@@ -661,15 +738,53 @@ fn tests_where<T>(
 type InfectedTests<'a> = Box<dyn Fn(&TestBinary, Mutation) -> BTreeSet<String> + 'a>;
 type ReachingTests<'a> = Box<dyn Fn(&TestBinary) -> BTreeSet<String> + 'a>;
 
+/// A predicted survivor.
+struct PlannedGap {
+    finding: Finding,
+    /// Mutations to confirm the prediction with.
+    survivors: Vec<Mutation>,
+    /// The gap says nothing more than "the expression in this byte range had one value in
+    /// every test". If that expression is a site of its own that already says so, the
+    /// gap is not reported a second time.
+    constant_expr: Option<(usize, usize)>,
+}
+
+/// The byte range of an operand without the parentheses and spaces around it.
+fn core_range(start: usize, text: &str) -> (usize, usize) {
+    let (mut from, mut to) = (0, text.len());
+    loop {
+        let inner = &text[from..to];
+        let trimmed = inner.trim();
+        from += inner.len() - inner.trim_start().len();
+        to = from + trimmed.len();
+        let wrapped = trimmed.starts_with('(') && trimmed.ends_with(')') && {
+            // The first parenthesis must be the one the last closes: `(a) && (b)` is not wrapped.
+            let mut depth = 0usize;
+            trimmed.char_indices().all(|(i, c)| {
+                match c {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                depth > 0 || i == trimmed.len() - 1
+            })
+        };
+        if !wrapped {
+            return (start + from, start + to);
+        }
+        from += 1;
+        to -= 1;
+    }
+}
+
 /// What the planner decided for one site.
 struct SitePlan<'a> {
     /// Predicted survivors: the finding to report and the mutations to confirm it with.
-    gaps: Vec<(Finding, Vec<Mutation>)>,
+    gaps: Vec<PlannedGap>,
     /// The comparison cannot have another outcome within its operand types. A function
     /// or condition built on it is constant for a reason no test can change.
     cannot_differ: bool,
-    /// Some gap says an expression had a single value in every test. An enclosing `&&` /
-    /// `||` then necessarily has an operand that never decides, which is not news.
+    /// The expression had a single value in every test.
     constant: bool,
     /// Mutations some test observes differently.
     run: Vec<Mutation>,
@@ -686,11 +801,14 @@ enum Planned<'a> {
     Plan(SitePlan<'a>),
 }
 
+/// A predicted survivor with the jobs that confirm it and the expression it calls constant.
+type ConfirmedGap = (Finding, Vec<usize>, Option<(usize, usize)>);
+
 /// A site with its jobs: indices into the job list.
 struct SiteWork<'a> {
     file: &'a str,
     site: &'a Site,
-    gaps: Vec<(Finding, Vec<usize>)>,
+    gaps: Vec<ConfirmedGap>,
     constant: bool,
     cannot_differ: bool,
     runs: Vec<(Mutation, usize)>,
@@ -761,7 +879,11 @@ impl Session {
                         if let Some(finding) =
                             report::input_gap_finding(file, site, gap, &merged, verify)
                         {
-                            gaps.push((finding, gap.survivors()));
+                            gaps.push(PlannedGap {
+                                finding,
+                                survivors: gap.survivors(),
+                                constant_expr: None,
+                            });
                         }
                     }
                     None => {}
@@ -779,8 +901,15 @@ impl Session {
                     }),
                 }
             }
-            SiteKind::Logic { and, .. } => {
+            SiteKind::Logic {
+                and,
+                lhs,
+                rhs,
+                gap: op_gap,
+            } => {
                 let and = *and;
+                let lhs_range = core_range(site.start, lhs);
+                let rhs_range = core_range(op_gap.1, rhs);
                 let merged = self.merged(|t| t.logic.get(&id), plan::LogicObs::merge);
                 let logic_plan = plan::plan_logic(and, &merged);
                 if logic_plan.gaps.contains(&plan::LogicGap::Unreached) {
@@ -790,18 +919,21 @@ impl Session {
                     .gaps
                     .iter()
                     .filter_map(|gap| {
-                        let mutation = match gap {
-                            plan::LogicGap::RhsNeverDecides => Mutation::LogicDropRhs,
-                            _ => Mutation::LogicDropLhs,
+                        // "The operand never decides" is the same statement as "the operand
+                        // had one value whenever it was evaluated".
+                        let (mutation, operand) = match gap {
+                            plan::LogicGap::RhsNeverDecides => (Mutation::LogicDropRhs, rhs_range),
+                            _ => (Mutation::LogicDropLhs, lhs_range),
                         };
-                        Some((
-                            report::logic_gap_finding(file, site, *gap, verify)?,
-                            vec![mutation],
-                        ))
+                        Some(PlannedGap {
+                            finding: report::logic_gap_finding(file, site, *gap, verify)?,
+                            survivors: vec![mutation],
+                            constant_expr: Some(operand),
+                        })
                     })
                     .collect();
                 SitePlan {
-                    constant: !gaps.is_empty(),
+                    constant: merged.constant_value(and).is_some(),
                     cannot_differ: false,
                     gaps,
                     run: logic_plan.run,
@@ -823,7 +955,11 @@ impl Session {
                     plan::ArithPlan::Opaque => return Planned::Nothing,
                     plan::ArithPlan::NeverDiffers => (
                         report::arith_gap_finding(file, site, verify)
-                            .map(|finding| (finding, vec![Mutation::ArithSwap]))
+                            .map(|finding| PlannedGap {
+                                finding,
+                                survivors: vec![Mutation::ArithSwap],
+                                constant_expr: None,
+                            })
                             .into_iter()
                             .collect(),
                         vec![],
@@ -843,7 +979,8 @@ impl Session {
                     }),
                 }
             }
-            SiteKind::Return { .. } => {
+            SiteKind::Return { sole_expr, .. } => {
+                let sole_expr = *sole_expr;
                 let merged = self.merged(|t| t.returns.get(&id), plan::ReturnObs::merge);
                 let return_plan = plan::plan_return(&merged);
                 if return_plan.unreached {
@@ -852,15 +989,17 @@ impl Session {
                 let gaps: Vec<_> = return_plan
                     .always
                     .and_then(|always| {
-                        Some((
-                            report::return_gap_finding(file, site, always, verify)?,
-                            vec![Mutation::Const(always)],
-                        ))
+                        Some(PlannedGap {
+                            finding: report::return_gap_finding(file, site, always, verify)?,
+                            survivors: vec![Mutation::Const(always)],
+                            // A body that is one expression returns that expression's value.
+                            constant_expr: sole_expr,
+                        })
                     })
                     .into_iter()
                     .collect();
                 SitePlan {
-                    constant: !gaps.is_empty(),
+                    constant: false,
                     cannot_differ: false,
                     gaps,
                     run: return_plan.run,
@@ -1062,6 +1201,7 @@ pub fn run(options: &Options) -> Result<Report> {
         &marker,
         "Working directory of tmt (targeted-mutation). Safe to delete.\n",
     )?;
+    let _lock = WorkLock::take(&work)?;
     let target_dir = metadata.target_directory.clone();
     let skip = |path: &Path| {
         path == target_dir
@@ -1072,30 +1212,21 @@ pub fn run(options: &Options) -> Result<Report> {
             || (path.parent() == Some(workspace.as_path())
                 && path.file_name().is_some_and(|n| n == "target"))
     };
-    match (options.all_files, git_visible_files(&workspace)) {
+    let visible = if options.all_files {
+        None
+    } else {
+        git_visible_files(&workspace)?
+    };
+    match visible {
         // Only what git would not ignore: build output, caches, local notes and secrets
         // that are kept out of the repository stay out of the copy too.
-        (false, Some(files)) => {
+        Some(files) => {
+            let copied = copy_git_visible(&workspace, &copy, files, &workspace, &skip)?;
             note(&format!(
-                "copying {} files (ignored files are left out)",
-                files.len()
+                "copied {copied} files (ignored files are left out)"
             ));
-            for relative in files {
-                let (src, dst) = (workspace.join(&relative), copy.join(&relative));
-                if skip(&src) || src.ancestors().any(|a| a != workspace && skip(a)) {
-                    continue;
-                }
-                let Ok(kind) = fs::symlink_metadata(&src).map(|m| m.file_type()) else {
-                    continue; // deleted in the working tree
-                };
-                if let Some(parent) = dst.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                let _ = kind;
-                copy_entry(&src, &dst, &workspace, &skip)?;
-            }
         }
-        _ => copy_tree(&workspace, &copy, &workspace, &skip)?,
+        None => copy_tree(&workspace, &copy, &workspace, &skip)?,
     }
     // Relative path dependencies that leave the workspace would point nowhere from the copy.
     let mut manifests: Vec<&Path> = metadata
@@ -1115,7 +1246,9 @@ pub fn run(options: &Options) -> Result<Report> {
             continue;
         };
         let text = fs::read_to_string(&canonical)?;
-        if let Some(rewritten) = absolutize_path_dependencies(&text, manifest_dir, &workspace)? {
+        if let Some(rewritten) =
+            absolutize_path_dependencies(&text, manifest_dir, &workspace, &copy)?
+        {
             write_in_copy(&copy, &copy.join(relative), &rewritten)?;
         }
     }
@@ -1385,19 +1518,25 @@ pub fn run(options: &Options) -> Result<Report> {
             let gaps = plan
                 .gaps
                 .into_iter()
-                .map(|(finding, survivors)| {
-                    // The trace says no test can notice. Confirm by running every test
-                    // that reaches the site against the listed survivors.
-                    let confirm = if options.verify {
-                        survivors
-                            .into_iter()
-                            .map(|m| add(m, &*plan.reaching))
-                            .collect()
-                    } else {
-                        vec![]
-                    };
-                    (finding, confirm)
-                })
+                .map(
+                    |PlannedGap {
+                         finding,
+                         survivors,
+                         constant_expr,
+                     }| {
+                        // The trace says no test can notice. Confirm by running every test
+                        // that reaches the site against the listed survivors.
+                        let confirm = if options.verify {
+                            survivors
+                                .into_iter()
+                                .map(|m| add(m, &*plan.reaching))
+                                .collect()
+                        } else {
+                            vec![]
+                        };
+                        (finding, confirm, constant_expr)
+                    },
+                )
                 .collect();
             let infected = &plan.infected;
             let runs = plan
@@ -1425,34 +1564,28 @@ pub fn run(options: &Options) -> Result<Report> {
     report.mutants_killed = results.iter().filter(|r| r.survived.is_none()).count();
     report.mutants_timed_out = results.iter().filter(|r| r.timed_out).count();
 
-    // Sites whose expression had one value in every test (confirmed), and comparisons that
-    // cannot have another outcome at all.
+    // Expressions known to be constant in the tests: comparisons with a confirmed
+    // one-sided gap or that cannot differ at all, and `&&` / `||` with a single value.
     let confirmed = |w: &SiteWork| {
         w.gaps
             .iter()
-            .all(|(_, confirm)| confirm.iter().all(|j| results[*j].survived.is_some()))
+            .all(|(_, confirm, _)| confirm.iter().all(|j| results[*j].survived.is_some()))
     };
-    let nested_in = |outer: &SiteWork, inner: &SiteWork| {
-        inner.file == outer.file
-            && inner.site.id != outer.site.id
-            && outer.site.start <= inner.site.start
-            && inner.site.end <= outer.site.end
-    };
+    let constants: BTreeSet<(&str, usize, usize)> = work
+        .iter()
+        .filter(|w| w.cannot_differ || (w.constant && confirmed(w)))
+        .map(|w| (w.file, w.site.start, w.site.end))
+        .collect();
     for item in &work {
         let at = report::location(item.file, item.site);
-        // An enclosing condition or function repeats what its parts already say: if an
-        // operand is constant in the tests, "this operand never decides" follows from it.
-        let explained = match item.site.kind {
-            SiteKind::Logic { .. } => work
-                .iter()
-                .any(|w| nested_in(item, w) && ((w.constant && confirmed(w)) || w.cannot_differ)),
-            SiteKind::Return { .. } => work.iter().any(|w| nested_in(item, w) && w.cannot_differ),
-            _ => false,
-        };
-        for (finding, confirm) in &item.gaps {
+        for (finding, confirm, constant_expr) in &item.gaps {
+            // Already said by the site of the expression itself (or, for a comparison that
+            // cannot differ, not worth saying at all).
+            let repeats = constant_expr
+                .is_some_and(|(start, end)| constants.contains(&(item.file, start, end)));
             if confirm.iter().any(|j| results[*j].survived.is_none()) {
                 report.unstable.push(at.clone());
-            } else if !explained {
+            } else if !repeats {
                 report.findings.push(finding.clone());
             }
         }
@@ -1663,10 +1796,14 @@ unix-only = { path = "../../unix" }
 [patch.crates-io]
 serde = { path = "../../serde-fork" }
 "#;
-        let out =
-            absolutize_path_dependencies(manifest, Path::new("/w/ws/app"), Path::new("/w/ws"))
-                .unwrap()
-                .expect("something to rewrite");
+        let out = absolutize_path_dependencies(
+            manifest,
+            Path::new("/w/ws/app"),
+            Path::new("/w/ws"),
+            Path::new("/copy"),
+        )
+        .unwrap()
+        .expect("something to rewrite");
         assert!(
             out.contains(r#"core = { path = "../core" }          # inside the workspace: kept"#),
             "{out}"
@@ -1685,19 +1822,49 @@ serde = { path = "../../serde-fork" }
 
         let inside = "[dependencies]\ncore = { path = \"../core\" }\n[workspace.dependencies]\nx = { path = \"x\" }\n";
         assert_eq!(
-            absolutize_path_dependencies(inside, Path::new("/w/ws/app"), Path::new("/w/ws"))
-                .unwrap(),
+            absolutize_path_dependencies(
+                inside,
+                Path::new("/w/ws/app"),
+                Path::new("/w/ws"),
+                Path::new("/copy")
+            )
+            .unwrap(),
             None
         );
         let ws = "[workspace.dependencies]\nshared = { path = \"../shared\" }\n";
-        let out = absolutize_path_dependencies(ws, Path::new("/w/ws"), Path::new("/w/ws"))
-            .unwrap()
-            .unwrap();
+        let out = absolutize_path_dependencies(
+            ws,
+            Path::new("/w/ws"),
+            Path::new("/w/ws"),
+            Path::new("/copy"),
+        )
+        .unwrap()
+        .unwrap();
         assert!(out.contains(r#"shared = { path = "/w/shared" }"#), "{out}");
         assert!(
-            absolutize_path_dependencies("not [ toml", Path::new("/w"), Path::new("/w")).is_err()
+            absolutize_path_dependencies(
+                "not [ toml",
+                Path::new("/w"),
+                Path::new("/w"),
+                Path::new("/copy")
+            )
+            .is_err()
         );
         assert_eq!(normalize(Path::new("/a/./b/../c")), PathBuf::from("/a/c"));
+        // An absolute path into the workspace has to follow the code into the copy.
+        let absolute = "[dependencies]\nhelper = { path = \"/w/ws/helper\" }\n";
+        let out = absolutize_path_dependencies(
+            absolute,
+            Path::new("/w/ws/app"),
+            Path::new("/w/ws"),
+            Path::new("/copy"),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            out.contains(r#"helper = { path = "/copy/helper" }"#),
+            "{out}"
+        );
     }
 
     #[test]
@@ -1731,6 +1898,17 @@ serde = { path = "../../serde-fork" }
             }
         });
         assert_eq!(failed.unwrap_err().to_string(), "job 3 broke");
+    }
+
+    #[test]
+    fn operand_ranges_ignore_wrapping_parentheses() {
+        assert_eq!(core_range(10, "a > 0"), (10, 15));
+        assert_eq!(core_range(10, "(a > 0)"), (11, 16));
+        assert_eq!(core_range(10, " ( (a > 0) ) "), (14, 19));
+        // Two groups, not one wrapper.
+        assert_eq!(core_range(0, "(a) && (b)"), (0, 10));
+        assert_eq!(core_range(0, "f(a)"), (0, 4));
+        assert_eq!(core_range(3, "()"), (4, 4));
     }
 
     #[test]

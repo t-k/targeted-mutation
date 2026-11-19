@@ -58,12 +58,12 @@ tmt [DIR] [--package NAME] [--jobs N] [--doc] [--work-dir DIR] [--all-files] [--
 - `--package NAME`: the workspace member to analyse. Not needed when `DIR` is the member's own directory.
 - `--jobs N`: run N mutants at the same time (default 1). Raise it only if the tests can run concurrently with themselves: no fixed ports, no shared files.
 - `--doc`: also run the doc tests. rustdoc recompiles them for every mutant they reach, so this is slow.
-- `--work-dir DIR`: where the working copy and its build go.
+- `--work-dir DIR`: where the working copy and its build go. It must be a directory of its own: the copy inside it is deleted and rebuilt on every run, and the tool refuses a directory that contains the workspace or a `src` it did not create.
 - `--all-files`: copy files that git ignores too. Use it when the build needs generated files that are not tracked.
 
-Exit status: `0` no gaps, `2` gaps found, `1` the analysis could not run (tests fail on the unmutated code, the crate does not build, ...).
+Exit status: `0` no gaps, `2` gaps found or a prediction failed its re-run (`UNSTABLE`), `1` the analysis could not run (tests fail on the unmutated code, the crate does not build, ...).
 
-Your source tree is never modified. In a git repository only the files git does not ignore are copied, so build output, caches and local files kept out of the repository stay where they are. The workspace is copied to `<target dir>/tmt/src` (or `--work-dir`) and built in a `target` directory next to that copy. Path dependencies that point outside the workspace are rewritten to absolute paths in the copy.
+Your source tree is never modified. In a git repository only the files git does not ignore are copied (submodules by their own rules), so build output, caches and local files kept out of the repository stay where they are. The copy contains no symbolic links: a linked file is copied as a file, and a linked directory is followed only if it lies inside the workspace. The workspace is copied to `<target dir>/tmt/src` (or `--work-dir`) and built in a `target` directory next to that copy. Path dependencies that point outside the workspace are rewritten to absolute paths in the copy.
 
 ## How it works
 
@@ -82,7 +82,7 @@ Mutants that cannot differ from the original within the operand types (`x >= 0` 
 | `x > 30.5` on floats | `>=`, and any threshold between the two nearest observed values | the operands were never equal in a test |
 | comparisons of other types | `<` and `<=` swapped, negation | the operands were never equal in a test |
 | `a == b`, `a != b` | negation, `true` / `false` | the result is the same in every test |
-| `a && b`, `a \|\| b` | `a` alone, `b` alone, the other operator | the dropped operand never decided the result in a test |
+| `a && b`, `a \|\| b` | one operand's value ignored (`a && { b; true }`, `{ a; b }`), the other operator | the ignored operand never decided the result in a test |
 | `a + b`, `-`, `*`, `/`, `%` on primitive numbers, and `+=` etc. | `+` and `-` swapped, `*` and `/` swapped, `%` to `/` | the two operators agree on every pair of operands the tests pass (`fee` is always 0, `factor` is always 1) |
 | `a & b`, `\|`, `^`, `<<`, `>>` on integers, and `&=` etc. | `&` and `\|` swapped, `^` to `&`, `<<` and `>>` swapped | as above |
 | `!x` on `bool` | `x` | never: always run |
@@ -97,11 +97,24 @@ Code in the arguments of `assert_eq!`, `assert_ne!`, `vec!`, `format!`, `print!`
 
 A probe that does not compile at some site (for example a guarded `let x; x = ...;`) is dropped and the build is retried; the summary line counts those sites.
 
+## What "guaranteed to survive" rests on
+
+An input gap is a statement about the mutant the tool actually runs, under these assumptions:
+
+- **Deterministic tests.** The prediction is made from one run of the tests. By default the tests are run again against the listed survivors; if that run fails, the finding is reported as `UNSTABLE` and the exit status is non-zero.
+- **The mutant keeps evaluating what the original evaluates.** A comparison replaced by `true` still evaluates both operands; `a && { b; true }` still runs `b` when `a` is true. The report shows these forms rather than the shorter `a`, because a test can notice that `b` no longer runs.
+- **`PartialOrd` is consistent.** While tracing, operands are compared once with `partial_cmp` and `<`, `<=`, `>`, `>=` are derived from the result. A type whose `lt` disagrees with its `partial_cmp` (which the trait forbids) is not handled.
+- **Integer mutants are computed without overflow.** `a >= b - 1 (without overflow)` means the comparison of the mathematical values; written in the operands' type it could overflow.
+- **Float thresholds are computed on the difference in `f64`.** The printed threshold (`celsius > 35.25`) is the same thing up to rounding; for `f32` operands it can differ in the last bit.
+- **Overflow and division by zero are never assumed equal.** An arithmetic mutant is a guaranteed survivor only where both operators are defined on every observed pair of operands and agree.
+
+The probes are written to leave the unmutated program alone: every operand is evaluated once, in the original order, and its temporaries are dropped where the original drops them. `fixtures/semantics` holds tests that would fail otherwise. Where this cannot be guaranteed from the syntax, the code is not probed: a compound assignment to anything but a plain variable, field or dereference (`v[i] += x`), and the arguments of a macro that the file defines itself under a standard name.
+
 ## Formal artifacts
 
-- `formal/lean/Planner.lean`: the survivor range is sound (every threshold in it agrees with the original on all observations), exact (every threshold outside it is separated by an observation), and the three-value trace summary is enough to decide it. Checked with Lean 4 core.
+- `formal/lean/Planner.lean`: over mathematical integers and a complete set of observations, the survivor range is sound (every threshold in it agrees with the original on all observations), exact (every threshold outside it is separated by an observation), and the three-value trace summary is enough to decide it. Checked with Lean 4 core.
 - `formal/pict/planner.pict`: 3-way combinations of operator, observation shape, literal position and type range. The generated table (`tests/data/planner.pict.tsv`) is replayed against a brute-force oracle in `plan::tests::pict_table`.
-- `formal/tla/RepairLoop.tla`: the instrument, build, disable-failing-probes loop terminates and never ships a probe that does not compile. Checked with TLC.
+- `formal/tla/RepairLoop.tla`: the instrument, build, disable-failing-probes loop terminates and never ships a probe that does not compile. Checked with TLC. The model covers compile errors only; that a probe which compiles also behaves like the code it replaces is what `fixtures/semantics` tests.
 - `formal/tla/JobPool.tla`: the parallel runner runs every mutant exactly once and has every result when the workers stop. Checked with TLC.
 
 ```text
@@ -112,7 +125,10 @@ java -jar tla2tools.jar formal/tla/RepairLoop.tla
 
 ## Limits
 
-- Rust only, one package per run.
+- Rust only, one package per run. Test binaries are started directly, not through `cargo test`: a configured target runner is not used, and the number of test threads is set by the tool (`RUST_TEST_THREADS` is ignored).
+- A module that two targets of the package both declare (`mod common;` in `lib.rs` and in `main.rs`) cannot be probed; its sites are counted as skipped.
+- Source files that start with a byte order mark or a `#!` line are not instrumented.
+- A macro that shadows a standard one is only recognised when it is defined at the top level of the same file.
 - Code in the arguments of macros other than the ones listed above, in `const` contexts and in test code is not mutated.
 - Unary minus, casts, and return values other than `bool` are not mutated. A `bool` result is replaced only at the function's normal exit, not at an early `return`.
 - For floats, a gap is reported only while no test compares equal operands. After that, thresholds within rounding distance of the constant still survive and are not reported.

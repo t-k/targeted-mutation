@@ -60,8 +60,10 @@ pub struct Report {
 }
 
 impl Report {
+    /// Whether the run found something to act on: a gap, or a prediction that did not
+    /// hold (which means the report cannot be trusted as it stands).
     pub fn has_gaps(&self) -> bool {
-        !self.findings.is_empty()
+        !self.findings.is_empty() || !self.unstable.is_empty()
     }
 }
 
@@ -112,7 +114,7 @@ pub fn describe(site: &Site, m: Mutation) -> String {
     match &site.kind {
         SiteKind::Stmt => format!("delete `{}`", one_line(&site.text)),
         SiteKind::Not { operand, .. } => format!("`{}`", one_line(operand)),
-        SiteKind::Return { name } => match m {
+        SiteKind::Return { name, .. } => match m {
             Mutation::Const(value) => format!("`{name}` returning `{value}`"),
             _ => format!("`{name}` returning something else"),
         },
@@ -163,8 +165,10 @@ pub fn describe(site: &Site, m: Mutation) -> String {
                         (CmpOp::Gt, -1) => format!("`{lhs} >= {rhs}`"),
                         (CmpOp::Le, -1) => format!("`{lhs} < {rhs}`"),
                         (CmpOp::Lt, 1) => format!("`{lhs} <= {rhs}`"),
-                        (_, d) if d > 0 => format!("`{lhs} {sym} {rhs} + {d}`"),
-                        (_, d) => format!("`{lhs} {sym} {rhs} - {}`", -d),
+                        // Meant as arithmetic on whole numbers: in the operands' own
+                        // type the addition could overflow, the mutant that was run cannot.
+                        (_, d) if d > 0 => format!("`{lhs} {sym} {rhs} + {d}` (without overflow)"),
+                        (_, d) => format!("`{lhs} {sym} {rhs} - {}` (without overflow)", -d),
                     },
                 },
                 Mutation::ShiftF(d) => match (float_literal(&lhs), float_literal(&rhs)) {
@@ -371,7 +375,7 @@ pub fn return_gap_finding(
     always: bool,
     verified: bool,
 ) -> Option<Finding> {
-    let SiteKind::Return { name } = &site.kind else {
+    let SiteKind::Return { name, .. } = &site.kind else {
         return None;
     };
     Some(Finding::InputGap {
@@ -497,7 +501,7 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
     }
     for at in &report.unstable {
         out.push_str(&format!(
-            "UNSTABLE  {}:{}:{}\n    {}\n  the trace predicted a survivor but a re-run failed: the tests are not deterministic\n\n",
+            "UNSTABLE  {}:{}:{}\n    {}\n  the trace predicted a survivor but the re-run failed: the tests are not deterministic, or do something the trace cannot see\n\n",
             at.file, at.line, at.column, at.code
         ));
     }
@@ -573,8 +577,14 @@ mod tests {
 
         let none = site_of("fn f(a: u32, b: u32) -> bool { a >= b }");
         assert_eq!(describe(&none, Mutation::Shift(1)), "`a > b`");
-        assert_eq!(describe(&none, Mutation::Shift(2)), "`a >= b + 2`");
-        assert_eq!(describe(&none, Mutation::Shift(-1)), "`a >= b - 1`");
+        assert_eq!(
+            describe(&none, Mutation::Shift(2)),
+            "`a >= b + 2` (without overflow)"
+        );
+        assert_eq!(
+            describe(&none, Mutation::Shift(-1)),
+            "`a >= b - 1` (without overflow)"
+        );
         let lt = site_of("fn f(a: u32, b: u32) -> bool { a < b }");
         assert_eq!(describe(&lt, Mutation::Shift(1)), "`a <= b`");
 
@@ -927,6 +937,7 @@ mod tests {
         let ret = Site {
             kind: SiteKind::Return {
                 name: "is_ready".into(),
+                sole_expr: None,
             },
             ..assign.clone()
         };

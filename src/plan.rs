@@ -581,6 +581,18 @@ impl LogicObs {
         self.short || self.rhs_true || self.rhs_false
     }
 
+    /// The value of the whole expression, if it was the same in every observation.
+    pub fn constant_value(&self, and: bool) -> Option<bool> {
+        // A short circuit yields false for `&&` and true for `||`.
+        let saw_true = self.rhs_true || (self.short && !and);
+        let saw_false = self.rhs_false || (self.short && and);
+        match (saw_true, saw_false) {
+            (true, false) => Some(true),
+            (false, true) => Some(false),
+            _ => None,
+        }
+    }
+
     /// The right operand was evaluated and its value decided the result.
     fn rhs_decided(&self, and: bool) -> bool {
         if and { self.rhs_false } else { self.rhs_true }
@@ -1039,6 +1051,35 @@ mod tests {
                 saw_false: true
             }
         );
+    }
+
+    #[test]
+    fn logic_constant_value() {
+        let cases = [(false, false), (false, true), (true, false), (true, true)];
+        for and in [true, false] {
+            for mask in 0u32..16 {
+                let seen: Vec<(bool, bool)> = cases
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, c)| (mask & (1 << i) != 0).then_some(*c))
+                    .collect();
+                let mut obs = LogicObs::default();
+                let mut values = std::collections::BTreeSet::new();
+                for (a, b) in &seen {
+                    let (value, evaluated) = eval_logic(and, None, *a, *b);
+                    values.insert(value);
+                    obs.short |= !evaluated;
+                    obs.rhs_true |= evaluated && *b;
+                    obs.rhs_false |= evaluated && !*b;
+                }
+                let expected = if values.len() == 1 {
+                    values.first().copied()
+                } else {
+                    None
+                };
+                assert_eq!(obs.constant_value(and), expected, "and={and} seen={seen:?}");
+            }
+        }
     }
 
     #[test]

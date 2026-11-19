@@ -508,11 +508,9 @@ mod tests {
                         tmt_rt::DIV => a.checked_div(b),
                         _ => a.checked_rem(b),
                     };
-                    assert_eq!(
-                        i32::tmt_same(op, a, b),
-                        real(op) == real(swapped),
-                        "op={op} {a} {b}"
-                    );
+                    // Equal only when both are defined: a fault on either side has to be run.
+                    let same = matches!((real(op), real(swapped)), (Some(x), Some(y)) if x == y);
+                    assert_eq!(i32::tmt_same(op, a, b), same, "op={op} {a} {b}");
                     if let Some(value) = real(op) {
                         assert_eq!(i32::tmt_real(op, a, b), value);
                     }
@@ -520,6 +518,10 @@ mod tests {
             }
         }
         assert!(u8::tmt_same(tmt_rt::ADD, 9, 0));
+        // Both shifts overflow: not "the same", the tests decide.
+        assert!(!u8::tmt_same(tmt_rt::SHL, 2, 9));
+        assert!(u8::tmt_same(tmt_rt::SHL, 2, 0));
+        assert!(!u8::tmt_same(tmt_rt::DIV, 4, 0));
         assert!(
             !u8::tmt_same(tmt_rt::ADD, 250, 9),
             "overflow in one of the two counts as different"

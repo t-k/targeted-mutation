@@ -595,13 +595,10 @@ fn doc_tests_are_used_on_request() {
     );
     // `double(2) == 4` kills `x / 2`; `is_even` is only ever called with an even number.
     let gaps = findings(&report, "input_gap");
+    // The function is that one expression, so "it always returns true" is not repeated.
     let gap_codes: Vec<&str> = gaps.iter().map(|g| g["code"].as_str().unwrap()).collect();
-    assert_eq!(
-        gap_codes,
-        ["fn is_even(x: u32) -> bool", "x % 2 == 0"],
-        "{report:#}"
-    );
-    assert_eq!(strings(&gaps[1]["survivors"]), ["`true`"]);
+    assert_eq!(gap_codes, ["x % 2 == 0"], "{report:#}");
+    assert_eq!(strings(&gaps[0]["survivors"]), ["`true`"]);
     assert_eq!(findings(&report, "assertion_gap").len(), 0, "{report:#}");
     assert!(
         report["mutants_killed"].as_u64().unwrap() >= 2,
@@ -788,4 +785,30 @@ fn symbolic_links_are_never_written_through() {
         !copy.join("data/loop").exists(),
         "a link to its own ancestor is not followed"
     );
+}
+
+#[test]
+fn probes_do_not_change_what_the_code_does() {
+    // The fixture's tests check how often user code runs, in which order, and how long
+    // temporaries live. They are part of the baseline run on the instrumented crate, so a
+    // probe that changed any of it would stop the analysis.
+    let dir = fixture("semantics", "semantics");
+    let run = tmt(&dir, &["--json", "--quiet"]);
+    assert_ne!(run.code, 1, "{}", run.stderr);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(report["skipped_sites"], 0, "{report:#}");
+    assert_eq!(
+        report["unstable"].as_array().unwrap().len(),
+        0,
+        "{report:#}"
+    );
+    let codes: Vec<&str> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["code"].as_str().unwrap())
+        .collect();
+    // The argument of the local `vec!` and the indexed `+=` are not probed.
+    assert!(!codes.iter().any(|c| c.contains("a < 3")), "{report:#}");
+    assert!(!codes.iter().any(|c| c.contains("slots[")), "{report:#}");
 }
