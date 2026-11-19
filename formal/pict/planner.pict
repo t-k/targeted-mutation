@@ -1,0 +1,19 @@
+# Observation shapes for one comparison site, fed to the planner (src/plan.rs).
+# Below/Above: what the tests observed for D = lhs - rhs on each side of zero.
+#   adjacent = D of -1 / +1 was observed, far = nearest observation is 3 away.
+# Domain: range of the non-literal operand relative to the literal K.
+#   tight_low = its type minimum equals K (e.g. unsigned vs 0), tight_high = its maximum equals K.
+Op:      lt, le, gt, ge, eq, ne
+Below:   none, adjacent, far
+Equal:   no, yes
+Above:   none, adjacent, far
+Valued:  yes, no
+Literal: none, rhs, lhs
+Domain:  wide, tight_low, tight_high
+
+IF [Valued] = "no" THEN [Literal] = "none" AND [Below] <> "far" AND [Above] <> "far";
+IF [Literal] = "none" THEN [Domain] = "wide";
+IF [Domain] = "tight_low" AND [Literal] = "rhs" THEN [Below] = "none";
+IF [Domain] = "tight_low" AND [Literal] = "lhs" THEN [Above] = "none";
+IF [Domain] = "tight_high" AND [Literal] = "rhs" THEN [Above] = "none";
+IF [Domain] = "tight_high" AND [Literal] = "lhs" THEN [Below] = "none";

@@ -1,0 +1,8 @@
+Op	Below	Equal	Above	Valued	Literal	Domain
+ge	adjacent	no	far	yes	rhs	wide
+lt	none	no	none	yes	none	wide
+ge	adjacent	yes	adjacent	yes	rhs	wide
+ge	none	yes	adjacent	yes	rhs	tight_low
+lt	adjacent	no	adjacent	no	none	wide
+eq	adjacent	yes	none	yes	rhs	wide
+le	far	no	far	yes	lhs	wide
