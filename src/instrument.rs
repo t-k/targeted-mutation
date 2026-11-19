@@ -297,6 +297,9 @@ pub struct Discovery {
     /// that is more than a variable. Their mutants are built one by one
     /// (`source_mutants`). They have no number.
     pub rebuild_sites: Vec<Site>,
+    /// Functions that return nothing and consist of one statement that is a site: an
+    /// empty body is the mutant that deletes the statement, so it is not made twice.
+    pub single_statement_bodies: Vec<String>,
     /// Out-of-line modules that only exist under `cfg(test)` (`#[cfg(test)] mod tests;`).
     pub test_modules: Vec<TestModule>,
 }
@@ -388,7 +391,11 @@ impl Finder<'_> {
         // mutant as an empty body.
         let one_deletable_statement = matches!(sig.output, syn::ReturnType::Default)
             && matches!(&body.stmts[..], [syn::Stmt::Expr(expr, Some(_))] if deletable(expr));
-        if sig.unsafety.is_some() || one_deletable_statement {
+        if sig.unsafety.is_some() {
+            return;
+        }
+        if one_deletable_statement {
+            self.found.single_statement_bodies.push(name);
             return;
         }
         let written = sole_expr.map(|(from, to)| squeezed(&self.source[from..to]));
@@ -946,6 +953,8 @@ fn values_of(ty: &syn::Type) -> Vec<String> {
                 }
                 ("String", []) => texts(&["String::new()", "\"xyzzy\".into()"]),
                 ("Result", [ok, ..]) => each(ok, &|v| format!("Ok({v})")),
+                // `fmt::Result`, or an alias of the crate's own.
+                ("Result", []) => vec!["Ok(Default::default())".to_string()],
                 ("Option", [inner]) => {
                     let mut values = vec!["None".to_string()];
                     values.extend(each(inner, &|v| format!("Some({v})")));
@@ -1027,10 +1036,39 @@ impl<'ast> Visit<'ast> for Finder<'_> {
     fn visit_generics(&mut self, _: &'ast syn::Generics) {}
     fn visit_generic_argument(&mut self, _: &'ast syn::GenericArgument) {}
     fn visit_variant(&mut self, _: &'ast syn::Variant) {}
-    fn visit_item_const(&mut self, _: &'ast syn::ItemConst) {}
-    fn visit_item_static(&mut self, _: &'ast syn::ItemStatic) {}
-    fn visit_impl_item_const(&mut self, _: &'ast syn::ImplItemConst) {}
-    fn visit_trait_item_const(&mut self, _: &'ast syn::TraitItemConst) {}
+    // The value of a constant is computed by the compiler: like the code of a
+    // `const fn`, it is mutated by building.
+    fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
+        if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) {
+            self.const_depth += 1;
+            self.visit_expr(&node.expr);
+            self.const_depth -= 1;
+        }
+    }
+    fn visit_item_static(&mut self, node: &'ast syn::ItemStatic) {
+        if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) {
+            self.const_depth += 1;
+            self.visit_expr(&node.expr);
+            self.const_depth -= 1;
+        }
+    }
+    fn visit_impl_item_const(&mut self, node: &'ast syn::ImplItemConst) {
+        if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) {
+            self.const_depth += 1;
+            self.visit_expr(&node.expr);
+            self.const_depth -= 1;
+        }
+    }
+    fn visit_trait_item_const(&mut self, node: &'ast syn::TraitItemConst) {
+        if let Some((_, value)) = &node.default
+            && !is_test_only(&node.attrs)
+            && !is_skipped(&node.attrs)
+        {
+            self.const_depth += 1;
+            self.visit_expr(value);
+            self.const_depth -= 1;
+        }
+    }
     fn visit_expr_const(&mut self, _: &'ast syn::ExprConst) {}
 
     fn visit_macro(&mut self, node: &'ast syn::Macro) {
@@ -1428,9 +1466,7 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                         node.left.span(),
                     );
                 }
-            } else if let Some((op, assign)) = arith_op(&node.op)
-                && !(is_literal(&node.left) && is_literal(&node.right))
-            {
+            } else if let Some((op, assign)) = arith_op(&node.op) {
                 let kind = SiteKind::Arith {
                     op,
                     assign,
@@ -1438,7 +1474,10 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                     rhs,
                     gap,
                 };
-                if !assign || is_plain_place(&node.left) {
+                // Two literals have no type until the context gives them one, and a
+                // probe is a context of its own.
+                let literals = is_literal(&node.left) && is_literal(&node.right);
+                if !literals && (!assign || is_plain_place(&node.left)) {
                     self.push(kind, start, end, node.left.span());
                 } else {
                     // Which of the place and the value is evaluated first depends on
@@ -2925,6 +2964,9 @@ mod tests {
             ),
             ("Result<bool, Error>", &["Ok(true)", "Ok(false)"]),
             ("io::Result<()>", &["Ok(())"]),
+            // Without arguments it is an alias: `fmt::Result`, or the crate's own.
+            ("fmt::Result", &["Ok(Default::default())"]),
+            ("Result", &["Ok(Default::default())"]),
             ("Option<u8>", &["None", "Some(0)", "Some(1)"]),
             ("Vec<bool>", &["vec![]", "vec![true]", "vec![false]"]),
             ("Box<u8>", &["Box::new(0)", "Box::new(1)"]),
@@ -3466,5 +3508,68 @@ mod tests {
         }
         let unit: syn::ItemFn = syn::parse_str("fn f() {}").unwrap();
         assert!(iterator_values(&unit.sig.output).is_empty());
+    }
+
+    #[test]
+    fn constants_and_literal_arithmetic_are_mutated_in_the_source() {
+        let src = "const HALF: u64 = SPAN / 2;\n\
+                   static LIMIT: i32 = -(1 << 4);\n\
+                   impl S { const K: bool = A < B; }\n\
+                   trait T { const D: u8 = 3 + 4; const R: u8; }\n\
+                   #[cfg(test)]\n\
+                   const ONLY_IN_TESTS: u8 = 5 + 6;\n\
+                   #[mutants::skip]\n\
+                   const MARKED: u8 = 7 + 8;\n\
+                   fn f(x: u32) -> u32 { let _ = [0u8; 2 + 3]; x + 60 * 60 }\n\
+                   fn one(s: &mut S) { s.go(); }\n\
+                   fn two(s: &mut S) { s.go(); s.stop(); }\n\
+                   fn value(s: &mut S) -> u8 { s.get() }\n";
+        let found = discover(src, 0).unwrap();
+        let built: Vec<String> = found
+            .rebuild_sites
+            .iter()
+            .flat_map(|site| {
+                source_mutants(site)
+                    .into_iter()
+                    .map(|m| format!("{}: {} -> {}", site.text, m.what, m.into))
+            })
+            .collect();
+        assert_eq!(
+            built,
+            [
+                "SPAN / 2: / -> *",
+                "SPAN / 2: / -> %",
+                "-(1 << 4): - -> ",
+                "1 << 4: << -> >>",
+                "A < B: < -> ==",
+                "A < B: < -> >",
+                "A < B: < -> <=",
+                "3 + 4: + -> -",
+                "3 + 4: + -> *",
+                // Two literals in ordinary code too: a probe would give them a type.
+                "60 * 60: * -> /",
+                "60 * 60: * -> +",
+            ]
+        );
+        mutated(src, &found.rebuild_sites);
+        // The rest of that function is probed as usual; an array length is left alone.
+        let probed: Vec<&str> = found
+            .sites
+            .iter()
+            .filter(|s| matches!(s.kind, SiteKind::Arith { .. }))
+            .map(|s| s.text.as_str())
+            .collect();
+        assert_eq!(probed, ["x + 60 * 60"]);
+        // An empty body is not made where deleting the one statement is the same thing.
+        assert_eq!(found.single_statement_bodies, ["one"]);
+        let bodies: Vec<String> = found
+            .sites
+            .iter()
+            .filter_map(|s| match &s.kind {
+                SiteKind::Body { name, value, .. } => Some(format!("{name} {value}")),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(bodies, ["f 0", "f 1", "two ()", "value 0", "value 1"]);
     }
 }
