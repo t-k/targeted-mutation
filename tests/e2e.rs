@@ -231,7 +231,7 @@ fn awkward_constructs() {
     );
     assert_eq!(
         float["observed"],
-        "nearest values the tests passed: `celsius` = 10, 40; any threshold between them passes"
+        "nearest values the tests passed: `celsius` = 10.0, 40.0; any threshold between them passes"
     );
     // A condition that is never true in the tests.
     assert_eq!(
@@ -421,7 +421,7 @@ fn workspace_member_by_name_and_by_directory() {
     );
     assert_eq!(
         strings(&gaps[0]["survivors"]),
-        ["`ws_core::is_large(size)`"]
+        ["`ws_core::is_large(size) && { outside::enabled(); true }`"]
     );
 
     let ambiguous = tmt(&ws, &["--quiet"]);
@@ -458,7 +458,10 @@ fn boolean_and_arithmetic_operators_and_macro_arguments() {
 
     // The right operand of `||` never decides.
     let or = gap("is_owner || is_admin");
-    assert_eq!(strings(&or["survivors"]), ["`is_owner`"]);
+    assert_eq!(
+        strings(&or["survivors"]),
+        ["`is_owner || { is_admin; false }`"]
+    );
     assert_eq!(
         strings(&or["add_tests"]),
         ["a case where `is_owner` is false and `is_admin` is true"]
@@ -645,4 +648,144 @@ fn files_ignored_by_git_stay_out_of_the_working_copy() {
     assert!(copy.join("notes.local").exists());
     assert!(!copy.join(".git").exists());
     assert!(!copy.join("target").exists());
+}
+
+#[test]
+fn observations_on_a_named_thread_are_not_mistaken_for_a_test() {
+    let dir = fixture("eligibility", "named-thread");
+    // The boundary value is only passed on a thread the test names itself. `--exact worker`
+    // would select no test at all and "pass"; the whole binary has to run instead.
+    append(
+        &dir.join("src/lib.rs"),
+        r#"
+#[test]
+fn boundary_on_a_named_thread() {
+    let handle = std::thread::Builder::new()
+        .name("worker".into())
+        .spawn(|| is_eligible(18))
+        .unwrap();
+    assert!(handle.join().unwrap());
+}
+"#,
+    );
+    let (code, report) = json(&dir);
+    assert_eq!(code, 0, "{report:#}");
+    assert_eq!(
+        report["findings"].as_array().unwrap().len(),
+        0,
+        "{report:#}"
+    );
+    assert_eq!(
+        report["mutants_run"], report["mutants_killed"],
+        "{report:#}"
+    );
+}
+
+#[test]
+fn work_dir_must_be_safe_to_delete() {
+    let dir = fixture("eligibility", "work-dir-safety");
+    let source = fs::read_to_string(dir.join("src/lib.rs")).unwrap();
+
+    // The package itself, or a directory above it: its `src` is the user's code.
+    for work in [dir.clone(), dir.parent().unwrap().to_path_buf()] {
+        let run = tmt(&dir, &["--quiet", "--work-dir", work.to_str().unwrap()]);
+        assert_eq!(run.code, 1, "{}", run.stdout);
+        assert!(
+            run.stderr.contains("contains the workspace"),
+            "{}",
+            run.stderr
+        );
+        assert_eq!(fs::read_to_string(dir.join("src/lib.rs")).unwrap(), source);
+    }
+
+    // Someone else's directory that happens to have a `src`.
+    let other = Path::new(env!("CARGO_TARGET_TMPDIR")).join("work-dir-safety-other");
+    let _ = fs::remove_dir_all(&other);
+    fs::create_dir_all(other.join("src")).unwrap();
+    fs::write(other.join("src/precious.txt"), "keep me").unwrap();
+    let run = tmt(&dir, &["--quiet", "--work-dir", other.to_str().unwrap()]);
+    assert_eq!(run.code, 1, "{}", run.stdout);
+    assert!(run.stderr.contains("refusing to delete"), "{}", run.stderr);
+    assert_eq!(
+        fs::read_to_string(other.join("src/precious.txt")).unwrap(),
+        "keep me"
+    );
+
+    // A directory of its own works, and can be reused.
+    let own = Path::new(env!("CARGO_TARGET_TMPDIR")).join("work-dir-safety-own");
+    let _ = fs::remove_dir_all(&own);
+    for _ in 0..2 {
+        let run = tmt(&dir, &["--quiet", "--work-dir", own.to_str().unwrap()]);
+        assert_eq!(run.code, 2, "{}", run.stderr);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn symbolic_links_are_never_written_through() {
+    let dir = fixture("eligibility", "symlinks");
+    let outside = Path::new(env!("CARGO_TARGET_TMPDIR")).join("symlinks-outside");
+    let _ = fs::remove_dir_all(&outside);
+    fs::create_dir_all(outside.join("dir")).unwrap();
+    let shared = "pub fn limit(x: u32) -> bool {\n    x > 3\n}\n";
+    fs::write(outside.join("shared.rs"), shared).unwrap();
+    fs::write(
+        outside.join("dir/inner.rs"),
+        "pub fn inner(x: u32) -> bool { x > 4 }\n",
+    )
+    .unwrap();
+
+    // A source file and a directory that are links to places outside the package, a link
+    // to a directory inside it, and a link that points back at its own parent.
+    use std::os::unix::fs::symlink;
+    symlink(outside.join("shared.rs"), dir.join("src/shared.rs")).unwrap();
+    symlink(outside.join("dir"), dir.join("src/outside_dir")).unwrap();
+    fs::create_dir_all(dir.join("data")).unwrap();
+    fs::write(dir.join("data/note.txt"), "data").unwrap();
+    symlink(dir.join("data"), dir.join("data_link")).unwrap();
+    symlink(&dir, dir.join("data/loop")).unwrap();
+    append(
+        &dir.join("src/lib.rs"),
+        "\nmod shared;\n#[test]\nfn uses_shared() {\n    assert!(shared::limit(9));\n    assert!(!shared::limit(1));\n}\n",
+    );
+
+    let (code, report) = json(&dir);
+    assert_eq!(code, 2, "{report:#}");
+    // The linked file is analysed as part of the crate, in the copy.
+    let codes: Vec<&str> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["code"].as_str().unwrap())
+        .collect();
+    assert!(codes.contains(&"x > 3"), "{report:#}");
+    // Nothing outside the copy changed.
+    assert_eq!(
+        fs::read_to_string(outside.join("shared.rs")).unwrap(),
+        shared
+    );
+    assert_eq!(
+        fs::read_to_string(outside.join("dir/inner.rs")).unwrap(),
+        "pub fn inner(x: u32) -> bool { x > 4 }\n"
+    );
+    // The copy holds plain files, no links.
+    let copy = dir.join("target/tmt/src");
+    assert!(
+        fs::symlink_metadata(copy.join("src/shared.rs"))
+            .unwrap()
+            .file_type()
+            .is_file()
+    );
+    assert!(
+        !copy.join("src/outside_dir").exists(),
+        "links leaving the workspace are not followed"
+    );
+    assert!(
+        copy.join("data_link/note.txt").exists(),
+        "links inside the workspace are copied"
+    );
+    assert!(
+        !copy.join("data/loop").exists(),
+        "a link to its own ancestor is not followed"
+    );
 }

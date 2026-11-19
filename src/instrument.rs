@@ -316,6 +316,29 @@ fn arith_op(op: &syn::BinOp) -> Option<(ArithOp, bool)> {
     })
 }
 
+/// A place whose evaluation has no effect and cannot fail: a variable, a field of one, or
+/// a dereference of one.
+///
+/// For numbers `place op= value` evaluates `value` first, for other types `place` first.
+/// The probe always takes the place first, which is the same thing only when evaluating
+/// the place cannot be observed. Indexing can panic and calls can do anything, so
+/// `v[i] += 1` and `f().x += 1` are not instrumented as operators (they can still be
+/// deleted as statements).
+fn is_plain_place(expr: &syn::Expr) -> bool {
+    match expr {
+        syn::Expr::Path(e) => e.attrs.is_empty(),
+        syn::Expr::Field(e) => is_plain_place(&e.base),
+        syn::Expr::Unary(syn::ExprUnary {
+            op: syn::UnOp::Deref(_),
+            expr,
+            ..
+        }) => is_plain_place(expr),
+        syn::Expr::Paren(e) => is_plain_place(&e.expr),
+        syn::Expr::Group(e) => is_plain_place(&e.expr),
+        _ => false,
+    }
+}
+
 fn returns_bool(sig: &syn::Signature) -> bool {
     match &sig.output {
         syn::ReturnType::Type(_, ty) => {
@@ -640,6 +663,7 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                 }
             } else if let Some((op, assign)) = arith_op(&node.op)
                 && !(is_literal(&node.left) && is_literal(&node.right))
+                && (!assign || is_plain_place(&node.left))
             {
                 self.push(
                     SiteKind::Arith {
@@ -1304,6 +1328,49 @@ mod tests {
     }
 
     #[test]
+    fn compound_assignment_is_probed_only_on_plain_places() {
+        let src = r#"
+            fn f(s: &mut S, v: &mut [u32], p: &mut u32, i: usize) {
+                let mut local = 0u32;
+                local += 1;
+                s.count += 1;
+                s.inner.total -= 2;
+                *p *= 3;
+                (*p) += 4;
+                v[i] += 5;
+                v[next()] += 6;
+                s.get_mut().x += 7;
+                *s.slot() += 8;
+            }
+        "#;
+        let probed: Vec<String> = found(src, 0)
+            .unwrap()
+            .sites
+            .into_iter()
+            .filter(|s| matches!(s.kind, SiteKind::Arith { assign: true, .. }))
+            .map(|s| s.text)
+            .collect();
+        assert_eq!(
+            probed,
+            [
+                "local += 1",
+                "s.count += 1",
+                "s.inner.total -= 2",
+                "*p *= 3",
+                "(*p) += 4"
+            ]
+        );
+        // The others are still statements that can be deleted.
+        let deletable = found(src, 0)
+            .unwrap()
+            .sites
+            .iter()
+            .filter(|s| s.kind == SiteKind::Stmt)
+            .count();
+        assert_eq!(deletable, 9);
+    }
+
+    #[test]
     fn bool_functions_are_return_sites() {
         let src = r#"
             pub fn is_ok(a: u8) -> bool { let b = a; b > 1 }
@@ -1353,6 +1420,62 @@ mod tests {
         let rendered = render(src, &sites, &all);
         let wrapper = rendered.text.find("ret(0u32").unwrap();
         assert_eq!(blame(&sites, &all, rendered.to_original(wrapper)), [0]);
+    }
+
+    #[test]
+    fn ids_are_consecutive_across_every_kind_of_site() {
+        let src = r#"
+            fn a(x: u8) -> bool { x > 1 }
+            fn b(x: u8) -> bool { !(x > 2) && !!flag(x) }
+            fn c(s: &mut S) { s.n += 1; s.go(); }
+        "#;
+        let sites = discover(src, 10).unwrap().sites;
+        let ids: Vec<u32> = sites.iter().map(|s| s.id).collect();
+        assert_eq!(ids, (10..10 + sites.len() as u32).collect::<Vec<_>>());
+        let texts: Vec<&str> = sites.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            [
+                "fn a(x: u8) -> bool",
+                "x > 1",
+                "fn b(x: u8) -> bool",
+                "!(x > 2) && !!flag(x)",
+                "!(x > 2)",
+                "x > 2",
+                "!!flag(x)",
+                "!flag(x)",
+                "s.n += 1;",
+                "s.go();",
+                "s.n += 1",
+            ]
+        );
+        syn::parse_file(&render(src, &sites, &all).text).expect("instrumented source parses");
+    }
+
+    #[test]
+    fn only_calls_and_assignments_are_deletable() {
+        let src = r#"
+            async fn f(s: &mut S, v: Vec<u8>) -> Result<(), E> {
+                s.field;
+                v[0];
+                (s.a, s.b);
+                s.value?;
+                s.future.await;
+                s.x = 1;
+                s.x -= 1;
+                s.x == 1;
+                s.call().await?;
+                Ok(())
+            }
+        "#;
+        let texts: Vec<String> = found(src, 0)
+            .unwrap()
+            .sites
+            .into_iter()
+            .filter(|s| s.kind == SiteKind::Stmt)
+            .map(|s| s.text)
+            .collect();
+        assert_eq!(texts, ["s.x = 1;", "s.x -= 1;", "s.call().await?;"]);
     }
 
     #[test]

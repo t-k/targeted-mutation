@@ -16,7 +16,7 @@ use serde::Deserialize;
 use crate::instrument::{self, LiteralSide, RUNTIME_MOD, Rendered, Site, SiteKind};
 use crate::plan::{self, Mutation, Obs};
 use crate::report::{self, Finding, Report};
-use crate::trace::{Trace, UNKNOWN_TEST};
+use crate::trace::Trace;
 
 pub struct Options {
     /// Directory of the package (or workspace) to analyse.
@@ -39,6 +39,8 @@ pub struct Options {
 /// How far from an error to look for the probe that caused it (a probe can break type
 /// inference a few lines further down).
 const NEARBY_LINES: usize = 6;
+/// File that marks a directory as tmt's own working directory.
+const WORK_MARKER: &str = ".tmt-work-dir";
 /// Name under which the crate root re-declares `std` for the runtime module.
 const STD_ALIAS: &str = "__tmt_std";
 /// More rebuilds than this means the blame logic is not converging.
@@ -215,6 +217,8 @@ enum Runner {
 
 struct TestBinary {
     name: String,
+    /// The tests the binary contains, by the name libtest selects them with.
+    tests: BTreeSet<String>,
     runner: Runner,
     baseline: Duration,
     trace: Trace,
@@ -227,32 +231,77 @@ enum Outcome {
     Timeout,
 }
 
-fn copy_tree(from: &Path, to: &Path, skip: &dyn Fn(&Path) -> bool) -> Result<()> {
+/// Copies one file, directory or symbolic link into the working copy.
+///
+/// The copy never contains a symbolic link: instrumented sources are written into it, and
+/// a link would send those writes back to the user's files. A link to a file becomes a
+/// plain file with the same content. A link to a directory is followed only when the
+/// directory lies inside `workspace` and does not contain the link itself.
+fn copy_entry(
+    src: &Path,
+    dst: &Path,
+    workspace: &Path,
+    skip: &dyn Fn(&Path) -> bool,
+) -> Result<()> {
+    let kind = fs::symlink_metadata(src)?.file_type();
+    if kind.is_symlink() {
+        let Ok(target) = src.canonicalize() else {
+            return Ok(()); // dangling
+        };
+        if target.is_dir() {
+            let contains_link = src
+                .parent()
+                .is_some_and(|dir| dir.canonicalize().is_ok_and(|dir| dir.starts_with(&target)));
+            if !target.starts_with(workspace) || contains_link || skip(&target) {
+                return Ok(());
+            }
+            return copy_tree(&target, dst, workspace, skip);
+        }
+        fs::copy(&target, dst).with_context(|| format!("copying {}", src.display()))?;
+    } else if kind.is_dir() {
+        // Build output and other caches (cargo marks its target directories this way).
+        if !src.join("CACHEDIR.TAG").exists() {
+            copy_tree(src, dst, workspace, skip)?;
+        }
+    } else {
+        fs::copy(src, dst).with_context(|| format!("copying {}", src.display()))?;
+    }
+    Ok(())
+}
+
+fn copy_tree(from: &Path, to: &Path, workspace: &Path, skip: &dyn Fn(&Path) -> bool) -> Result<()> {
     fs::create_dir_all(to)?;
     for entry in fs::read_dir(from).with_context(|| format!("reading {}", from.display()))? {
-        let entry = entry?;
-        let src = entry.path();
+        let src = entry?.path();
         if skip(&src) {
             continue;
         }
-        let dst = to.join(entry.file_name());
-        let kind = entry.file_type()?;
-        // Build output and other caches (cargo marks its target directories this way).
-        if kind.is_dir() && src.join("CACHEDIR.TAG").exists() {
+        let Some(name) = src.file_name() else {
             continue;
-        }
-        if kind.is_dir() {
-            copy_tree(&src, &dst, skip)?;
-        } else if kind.is_symlink() {
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(fs::read_link(&src)?, &dst)?;
-            #[cfg(not(unix))]
-            fs::copy(&src, &dst).map(|_| ())?;
-        } else {
-            fs::copy(&src, &dst).with_context(|| format!("copying {}", src.display()))?;
-        }
+        };
+        copy_entry(&src, &to.join(name), workspace, skip)?;
     }
     Ok(())
+}
+
+/// Writes a file of the working copy. Refuses to write anywhere else, and never through
+/// a symbolic link.
+fn write_in_copy(copy: &Path, path: &Path, content: &str) -> Result<()> {
+    if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+        fs::remove_file(path)?;
+    }
+    let parent = path.parent().and_then(|p| p.canonicalize().ok());
+    let inside = match (parent, copy.canonicalize()) {
+        (Some(parent), Ok(copy)) => parent.starts_with(copy),
+        _ => false,
+    };
+    if !inside {
+        bail!(
+            "refusing to write outside the working copy: {}",
+            path.display()
+        );
+    }
+    fs::write(path, content).with_context(|| format!("writing {}", path.display()))
 }
 
 fn rust_files(dir: &Path, skip: &dyn Fn(&Path) -> bool, out: &mut Vec<PathBuf>) -> Result<()> {
@@ -261,10 +310,13 @@ fn rust_files(dir: &Path, skip: &dyn Fn(&Path) -> bool, out: &mut Vec<PathBuf>) 
         .collect::<std::io::Result<_>>()?;
     entries.sort();
     for path in entries {
-        if skip(&path) {
+        let Ok(kind) = fs::symlink_metadata(&path).map(|m| m.file_type()) else {
+            continue;
+        };
+        if skip(&path) || kind.is_symlink() {
             continue;
         }
-        if path.is_dir() {
+        if kind.is_dir() {
             rust_files(&path, skip, out)?;
         } else if path.extension().is_some_and(|e| e == "rs") {
             out.push(path);
@@ -410,12 +462,25 @@ fn absolutize_path_dependencies(
 }
 
 /// Tests to pass to the binary, or `None` for "run everything".
-fn test_filter(tests: &BTreeSet<String>) -> Option<Vec<String>> {
-    if tests.contains(UNKNOWN_TEST) || tests.len() > MAX_TEST_FILTERS {
+///
+/// A name that is not one of the binary's tests comes from a thread the test named
+/// itself; passing it to libtest would select nothing and "pass". Such observations
+/// belong to some unknown test, like those of unnamed threads.
+fn test_filter(tests: &BTreeSet<String>, known: &BTreeSet<String>) -> Option<Vec<String>> {
+    if tests.len() > MAX_TEST_FILTERS || !tests.iter().all(|t| known.contains(t)) {
         None
     } else {
         Some(tests.iter().cloned().collect())
     }
+}
+
+/// Names of the tests in libtest's `--list --format terse` output.
+fn parse_test_list(stdout: &str) -> BTreeSet<String> {
+    stdout
+        .lines()
+        .filter_map(|line| line.strip_suffix(": test"))
+        .map(str::to_string)
+        .collect()
 }
 
 fn mutant_timeout(baseline: Duration) -> Duration {
@@ -462,6 +527,9 @@ fn run_binary(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    // Its own process group, so that a timeout can stop whatever the tests started too.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
     let mut child = cmd
         .spawn()
         .with_context(|| format!("starting the tests of `{}`", bin.name))?;
@@ -475,6 +543,12 @@ fn run_binary(
             });
         }
         if started.elapsed() > timeout {
+            #[cfg(unix)]
+            let _ = Command::new("kill")
+                .args(["-KILL", &format!("-{}", child.id())])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
             let _ = child.kill();
             let _ = child.wait();
             return Ok(Outcome::Timeout);
@@ -820,7 +894,7 @@ impl Session {
                     return None;
                 }
                 let filter = match bin.runner {
-                    Runner::Exe(_) => test_filter(&tests),
+                    Runner::Exe(_) => test_filter(&tests, &bin.tests),
                     Runner::Doc { .. } => None,
                 };
                 Some((index, filter))
@@ -963,10 +1037,31 @@ pub fn run(options: &Options) -> Result<Report> {
         }
         None => metadata.target_directory.join("tmt"),
     };
+    // The copy is deleted and rebuilt on every run. Make sure it is ours to delete.
+    if workspace.starts_with(&work) {
+        bail!(
+            "the work directory {} contains the workspace; choose a directory of its own",
+            work.display()
+        );
+    }
+    fs::create_dir_all(&work).with_context(|| format!("creating {}", work.display()))?;
+    let work = work.canonicalize()?;
     let copy = work.join("src");
+    let marker = work.join(WORK_MARKER);
     if copy.exists() {
+        if !marker.exists() {
+            bail!(
+                "{} exists and was not created by tmt; refusing to delete it. \
+                 Choose another --work-dir or remove it yourself.",
+                copy.display()
+            );
+        }
         fs::remove_dir_all(&copy).with_context(|| format!("clearing {}", copy.display()))?;
     }
+    fs::write(
+        &marker,
+        "Working directory of tmt (targeted-mutation). Safe to delete.\n",
+    )?;
     let target_dir = metadata.target_directory.clone();
     let skip = |path: &Path| {
         path == target_dir
@@ -996,19 +1091,11 @@ pub fn run(options: &Options) -> Result<Report> {
                 if let Some(parent) = dst.parent() {
                     fs::create_dir_all(parent)?;
                 }
-                if kind.is_dir() {
-                    copy_tree(&src, &dst, &skip)?; // a submodule
-                } else if kind.is_symlink() {
-                    #[cfg(unix)]
-                    std::os::unix::fs::symlink(fs::read_link(&src)?, &dst)?;
-                    #[cfg(not(unix))]
-                    fs::copy(&src, &dst).map(|_| ())?;
-                } else {
-                    fs::copy(&src, &dst).with_context(|| format!("copying {}", src.display()))?;
-                }
+                let _ = kind;
+                copy_entry(&src, &dst, &workspace, &skip)?;
             }
         }
-        _ => copy_tree(&workspace, &copy, &skip)?,
+        _ => copy_tree(&workspace, &copy, &workspace, &skip)?,
     }
     // Relative path dependencies that leave the workspace would point nowhere from the copy.
     let mut manifests: Vec<&Path> = metadata
@@ -1029,7 +1116,7 @@ pub fn run(options: &Options) -> Result<Report> {
         };
         let text = fs::read_to_string(&canonical)?;
         if let Some(rewritten) = absolutize_path_dependencies(&text, manifest_dir, &workspace)? {
-            fs::write(copy.join(relative), rewritten)?;
+            write_in_copy(&copy, &copy.join(relative), &rewritten)?;
         }
     }
 
@@ -1108,8 +1195,9 @@ pub fn run(options: &Options) -> Result<Report> {
     note(&format!("{} sites in {} files", total_sites, files.len()));
 
     let root_source = fs::read_to_string(&root_file)?;
-    fs::write(
-        source_dir.join(format!("{RUNTIME_MOD}.rs")),
+    write_in_copy(
+        &copy,
+        &source_dir.join(format!("{RUNTIME_MOD}.rs")),
         crate::RUNTIME_SOURCE,
     )?;
     let std_alias = format!("extern crate std as {STD_ALIAS};");
@@ -1131,11 +1219,11 @@ pub fn run(options: &Options) -> Result<Report> {
             if file.path == root_file {
                 text.push_str(&root_suffix);
             }
-            fs::write(&file.path, text)?;
+            write_in_copy(&copy, &file.path, &text)?;
             file.rendered = Some(rendered);
         }
         if !files.iter().any(|f| f.path == root_file) {
-            fs::write(&root_file, format!("{root_source}{root_suffix}"))?;
+            write_in_copy(&copy, &root_file, &format!("{root_source}{root_suffix}"))?;
         }
         note(if rounds == 0 {
             "building the instrumented crate"
@@ -1220,6 +1308,7 @@ pub fn run(options: &Options) -> Result<Report> {
         let _ = fs::remove_file(&trace_path);
         let mut bin = TestBinary {
             name,
+            tests: BTreeSet::new(),
             runner,
             baseline: Duration::ZERO,
             trace: Trace::default(),
@@ -1241,7 +1330,31 @@ pub fn run(options: &Options) -> Result<Report> {
             );
         }
         bin.baseline = started.elapsed();
-        bin.trace = Trace::parse(&fs::read_to_string(&trace_path).unwrap_or_default());
+        // No file means no probe was reached. Anything else unreadable or malformed means
+        // the evidence is incomplete, and conclusions drawn from it would be wrong.
+        let text = match fs::read_to_string(&trace_path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+            Err(err) => bail!("cannot read the trace of `{}`: {err}", bin.name),
+        };
+        bin.trace = Trace::parse(&text);
+        if bin.trace.malformed_lines > 0 {
+            bail!(
+                "the trace of `{}` has {} malformed lines; not drawing conclusions from it",
+                bin.name,
+                bin.trace.malformed_lines
+            );
+        }
+        if let Runner::Exe(exe) = &bin.runner {
+            let listing = Command::new(exe)
+                .args(["--list", "--format", "terse"])
+                .current_dir(&session.package_dir)
+                .stdin(Stdio::null())
+                .stderr(Stdio::null())
+                .output()
+                .with_context(|| format!("listing the tests of `{}`", bin.name))?;
+            bin.tests = parse_test_list(&String::from_utf8_lossy(&listing.stdout));
+        }
         session.binaries.push(bin);
     }
 
@@ -1365,6 +1478,7 @@ pub fn run(options: &Options) -> Result<Report> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::trace::UNKNOWN_TEST;
 
     #[test]
     fn parses_cargo_json_messages() {
@@ -1436,21 +1550,37 @@ mod tests {
 
     #[test]
     fn test_filter_falls_back_to_the_whole_binary() {
-        let some: BTreeSet<String> = ["tests::a", "tests::b"]
-            .into_iter()
-            .map(String::from)
-            .collect();
+        let set = |names: &[&str]| {
+            names
+                .iter()
+                .map(|n| n.to_string())
+                .collect::<BTreeSet<String>>()
+        };
+        let known = set(&["tests::a", "tests::b", "tests::c"]);
         assert_eq!(
-            test_filter(&some),
+            test_filter(&set(&["tests::a", "tests::b"]), &known),
             Some(vec!["tests::a".to_string(), "tests::b".to_string()])
         );
-        let mut unknown = some.clone();
-        unknown.insert(UNKNOWN_TEST.to_string());
-        assert_eq!(test_filter(&unknown), None);
+        // Observed outside any test thread.
+        assert_eq!(test_filter(&set(&["tests::a", UNKNOWN_TEST]), &known), None);
+        // Observed on a thread the test named itself: not a test of this binary.
+        assert_eq!(test_filter(&set(&["tests::a", "worker"]), &known), None);
+        assert_eq!(test_filter(&set(&["worker"]), &known), None);
+
         let many: BTreeSet<String> = (0..=MAX_TEST_FILTERS).map(|i| format!("t{i}")).collect();
-        assert_eq!(test_filter(&many), None);
+        assert_eq!(test_filter(&many, &many), None);
         let limit: BTreeSet<String> = (0..MAX_TEST_FILTERS).map(|i| format!("t{i}")).collect();
-        assert!(test_filter(&limit).is_some());
+        assert!(test_filter(&limit, &limit).is_some());
+    }
+
+    #[test]
+    fn libtest_listing() {
+        let listing =
+            "tests::a: test\ntests::nested::b: test\nbench_it: benchmark\n\n2 tests, 1 benchmark\n";
+        assert_eq!(
+            parse_test_list(listing).into_iter().collect::<Vec<_>>(),
+            ["tests::a", "tests::nested::b"]
+        );
     }
 
     #[test]

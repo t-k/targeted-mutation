@@ -293,23 +293,39 @@ fn state() -> &'static State {
         let mutant = std::env::var("TMT_MUTANT")
             .ok()
             .and_then(|s| parse_mutant(&s));
-        let tracer = std::env::var_os("TMT_TRACE").and_then(|path| {
-            let out = std::fs::OpenOptions::new()
+        let tracer = std::env::var_os("TMT_TRACE").map(|path| {
+            let out = match std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
-                .open(path)
-                .ok()?;
-            Some(Mutex::new(Tracer {
+                .open(&path)
+            {
+                Ok(out) => out,
+                Err(err) => trace_failed(&err),
+            };
+            Mutex::new(Tracer {
                 out,
                 names: Vec::new(),
                 ids: HashMap::new(),
                 cmp: HashMap::new(),
                 bits: HashMap::new(),
                 typed: HashSet::new(),
-            }))
+            })
         });
         State { mutant, tracer }
     })
+}
+
+/// An incomplete trace would be read as "the tests never did this". Stop the test run
+/// instead, so that the analysis fails rather than concluding something false.
+fn trace_failed(err: &std::io::Error) -> ! {
+    std::eprintln!("targeted-mutation: cannot write the trace: {err}");
+    std::process::abort()
+}
+
+fn write_line(out: &mut std::fs::File, line: &str) {
+    if let Err(err) = out.write_all(line.as_bytes()) {
+        trace_failed(&err);
+    }
 }
 
 fn mutant_at(site: u32) -> Option<Mutant> {
@@ -376,7 +392,7 @@ fn record_bits(kind: u8, site: u32, bits: u8) {
                 "{}\t{}\t{}\t{}\n",
                 kind as char, site, t.names[test as usize], *seen
             );
-            let _ = t.out.write_all(line.as_bytes());
+            write_line(&mut t.out, &line);
         }
     });
 }
@@ -386,13 +402,13 @@ fn record_cmp(site: u32, rel: u8, d: Diff, av: Val, bv: Val) {
         if let (Val::Int(_, amin, amax), Val::Int(_, bmin, bmax)) = (av, bv) {
             if t.typed.insert(site) {
                 let line = format!("T\t{}\t{}\t{}\t{}\t{}\n", site, amin, amax, bmin, bmax);
-                let _ = t.out.write_all(line.as_bytes());
+                write_line(&mut t.out, &line);
             }
         }
         let summary = t.cmp.entry((site, test)).or_default();
         if summary.observe(rel, d) {
             let line = summary.line(site, &t.names[test as usize]);
-            let _ = t.out.write_all(line.as_bytes());
+            write_line(&mut t.out, &line);
         }
     });
 }
@@ -431,6 +447,11 @@ fn finish(site: u32, op: u8, orig: bool, rel: u8, av: Val, bv: Val) -> bool {
 }
 
 /// `a < b`, `a <= b`, `a > b`, `a >= b`.
+///
+/// While tracing or running a mutant the operands are compared exactly once, through
+/// `partial_cmp`, and the operator's result is derived from that. This is what the
+/// operator itself does unless a type overrides `lt`/`le`/`gt`/`ge` inconsistently with
+/// `partial_cmp`, which the `PartialOrd` contract forbids.
 pub fn ord<A: ?Sized + PartialOrd<B>, B: ?Sized>(
     site: u32,
     op: u8,
@@ -439,15 +460,14 @@ pub fn ord<A: ?Sized + PartialOrd<B>, B: ?Sized>(
     av: Val,
     bv: Val,
 ) -> bool {
-    let orig = match op {
-        LT => a < b,
-        LE => a <= b,
-        GT => a > b,
-        _ => a >= b,
-    };
     let st = state();
     if st.mutant.is_none() && st.tracer.is_none() {
-        return orig;
+        return match op {
+            LT => a < b,
+            LE => a <= b,
+            GT => a > b,
+            _ => a >= b,
+        };
     }
     let rel = match a.partial_cmp(b) {
         Some(Ordering::Less) => REL_LT,
@@ -455,7 +475,7 @@ pub fn ord<A: ?Sized + PartialOrd<B>, B: ?Sized>(
         Some(Ordering::Greater) => REL_GT,
         None => REL_UN,
     };
-    finish(site, op, orig, rel, av, bv)
+    finish(site, op, eval_rel(op, rel), rel, av, bv)
 }
 
 /// `a == b`, `a != b`.

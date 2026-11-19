@@ -101,9 +101,10 @@ fn float_literal(text: &str) -> Option<f64> {
     }
 }
 
-/// Floats in reports: enough digits to tell values apart, without rounding noise.
+/// Floats in reports: the shortest text that reads back as the same value, so nothing is
+/// rounded away.
 fn show_float(v: f64) -> String {
-    format!("{}", (v * 1e9).round() / 1e9)
+    format!("{v:?}")
 }
 
 /// Source-level form of a mutant.
@@ -118,8 +119,11 @@ pub fn describe(site: &Site, m: Mutation) -> String {
         SiteKind::Logic { and, lhs, rhs, .. } => {
             let (lhs, rhs) = (one_line(lhs), one_line(rhs));
             match m {
-                Mutation::LogicDropRhs => format!("`{lhs}`"),
-                Mutation::LogicDropLhs => format!("`{rhs}`"),
+                // Both operands are still evaluated whenever the original evaluates them;
+                // only the value of one is ignored. The forms below say exactly that.
+                Mutation::LogicDropRhs if *and => format!("`{lhs} && {{ {rhs}; true }}`"),
+                Mutation::LogicDropRhs => format!("`{lhs} || {{ {rhs}; false }}`"),
+                Mutation::LogicDropLhs => format!("`{{ {lhs}; {rhs} }}`"),
                 _ => format!("`{lhs} {} {rhs}`", if *and { "||" } else { "&&" }),
             }
         }
@@ -233,11 +237,25 @@ pub fn input_gap_finding(
         return None;
     };
     let (lhs_text, rhs_text) = (one_line(lhs), one_line(rhs));
-    let survivors: Vec<String> = gap
+    let original = format!("`{lhs_text} {} {rhs_text}`", op.symbol());
+    let mut survivors: Vec<String> = gap
         .survivors()
         .into_iter()
         .map(|m| describe(site, m))
         .collect();
+    // A float shift too small to move the literal is not a different program.
+    survivors.retain(|s| *s != original);
+    let literal_value = float_literal(&lhs_text).or(float_literal(&rhs_text));
+    let moved: Vec<String> = gap
+        .survivors()
+        .into_iter()
+        .filter(|m| match (m, literal_value) {
+            (Mutation::ShiftF(d), Some(k)) => k + d != k && k - d != k,
+            _ => true,
+        })
+        .map(|m| describe(site, m))
+        .collect();
+    survivors.retain(|s| moved.contains(s));
     let mut observed = observed_values(&lhs_text, &rhs_text, *literal, obs);
     let (survivor_count, add_tests) = match gap {
         InputGap::Unreached => return None,
@@ -517,6 +535,10 @@ mod tests {
     use super::*;
     use crate::instrument::discover;
 
+    fn or_site() -> Site {
+        site_of("fn f(a: bool, b: bool) -> bool { a || b }")
+    }
+
     fn assign_kind() -> SiteKind {
         SiteKind::Arith {
             op: ArithOp::Add,
@@ -733,7 +755,7 @@ mod tests {
         assert_eq!(
             observed.as_deref(),
             Some(
-                "nearest values the tests passed: `celsius` = 10, 40; any threshold between them passes"
+                "nearest values the tests passed: `celsius` = 10.0, 40.0; any threshold between them passes"
             )
         );
 
@@ -757,7 +779,7 @@ mod tests {
         };
         assert_eq!(
             observed.as_deref(),
-            Some("nearest values the tests passed: `x` - `y` = -1, 2")
+            Some("nearest values the tests passed: `x` - `y` = -1.0, 2.0")
         );
 
         assert_eq!(float_literal("30.5"), Some(30.5));
@@ -769,15 +791,35 @@ mod tests {
         assert_eq!(float_literal("-x"), None);
         assert_eq!(float_literal("-2.5"), Some(-2.5));
         assert_eq!(float_literal("e"), None);
-        assert_eq!(show_float(0.1 + 0.2), "0.3");
+        // Nothing is rounded away: a tiny shift stays visible.
+        assert_eq!(show_float(0.1 + 0.2), "0.30000000000000004");
+        assert_eq!(show_float(1e-10), "1e-10");
+        assert_eq!(show_float(10.0), "10.0");
+        assert_eq!(show_float(35.25), "35.25");
+        // A shift that does not change the literal is not listed as a mutant.
+        let big = site_of("fn f(x: f64) -> bool { x > 1e300 }");
+        let tiny = InputGap::EqualNeverObserved {
+            flipped: CmpOp::Ge,
+            float_gap: Some((-2e-300, 2e-300)),
+        };
+        let Some(Finding::InputGap { survivors, .. }) =
+            input_gap_finding("f.rs", &big, &tiny, &obs, true)
+        else {
+            panic!()
+        };
+        assert_eq!(survivors, ["`x >= 1e300`"]);
     }
 
     #[test]
     fn logic_and_arithmetic_findings() {
         let and = site_of("fn f(a: bool, b: bool) -> bool { a && b }");
         assert_eq!(describe(&and, Mutation::LogicSwap), "`a || b`");
-        assert_eq!(describe(&and, Mutation::LogicDropRhs), "`a`");
-        assert_eq!(describe(&and, Mutation::LogicDropLhs), "`b`");
+        assert_eq!(describe(&and, Mutation::LogicDropRhs), "`a && { b; true }`");
+        assert_eq!(
+            describe(&or_site(), Mutation::LogicDropRhs),
+            "`a || { b; false }`"
+        );
+        assert_eq!(describe(&and, Mutation::LogicDropLhs), "`{ a; b }`");
         let or = site_of("fn f(a: bool, b: bool) -> bool { a || b }");
         assert_eq!(describe(&or, Mutation::LogicSwap), "`a && b`");
         let advice = |site: &Site, gap| match logic_gap_finding("f.rs", site, gap, true) {
@@ -791,24 +833,24 @@ mod tests {
         assert_eq!(
             advice(&and, LogicGap::RhsNeverDecides),
             (
-                "`a`".into(),
+                "`a && { b; true }`".into(),
                 "a case where `a` is true and `b` is false".into()
             )
         );
         assert_eq!(
             advice(&and, LogicGap::LhsNeverDecides),
-            ("`b`".into(), "a case where `a` is false".into())
+            ("`{ a; b }`".into(), "a case where `a` is false".into())
         );
         assert_eq!(
             advice(&or, LogicGap::RhsNeverDecides),
             (
-                "`a`".into(),
+                "`a || { b; false }`".into(),
                 "a case where `a` is false and `b` is true".into()
             )
         );
         assert_eq!(
             advice(&or, LogicGap::LhsNeverDecides),
-            ("`b`".into(), "a case where `a` is true".into())
+            ("`{ a; b }`".into(), "a case where `a` is true".into())
         );
         assert_eq!(
             logic_gap_finding("f.rs", &and, LogicGap::Unreached, true),
@@ -1064,6 +1106,18 @@ mod tests {
         let listed = render_text(&report, true);
         assert!(listed.contains("UNREACHED  src/lib.rs:3:9"));
         assert!(!listed.contains("--show-unreached"), "{listed}");
+        let one_more = Report {
+            findings: vec![Finding::InputGap {
+                at: report.unreached[0].clone(),
+                survivors: vec!["`a`".into()],
+                survivor_count: 2,
+                add_tests: vec![],
+                observed: None,
+                verified: true,
+            }],
+            ..report.clone()
+        };
+        assert!(render_text(&one_more, false).contains("`a` (+1 more)"));
         let nothing_unreached = Report {
             unreached: vec![],
             ..report.clone()

@@ -52,10 +52,11 @@ Without the precondition check the commit still fails, but the first write of th
 
 ```text
 cargo install --path .
-tmt [DIR] [--package NAME] [--doc] [--work-dir DIR] [--json] [--show-unreached] [--no-verify] [--quiet]
+tmt [DIR] [--package NAME] [--jobs N] [--doc] [--work-dir DIR] [--all-files] [--json] [--show-unreached] [--no-verify] [--quiet]
 ```
 
 - `--package NAME`: the workspace member to analyse. Not needed when `DIR` is the member's own directory.
+- `--jobs N`: run N mutants at the same time (default 1). Raise it only if the tests can run concurrently with themselves: no fixed ports, no shared files.
 - `--doc`: also run the doc tests. rustdoc recompiles them for every mutant they reach, so this is slow.
 - `--work-dir DIR`: where the working copy and its build go.
 - `--all-files`: copy files that git ignores too. Use it when the build needs generated files that are not tracked.
@@ -82,10 +83,15 @@ Mutants that cannot differ from the original within the operand types (`x >= 0` 
 | comparisons of other types | `<` and `<=` swapped, negation | the operands were never equal in a test |
 | `a == b`, `a != b` | negation, `true` / `false` | the result is the same in every test |
 | `a && b`, `a \|\| b` | `a` alone, `b` alone, the other operator | the dropped operand never decided the result in a test |
-| `a + b`, `-`, `*`, `/`, `%` on primitive numbers | `+` and `-` swapped, `*` and `/` swapped, `%` to `/` | the two operators agree on every pair of operands the tests pass (`fee` is always 0, `factor` is always 1) |
+| `a + b`, `-`, `*`, `/`, `%` on primitive numbers, and `+=` etc. | `+` and `-` swapped, `*` and `/` swapped, `%` to `/` | the two operators agree on every pair of operands the tests pass (`fee` is always 0, `factor` is always 1) |
+| `a & b`, `\|`, `^`, `<<`, `>>` on integers, and `&=` etc. | `&` and `\|` swapped, `^` to `&`, `<<` and `>>` swapped | as above |
+| `!x` on `bool` | `x` | never: always run |
+| a function returning `bool` | the value at its normal exit replaced by `true` / `false` | the function returned the same value in every test |
 | `f(x);`, `check()?;`, `x += 1;`, `x = y;` | the statement deleted | never: these are always run |
 
-Arithmetic on other types (`String + &str`, `Duration + Duration`) is left as it is.
+Arithmetic on other types (`String + &str`, `Duration + Duration`) and `!` on anything but `bool` are left as they are.
+
+A finding is not repeated by what encloses it: if `a > 0` is true in every test, the report says so once, and does not add that `a > 0 && b` has an operand that never decides.
 
 Code in the arguments of `assert_eq!`, `assert_ne!`, `vec!`, `format!`, `print!`, `println!`, `eprint!`, `eprintln!`, `write!`, `writeln!`, `panic!`, `unreachable!`, `todo!`, `unimplemented!`, `format_args!` and `matches!` is mutated like any other code. `assert!`, `debug_assert!` and `dbg!` put the source text of their argument into their output, so their arguments are not touched.
 
@@ -96,6 +102,7 @@ A probe that does not compile at some site (for example a guarded `let x; x = ..
 - `formal/lean/Planner.lean`: the survivor range is sound (every threshold in it agrees with the original on all observations), exact (every threshold outside it is separated by an observation), and the three-value trace summary is enough to decide it. Checked with Lean 4 core.
 - `formal/pict/planner.pict`: 3-way combinations of operator, observation shape, literal position and type range. The generated table (`tests/data/planner.pict.tsv`) is replayed against a brute-force oracle in `plan::tests::pict_table`.
 - `formal/tla/RepairLoop.tla`: the instrument, build, disable-failing-probes loop terminates and never ships a probe that does not compile. Checked with TLC.
+- `formal/tla/JobPool.tla`: the parallel runner runs every mutant exactly once and has every result when the workers stop. Checked with TLC.
 
 ```text
 lean formal/lean/Planner.lean
@@ -107,13 +114,13 @@ java -jar tla2tools.jar formal/tla/RepairLoop.tla
 
 - Rust only, one package per run.
 - Code in the arguments of macros other than the ones listed above, in `const` contexts and in test code is not mutated.
-- Bit operators, unary operators, compound assignment operators (`+=` is only deleted, not turned into `-=`) and return values are not mutated.
+- Unary minus, casts, and return values other than `bool` are not mutated. A `bool` result is replaced only at the function's normal exit, not at an early `return`.
 - For floats, a gap is reported only while no test compares equal operands. After that, thresholds within rounding distance of the constant still survive and are not reported.
 - Strings and other non-numeric types have no notion of "next value": only `<` versus `<=` is checked.
 - The survivor prediction assumes deterministic tests. A wrong prediction shows up as `UNSTABLE`.
 - Equivalent mutants are not always detected. If `max(a, b)` is written with `a >= b`, then `a > b` is reported although no test could observe it. The same goes for an operand that is constant by construction (`is_large(n) && FEATURE_ENABLED`).
 - Observations made on threads that a test spawns, and all observations of doc tests, cannot be attributed to a single test; the mutant is then run against the whole test binary.
-- Mutants are run one after another.
+- With `--jobs`, a mutant's time limit is still derived from the unloaded test run, so a heavily loaded machine can turn a slow mutant into a timeout (counted as killed).
 
 ## Evaluating against other tools
 
