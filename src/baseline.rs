@@ -14,12 +14,18 @@ pub fn fingerprint(finding: &Finding) -> String {
         Finding::InputGap { at, survivors, .. } => ("input_gap", at, survivors),
         Finding::AssertionGap { at, survivors, .. } => ("assertion_gap", at, survivors),
     };
-    format!("{kind}\t{}\t{}\t{}", at.file, at.code, survivors.join(" | "))
+    format!(
+        "{kind}\t{}\t{}\t{}",
+        at.file,
+        at.code,
+        survivors.join(" | ")
+    )
 }
 
 /// Reads a baseline written by [`write`]: one fingerprint per JSON array element.
 pub fn load(path: &Path) -> Result<BTreeSet<String>> {
-    let text = std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     serde_json::from_str(&text).with_context(|| format!("{} is not a tmt baseline", path.display()))
 }
 
@@ -59,7 +65,12 @@ mod tests {
 
     fn gap(line: usize, code: &str, survivors: &[&str]) -> Finding {
         Finding::AssertionGap {
-            at: Location { file: "src/lib.rs".into(), line, column: 5, code: code.into() },
+            at: Location {
+                file: "src/lib.rs".into(),
+                line,
+                column: 5,
+                code: code.into(),
+            },
             survivors: survivors.iter().map(|s| s.to_string()).collect(),
             tests: vec!["tests::t".into()],
             effects: vec![],
@@ -69,11 +80,24 @@ mod tests {
     #[test]
     fn fingerprints_ignore_position_but_not_content() {
         let base = fingerprint(&gap(10, "a > b", &["`a >= b`"]));
-        assert_eq!(base, fingerprint(&gap(99, "a > b", &["`a >= b`"])), "moved code");
+        assert_eq!(
+            base,
+            fingerprint(&gap(99, "a > b", &["`a >= b`"])),
+            "moved code"
+        );
         assert_ne!(base, fingerprint(&gap(10, "a > c", &["`a >= b`"])));
-        assert_ne!(base, fingerprint(&gap(10, "a > b", &["`a >= b`", "`!(a > b)`"])), "a new survivor");
+        assert_ne!(
+            base,
+            fingerprint(&gap(10, "a > b", &["`a >= b`", "`!(a > b)`"])),
+            "a new survivor"
+        );
         let input = Finding::InputGap {
-            at: Location { file: "src/lib.rs".into(), line: 10, column: 5, code: "a > b".into() },
+            at: Location {
+                file: "src/lib.rs".into(),
+                line: 10,
+                column: 5,
+                code: "a > b".into(),
+            },
             survivors: vec!["`a >= b`".into()],
             survivor_count: 1,
             add_tests: vec![],
@@ -85,8 +109,12 @@ mod tests {
 
     #[test]
     fn baseline_round_trip() {
-        let path = std::env::temp_dir().join(format!("tmt-baseline-test-{}.json", std::process::id()));
-        let findings = [gap(1, "a > b", &["`a >= b`"]), gap(2, "x();", &["delete `x();`"])];
+        let path =
+            std::env::temp_dir().join(format!("tmt-baseline-test-{}.json", std::process::id()));
+        let findings = [
+            gap(1, "a > b", &["`a >= b`"]),
+            gap(2, "x();", &["delete `x();`"]),
+        ];
         write(&path, &findings).unwrap();
         let loaded = load(&path).unwrap();
         assert_eq!(loaded.len(), 2);

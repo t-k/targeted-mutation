@@ -15,7 +15,9 @@ use serde::Deserialize;
 
 use crate::instrument::{self, LiteralSide, RUNTIME_MOD, Rendered, Site, SiteKind};
 use crate::plan::{self, Mutation, Obs};
+use crate::propagation::{self, Change};
 use crate::report::{self, Finding, Report};
+use crate::scope::{self, Scope};
 use crate::trace::Trace;
 
 pub struct Options {
@@ -28,6 +30,20 @@ pub struct Options {
     pub work_dir: Option<PathBuf>,
     /// Progress lines on stderr.
     pub progress: bool,
+    /// Analyse only code changed since this git revision (plus untracked files).
+    pub since: Option<String>,
+    /// Analyse only these lines: `FILE:FROM-TO`, with `FILE` relative to the package.
+    pub lines: Vec<String>,
+    /// Findings listed in this file are not reported.
+    pub baseline: Option<PathBuf>,
+    /// Write the findings of this run to this file, as a baseline for later runs.
+    pub write_baseline: Option<PathBuf>,
+    /// Other workspace packages whose tests are run too.
+    pub also_test: Vec<String>,
+    /// Run the tests of every workspace package that depends on the analysed one.
+    pub dependents: bool,
+    /// Trace surviving mutants to say what they change in the tests.
+    pub effects: bool,
     /// How many mutants to run at the same time.
     pub jobs: usize,
     /// Copy every file of the workspace, including the ones git ignores.
@@ -58,8 +74,15 @@ struct Metadata {
 #[derive(Deserialize)]
 struct Package {
     name: String,
+    #[serde(default)]
+    dependencies: Vec<Dependency>,
     manifest_path: PathBuf,
     targets: Vec<Target>,
+}
+
+#[derive(Deserialize)]
+struct Dependency {
+    name: String,
 }
 
 #[derive(Deserialize)]
@@ -122,9 +145,28 @@ struct CompileError {
 
 #[derive(Debug, Default, PartialEq)]
 struct BuildOutput {
-    /// `(target name, executable)` of the package's test binaries.
-    test_binaries: Vec<(String, PathBuf)>,
+    /// `(target name, executable, package)` of the test binaries.
+    test_binaries: Vec<(String, PathBuf, String)>,
     errors: Vec<CompileError>,
+}
+
+/// The workspace packages that depend on `package`, directly or through others.
+fn dependents_of(package: &str, packages: &[Package]) -> Vec<String> {
+    let mut found: Vec<String> = vec![];
+    let mut frontier = vec![package.to_string()];
+    while let Some(current) = frontier.pop() {
+        for other in packages {
+            if other.name != package
+                && !found.contains(&other.name)
+                && other.dependencies.iter().any(|d| d.name == current)
+            {
+                found.push(other.name.clone());
+                frontier.push(other.name.clone());
+            }
+        }
+    }
+    found.sort();
+    found
 }
 
 /// Package ids embed the path, and the build runs in a copy, so compare by name.
@@ -136,7 +178,7 @@ fn is_package(id: &str, name: &str) -> bool {
         || id.split(' ').next() == Some(name)
 }
 
-fn parse_build_output(stdout: &str, package: &str) -> BuildOutput {
+fn parse_build_output(stdout: &str, packages: &[&str]) -> BuildOutput {
     let mut out = BuildOutput::default();
     for line in stdout.lines() {
         let Ok(msg) = serde_json::from_str::<CargoMessage>(line) else {
@@ -144,15 +186,16 @@ fn parse_build_output(stdout: &str, package: &str) -> BuildOutput {
         };
         match msg.reason.as_str() {
             "compiler-artifact" => {
-                if let (Some(exe), Some(target), Some(profile)) =
-                    (msg.executable, msg.target, msg.profile)
-                    && profile.test
-                    && msg
-                        .package_id
-                        .as_deref()
-                        .is_some_and(|id| is_package(id, package))
+                if let (Some(exe), Some(target), Some(profile), Some(id)) = (
+                    msg.executable,
+                    msg.target,
+                    msg.profile,
+                    msg.package_id.as_deref(),
+                ) && profile.test
+                    && let Some(package) = packages.iter().find(|name| is_package(id, name))
                 {
-                    out.test_binaries.push((target.name, exe));
+                    out.test_binaries
+                        .push((target.name, exe, package.to_string()));
                 }
             }
             "compiler-message" => {
@@ -217,6 +260,8 @@ enum Runner {
 
 struct TestBinary {
     name: String,
+    /// Directory the tests run in: their package's, as under `cargo test`.
+    cwd: PathBuf,
     /// The tests the binary contains, by the name libtest selects them with.
     tests: BTreeSet<String>,
     runner: Runner,
@@ -259,6 +304,57 @@ impl Drop for WorkLock {
     }
 }
 
+/// Paths of the working copy that the current run wants to exist.
+type Kept = std::cell::RefCell<HashSet<PathBuf>>;
+
+/// Makes `dst` a copy of the file `src`, leaving it alone if it already is one. A file
+/// that keeps its modification time is not rebuilt by cargo, so a second run only
+/// recompiles what changed.
+fn sync_file(src: &Path, dst: &Path, kept: &Kept) -> Result<()> {
+    kept.borrow_mut().insert(dst.to_path_buf());
+    let up_to_date = match (fs::metadata(src), fs::symlink_metadata(dst)) {
+        (Ok(from), Ok(to)) => {
+            to.is_file()
+                && from.len() == to.len()
+                && matches!((from.modified(), to.modified()), (Ok(a), Ok(b)) if b >= a)
+        }
+        _ => false,
+    };
+    if up_to_date {
+        return Ok(());
+    }
+    if let Ok(existing) = fs::symlink_metadata(dst) {
+        if existing.is_dir() {
+            fs::remove_dir_all(dst)?;
+        } else {
+            fs::remove_file(dst)?;
+        }
+    }
+    fs::copy(src, dst).with_context(|| format!("copying {}", src.display()))?;
+    Ok(())
+}
+
+/// Removes from the working copy whatever the current run did not put there.
+fn prune(dir: &Path, kept: &Kept) -> Result<bool> {
+    let mut empty = true;
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        let is_dir = fs::symlink_metadata(&path)?.is_dir();
+        if is_dir {
+            if prune(&path, kept)? {
+                fs::remove_dir(&path)?;
+            } else {
+                empty = false;
+            }
+        } else if kept.borrow().contains(&path) {
+            empty = false;
+        } else {
+            fs::remove_file(&path)?;
+        }
+    }
+    Ok(empty)
+}
+
 /// Copies one file, directory or symbolic link into the working copy.
 ///
 /// The copy never contains a symbolic link: instrumented sources are written into it, and
@@ -270,6 +366,7 @@ fn copy_entry(
     dst: &Path,
     workspace: &Path,
     skip: &dyn Fn(&Path) -> bool,
+    kept: &Kept,
 ) -> Result<()> {
     let kind = fs::symlink_metadata(src)?.file_type();
     if kind.is_symlink() {
@@ -283,21 +380,27 @@ fn copy_entry(
             if !target.starts_with(workspace) || contains_link || skip(&target) {
                 return Ok(());
             }
-            return copy_tree(&target, dst, workspace, skip);
+            return copy_tree(&target, dst, workspace, skip, kept);
         }
-        fs::copy(&target, dst).with_context(|| format!("copying {}", src.display()))?;
+        sync_file(&target, dst, kept)?;
     } else if kind.is_dir() {
         // Build output and other caches (cargo marks its target directories this way).
         if !src.join("CACHEDIR.TAG").exists() {
-            copy_tree(src, dst, workspace, skip)?;
+            copy_tree(src, dst, workspace, skip, kept)?;
         }
     } else {
-        fs::copy(src, dst).with_context(|| format!("copying {}", src.display()))?;
+        sync_file(src, dst, kept)?;
     }
     Ok(())
 }
 
-fn copy_tree(from: &Path, to: &Path, workspace: &Path, skip: &dyn Fn(&Path) -> bool) -> Result<()> {
+fn copy_tree(
+    from: &Path,
+    to: &Path,
+    workspace: &Path,
+    skip: &dyn Fn(&Path) -> bool,
+    kept: &Kept,
+) -> Result<()> {
     fs::create_dir_all(to)?;
     for entry in fs::read_dir(from).with_context(|| format!("reading {}", from.display()))? {
         let src = entry?.path();
@@ -307,7 +410,7 @@ fn copy_tree(from: &Path, to: &Path, workspace: &Path, skip: &dyn Fn(&Path) -> b
         let Some(name) = src.file_name() else {
             continue;
         };
-        copy_entry(&src, &to.join(name), workspace, skip)?;
+        copy_entry(&src, &to.join(name), workspace, skip, kept)?;
     }
     Ok(())
 }
@@ -328,6 +431,9 @@ fn write_in_copy(copy: &Path, path: &Path, content: &str) -> Result<()> {
             "refusing to write outside the working copy: {}",
             path.display()
         );
+    }
+    if fs::read_to_string(path).is_ok_and(|existing| existing == content) {
+        return Ok(()); // keep the modification time: nothing to rebuild
     }
     fs::write(path, content).with_context(|| format!("writing {}", path.display()))
 }
@@ -410,6 +516,7 @@ fn copy_git_visible(
     files: Vec<PathBuf>,
     workspace: &Path,
     skip: &dyn Fn(&Path) -> bool,
+    kept: &Kept,
 ) -> Result<usize> {
     let mut copied = 0;
     for relative in files {
@@ -429,11 +536,13 @@ fn copy_git_visible(
         }
         if kind.is_dir() {
             match git_visible_files(&src)? {
-                Some(inner) => copied += copy_git_visible(&src, &dst, inner, workspace, skip)?,
-                None => copy_tree(&src, &dst, workspace, skip)?,
+                Some(inner) => {
+                    copied += copy_git_visible(&src, &dst, inner, workspace, skip, kept)?
+                }
+                None => copy_tree(&src, &dst, workspace, skip, kept)?,
             }
         } else {
-            copy_entry(&src, &dst, workspace, skip)?;
+            copy_entry(&src, &dst, workspace, skip, kept)?;
             copied += 1;
         }
     }
@@ -566,11 +675,15 @@ fn mutant_timeout(baseline: Duration) -> Duration {
 
 fn run_binary(
     bin: &TestBinary,
-    cwd: &Path,
     tests: Option<&[String]>,
-    env: (&str, &str),
+    env: &[(&str, &str)],
     timeout: Duration,
+    stop_at_first_failure: bool,
 ) -> Result<Outcome> {
+    use std::io::BufRead;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
     let threads = std::thread::available_parallelism()
         .map_or(2, |n| n.get())
         .max(2);
@@ -583,7 +696,8 @@ fn run_binary(
             if let Some(tests) = tests {
                 cmd.arg("--exact").args(tests);
             }
-            cmd.current_dir(cwd).env("CARGO_MANIFEST_DIR", cwd);
+            cmd.current_dir(&bin.cwd)
+                .env("CARGO_MANIFEST_DIR", &bin.cwd);
             cmd
         }
         Runner::Doc {
@@ -600,9 +714,13 @@ fn run_binary(
     };
     cmd.env_remove("TMT_TRACE")
         .env_remove("TMT_MUTANT")
-        .env(env.0, env.1)
+        .envs(env.iter().copied())
         .stdin(Stdio::null())
-        .stdout(Stdio::null())
+        .stdout(if stop_at_first_failure {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stderr(Stdio::null());
     // Its own process group, so that a timeout can stop whatever the tests started too.
     #[cfg(unix)]
@@ -610,28 +728,113 @@ fn run_binary(
     let mut child = cmd
         .spawn()
         .with_context(|| format!("starting the tests of `{}`", bin.name))?;
+    // One failed test is enough to know the mutant is killed: libtest reports each test as
+    // it finishes, so the rest of the run does not have to be waited for.
+    let failed = Arc::new(AtomicBool::new(false));
+    let watcher = child.stdout.take().map(|stdout| {
+        let failed = Arc::clone(&failed);
+        std::thread::spawn(move || {
+            for line in std::io::BufReader::new(stdout)
+                .lines()
+                .map_while(|l| l.ok())
+            {
+                if is_failure_line(&line) {
+                    failed.store(true, Ordering::SeqCst);
+                }
+            }
+        })
+    });
+    let kill = |child: &mut std::process::Child| {
+        #[cfg(unix)]
+        let _ = Command::new("kill")
+            .args(["-KILL", &format!("-{}", child.id())])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        let _ = child.kill();
+        let _ = child.wait();
+    };
     let started = Instant::now();
-    loop {
+    let outcome = loop {
         if let Some(status) = child.try_wait()? {
-            return Ok(if status.success() {
+            break if status.success() {
                 Outcome::Pass
             } else {
                 Outcome::Fail
-            });
+            };
+        }
+        if failed.load(Ordering::SeqCst) {
+            kill(&mut child);
+            break Outcome::Fail;
         }
         if started.elapsed() > timeout {
-            #[cfg(unix)]
-            let _ = Command::new("kill")
-                .args(["-KILL", &format!("-{}", child.id())])
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .status();
-            let _ = child.kill();
-            let _ = child.wait();
-            return Ok(Outcome::Timeout);
+            kill(&mut child);
+            break Outcome::Timeout;
         }
         std::thread::sleep(Duration::from_millis(5));
+    };
+    if let Some(watcher) = watcher {
+        let _ = watcher.join();
     }
+    Ok(outcome)
+}
+
+/// A line of libtest output that reports a failed test.
+fn is_failure_line(line: &str) -> bool {
+    line.starts_with("test ") && line.ends_with(" ... FAILED")
+}
+
+/// The lines to analyse, from `--since` and `--lines`; `None` for everything. File names
+/// are relative to the workspace root.
+fn requested_scope(
+    options: &Options,
+    workspace: &Path,
+    package_dir: &Path,
+    copy: &Path,
+) -> Result<Option<Scope>> {
+    if options.since.is_none() && options.lines.is_empty() {
+        return Ok(None);
+    }
+    // `--lines` names files the way the report does: relative to the package.
+    let prefix = package_dir.strip_prefix(copy).unwrap_or(Path::new(""));
+    let lines: Vec<String> = options
+        .lines
+        .iter()
+        .map(|spec| prefix.join(spec).to_string_lossy().into_owned())
+        .collect();
+    let mut scope = Scope::parse_lines(&lines)?;
+    if let Some(revision) = &options.since {
+        let git = |args: &[&str]| -> Result<String> {
+            let output = Command::new("git")
+                .arg("-C")
+                .arg(workspace)
+                .args(args)
+                .output()
+                .context("running git")?;
+            if !output.status.success() {
+                bail!(
+                    "git {} failed: {}",
+                    args.join(" "),
+                    String::from_utf8_lossy(&output.stderr).trim()
+                );
+            }
+            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+        };
+        // `--relative` gives paths from the workspace root even inside a larger repository.
+        scope.merge(Scope::from_diff(&git(&[
+            "diff",
+            "-U0",
+            "--no-color",
+            "--no-ext-diff",
+            "--relative",
+            revision,
+            "--",
+        ])?));
+        for file in git(&["ls-files", "--others", "--exclude-standard"])?.lines() {
+            scope.add_whole_file(file);
+        }
+    }
+    Ok(Some(scope))
 }
 
 /// The sites to disable for one compile error, from the most to the least specific guess:
@@ -1046,7 +1249,7 @@ impl Session {
         }
     }
 
-    /// Runs one mutant against its tests, stopping at the first binary that fails.
+    /// Runs one mutant against its tests, stopping at the first test that fails.
     fn run_job(&self, job: &Job) -> Result<JobResult> {
         let spec = format!("{}:{}", job.site, job.mutation.encode());
         let mut passed = vec![];
@@ -1054,10 +1257,10 @@ impl Session {
             let bin = &self.binaries[*index];
             let outcome = run_binary(
                 bin,
-                &self.package_dir,
                 filter.as_deref(),
-                ("TMT_MUTANT", &spec),
+                &[("TMT_MUTANT", &spec)],
                 mutant_timeout(bin.baseline),
+                true,
             )?;
             if outcome != Outcome::Pass {
                 return Ok(JobResult {
@@ -1074,6 +1277,39 @@ impl Session {
             survived: Some(passed),
             timed_out: false,
         })
+    }
+
+    /// Runs a surviving mutant once more with tracing on, and returns what it changed in
+    /// each test compared with the original run.
+    fn trace_job(&self, job: &Job, scratch: &Path) -> Result<BTreeMap<String, BTreeSet<Change>>> {
+        let spec = format!("{}:{}", job.site, job.mutation.encode());
+        let mut all: BTreeMap<String, BTreeSet<Change>> = BTreeMap::new();
+        for (index, filter) in &job.tests {
+            let bin = &self.binaries[*index];
+            let path = scratch.join(format!("effects-{}-{index}.tsv", job.site));
+            let _ = fs::remove_file(&path);
+            let trace_env = path.to_string_lossy().into_owned();
+            let outcome = run_binary(
+                bin,
+                filter.as_deref(),
+                &[("TMT_MUTANT", &spec), ("TMT_TRACE", &trace_env)],
+                mutant_timeout(bin.baseline),
+                false,
+            )?;
+            let text = fs::read_to_string(&path).unwrap_or_default();
+            let _ = fs::remove_file(&path);
+            if outcome != Outcome::Pass {
+                continue; // not the run we saw before: say nothing rather than guess
+            }
+            let mutated = Trace::parse(&text);
+            let ran: Option<BTreeSet<String>> =
+                filter.as_ref().map(|names| names.iter().cloned().collect());
+            for (test, found) in propagation::changes(&bin.trace, &mutated, ran.as_ref(), job.site)
+            {
+                all.entry(test).or_default().extend(found);
+            }
+        }
+        Ok(all)
     }
 
     /// Runs every job exactly once on `workers` threads (formal/tla/JobPool.tla) and
@@ -1159,6 +1395,28 @@ pub fn run(options: &Options) -> Result<Report> {
             }),
     }
     .ok_or_else(|| anyhow!("cannot tell which package to analyse; pass --package <name>"))?;
+    // The packages whose tests are built and run: the analysed one, and on request others
+    // of the workspace that use it.
+    let mut test_packages: Vec<&Package> = vec![package];
+    for name in &options.also_test {
+        let other = metadata
+            .packages
+            .iter()
+            .find(|p| &p.name == name)
+            .ok_or_else(|| anyhow!("--also-test: no package `{name}` in the workspace"))?;
+        if !test_packages.iter().any(|p| p.name == other.name) {
+            test_packages.push(other);
+        }
+    }
+    if options.dependents {
+        for name in dependents_of(&package.name, &metadata.packages) {
+            if let Some(other) = metadata.packages.iter().find(|p| p.name == name)
+                && !test_packages.iter().any(|p| p.name == other.name)
+            {
+                test_packages.push(other);
+            }
+        }
+    }
     let is_kind = |t: &Target, kinds: &[&str]| t.kind.iter().any(|k| kinds.contains(&k.as_str()));
     let root_target = package
         .targets
@@ -1176,7 +1434,8 @@ pub fn run(options: &Options) -> Result<Report> {
         }
         None => metadata.target_directory.join("tmt"),
     };
-    // The copy is deleted and rebuilt on every run. Make sure it is ours to delete.
+    // The copy is brought up to date on every run, and files that are no longer wanted
+    // are deleted from it. Make sure it is ours to delete from.
     if workspace.starts_with(&work) {
         bail!(
             "the work directory {} contains the workspace; choose a directory of its own",
@@ -1187,16 +1446,14 @@ pub fn run(options: &Options) -> Result<Report> {
     let work = work.canonicalize()?;
     let copy = work.join("src");
     let marker = work.join(WORK_MARKER);
-    if copy.exists() {
-        if !marker.exists() {
+    if copy.exists()
+        && !marker.exists() {
             bail!(
                 "{} exists and was not created by tmt; refusing to delete it. \
                  Choose another --work-dir or remove it yourself.",
                 copy.display()
             );
         }
-        fs::remove_dir_all(&copy).with_context(|| format!("clearing {}", copy.display()))?;
-    }
     fs::write(
         &marker,
         "Working directory of tmt (targeted-mutation). Safe to delete.\n",
@@ -1212,6 +1469,8 @@ pub fn run(options: &Options) -> Result<Report> {
             || (path.parent() == Some(workspace.as_path())
                 && path.file_name().is_some_and(|n| n == "target"))
     };
+    let kept = Kept::default();
+    fs::create_dir_all(&copy)?;
     let visible = if options.all_files {
         None
     } else {
@@ -1221,13 +1480,14 @@ pub fn run(options: &Options) -> Result<Report> {
         // Only what git would not ignore: build output, caches, local notes and secrets
         // that are kept out of the repository stay out of the copy too.
         Some(files) => {
-            let copied = copy_git_visible(&workspace, &copy, files, &workspace, &skip)?;
+            let copied = copy_git_visible(&workspace, &copy, files, &workspace, &skip, &kept)?;
             note(&format!(
                 "copied {copied} files (ignored files are left out)"
             ));
         }
-        None => copy_tree(&workspace, &copy, &workspace, &skip)?,
+        None => copy_tree(&workspace, &copy, &workspace, &skip, &kept)?,
     }
+    prune(&copy, &kept)?;
     // Relative path dependencies that leave the workspace would point nowhere from the copy.
     let mut manifests: Vec<&Path> = metadata
         .packages
@@ -1324,6 +1584,26 @@ pub fn run(options: &Options) -> Result<Report> {
         }
     }
     files.retain(|f| !f.path.ancestors().any(|a| test_only.contains(a)));
+
+    // Only the requested lines, if any were requested.
+    let scope = requested_scope(options, &workspace, &package_dir, &copy)?;
+    if let Some(scope) = &scope {
+        for file in &mut files {
+            let relative = file
+                .path
+                .strip_prefix(&copy)
+                .unwrap_or(&file.path)
+                .to_string_lossy()
+                .into_owned();
+            let original = &file.original;
+            file.sites.retain(|site| {
+                scope.touches(&relative, scope::line_of(original, site.start), scope::line_of(original, site.end))
+                    // A function is in scope by its signature line too.
+                    || scope.touches(&relative, site.line, site.line)
+            });
+        }
+        files.retain(|f| !f.sites.is_empty() || f.path == root_file);
+    }
     let total_sites: usize = files.iter().map(|f| f.sites.len()).sum();
     note(&format!("{} sites in {} files", total_sites, files.len()));
 
@@ -1364,19 +1644,15 @@ pub fn run(options: &Options) -> Result<Report> {
             "rebuilding without the sites that failed to compile"
         });
         let output = Command::new("cargo")
-            .args([
-                "test",
-                "--no-run",
-                "--message-format=json",
-                "-p",
-                &package.name,
-            ])
+            .args(["test", "--no-run", "--message-format=json"])
+            .args(test_packages.iter().flat_map(|p| ["-p", p.name.as_str()]))
             .current_dir(&copy)
             .env("CARGO_TARGET_DIR", &build_target)
             .stderr(Stdio::piped())
             .output()
             .context("running cargo test --no-run")?;
-        let build = parse_build_output(&String::from_utf8_lossy(&output.stdout), &package.name);
+        let names: Vec<&str> = test_packages.iter().map(|p| p.name.as_str()).collect();
+        let build = parse_build_output(&String::from_utf8_lossy(&output.stdout), &names);
         if output.status.success() {
             break build;
         }
@@ -1423,24 +1699,40 @@ pub fn run(options: &Options) -> Result<Report> {
         package_dir,
         binaries: vec![],
     };
-    let mut runners: Vec<(String, Runner)> = build
-        .test_binaries
-        .into_iter()
-        .map(|(name, exe)| (name, Runner::Exe(exe)))
-        .collect();
+    let mut runners: Vec<(String, Runner, PathBuf)> = vec![];
+    for (name, exe, owner) in build.test_binaries {
+        let owner_package = test_packages
+            .iter()
+            .find(|p| p.name == owner)
+            .expect("binaries are filtered by these packages");
+        let cwd = in_copy(
+            owner_package
+                .manifest_path
+                .parent()
+                .expect("manifest has a parent"),
+        )?;
+        // Tests of other packages are named after their package.
+        let name = if owner == package.name {
+            name
+        } else {
+            format!("{owner}::{name}")
+        };
+        runners.push((name, Runner::Exe(exe), cwd));
+    }
     if options.doc && is_kind(root_target, &["lib", "rlib", "proc-macro"]) {
         let doc = Runner::Doc {
             copy: copy.clone(),
             target_dir: build_target.clone(),
             package: package.name.clone(),
         };
-        runners.push(("doc tests".to_string(), doc));
+        runners.push(("doc tests".to_string(), doc, session.package_dir.clone()));
     }
-    for (index, (name, runner)) in runners.into_iter().enumerate() {
+    for (index, (name, runner, cwd)) in runners.into_iter().enumerate() {
         let trace_path = work.join(format!("trace-{index}.tsv"));
         let _ = fs::remove_file(&trace_path);
         let mut bin = TestBinary {
             name,
+            cwd,
             tests: BTreeSet::new(),
             runner,
             baseline: Duration::ZERO,
@@ -1451,10 +1743,10 @@ pub fn run(options: &Options) -> Result<Report> {
         let trace_env = trace_path.to_string_lossy().into_owned();
         let outcome = run_binary(
             &bin,
-            &session.package_dir,
             None,
-            ("TMT_TRACE", &trace_env),
+            &[("TMT_TRACE", &trace_env)],
             Duration::from_secs(3600),
+            false,
         )?;
         if outcome != Outcome::Pass {
             bail!(
@@ -1481,7 +1773,7 @@ pub fn run(options: &Options) -> Result<Report> {
         if let Runner::Exe(exe) = &bin.runner {
             let listing = Command::new(exe)
                 .args(["--list", "--format", "terse"])
-                .current_dir(&session.package_dir)
+                .current_dir(&bin.cwd)
                 .stdin(Stdio::null())
                 .stderr(Stdio::null())
                 .output()
@@ -1498,8 +1790,11 @@ pub fn run(options: &Options) -> Result<Report> {
         skipped_sites: disabled.len(),
         ..Report::default()
     };
+    let scratch = work.clone();
     let mut jobs: Vec<Job> = vec![];
     let mut work: Vec<SiteWork> = vec![];
+    // `(index of the finding, job of its first surviving mutant)`.
+    let mut effect_jobs: Vec<(usize, usize)> = vec![];
     for file in &files {
         for site in file.sites.iter().filter(|s| !disabled.contains(&s.id)) {
             let plan = match session.plan(&file.display, site, options.verify) {
@@ -1598,6 +1893,12 @@ pub fn run(options: &Options) -> Result<Report> {
             }
         }
         if !survivors.is_empty() {
+            // The first survivor is traced below to see what it changes.
+            let first = item
+                .runs
+                .iter()
+                .find(|(_, job)| results[*job].survived.is_some());
+            effect_jobs.push((report.findings.len(), first.expect("a survivor").1));
             report.findings.push(Finding::AssertionGap {
                 at,
                 survivors,
@@ -1606,7 +1907,121 @@ pub fn run(options: &Options) -> Result<Report> {
             });
         }
     }
+
+    // 7. What do the surviving mutants change in the tests that let them through?
+    if options.effects && !effect_jobs.is_empty() {
+        session.note(&format!("tracing {} surviving mutants", effect_jobs.len()));
+        let sites: BTreeMap<u32, (&str, &Site)> = files
+            .iter()
+            .flat_map(|f| f.sites.iter().map(move |s| (s.id, (f.display.as_str(), s))))
+            .collect();
+        let traced = run_pool(effect_jobs.len(), options.jobs, |index| {
+            session.trace_job(&jobs[effect_jobs[index].1], &scratch)
+        })?;
+        for ((finding, job), mut changes) in effect_jobs.iter().zip(traced) {
+            // What happens inside the mutated code itself is not an effect of it: deleting
+            // a statement trivially stops the expressions in it from running.
+            if let Some((mutated_file, mutated)) = sites.get(&jobs[*job].site) {
+                for found in changes.values_mut() {
+                    found.retain(|change| {
+                        sites.get(&change.site()).is_none_or(|(file, site)| {
+                            file != mutated_file
+                                || site.end <= mutated.start
+                                || mutated.end <= site.start
+                        })
+                    });
+                }
+                changes.retain(|_, found| !found.is_empty());
+            }
+            if let Finding::AssertionGap { effects, .. } = &mut report.findings[*finding] {
+                *effects = describe_effects(&changes, &sites);
+            }
+        }
+    }
+
+    // 8. Findings the user has already dealt with.
+    let ignored: BTreeMap<&str, BTreeMap<usize, String>> = files
+        .iter()
+        .map(|f| {
+            (
+                f.display.as_str(),
+                crate::baseline::ignored_lines(&f.original),
+            )
+        })
+        .collect();
+    let known = match &options.baseline {
+        Some(path) => crate::baseline::load(path)?,
+        None => BTreeSet::new(),
+    };
+    let location = |finding: &Finding| match finding {
+        Finding::InputGap { at, .. } | Finding::AssertionGap { at, .. } => {
+            (at.file.clone(), at.line)
+        }
+    };
+    let before = report.findings.len();
+    report.findings.retain(|finding| {
+        let (file, line) = location(finding);
+        !ignored
+            .get(file.as_str())
+            .is_some_and(|lines| lines.contains_key(&line))
+    });
+    if let Some(path) = &options.write_baseline {
+        crate::baseline::write(path, &report.findings)?;
+    }
+    report
+        .findings
+        .retain(|finding| !known.contains(&crate::baseline::fingerprint(finding)));
+    report.suppressed = before - report.findings.len();
     Ok(report)
+}
+
+/// The changes a surviving mutant causes, as up to three sentences. Changes that many
+/// tests share are mentioned once.
+fn describe_effects(
+    changes: &BTreeMap<String, BTreeSet<Change>>,
+    sites: &BTreeMap<u32, (&str, &Site)>,
+) -> Vec<String> {
+    let mut by_change: BTreeMap<&Change, Vec<&str>> = BTreeMap::new();
+    for (test, found) in changes {
+        for change in found {
+            by_change.entry(change).or_default().push(test);
+        }
+    }
+    if by_change.is_empty() {
+        return vec![
+            "with the mutant, nothing else changes in these tests: they do not use the result of this code".to_string(),
+        ];
+    }
+    let mut out = vec![];
+    for (change, tests) in by_change.iter().take(3) {
+        let Some((file, site)) = sites.get(&change.site()) else {
+            continue;
+        };
+        let code = report::location(file, site).code;
+        let at = format!("{file}:{}", site.line);
+        let who = match tests[..] {
+            ["?"] => "a test".to_string(),
+            [one] => format!("`{one}`"),
+            [first, ..] => format!("`{first}` (and {} more)", tests.len() - 1),
+            [] => continue,
+        };
+        out.push(match change {
+            Change::Returns { value, .. } => {
+                format!("with the mutant, {who} gets `{value}` from `{code}` ({at})")
+            }
+            Change::NowRuns { .. } => format!("with the mutant, {who} now runs `{code}` ({at})"),
+            Change::NoLongerRuns { .. } => {
+                format!("with the mutant, {who} no longer runs `{code}` ({at})")
+            }
+            Change::NewOutcome { .. } => {
+                format!("with the mutant, {who} takes `{code}` ({at}) a way it did not before")
+            }
+        });
+    }
+    if by_change.len() > 3 {
+        out.push(format!("(and {} more such changes)", by_change.len() - 3));
+    }
+    out
 }
 
 #[cfg(test)]
@@ -1635,11 +2050,15 @@ mod tests {
             r#"{"reason":"build-finished","success":false}"#,
             "\n",
         );
-        let out = parse_build_output(stdout, "p");
+        let out = parse_build_output(stdout, &["p", "other"]);
         assert_eq!(
             out.test_binaries,
-            [("p".to_string(), PathBuf::from("/t/p-abc"))]
+            [("p".to_string(), PathBuf::from("/t/p-abc"), "p".to_string())]
         );
+        // With several packages each binary is attributed to its own.
+        let both = parse_build_output(stdout, &["dep", "p"]);
+        let owners: Vec<&str> = both.test_binaries.iter().map(|b| b.2.as_str()).collect();
+        assert_eq!(owners, ["p", "dep"]);
         assert_eq!(
             out.errors,
             [CompileError {
@@ -1910,6 +2329,93 @@ serde = { path = "../../serde-fork" }
         assert_eq!(core_range(0, "(a) && (b)"), (0, 10));
         assert_eq!(core_range(0, "f(a)"), (0, 4));
         assert_eq!(core_range(3, "()"), (4, 4));
+    }
+
+    #[test]
+    fn workspace_dependents() {
+        let package = |name: &str, deps: &[&str]| Package {
+            name: name.to_string(),
+            dependencies: deps
+                .iter()
+                .map(|d| Dependency {
+                    name: d.to_string(),
+                })
+                .collect(),
+            manifest_path: PathBuf::new(),
+            targets: vec![],
+        };
+        let packages = [
+            package("core", &["serde"]),
+            package("mid", &["core"]),
+            package("app", &["mid", "other"]),
+            package("other", &[]),
+            package("cycle", &["app", "core"]),
+        ];
+        assert_eq!(dependents_of("core", &packages), ["app", "cycle", "mid"]);
+        assert_eq!(dependents_of("mid", &packages), ["app", "cycle"]);
+        assert_eq!(dependents_of("other", &packages), ["app", "cycle"]);
+        assert!(dependents_of("app", &packages) == ["cycle"]);
+        assert!(dependents_of("nobody", &packages).is_empty());
+    }
+
+    #[test]
+    fn failure_lines_of_libtest() {
+        assert!(is_failure_line("test tests::a ... FAILED"));
+        assert!(is_failure_line(
+            "test src/lib.rs - double (line 3) ... FAILED"
+        ));
+        assert!(!is_failure_line("test tests::a ... ok"));
+        assert!(!is_failure_line("test result: FAILED. 1 passed; 1 failed"));
+        assert!(!is_failure_line("my output says ... FAILED"));
+        assert!(!is_failure_line(
+            "test tests::a ... FAILED (but printed by the test)"
+        ));
+    }
+
+    #[test]
+    fn effects_in_words() {
+        let source = "fn f(s: &mut S) -> bool { s.reset(); s.count > 1 }";
+        let found = instrument::discover(source, 0).unwrap().sites;
+        let sites: BTreeMap<u32, (&str, &Site)> =
+            found.iter().map(|s| (s.id, ("src/lib.rs", s))).collect();
+        let texts: Vec<&str> = found.iter().map(|s| s.text.as_str()).collect();
+        assert_eq!(
+            texts,
+            ["fn f(s: &mut S) -> bool", "s.reset();", "s.count > 1"]
+        );
+
+        let set = |list: &[Change]| list.iter().cloned().collect::<BTreeSet<Change>>();
+        let mut changes = BTreeMap::new();
+        changes.insert(
+            "tests::a".to_string(),
+            set(&[
+                Change::Returns {
+                    site: 0,
+                    value: true,
+                },
+                Change::NowRuns { site: 1 },
+            ]),
+        );
+        changes.insert(
+            "tests::b".to_string(),
+            set(&[Change::NowRuns { site: 1 }, Change::NewOutcome { site: 2 }]),
+        );
+        changes.insert("?".to_string(), set(&[Change::NoLongerRuns { site: 2 }]));
+        assert_eq!(
+            describe_effects(&changes, &sites),
+            [
+                "with the mutant, `tests::a` gets `true` from `fn f(s: &mut S) -> bool` (src/lib.rs:1)",
+                "with the mutant, `tests::a` (and 1 more) now runs `s.reset();` (src/lib.rs:1)",
+                "with the mutant, a test no longer runs `s.count > 1` (src/lib.rs:1)",
+                "(and 1 more such changes)",
+            ]
+        );
+        assert_eq!(
+            describe_effects(&BTreeMap::new(), &sites),
+            [
+                "with the mutant, nothing else changes in these tests: they do not use the result of this code"
+            ]
+        );
     }
 
     #[test]

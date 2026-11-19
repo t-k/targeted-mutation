@@ -35,6 +35,30 @@ struct Cli {
     /// with themselves (no fixed ports, no shared files).
     #[arg(short, long, default_value_t = 1, value_name = "N")]
     jobs: usize,
+    /// Analyse only the code changed since this git revision, and untracked files.
+    #[arg(long, value_name = "REV")]
+    since: Option<String>,
+    /// Analyse only these lines: FILE:FROM-TO, FILE:LINE or FILE (relative to the package).
+    #[arg(long, value_name = "FILE:FROM-TO")]
+    lines: Vec<String>,
+    /// Do not report the findings listed in this file.
+    #[arg(long, value_name = "FILE")]
+    baseline: Option<PathBuf>,
+    /// Write this run's findings to a file that later runs can use as --baseline.
+    #[arg(long, value_name = "FILE")]
+    write_baseline: Option<PathBuf>,
+    /// Also run the tests of this workspace package (repeatable).
+    #[arg(long, value_name = "PACKAGE")]
+    also_test: Vec<String>,
+    /// Also run the tests of every workspace package that depends on the analysed one.
+    #[arg(long)]
+    dependents: bool,
+    /// Do not trace surviving mutants to say what they change.
+    #[arg(long)]
+    no_effects: bool,
+    /// Print the report as SARIF 2.1.0.
+    #[arg(long, conflicts_with = "json")]
+    sarif: bool,
     /// Also list the code that no test executes.
     #[arg(long)]
     show_unreached: bool,
@@ -52,13 +76,22 @@ fn main() -> ExitCode {
         verify: !cli.no_verify,
         work_dir: cli.work_dir,
         progress: !cli.quiet,
+        since: cli.since,
+        lines: cli.lines,
+        baseline: cli.baseline,
+        write_baseline: cli.write_baseline,
+        also_test: cli.also_test,
+        dependents: cli.dependents,
+        effects: !cli.no_effects,
         jobs: cli.jobs,
         all_files: cli.all_files,
         doc: cli.doc,
     };
     match driver::run(&options) {
         Ok(result) => {
-            if cli.json {
+            if cli.sarif {
+                println!("{}", report::render_sarif(&result, ""));
+            } else if cli.json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&result).expect("report serialises")

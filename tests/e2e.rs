@@ -812,3 +812,240 @@ fn probes_do_not_change_what_the_code_does() {
     assert!(!codes.iter().any(|c| c.contains("a < 3")), "{report:#}");
     assert!(!codes.iter().any(|c| c.contains("slots[")), "{report:#}");
 }
+
+fn git_output(dir: &Path, args: &[&str]) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "git {args:?}: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8(output.stdout).unwrap().trim().to_string()
+}
+
+#[test]
+fn only_changed_code_is_analysed_on_request() {
+    let dir = fixture("kitchen-sink", "since");
+    fs::write(dir.join(".gitignore"), "target/\nCargo.lock\n").unwrap();
+    git_output(&dir, &["init", "-q"]);
+    git_output(&dir, &["add", "-A"]);
+    // A tree is a revision too: the state of the files as staged just now.
+    let base = git_output(&dir, &["write-tree"]);
+
+    // Nothing changed: nothing to analyse.
+    let run = tmt(&dir, &["--json", "--quiet", "--since", &base]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(report["sites"], 0, "{report:#}");
+    assert_eq!(report["mutants_run"], 0, "{report:#}");
+
+    // Change one function and add an untracked file.
+    let source = fs::read_to_string(dir.join("src/lib.rs")).unwrap();
+    fs::write(
+        dir.join("src/lib.rs"),
+        source.replace("celsius > 30.5", "celsius > 31.5"),
+    )
+    .unwrap();
+    fs::write(
+        dir.join("src/extra.rs"),
+        "pub fn tiny(x: u8) -> bool {\n    x > 200\n}\n",
+    )
+    .unwrap();
+    append(&dir.join("src/lib.rs"), "\npub mod extra;\n");
+
+    let run = tmt(&dir, &["--json", "--quiet", "--since", &base]);
+    assert_eq!(run.code, 2, "{}", run.stderr);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    let codes: Vec<&str> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["code"].as_str().unwrap())
+        .collect();
+    assert_eq!(codes, ["celsius > 31.5"], "{report:#}");
+    // The changed comparison, its function, and the two sites of the new file.
+    assert_eq!(report["sites"], 4, "{report:#}");
+    let unreached: Vec<&str> = report["unreached"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["file"].as_str().unwrap())
+        .collect();
+    assert_eq!(unreached, ["src/extra.rs", "src/extra.rs"]);
+
+    // The same selection by hand.
+    let run = tmt(
+        &dir,
+        &[
+            "--json",
+            "--quiet",
+            "--lines",
+            "src/lib.rs:24-26",
+            "--lines",
+            "src/extra.rs",
+        ],
+    );
+    let by_lines: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(by_lines, report);
+    let bad = tmt(&dir, &["--quiet", "--lines", "src/lib.rs:9-2"]);
+    assert_eq!(bad.code, 1);
+    assert!(bad.stderr.contains("not a line range"), "{}", bad.stderr);
+    let unknown = tmt(&dir, &["--quiet", "--since", "no-such-revision"]);
+    assert_eq!(unknown.code, 1);
+}
+
+#[test]
+fn known_findings_can_be_suppressed() {
+    let dir = fixture("eligibility", "suppress");
+    let baseline = dir.join("tmt-baseline.json");
+    let baseline_arg = baseline.to_str().unwrap();
+
+    // Record what is there today.
+    let run = tmt(
+        &dir,
+        &["--json", "--quiet", "--write-baseline", baseline_arg],
+    );
+    assert_eq!(run.code, 2, "{}", run.stderr);
+    assert!(fs::read_to_string(&baseline).unwrap().contains("age >= 18"));
+
+    // With the baseline the known gap is neither reported nor a failure.
+    let run = tmt(&dir, &["--json", "--quiet", "--baseline", baseline_arg]);
+    assert_eq!(run.code, 0, "{}", run.stdout);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(report["findings"].as_array().unwrap().len(), 0);
+    assert_eq!(report["suppressed"], 1);
+    let text = tmt(&dir, &["--quiet", "--baseline", baseline_arg]);
+    assert!(
+        text.stdout.contains("1 findings suppressed"),
+        "{}",
+        text.stdout
+    );
+
+    // Code that moves keeps its entry; a new gap is still reported.
+    let source = fs::read_to_string(dir.join("src/lib.rs")).unwrap();
+    fs::write(
+        dir.join("src/lib.rs"),
+        format!("// moved down\n\n{source}\npub fn is_senior(age: u32) -> bool {{\n    age >= 65\n}}\n\n#[test]\nfn seniors() {{\n    assert!(is_senior(70));\n    assert!(!is_senior(30));\n}}\n"),
+    )
+    .unwrap();
+    let run = tmt(&dir, &["--json", "--quiet", "--baseline", baseline_arg]);
+    assert_eq!(run.code, 2, "{}", run.stdout);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    let codes: Vec<&str> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["code"].as_str().unwrap())
+        .collect();
+    assert_eq!(codes, ["age >= 65"], "{report:#}");
+    assert_eq!(report["suppressed"], 1);
+
+    // A comment on the line (or the line above) silences the rest.
+    let source = fs::read_to_string(dir.join("src/lib.rs")).unwrap();
+    fs::write(
+        dir.join("src/lib.rs"),
+        source.replace(
+            "    age >= 65",
+            "    // tmt:ignore the pension age is checked by the caller's tests\n    age >= 65",
+        ),
+    )
+    .unwrap();
+    let run = tmt(&dir, &["--json", "--quiet", "--baseline", baseline_arg]);
+    assert_eq!(run.code, 0, "{}", run.stdout);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(report["suppressed"], 2);
+
+    let missing = tmt(
+        &dir,
+        &["--quiet", "--baseline", "/nonexistent/baseline.json"],
+    );
+    assert_eq!(missing.code, 1);
+}
+
+#[test]
+fn tests_of_dependent_packages_can_close_a_gap() {
+    let root = fixture("multi", "dependents");
+    let ws = root.join("ws");
+    // On its own tests the core package leaves its boundary open.
+    let alone = tmt(&ws, &["--json", "--quiet", "--package", "ws-core"]);
+    assert_eq!(alone.code, 2, "{}", alone.stderr);
+
+    // The dependent package tests the boundary.
+    for flags in [&["--dependents"][..], &["--also-test", "ws-app"][..]] {
+        let mut args = vec!["--json", "--quiet", "--package", "ws-core"];
+        args.extend_from_slice(flags);
+        let run = tmt(&ws, &args);
+        assert_eq!(run.code, 0, "{flags:?}: {}{}", run.stdout, run.stderr);
+        let report: Value = serde_json::from_str(&run.stdout).unwrap();
+        assert_eq!(
+            report["findings"].as_array().unwrap().len(),
+            0,
+            "{report:#}"
+        );
+        assert_eq!(
+            report["sites"], 2,
+            "still only the core package's code: {report:#}"
+        );
+        assert!(
+            report["mutants_killed"].as_u64().unwrap() >= 2,
+            "{report:#}"
+        );
+    }
+    let unknown = tmt(
+        &ws,
+        &["--quiet", "--package", "ws-core", "--also-test", "nope"],
+    );
+    assert_eq!(unknown.code, 1);
+    assert!(unknown.stderr.contains("--also-test"), "{}", unknown.stderr);
+}
+
+#[test]
+fn surviving_mutants_are_traced_to_what_they_change() {
+    let dir = fixture("batch-store", "effects");
+    let (_, report) = json(&dir);
+    let gap = findings(&report, "assertion_gap")[0];
+    let effects = strings(&gap["effects"]);
+    // Without the precondition check the failing batch gets as far as writing a document.
+    assert!(
+        effects.iter().any(
+            |e| e.contains("commit_fails_when_an_update_target_is_missing")
+                && e.contains("now runs `self.docs.insert(key.clone(), value.clone());`")
+        ),
+        "{effects:?}"
+    );
+    let plain = tmt(&dir, &["--json", "--quiet", "--no-effects"]);
+    let plain: Value = serde_json::from_str(&plain.stdout).unwrap();
+    assert_eq!(
+        findings(&plain, "assertion_gap")[0]["effects"]
+            .as_array()
+            .unwrap()
+            .len(),
+        0
+    );
+
+    // A mutant whose effect the tests never look at.
+    let sink = fixture("kitchen-sink", "effects-sink");
+    let (_, report) = json(&sink);
+    let total = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["code"] == "self.total += 1;" && f["kind"] == "assertion_gap")
+        .unwrap();
+    assert_eq!(
+        strings(&total["effects"]),
+        [
+            "with the mutant, nothing else changes in these tests: they do not use the result of this code"
+        ]
+    );
+
+    let sarif = tmt(&dir, &["--sarif", "--quiet"]);
+    assert_eq!(sarif.code, 2);
+    let sarif: Value = serde_json::from_str(&sarif.stdout).unwrap();
+    assert_eq!(sarif["runs"][0]["results"][0]["ruleId"], "assertion-gap");
+}

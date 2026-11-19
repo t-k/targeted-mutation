@@ -61,7 +61,11 @@ fn per_test(trace: &Trace) -> BTreeMap<(&str, u32), Seen> {
     }
     for (site, tests) in &trace.logic {
         for (test, obs) in tests {
-            let LogicObs { short, rhs_true, rhs_false } = *obs;
+            let LogicObs {
+                short,
+                rhs_true,
+                rhs_false,
+            } = *obs;
             let seen = all.entry((test, *site)).or_default();
             seen.reached |= obs.reached();
             seen.outcomes |= short as u8 | (rhs_true as u8) << 1 | (rhs_false as u8) << 2;
@@ -74,7 +78,10 @@ fn per_test(trace: &Trace) -> BTreeMap<(&str, u32), Seen> {
     }
     for (site, tests) in &trace.returns {
         for (test, obs) in tests {
-            let ReturnObs { saw_true, saw_false } = *obs;
+            let ReturnObs {
+                saw_true,
+                saw_false,
+            } = *obs;
             let seen = all.entry((test, *site)).or_default();
             seen.reached |= obs.reached();
             seen.returned_true |= saw_true;
@@ -94,7 +101,8 @@ pub fn changes(
     mutated_site: u32,
 ) -> BTreeMap<String, BTreeSet<Change>> {
     let (before, after) = (per_test(original), per_test(mutated));
-    let in_scope = |test: &str, site: u32| site != mutated_site && tests.is_none_or(|t| t.contains(test));
+    let in_scope =
+        |test: &str, site: u32| site != mutated_site && tests.is_none_or(|t| t.contains(test));
     let mut out: BTreeMap<String, BTreeSet<Change>> = BTreeMap::new();
     for ((test, site), now) in &after {
         if !in_scope(test, *site) {
@@ -118,8 +126,13 @@ pub fn changes(
         }
     }
     for ((test, site), was) in &before {
-        if in_scope(test, *site) && was.reached && !after.get(&(*test, *site)).is_some_and(|now| now.reached) {
-            out.entry(test.to_string()).or_default().insert(Change::NoLongerRuns { site: *site });
+        if in_scope(test, *site)
+            && was.reached
+            && !after.get(&(*test, *site)).is_some_and(|now| now.reached)
+        {
+            out.entry(test.to_string())
+                .or_default()
+                .insert(Change::NoLongerRuns { site: *site });
         }
     }
     out.retain(|_, found| !found.is_empty());
@@ -142,11 +155,22 @@ mod tests {
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(
             found["t"].iter().cloned().collect::<Vec<_>>(),
-            [Change::NowRuns { site: 3 }, Change::NoLongerRuns { site: 2 }]
+            [
+                Change::NowRuns { site: 3 },
+                Change::NoLongerRuns { site: 2 }
+            ]
         );
         // The mutated site itself is never reported.
-        assert!(changes(&original, &mutated, None, 3)["t"].iter().all(|c| c.site() != 3));
-        assert!(!changes(&original, &mutated, None, 2)["t"].iter().any(|c| c.site() == 2));
+        assert!(
+            changes(&original, &mutated, None, 3)["t"]
+                .iter()
+                .all(|c| c.site() != 3)
+        );
+        assert!(
+            !changes(&original, &mutated, None, 2)["t"]
+                .iter()
+                .any(|c| c.site() == 2)
+        );
     }
 
     #[test]
@@ -157,16 +181,18 @@ mod tests {
         assert!(changes(&original, &mutated, Some(&only("t")), 9).is_empty());
         // Had the whole binary run, `u` not running the statement would be a change.
         assert_eq!(
-            changes(&original, &mutated, None, 9)["u"].iter().cloned().collect::<Vec<_>>(),
+            changes(&original, &mutated, None, 9)["u"]
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
             [Change::NoLongerRuns { site: 1 }]
         );
     }
 
     #[test]
     fn comparisons_conditions_and_results() {
-        let original = Trace::parse(
-            "O\t1\tt\t1\t0\t-3\t-\t1\t-\t-\nL\t2\tt\t1\nB\t3\tt\t2\nA\t4\tt\t1\n",
-        );
+        let original =
+            Trace::parse("O\t1\tt\t1\t0\t-3\t-\t1\t-\t-\nL\t2\tt\t1\nB\t3\tt\t2\nA\t4\tt\t1\n");
         let mutated = Trace::parse(
             "O\t1\tt\t5\t0\t-3\t2\t1\t-\t-\nL\t2\tt\t3\nB\t3\tt\t3\nA\t4\tt\t2\nB\t5\tt\t1\n",
         );
@@ -174,7 +200,10 @@ mod tests {
         assert_eq!(
             found["t"].iter().cloned().collect::<Vec<_>>(),
             [
-                Change::Returns { site: 3, value: true },
+                Change::Returns {
+                    site: 3,
+                    value: true
+                },
                 // A function the test did not call before is "now runs", not "now returns".
                 Change::NowRuns { site: 5 },
                 Change::NewOutcome { site: 1 },
@@ -184,6 +213,10 @@ mod tests {
         // Identical traces: nothing propagates.
         assert!(changes(&original, &original, None, 9).is_empty());
         // Seeing fewer outcomes than before is not reported as a new outcome.
-        assert!(changes(&mutated, &original, None, 9)["t"].iter().all(|c| matches!(c, Change::NoLongerRuns { site: 5 })));
+        assert!(
+            changes(&mutated, &original, None, 9)["t"]
+                .iter()
+                .all(|c| matches!(c, Change::NoLongerRuns { site: 5 }))
+        );
     }
 }

@@ -19,7 +19,9 @@ impl Scope {
                 bail!("not a line range: `{spec}` (expected FILE:FROM-TO)");
             }
             let (file, range) = match spec.rsplit_once(':') {
-                Some((file, lines)) if !file.is_empty() && lines.starts_with(|c: char| c.is_ascii_digit()) => {
+                Some((file, lines))
+                    if !file.is_empty() && lines.starts_with(|c: char| c.is_ascii_digit()) =>
+                {
                     let (from, to) = lines.split_once('-').unwrap_or((lines, lines));
                     let parse = |text: &str| text.parse::<usize>().ok().filter(|n| *n > 0);
                     match (parse(from), parse(to)) {
@@ -52,7 +54,8 @@ impl Scope {
                 && let Some(added) = line.split(' ').find_map(|part| part.strip_prefix('+'))
             {
                 let (start, count) = added.split_once(',').unwrap_or((added, "1"));
-                let (Ok(start), Ok(count)) = (start.parse::<usize>(), count.parse::<usize>()) else {
+                let (Ok(start), Ok(count)) = (start.parse::<usize>(), count.parse::<usize>())
+                else {
                     continue;
                 };
                 let range = if count == 0 {
@@ -68,7 +71,10 @@ impl Scope {
     }
 
     pub fn add(&mut self, file: &str, range: (usize, usize)) {
-        self.files.entry(file.replace('\\', "/")).or_default().push(range);
+        self.files
+            .entry(file.replace('\\', "/"))
+            .or_default()
+            .push(range);
     }
 
     pub fn add_whole_file(&mut self, file: &str) {
@@ -93,13 +99,21 @@ impl Scope {
     pub fn touches(&self, file: &str, first: usize, last: usize) -> bool {
         self.files
             .get(&file.replace('\\', "/"))
-            .is_some_and(|ranges| ranges.iter().any(|(from, to)| first <= *to && *from <= last))
+            .is_some_and(|ranges| {
+                ranges
+                    .iter()
+                    .any(|(from, to)| first <= *to && *from <= last)
+            })
     }
 }
 
 /// 1-based line of the byte at `offset`.
 pub fn line_of(source: &str, offset: usize) -> usize {
-    source.as_bytes()[..offset.min(source.len())].iter().filter(|b| **b == b'\n').count() + 1
+    source.as_bytes()[..offset.min(source.len())]
+        .iter()
+        .filter(|b| **b == b'\n')
+        .count()
+        + 1
 }
 
 #[cfg(test)]
@@ -112,7 +126,8 @@ mod tests {
 
     #[test]
     fn line_specs() {
-        let scope = Scope::parse_lines(&specs(&["src/a.rs:10-20", "src/a.rs:30", "src/b.rs"])).unwrap();
+        let scope =
+            Scope::parse_lines(&specs(&["src/a.rs:10-20", "src/a.rs:30", "src/b.rs"])).unwrap();
         // Inside, on both boundaries, overlapping, and outside.
         assert!(scope.touches("src/a.rs", 12, 13));
         assert!(scope.touches("src/a.rs", 1, 10));
@@ -124,12 +139,21 @@ mod tests {
         assert!(!scope.touches("src/a.rs", 31, 99));
         assert!(scope.touches("src/b.rs", 7, 7));
         assert!(!scope.touches("src/c.rs", 7, 7));
-        assert!(scope.touches("src\\b.rs", 1, 1), "separators are normalised");
+        assert!(
+            scope.touches("src\\b.rs", 1, 1),
+            "separators are normalised"
+        );
         assert_eq!(scope.files().collect::<Vec<_>>(), ["src/a.rs", "src/b.rs"]);
         assert!(!scope.is_empty());
         assert!(Scope::default().is_empty());
 
-        for bad in ["src/a.rs:0", "src/a.rs:5-3", "src/a.rs:1-x", ":3", "src/a.rs:3-"] {
+        for bad in [
+            "src/a.rs:0",
+            "src/a.rs:5-3",
+            "src/a.rs:1-x",
+            ":3",
+            "src/a.rs:3-",
+        ] {
             assert!(Scope::parse_lines(&specs(&[bad])).is_err(), "{bad}");
         }
         // A Windows drive letter or a name with a colon is a file, not a range.
@@ -175,10 +199,31 @@ new file mode 100644
 ";
         let scope = Scope::from_diff(diff);
         // Changed: 10..=12. Single line: 31. Pure deletion after line 40: 40 and 41.
-        for (line, expected) in [(9, false), (10, true), (12, true), (13, false), (31, true), (32, false), (39, false), (40, true), (41, true), (42, false), (1, true), (2, true), (3, false)] {
-            assert_eq!(scope.touches("src/a.rs", line, line), expected, "line {line}");
+        for (line, expected) in [
+            (9, false),
+            (10, true),
+            (12, true),
+            (13, false),
+            (31, true),
+            (32, false),
+            (39, false),
+            (40, true),
+            (41, true),
+            (42, false),
+            (1, true),
+            (2, true),
+            (3, false),
+        ] {
+            assert_eq!(
+                scope.touches("src/a.rs", line, line),
+                expected,
+                "line {line}"
+            );
         }
-        assert!(!scope.touches("src/gone.rs", 1, 100), "a deleted file has no lines left");
+        assert!(
+            !scope.touches("src/gone.rs", 1, 100),
+            "a deleted file has no lines left"
+        );
         assert!(scope.touches("src/new.rs", 4, 4));
         assert!(!scope.touches("src/new.rs", 5, 5));
         assert_eq!(Scope::from_diff(""), Scope::default());
@@ -191,13 +236,20 @@ new file mode 100644
         other.add_whole_file("b.rs");
         other.add("a.rs", (9, 9));
         scope.merge(other);
-        assert!(scope.touches("a.rs", 9, 9) && scope.touches("a.rs", 2, 2) && !scope.touches("a.rs", 5, 5));
+        assert!(
+            scope.touches("a.rs", 9, 9)
+                && scope.touches("a.rs", 2, 2)
+                && !scope.touches("a.rs", 5, 5)
+        );
         assert!(scope.touches("b.rs", 12345, 12345));
     }
 
     #[test]
     fn lines_of_offsets() {
         let source = "a\nbc\n\nd";
-        assert_eq!([0, 1, 2, 4, 5, 6, 7, 99].map(|o| line_of(source, o)), [1, 1, 2, 2, 3, 4, 4, 4]);
+        assert_eq!(
+            [0, 1, 2, 4, 5, 6, 7, 99].map(|o| line_of(source, o)),
+            [1, 1, 2, 2, 3, 4, 4, 4]
+        );
     }
 }
