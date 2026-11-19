@@ -2840,4 +2840,83 @@ serde = { path = "../../serde-fork" }
         assert_eq!(fs::read_to_string(&outside).unwrap(), "keep");
         fs::remove_dir_all(&dir).unwrap();
     }
+    #[test]
+    fn work_copy_log_follows_every_write() {
+        let dir = scratch("copy-log-order");
+        let (workspace, work) = (dir.join("ws"), dir.join("work"));
+        let copy = work.join("src");
+        let log = work.join(WRITTEN_LOG);
+        let names = ["h", "c", "f", "a", "e", "b", "g", "d"].map(|n| format!("src/{n}.rs"));
+        for name in &names {
+            fs::write(workspace.join(name), "x").unwrap();
+        }
+        let state = copy_run(&dir, &[], false);
+        // The entry is there before the file changes, once.
+        state.record(&copy.join(&names[0])).unwrap();
+        state.record(&copy.join(&names[0])).unwrap();
+        assert_eq!(fs::read_to_string(&log).unwrap(), "src/h.rs\n");
+        assert_eq!(fs::read_to_string(copy.join(&names[0])).unwrap(), "x");
+        for name in &names {
+            state.write(&copy.join(name), "probe").unwrap();
+        }
+        state.settle(&workspace).unwrap();
+        let mut sorted = names.to_vec();
+        sorted.sort();
+        assert_eq!(
+            fs::read_to_string(&log).unwrap(),
+            sorted.iter().map(|n| format!("{n}\n")).collect::<String>()
+        );
+
+        // After the log was trimmed, a later write is logged again.
+        let state = copy_run(&dir, &[], false);
+        state.settle(&workspace).unwrap();
+        assert_eq!(fs::read_to_string(&log).unwrap(), "");
+        state.write(&copy.join(&names[3]), "probe").unwrap();
+        assert_eq!(fs::read_to_string(&log).unwrap(), "src/a.rs\n");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn sync_copies_what_is_not_up_to_date_and_nothing_else() {
+        let dir = scratch("copy-sync");
+        let (workspace, work) = (dir.join("ws"), dir.join("work"));
+        let copy = work.join("src");
+        let hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+        for name in ["same", "longer", "newer", "was_dir", "was_link"] {
+            fs::write(workspace.join("src").join(name), "source").unwrap();
+            set_modified(&workspace.join("src").join(name), hour_ago);
+        }
+        fs::create_dir_all(copy.join("src/was_dir/inner")).unwrap();
+        // Same size and not older: taken for a copy, whatever it holds.
+        fs::write(copy.join("src/same"), "SOURCE").unwrap();
+        set_modified(&copy.join("src/same"), hour_ago);
+        fs::write(copy.join("src/longer"), "SOURCE+").unwrap();
+        fs::write(copy.join("src/newer"), "SOURCE").unwrap();
+        set_modified(&copy.join("src/newer"), hour_ago - Duration::from_secs(60));
+        // A link in the copy is replaced, not written through.
+        let outside = dir.join("outside");
+        fs::write(&outside, "keep").unwrap();
+        std::os::unix::fs::symlink(&outside, copy.join("src/was_link")).unwrap();
+        // What the run does not want goes, with the directories it leaves empty.
+        fs::create_dir_all(copy.join("old/deep")).unwrap();
+        fs::write(copy.join("old/deep/x"), "x").unwrap();
+        fs::create_dir_all(workspace.join("keep/deep")).unwrap();
+        fs::write(workspace.join("keep/deep/y"), "y").unwrap();
+
+        copy_run(&dir, &[], true);
+        let read = |name: &str| fs::read_to_string(copy.join(name)).unwrap();
+        assert_eq!(read("src/same"), "SOURCE");
+        for name in ["src/longer", "src/newer", "src/was_dir", "src/was_link"] {
+            assert_eq!(read(name), "source", "{name}");
+        }
+        assert!(
+            fs::symlink_metadata(copy.join("src/was_link"))
+                .unwrap()
+                .is_file()
+        );
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "keep");
+        assert!(!copy.join("old").exists());
+        assert_eq!(read("keep/deep/y"), "y");
+        fs::remove_dir_all(&dir).unwrap();
+    }
 }
