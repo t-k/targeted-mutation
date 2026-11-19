@@ -129,3 +129,7 @@ The idea of generating mutants with knowledge of the tests is called *test-aware
 cargo test          # unit tests, PICT table, end-to-end runs on fixtures/
 cargo run -- .      # the tool on itself
 ```
+
+## License
+
+Apache License, Version 2.0. See [LICENSE](LICENSE).
