@@ -2,6 +2,13 @@
 name = "targeted-mutation"
 version = "0.1.0"
 edition = "2024"
+description = "Targeted mutation testing for Rust: find the wrong implementations your tests let through"
+license = "MIT OR Apache-2.0"
+exclude = ["fixtures/*/target", "formal", "docs.local"]
+
+[[bin]]
+name = "tmt"
+path = "src/main.rs"
 
 [dependencies]
 anyhow = "1.0.104"
