@@ -784,4 +784,100 @@ mod tests {
         assert!(tmt_rt::eq(0, tmt_rt::NE, "a", "b", Val::None, Val::None));
         assert!(tmt_rt::live(0));
     }
+    /// The two replacements of each operator are those of cargo-mutants, and the runtime
+    /// and the report name the same ones.
+    #[test]
+    fn both_replacements_of_every_operator() {
+        use crate::instrument::ArithOp;
+        let code = |op: ArithOp| match op {
+            ArithOp::Add => tmt_rt::ADD,
+            ArithOp::Sub => tmt_rt::SUB,
+            ArithOp::Mul => tmt_rt::MUL,
+            ArithOp::Div => tmt_rt::DIV,
+            ArithOp::Rem => tmt_rt::REM,
+            ArithOp::BitAnd => tmt_rt::BITAND,
+            ArithOp::BitOr => tmt_rt::BITOR,
+            ArithOp::BitXor => tmt_rt::BITXOR,
+            ArithOp::Shl => tmt_rt::SHL,
+            ArithOp::Shr => tmt_rt::SHR,
+        };
+        let table = [
+            (ArithOp::Add, "-", Some("*")),
+            (ArithOp::Sub, "+", Some("/")),
+            (ArithOp::Mul, "/", Some("+")),
+            (ArithOp::Div, "*", Some("%")),
+            (ArithOp::Rem, "/", Some("+")),
+            (ArithOp::BitAnd, "|", Some("^")),
+            (ArithOp::BitOr, "&", Some("^")),
+            (ArithOp::BitXor, "&", Some("|")),
+            (ArithOp::Shl, ">>", None),
+            (ArithOp::Shr, "<<", None),
+        ];
+        assert_eq!(table.map(|row| row.0), ArithOp::ALL);
+        for (op, first, second) in table {
+            assert_eq!(op.swapped().symbol(), first, "{op:?}");
+            assert_eq!(op.swapped2().map(ArithOp::symbol), second, "{op:?}");
+            assert_eq!(
+                tmt_rt::arith_swapped(code(op)),
+                code(op.swapped()),
+                "{op:?}"
+            );
+            assert_eq!(
+                tmt_rt::arith_swapped2(code(op)),
+                op.swapped2().map(code),
+                "{op:?}"
+            );
+        }
+        assert_eq!(
+            tmt_rt::parse_mutant("3:as2"),
+            Some((3, tmt_rt::Mutant::ArithSwap2))
+        );
+
+        // What is recorded for a pair of operands: whether each replacement agrees.
+        use tmt_rt::ArithNum;
+        // 2 + 2 = 2 * 2, but not 2 - 2.
+        assert!(!i32::tmt_same(tmt_rt::ADD, tmt_rt::SUB, 2, 2));
+        assert!(i32::tmt_same(tmt_rt::ADD, tmt_rt::MUL, 2, 2));
+        // 6 / 1 = 6 * 1, but not 6 % 1.
+        assert!(i32::tmt_same(tmt_rt::DIV, tmt_rt::MUL, 6, 1));
+        assert!(!i32::tmt_same(tmt_rt::DIV, tmt_rt::REM, 6, 1));
+        // 4 | 1 = 4 ^ 1, but not 4 & 1.
+        assert!(i32::tmt_same(tmt_rt::BITOR, tmt_rt::BITXOR, 4, 1));
+        assert!(!i32::tmt_same(tmt_rt::BITOR, tmt_rt::BITAND, 4, 1));
+        assert!(f64::tmt_same(tmt_rt::MUL, tmt_rt::ADD, 2.0, 2.0));
+
+        // And as the planner reads it.
+        let seen = |bits: u8| crate::plan::ArithObs::from_bits(bits);
+        let both = seen(tmt_rt::ARITH_DIFFERS | tmt_rt::ARITH_SAME2);
+        assert!(both.differs && both.same2 && !both.same && !both.differs2 && !both.opaque);
+        assert!(both.infected_by(Mutation::ArithSwap));
+        assert!(!both.infected_by(Mutation::ArithSwap2));
+        let other = seen(tmt_rt::ARITH_SAME | tmt_rt::ARITH_DIFFERS2);
+        assert!(!other.infected_by(Mutation::ArithSwap));
+        assert!(other.infected_by(Mutation::ArithSwap2));
+        assert_eq!(crate::plan::plan_arith(&both), crate::plan::ArithPlan::Run);
+        assert_eq!(
+            crate::plan::plan_arith(&both.second()),
+            crate::plan::ArithPlan::NeverDiffers
+        );
+        assert_eq!(
+            crate::plan::plan_arith(&other.second()),
+            crate::plan::ArithPlan::Run
+        );
+        let mut merged = both;
+        merged.merge(&other);
+        assert!(merged.same && merged.differs && merged.same2 && merged.differs2);
+        // Operands that are not numbers stay that for both.
+        assert_eq!(
+            crate::plan::plan_arith(&seen(tmt_rt::ARITH_OPAQUE).second()),
+            crate::plan::ArithPlan::Opaque
+        );
+        assert_eq!(Mutation::ArithSwap2.encode(), "as2");
+
+        // A trace line with the wider bits is read; one beyond them is not.
+        let trace = Trace::parse("A\t1\tt\t18\nA\t2\tt\t31\nA\t3\tt\t32\n");
+        assert_eq!(trace.arith[&1]["t"], seen(18));
+        assert!(trace.arith.contains_key(&2) && !trace.arith.contains_key(&3));
+        assert_eq!(trace.malformed_lines, 1);
+    }
 }

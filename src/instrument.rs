@@ -2637,4 +2637,362 @@ mod tests {
         assert_eq!(out.inserted_by(inner_probe), Some(arith.id));
         assert_eq!(out.inserted_by(out.text.find("b, 1").unwrap()), None);
     }
+    fn values(ty: &str) -> Vec<String> {
+        let function: syn::ItemFn = syn::parse_str(&format!("fn f() -> {ty} {{ todo!() }}"))
+            .unwrap_or_else(|e| panic!("{ty}: {e}"));
+        body_values(&function.sig.output)
+    }
+
+    /// The table of cargo-mutants (https://mutants.rs/mutants.html), row by row.
+    #[test]
+    fn replacement_values_by_return_type() {
+        let rows: &[(&str, &[&str])] = &[
+            ("()", &["()"]),
+            ("i8", &["0", "1", "-1"]),
+            ("isize", &["0", "1", "-1"]),
+            ("i128", &["0", "1", "-1"]),
+            ("u8", &["0", "1"]),
+            ("usize", &["0", "1"]),
+            ("u128", &["0", "1"]),
+            ("f32", &["0.0", "1.0", "-1.0"]),
+            ("f64", &["0.0", "1.0", "-1.0"]),
+            ("bool", &["true", "false"]),
+            (
+                "NonZeroI32",
+                &["1.try_into().unwrap()", "(-1).try_into().unwrap()"],
+            ),
+            ("std::num::NonZeroU8", &["1.try_into().unwrap()"]),
+            ("NonZero<u64>", &["1.try_into().unwrap()"]),
+            (
+                "NonZero<i64>",
+                &["1.try_into().unwrap()", "(-1).try_into().unwrap()"],
+            ),
+            ("String", &["String::new()", "\"xyzzy\".into()"]),
+            ("&str", &["\"\"", "\"xyzzy\""]),
+            ("&'static str", &["\"\"", "\"xyzzy\""]),
+            ("&u8", &["Box::leak(Box::new(0))", "Box::leak(Box::new(1))"]),
+            (
+                "&mut bool",
+                &["Box::leak(Box::new(true))", "Box::leak(Box::new(false))"],
+            ),
+            (
+                "&[u8]",
+                &[
+                    "Vec::leak(Vec::new())",
+                    "Vec::leak(vec![0])",
+                    "Vec::leak(vec![1])",
+                ],
+            ),
+            (
+                "&mut [bool]",
+                &[
+                    "Vec::leak(Vec::new())",
+                    "Vec::leak(vec![true])",
+                    "Vec::leak(vec![false])",
+                ],
+            ),
+            ("Result<bool, Error>", &["Ok(true)", "Ok(false)"]),
+            ("io::Result<()>", &["Ok(())"]),
+            ("Option<u8>", &["None", "Some(0)", "Some(1)"]),
+            ("Vec<bool>", &["vec![]", "vec![true]", "vec![false]"]),
+            ("Box<u8>", &["Box::new(0)", "Box::new(1)"]),
+            (
+                "std::rc::Rc<u8>",
+                &["std::rc::Rc::new(0)", "std::rc::Rc::new(1)"],
+            ),
+            ("Arc<bool>", &["Arc::new(true)", "Arc::new(false)"]),
+            ("RefCell<()>", &["RefCell::new(())"]),
+            ("Mutex<()>", &["Mutex::new(())"]),
+            ("Cell<()>", &["Cell::new(())"]),
+            (
+                "HashSet<u8>",
+                &[
+                    "HashSet::new()",
+                    "HashSet::from_iter([0])",
+                    "HashSet::from_iter([1])",
+                ],
+            ),
+            (
+                "BTreeSet<()>",
+                &["BTreeSet::new()", "BTreeSet::from_iter([()])"],
+            ),
+            (
+                "BinaryHeap<()>",
+                &["BinaryHeap::new()", "BinaryHeap::from_iter([()])"],
+            ),
+            (
+                "LinkedList<()>",
+                &["LinkedList::new()", "LinkedList::from_iter([()])"],
+            ),
+            (
+                "VecDeque<()>",
+                &["VecDeque::new()", "VecDeque::from_iter([()])"],
+            ),
+            (
+                "HashMap<bool, u8>",
+                &[
+                    "HashMap::new()",
+                    "HashMap::from_iter([(true, 0)])",
+                    "HashMap::from_iter([(true, 1)])",
+                    "HashMap::from_iter([(false, 0)])",
+                    "HashMap::from_iter([(false, 1)])",
+                ],
+            ),
+            (
+                "std::collections::BTreeMap<(), ()>",
+                &[
+                    "std::collections::BTreeMap::new()",
+                    "std::collections::BTreeMap::from_iter([((), ())])",
+                ],
+            ),
+            (
+                "Cow<'a, str>",
+                &[
+                    "Cow::Borrowed(\"\")",
+                    "Cow::Owned(\"\".to_owned())",
+                    "Cow::Borrowed(\"xyzzy\")",
+                    "Cow::Owned(\"xyzzy\".to_owned())",
+                ],
+            ),
+            ("[u8; 4]", &["[0; 4]", "[1; 4]"]),
+            ("[bool; N + 1]", &["[true; N + 1]", "[false; N + 1]"]),
+            (
+                "(u8, bool)",
+                &["(0, true)", "(0, false)", "(1, true)", "(1, false)"],
+            ),
+            ("(bool,)", &["(true,)", "(false,)"]),
+            ("HttpResponse", &["HttpResponse::Ok().finish()"]),
+            (
+                "actix_web::HttpResponse",
+                &["actix_web::HttpResponse::Ok().finish()"],
+            ),
+            ("Config", &["Default::default()"]),
+            ("Self", &["Default::default()"]),
+            ("<T as Tr>::Out", &["Default::default()"]),
+            ("fn(u8) -> u8", &["Default::default()"]),
+            ("*const u8", &["Default::default()"]),
+            // Nested: every value of the inner type, wrapped.
+            (
+                "Result<Option<String>, E>",
+                &[
+                    "Ok(None)",
+                    "Ok(Some(String::new()))",
+                    "Ok(Some(\"xyzzy\".into()))",
+                ],
+            ),
+            ("(Vec<()>)", &["vec![]", "vec![()]"]),
+            ("Option<Config>", &["None", "Some(Default::default())"]),
+            // Nothing can be returned in place of these.
+            ("!", &[]),
+            ("impl Iterator<Item = u8>", &[]),
+            ("Box<impl Fn()>", &[]),
+            ("Option<!>", &["None"]),
+        ];
+        for (ty, expected) in rows {
+            assert_eq!(values(ty), *expected, "{ty}");
+        }
+        // No return type at all is `()`.
+        let unit: syn::ItemFn = syn::parse_str("fn f() {}").unwrap();
+        assert_eq!(body_values(&unit.sig.output), ["()"]);
+    }
+
+    #[test]
+    fn which_functions_get_their_body_replaced() {
+        let src = r#"
+            fn plain(a: u8) -> u8 { a + 1 }
+            fn already(a: u8) -> bool { let _ = a; true }
+            fn sole() -> bool { true }
+            fn spaced() -> (u8, bool) { ( 0 , true ) }
+            unsafe fn raw(a: u8) -> u8 { a }
+            fn empty() {}
+            fn one_call(s: &mut S) { s.go(); }
+            fn two_calls(s: &mut S) { s.go(); s.stop(); }
+            fn one_let(a: u8) { let _ = a; }
+            fn never() -> ! { loop {} }
+            fn hidden() -> impl Sized { 1 }
+            #[mutants::skip]
+            fn marked(a: u8) -> u8 { a + 2 }
+            #[cfg_attr(test, mutants::skip)]
+            fn marked_in_tests(a: u8) -> u8 { a + 3 }
+            #[mutants::skip]
+            impl S { fn method(&self, a: u8) -> u8 { a + 4 } }
+            #[mutants::skip]
+            mod generated { fn inner(a: u8) -> u8 { a + 5 } }
+            trait T { fn required(&self) -> u8; fn provided(&self) -> u8 { 7 } }
+            async fn later() -> u8 { 9 }
+        "#;
+        let sites = discover(src, 0).unwrap().sites;
+        let bodies: Vec<String> = sites
+            .iter()
+            .filter_map(|s| match &s.kind {
+                SiteKind::Body { name, value, .. } => Some(format!("{name} {value}")),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            bodies,
+            [
+                "plain 0",
+                "plain 1",
+                "already true",
+                "already false",
+                // The body is this value already, however it is spaced.
+                "sole false",
+                "spaced (0, false)",
+                "spaced (1, true)",
+                "spaced (1, false)",
+                // One statement that can be deleted is the same mutant as no body.
+                "two_calls ()",
+                "one_let ()",
+                "provided 0",
+                "provided 1",
+                "later 0",
+                "later 1",
+            ]
+        );
+        // Nothing at all is mutated in what is marked to be skipped.
+        let texts: Vec<&str> = sites.iter().map(|s| s.text.as_str()).collect();
+        for skipped in ["a + 2", "a + 3", "a + 4", "a + 5"] {
+            assert!(!texts.contains(&skipped), "{skipped}");
+        }
+        assert!(texts.contains(&"a + 1"));
+        let unsafe_sites: Vec<&Site> = sites.iter().filter(|s| s.text.contains("raw")).collect();
+        assert!(unsafe_sites.is_empty(), "{unsafe_sites:?}");
+
+        let body = sites
+            .iter()
+            .find(|s| matches!(s.kind, SiteKind::Body { .. }))
+            .unwrap();
+        assert_eq!(
+            (body.line, body.column, body.text.as_str()),
+            (2, 13, "fn plain(a: u8) -> u8")
+        );
+        let out = render(src, &sites, &all).text;
+        syn::parse_file(&out).expect("instrumented source parses");
+        assert_eq!(out.lines().count(), src.lines().count());
+        assert!(
+            out.contains(
+                "fn plain(a: u8) -> u8 { if !crate::__tmt_rt::live(0u32) { return 0; } \
+                 if !crate::__tmt_rt::live(1u32) { return 1; } (match (a, 1)"
+            ),
+            "{out}"
+        );
+        // A body that is exactly its expression: the function-level probes go around
+        // the probe of the expression.
+        let tight = "fn f(a: u8, b: u8) -> bool {a > b}";
+        let sites = discover(tight, 0).unwrap().sites;
+        let out = render(tight, &sites, &all).text;
+        syn::parse_file(&out).expect("instrumented source parses");
+        assert!(
+            out.starts_with(
+                "fn f(a: u8, b: u8) -> bool { let __tmt_v: bool = { \
+                 if !crate::__tmt_rt::live(1u32) { return true; } \
+                 if !crate::__tmt_rt::live(2u32) { return false; }(match (&(a), &(b))"
+            ),
+            "{out}"
+        );
+        assert!(
+            out.ends_with(" })}; crate::__tmt_rt::ret(0u32, __tmt_v) }"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn minus_guards_and_fields() {
+        let src = r#"
+            fn f(x: i32, y: f64, k: Kind, base: Options) -> Options {
+                let a = -x + -5 - -0 + (-0.0 * -y) as i32;
+                let b = match k {
+                    Kind::A(n) if n > 1 => 1,
+                    Kind::A(n) if let Some(m) = half(n) => m,
+                    Kind::B if x > 0 && let Some(m) = half(x) => m,
+                    #[cfg(any())]
+                    Kind::B if x > 2 => 2,
+                    Kind::B => 3,
+                };
+                let c = match b { n if n > 3 => 1, _ => 0 };
+                let first = Options { depth: a, name, ..base };
+                let second = Options { depth: -b, ..Default::default() };
+                let third = Wrap::<u8> { 0: c, ..Wrap::new() };
+                let _ = Options { depth: 1, ..base.clone() };
+                let _ = Options { depth: 2, ..make(3) };
+                let _ = Options { #[cfg(any())] depth: 4, strict: true, ..*other };
+                let _ = Options { depth: 5, name: n, strict: false };
+                first
+            }
+        "#;
+        let sites = found(src, 0).unwrap().sites;
+        let kinds: Vec<String> = sites
+            .iter()
+            .filter_map(|s| match &s.kind {
+                SiteKind::Neg {
+                    operand, literal, ..
+                } => Some(format!("neg {} | {operand} | literal={literal}", s.text)),
+                SiteKind::Guard { can_be_false } => {
+                    Some(format!("guard {} | can_be_false={can_be_false}", s.text))
+                }
+                SiteKind::Field {
+                    name,
+                    shorthand,
+                    from_base,
+                } => Some(format!(
+                    "field {} | {name} | shorthand={shorthand} | {from_base}",
+                    s.text
+                )),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "neg -x | x | literal=false",
+                "neg -5 | 5 | literal=true",
+                // `-0` and `-0.0` are 0 either way.
+                "neg -y | y | literal=false",
+                // No catch-all arm: the arm cannot be removed, so `false` is a mutant.
+                "guard n > 1 | can_be_false=true",
+                // Where the arm can be removed, that is the guard being `false`.
+                "guard n > 3 | can_be_false=false",
+                "field depth: a | depth | shorthand=false | (base).depth",
+                "field name | name | shorthand=true | (base).name",
+                "field depth: -b | depth | shorthand=false | (Options { ..Default::default() }).depth",
+                "neg -b | b | literal=false",
+                "field 0: c | 0 | shorthand=false | (Wrap::<u8> { ..Wrap::new() }).0",
+                // Not with a base that has arguments or a receiver, not a field with an
+                // attribute, and not without a base.
+                "field strict: true | strict | shorthand=false | (*other).strict",
+            ]
+        );
+        let out = render(src, &sites, &all).text;
+        syn::parse_file(&out).expect("instrumented source parses");
+        assert_eq!(out.lines().count(), src.lines().count());
+        for expected in [
+            // The operand is evaluated once, outside the names of the probe.
+            "(match (x) { __tmt_a => if crate::__tmt_rt::live(",
+            // A literal stays a literal, with the type its place gives it.
+            "u32) { -__tmt_a } else { __tmt_a } })",
+            "u32) { -5 } else { 5 })",
+            // A guard and the comparison it consists of: the guard goes around.
+            "Kind::A(n) if crate::__tmt_rt::ret(",
+            "u32, (match (&(n), &(1))",
+            "n if crate::__tmt_rt::arm(",
+            ") && (crate::__tmt_rt::ret(",
+            "depth: if crate::__tmt_rt::live(",
+            "{ a } else { (base).depth }",
+            // A field written by its name alone gets the name back.
+            "name: if crate::__tmt_rt::live(",
+            "{ name } else { (base).name }, ..base }",
+            "} else { (Options { ..Default::default() }).depth }, ..Default::default() }",
+            "0: if crate::__tmt_rt::live(",
+            "Options { depth: 1, ..base.clone() }",
+            "Options { depth: 2, ..make(3) }",
+            "Options { depth: 5, name: n, strict: false }",
+        ] {
+            assert!(out.contains(expected), "{expected}\n{out}");
+        }
+        assert!(
+            !out.contains("{ -0 }") && !out.contains("{ -0.0 }"),
+            "{out}"
+        );
+    }
 }

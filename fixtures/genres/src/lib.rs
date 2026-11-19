@@ -88,6 +88,13 @@ pub fn record(log: &mut Vec<String>, line: &str) {
     }
 }
 
+/// No value of this type can be made up: it has no default.
+pub struct Token(pub u32);
+
+pub fn token(n: u32) -> Token {
+    Token(n)
+}
+
 #[cfg_attr(any(), mutants::skip)]
 pub fn untouched(x: i32) -> i32 {
     x + 1
@@ -108,6 +115,7 @@ mod tests {
         assert_eq!(tripled(0), 0);
         assert_eq!(untouched(1), 2);
         assert_eq!(evens(5).count(), 3);
+        assert_eq!(token(3).0, 3);
     }
 
     #[test]

@@ -1151,3 +1151,104 @@ fn closes_the_gaps() {
         );
     }
 }
+
+#[test]
+fn the_mutants_of_cargo_mutants() {
+    let dir = fixture("genres", "genres");
+    let (code, report) = json(&dir);
+    assert_eq!(code, 2, "{report:#}");
+    assert_eq!(report["skipped_sites"], 0, "{report:#}");
+    // `Default::default()` for a type without a default is not a mutant.
+    assert_eq!(report["unviable_mutants"], 1, "{report:#}");
+    let all = report["findings"].as_array().unwrap();
+    let survivors = |code: &str, kind: &str| -> Vec<&str> {
+        all.iter()
+            .filter(|f| f["code"] == code && f["kind"] == kind)
+            .flat_map(|f| strings(&f["survivors"]))
+            .collect()
+    };
+    // A function's body replaced by a value: the tests only look at one result.
+    assert_eq!(
+        survivors("fn opposite(x: i32) -> i32", "assertion_gap"),
+        ["the body of `opposite` replaced by `0`"]
+    );
+    assert_eq!(
+        survivors("fn freezing() -> i32", "assertion_gap"),
+        [
+            "the body of `freezing` replaced by `1`",
+            "the body of `freezing` replaced by `-1`"
+        ]
+    );
+    assert_eq!(
+        survivors("fn label(n: u32) -> String", "assertion_gap"),
+        ["the body of `label` replaced by `\"xyzzy\".into()`"]
+    );
+    assert_eq!(
+        survivors(
+            "fn longest<'a>(words: &[&'a str]) -> Option<&'a str>",
+            "assertion_gap"
+        ),
+        [
+            "the body of `longest` replaced by `Some(\"\")`",
+            "the body of `longest` replaced by `Some(\"xyzzy\")`"
+        ]
+    );
+    assert_eq!(
+        survivors(
+            "fn parse(text: &str) -> Result<u32, String>",
+            "assertion_gap"
+        ),
+        [
+            "the body of `parse` replaced by `Ok(0)`",
+            "the body of `parse` replaced by `Ok(1)`"
+        ]
+    );
+    assert_eq!(
+        survivors("fn pair(n: u32) -> (u32, bool)", "assertion_gap"),
+        ["the body of `pair` replaced by `(1, false)`"]
+    );
+    assert_eq!(
+        survivors(
+            "fn record(log: &mut Vec<String>, line: &str)",
+            "assertion_gap"
+        ),
+        ["the body of `record` replaced by `()`"]
+    );
+    // The map is looked into, so every replacement of it fails.
+    assert!(
+        survivors(
+            "fn lengths(words: &[&str]) -> HashMap<String, usize>",
+            "assertion_gap"
+        )
+        .is_empty(),
+        "{report:#}"
+    );
+    // A dropped minus: `opposite` is only called with 0, `freezing` only checked against 0.
+    assert_eq!(survivors("-x", "assertion_gap"), ["`x`"]);
+    assert_eq!(survivors("-5", "assertion_gap"), ["`5`"]);
+    // The second replacement of `*` is `+`, which 0 tells apart; `/` it does not.
+    assert_eq!(survivors("x * 3", "input_gap"), ["`x / 3`"]);
+    // A guard that is true whenever the tests get there. It is said once, at the
+    // comparison the guard consists of.
+    assert_eq!(survivors("*side > 10", "input_gap"), ["`true`"]);
+    // A field left to the base: the default depth is the 0 the test asks for.
+    assert_eq!(
+        survivors("depth", "assertion_gap"),
+        ["without the field `depth` (it is then `(Options { ..Default::default() }).depth`)"]
+    );
+    let codes: Vec<&str> = all.iter().map(|f| f["code"].as_str().unwrap()).collect();
+    for killed in [
+        // The other fields are checked, and so are the guards of `sign`.
+        "strict: true",
+        "name: name.to_string()",
+        "n < 0 => ..",
+        // Marked with `mutants::skip`, and return types nothing else can stand in for.
+        "x + 1",
+        "fn untouched(x: i32) -> i32",
+        "fn evens(limit: u32) -> impl Iterator<Item = u32>",
+        "fn token(n: u32) -> Token",
+    ] {
+        assert!(!codes.contains(&killed), "`{killed}`: {report:#}");
+    }
+    assert_eq!(report["unreached"].as_array().unwrap().len(), 1);
+}

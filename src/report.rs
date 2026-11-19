@@ -1636,4 +1636,71 @@ mod tests {
             ["above it", "left of both", "statement", "its operator", "b"]
         );
     }
+    #[test]
+    fn second_replacements_guards_fields_and_bodies_in_words() {
+        let all = |src: &str| discover(src, 0).unwrap().sites;
+        let add = site_of("fn f(total: u32, fee: u32) -> u32 { total + fee }");
+        assert_eq!(describe(&add, Mutation::ArithSwap2), "`total * fee`");
+        let Some(Finding::InputGap {
+            survivors,
+            add_tests,
+            ..
+        }) = arith_gap_finding("f.rs", &add, Mutation::ArithSwap2, true)
+        else {
+            panic!()
+        };
+        assert_eq!(survivors, ["`total * fee`"]);
+        assert_eq!(
+            add_tests,
+            ["operands for which `total + fee` and `total * fee` differ"]
+        );
+        let sites = all("fn f(bits: &mut u8, mask: u8) { *bits ^= mask; *bits <<= 1 }");
+        let arith: Vec<&Site> = sites
+            .iter()
+            .filter(|s| matches!(s.kind, SiteKind::Arith { .. }))
+            .collect();
+        assert_eq!(describe(arith[0], Mutation::ArithSwap), "`*bits &= mask`");
+        assert_eq!(describe(arith[0], Mutation::ArithSwap2), "`*bits |= mask`");
+        // A shift has one replacement: no second finding.
+        assert_eq!(
+            arith_gap_finding("f.rs", arith[1], Mutation::ArithSwap2, true),
+            None
+        );
+
+        let sites = all("fn f(k: Option<i32>, base: O) -> O { \
+             let d = match k { Some(n) if n > 1 => -n, _ => 0 }; O { depth: d, ..base } }");
+        let of = |pick: &dyn Fn(&SiteKind) -> bool| sites.iter().find(|s| pick(&s.kind)).unwrap();
+        let guard = of(&|k| matches!(k, SiteKind::Guard { .. }));
+        assert_eq!(
+            describe(guard, Mutation::Const(true)),
+            "the guard `n > 1` replaced by `true`"
+        );
+        assert_eq!(
+            guard_gap_finding("f.rs", guard, false, true),
+            Finding::InputGap {
+                at: location("f.rs", guard),
+                survivors: vec!["the guard `n > 1` replaced by `false`".into()],
+                survivor_count: 1,
+                add_tests: vec!["a case where the guard `n > 1` is true".into()],
+                observed: None,
+                verified: true,
+            }
+        );
+        let neg = of(&|k| matches!(k, SiteKind::Neg { .. }));
+        assert_eq!(describe(neg, Mutation::Delete), "`n`");
+        let field = of(&|k| matches!(k, SiteKind::Field { .. }));
+        assert_eq!(
+            describe(field, Mutation::Delete),
+            "without the field `depth: d` (it is then `(base).depth`)"
+        );
+        let body = of(&|k| matches!(k, SiteKind::Body { .. }));
+        assert_eq!(
+            describe(body, Mutation::Delete),
+            "the body of `f` replaced by `Default::default()`"
+        );
+        assert_eq!(
+            location("f.rs", body).code,
+            "fn f(k: Option<i32>, base: O) -> O"
+        );
+    }
 }
