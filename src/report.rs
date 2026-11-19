@@ -119,10 +119,30 @@ pub fn describe(site: &Site, m: Mutation) -> String {
     match &site.kind {
         SiteKind::Stmt => format!("delete `{}`", one_line(&site.text)),
         SiteKind::Not { operand, .. } => format!("`{}`", one_line(operand)),
-        SiteKind::Return { name, .. } => match m {
-            Mutation::Const(value) => format!("`{name}` returning `{value}`"),
+        SiteKind::Return { name, option, .. } => match (m, option) {
+            (Mutation::Const(false), Some(_)) => format!("`{name}` returning `None`"),
+            (Mutation::Const(value), _) => format!("`{name}` returning `{value}`"),
             _ => format!("`{name}` returning something else"),
         },
+        SiteKind::Range {
+            inclusive,
+            lhs,
+            rhs,
+            ..
+        } => {
+            let dots = if *inclusive { ".." } else { "..=" };
+            format!("`{}{dots}{}`", one_line(lhs), one_line(rhs))
+        }
+        SiteKind::Arm { pattern, .. } => format!("remove the arm `{} => ..`", one_line(pattern)),
+        SiteKind::MinMax {
+            max,
+            receiver,
+            argument,
+            ..
+        } => {
+            let other = if *max { "min" } else { "max" };
+            format!("`{}.{other}({})`", one_line(receiver), one_line(argument))
+        }
         SiteKind::Logic { and, lhs, rhs, .. } => {
             let (lhs, rhs) = (one_line(lhs), one_line(rhs));
             match m {
@@ -373,6 +393,28 @@ pub fn logic_gap_finding(
     })
 }
 
+/// Input gap at `a.max(b)` / `a.min(b)`: the two operands were equal in every test.
+pub fn min_max_gap_finding(file: &str, site: &Site, verified: bool) -> Option<Finding> {
+    let SiteKind::MinMax {
+        receiver, argument, ..
+    } = &site.kind
+    else {
+        return None;
+    };
+    Some(Finding::InputGap {
+        at: location(file, site),
+        survivors: vec![describe(site, Mutation::MinMax)],
+        survivor_count: 1,
+        add_tests: vec![format!(
+            "`{}` different from `{}`",
+            one_line(receiver),
+            one_line(argument)
+        )],
+        observed: None,
+        verified,
+    })
+}
+
 /// Input gap at a `-> bool` function that returned the same value in every test.
 pub fn return_gap_finding(
     file: &str,
@@ -380,14 +422,19 @@ pub fn return_gap_finding(
     always: bool,
     verified: bool,
 ) -> Option<Finding> {
-    let SiteKind::Return { name, .. } = &site.kind else {
+    let SiteKind::Return { name, option, .. } = &site.kind else {
         return None;
+    };
+    let other = match (option, always) {
+        (None, always) => format!("{}", !always),
+        (Some(_), false) => "`Some`".to_string(),
+        (Some(_), true) => "`None`".to_string(),
     };
     Some(Finding::InputGap {
         at: location(file, site),
         survivors: vec![describe(site, Mutation::Const(always))],
         survivor_count: 1,
-        add_tests: vec![format!("a case where `{name}` returns {}", !always)],
+        add_tests: vec![format!("a case where `{name}` returns {other}")],
         observed: None,
         verified,
     })
@@ -1021,6 +1068,7 @@ mod tests {
         let ret = Site {
             kind: SiteKind::Return {
                 name: "is_ready".into(),
+                option: None,
                 sole_expr: None,
             },
             ..assign.clone()
@@ -1040,6 +1088,77 @@ mod tests {
         assert_eq!(survivors[0], "`is_ready` returning `false`");
         assert_eq!(add_tests[0], "a case where `is_ready` returns true");
         assert_eq!(return_gap_finding("f.rs", &not, false, true), None);
+
+        let find = Site {
+            kind: SiteKind::Return {
+                name: "find".into(),
+                option: Some("Option<&str>".into()),
+                sole_expr: None,
+            },
+            ..assign.clone()
+        };
+        assert_eq!(
+            describe(&find, Mutation::Const(false)),
+            "`find` returning `None`"
+        );
+        let Some(Finding::InputGap { add_tests, .. }) =
+            return_gap_finding("f.rs", &find, false, true)
+        else {
+            panic!()
+        };
+        assert_eq!(add_tests[0], "a case where `find` returns `Some`");
+        let range = Site {
+            kind: SiteKind::Range {
+                inclusive: false,
+                lhs: "0".into(),
+                rhs: "n".into(),
+                gap: (0, 0),
+            },
+            ..assign.clone()
+        };
+        assert_eq!(describe(&range, Mutation::RangeEnd), "`0..=n`");
+        let closed = Site {
+            kind: SiteKind::Range {
+                inclusive: true,
+                lhs: "1".into(),
+                rhs: "n".into(),
+                gap: (0, 0),
+            },
+            ..assign.clone()
+        };
+        assert_eq!(describe(&closed, Mutation::RangeEnd), "`1..n`");
+        let arm = Site {
+            kind: SiteKind::Arm {
+                pattern: "Kind::Update { key, .. }".into(),
+                guard: crate::instrument::ArmGuard::None(0),
+            },
+            ..assign.clone()
+        };
+        assert_eq!(
+            describe(&arm, Mutation::Delete),
+            "remove the arm `Kind::Update { key, .. } => ..`"
+        );
+
+        let clamp = Site {
+            kind: SiteKind::MinMax {
+                max: true,
+                receiver: "drift".into(),
+                argument: "peak.get()".into(),
+                call: (0, 0),
+                close: (0, 0),
+            },
+            ..assign.clone()
+        };
+        assert_eq!(
+            describe(&clamp, Mutation::MinMax),
+            "`drift.min(peak.get())`"
+        );
+        let Some(Finding::InputGap { add_tests, .. }) = min_max_gap_finding("f.rs", &clamp, true)
+        else {
+            panic!()
+        };
+        assert_eq!(add_tests[0], "`drift` different from `peak.get()`");
+        assert_eq!(min_max_gap_finding("f.rs", &assign, true), None);
 
         let rem = site_of("fn f(n: u32, k: u32) -> u32 { n % k }");
         assert_eq!(describe(&rem, Mutation::ArithSwap), "`n / k`");

@@ -300,6 +300,10 @@ pub enum Mutation {
     ArithSwap,
     /// `!x` becomes `x`.
     DropNot,
+    /// `a..b` becomes `a..=b` and the other way round.
+    RangeEnd,
+    /// `a.max(b)` becomes `a.min(b)` and the other way round.
+    MinMax,
 }
 
 impl Mutation {
@@ -317,6 +321,8 @@ impl Mutation {
             Mutation::LogicDropLhs => "ldl".to_string(),
             Mutation::ArithSwap => "asw".to_string(),
             Mutation::DropNot => "unn".to_string(),
+            Mutation::RangeEnd => "rng".to_string(),
+            Mutation::MinMax => "mmx".to_string(),
         }
     }
 }
@@ -736,6 +742,28 @@ pub struct ReturnPlan {
     pub run: Vec<Mutation>,
 }
 
+/// Plans a function returning `Option<T>`, where `saw_true` stands for `Some` and
+/// `saw_false` for `None`. The result can be replaced by `None` but not by a `Some`.
+pub fn plan_option_return(obs: &ReturnObs) -> ReturnPlan {
+    match (obs.saw_true, obs.saw_false) {
+        (false, false) => ReturnPlan {
+            unreached: true,
+            ..ReturnPlan::default()
+        },
+        // Never `Some`: always returning `None` passes every test.
+        (false, true) => ReturnPlan {
+            unreached: false,
+            always: Some(false),
+            run: vec![],
+        },
+        (true, _) => ReturnPlan {
+            unreached: false,
+            always: None,
+            run: vec![Mutation::Const(false)],
+        },
+    }
+}
+
 pub fn plan_return(obs: &ReturnObs) -> ReturnPlan {
     match (obs.saw_true, obs.saw_false) {
         (false, false) => ReturnPlan {
@@ -1083,6 +1111,41 @@ mod tests {
     }
 
     #[test]
+    fn option_return_plans() {
+        let plan = |bits| plan_option_return(&ReturnObs::from_bits(bits));
+        assert_eq!(
+            plan(0),
+            ReturnPlan {
+                unreached: true,
+                always: None,
+                run: vec![]
+            }
+        );
+        // Only `None` was ever returned: "always None" changes nothing.
+        assert_eq!(
+            plan(2),
+            ReturnPlan {
+                unreached: false,
+                always: Some(false),
+                run: vec![]
+            }
+        );
+        // `Some` was returned: replacing it by `None` has to be run, against those tests.
+        for bits in [1, 3] {
+            assert_eq!(
+                plan(bits),
+                ReturnPlan {
+                    unreached: false,
+                    always: None,
+                    run: vec![Mutation::Const(false)]
+                }
+            );
+            assert!(ReturnObs::from_bits(bits).infected_by_const(false));
+        }
+        assert!(!ReturnObs::from_bits(2).infected_by_const(false));
+    }
+
+    #[test]
     fn arithmetic_plans() {
         for bits in 0u8..8 {
             let obs = ArithObs::from_bits(bits);
@@ -1326,6 +1389,8 @@ mod tests {
         assert_eq!(Mutation::LogicDropLhs.encode(), "ldl");
         assert_eq!(Mutation::ArithSwap.encode(), "asw");
         assert_eq!(Mutation::DropNot.encode(), "unn");
+        assert_eq!(Mutation::RangeEnd.encode(), "rng");
+        assert_eq!(Mutation::MinMax.encode(), "mmx");
     }
 
     fn candidate_mutations(op: CmpOp) -> Vec<Mutation> {

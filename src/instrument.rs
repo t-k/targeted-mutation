@@ -63,12 +63,46 @@ pub enum SiteKind {
     /// body's braces and its text is the function signature.
     Return {
         name: String,
+        /// `None` for a function returning `bool`; for one returning `Option<T>`, the
+        /// return type as written.
+        option: Option<String>,
         /// Byte range of the body when it is a single expression: the function's result
         /// is then exactly that expression's value.
         sole_expr: Option<(usize, usize)>,
     },
+    /// `receiver.max(argument)` or `.min(..)`: the other of the two.
+    MinMax {
+        max: bool,
+        receiver: String,
+        argument: String,
+        /// Byte ranges of `.max(` and of the closing `)`.
+        call: (usize, usize),
+        close: (usize, usize),
+    },
+    /// `lhs..rhs` or `lhs..=rhs` on integers: the end moves by one.
+    Range {
+        inclusive: bool,
+        lhs: String,
+        rhs: String,
+        gap: (usize, usize),
+    },
+    /// An arm of a `match` that ends in a catch-all arm: without this arm the value falls
+    /// through to the arms below.
+    Arm {
+        pattern: String,
+        /// Where to put the probe: the start of the `=>`, or the range of an existing guard.
+        guard: ArmGuard,
+    },
     /// A call or assignment statement that can be deleted.
     Stmt,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ArmGuard {
+    /// No guard: one is added before the `=>` at this offset.
+    None(usize),
+    /// `if <expr>` with the expression at this byte range.
+    Existing(usize, usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
@@ -244,9 +278,31 @@ struct Finder<'s> {
 }
 
 impl Finder<'_> {
-    /// Registers the body of a `-> bool` function as a site.
-    fn bool_function(&mut self, sig: &syn::Signature, body: &syn::Block) {
-        if !returns_bool(sig) || body.stmts.is_empty() {
+    /// Registers the body of a function that returns `bool` or `Option<T>` as a site.
+    fn result_function(&mut self, sig: &syn::Signature, body: &syn::Block) {
+        let syn::ReturnType::Type(_, ty) = &sig.output else {
+            return;
+        };
+        let option = match &**ty {
+            syn::Type::Path(p) if p.qself.is_none() && p.path.is_ident("bool") => None,
+            syn::Type::Path(p)
+                if p.qself.is_none()
+                    && p.path.segments.last().is_some_and(|s| {
+                        s.ident == "Option"
+                            && matches!(s.arguments, syn::PathArguments::AngleBracketed(_))
+                    }) =>
+            {
+                match self.range(ty.span()) {
+                    // `impl Trait` cannot be written in a `let`.
+                    Some((from, to)) if !self.source[from..to].contains("impl ") => {
+                        Some(self.source[from..to].to_string())
+                    }
+                    _ => return,
+                }
+            }
+            _ => return,
+        };
+        if body.stmts.is_empty() {
             return;
         }
         let braces = body.brace_token.span;
@@ -265,6 +321,7 @@ impl Finder<'_> {
             id: self.next_id,
             kind: SiteKind::Return {
                 name: sig.ident.to_string(),
+                option,
                 sole_expr: match &body.stmts[..] {
                     [syn::Stmt::Expr(expr, None)] => self.range(expr.span()),
                     _ => None,
@@ -363,15 +420,6 @@ fn is_plain_place(expr: &syn::Expr) -> bool {
         syn::Expr::Paren(e) => is_plain_place(&e.expr),
         syn::Expr::Group(e) => is_plain_place(&e.expr),
         _ => false,
-    }
-}
-
-fn returns_bool(sig: &syn::Signature) -> bool {
-    match &sig.output {
-        syn::ReturnType::Type(_, ty) => {
-            matches!(&**ty, syn::Type::Path(p) if p.qself.is_none() && p.path.is_ident("bool"))
-        }
-        syn::ReturnType::Default => false,
     }
 }
 
@@ -583,14 +631,14 @@ impl<'ast> Visit<'ast> for Finder<'_> {
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
         if !is_test_only(&node.attrs) && node.sig.constness.is_none() {
-            self.bool_function(&node.sig, &node.block);
+            self.result_function(&node.sig, &node.block);
             visit::visit_item_fn(self, node);
         }
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
         if !is_test_only(&node.attrs) && node.sig.constness.is_none() {
-            self.bool_function(&node.sig, &node.block);
+            self.result_function(&node.sig, &node.block);
             visit::visit_impl_item_fn(self, node);
         }
     }
@@ -598,7 +646,7 @@ impl<'ast> Visit<'ast> for Finder<'_> {
     fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
         if !is_test_only(&node.attrs) && node.sig.constness.is_none() {
             if let Some(body) = &node.default {
-                self.bool_function(&node.sig, body);
+                self.result_function(&node.sig, body);
             }
             visit::visit_trait_item_fn(self, node);
         }
@@ -628,6 +676,120 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             }
         }
         visit::visit_block(self, node);
+    }
+
+    fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        let name = node.method.to_string();
+        if (name == "max" || name == "min")
+            && node.args.len() == 1
+            && node.turbofish.is_none()
+            && node.attrs.is_empty()
+            && let (
+                Some((start, receiver_end)),
+                Some((argument_start, argument_end)),
+                Some((_, end)),
+            ) = (
+                self.range(node.receiver.span()),
+                self.range(node.args[0].span()),
+                self.range(node.paren_token.span.close()),
+            )
+            && receiver_end <= argument_start
+            && argument_end < end
+        {
+            let kind = SiteKind::MinMax {
+                max: name == "max",
+                receiver: self.source[start..receiver_end].to_string(),
+                argument: self.source[argument_start..argument_end].to_string(),
+                call: (receiver_end, argument_start),
+                close: (argument_end, end),
+            };
+            self.push(kind, start, end, node.receiver.span());
+        }
+        visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_expr_range(&mut self, node: &'ast syn::ExprRange) {
+        if let (Some(from), Some(to)) = (&node.start, &node.end)
+            && node.attrs.is_empty()
+            && let (Some((start, lhs_end)), Some((rhs_start, end))) =
+                (self.range(from.span()), self.range(to.span()))
+            && lhs_end <= rhs_start
+        {
+            let kind = SiteKind::Range {
+                inclusive: matches!(node.limits, syn::RangeLimits::Closed(_)),
+                lhs: self.source[start..lhs_end].to_string(),
+                rhs: self.source[rhs_start..end].to_string(),
+                gap: (lhs_end, rhs_start),
+            };
+            self.push(kind, start, end, from.span());
+        }
+        visit::visit_expr_range(self, node);
+    }
+
+    fn visit_expr_match(&mut self, node: &'ast syn::ExprMatch) {
+        // A binding or `_` takes everything: with such a last arm the match stays
+        // exhaustive when an arm above it stops matching.
+        let catches_all = |arm: &syn::Arm| {
+            arm.guard.is_none()
+                && match &arm.pat {
+                    syn::Pat::Wild(_) => true,
+                    syn::Pat::Ident(p) => {
+                        p.subpat.is_none()
+                            && p.ident
+                                .to_string()
+                                .starts_with(|c: char| c.is_lowercase() || c == '_')
+                    }
+                    _ => false,
+                }
+        };
+        if let Some((last, others)) = node.arms.split_last()
+            && catches_all(last)
+        {
+            for arm in others
+                .iter()
+                .filter(|arm| arm.attrs.is_empty() && !catches_all(arm))
+            {
+                let (Some((start, pat_end)), Some((_, end)), Some((arrow, _))) = (
+                    self.range(arm.pat.span()),
+                    self.range(arm.body.span()),
+                    self.range(arm.fat_arrow_token.span()),
+                ) else {
+                    continue;
+                };
+                let guard = match &arm.guard {
+                    None => ArmGuard::None(arrow),
+                    Some((_, expr)) => match self.range(expr.span()) {
+                        Some((from, to)) => ArmGuard::Existing(from, to),
+                        None => continue,
+                    },
+                };
+                let pattern = match guard {
+                    ArmGuard::Existing(from, to) => {
+                        format!(
+                            "{} if {}",
+                            &self.source[start..pat_end],
+                            &self.source[from..to]
+                        )
+                    }
+                    ArmGuard::None(_) => self.source[start..pat_end].to_string(),
+                };
+                let at = arm.pat.span().start();
+                self.found.sites.push(Site {
+                    id: self.next_id,
+                    kind: SiteKind::Arm {
+                        pattern: pattern.clone(),
+                        guard,
+                    },
+                    line: at.line,
+                    column: at.column + 1,
+                    start,
+                    end,
+                    text: format!("{pattern} => .."),
+                });
+                self.next_id += 1;
+            }
+        }
+        visit::visit_expr_match(self, node);
     }
 
     fn visit_expr_unary(&mut self, node: &'ast syn::ExprUnary) {
@@ -837,10 +999,94 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     ),
                 )
             }
-            SiteKind::Return { .. } => (
-                " let __tmt_v: bool = {".to_string(),
-                format!("}}; {rt}::ret({}u32, __tmt_v) ", site.id),
-            ),
+            SiteKind::Return { option, .. } => match option {
+                None => (
+                    " let __tmt_v: bool = {".to_string(),
+                    format!("}}; {rt}::ret({}u32, __tmt_v) ", site.id),
+                ),
+                Some(ty) => (
+                    format!(" let __tmt_v: {ty} = {{"),
+                    format!("}}; {rt}::ret_opt({}u32, __tmt_v) ", site.id),
+                ),
+            },
+            SiteKind::MinMax {
+                max, call, close, ..
+            } => {
+                edits.push(Edit {
+                    pos: call.0,
+                    end: call.1,
+                    phase: 1,
+                    order: 0,
+                    text: ", ".into(),
+                });
+                // The call's own `)` (and a trailing comma) is replaced by the probe.
+                let method = if *max { "tmt_max" } else { "tmt_min" };
+                edits.push(Edit {
+                    pos: close.0,
+                    end: close.1,
+                    phase: 1,
+                    order: 0,
+                    text: format!(
+                        ") {{ (__tmt_a, __tmt_b) => {{ #[allow(unused_imports)] use {rt}::{{AnyMinMax as _, MinMaxPrim as _}}; \
+                         (&{rt}::Ar::new(__tmt_a, __tmt_b)).{method}({}u32) }} }})",
+                        site.id
+                    ),
+                });
+                ("(match (".to_string(), String::new())
+            }
+            SiteKind::Range { inclusive, gap, .. } => {
+                edits.push(Edit {
+                    pos: gap.0,
+                    end: gap.1,
+                    phase: 1,
+                    order: 0,
+                    text: ", ".into(),
+                });
+                let method = if *inclusive {
+                    "tmt_range_inclusive"
+                } else {
+                    "tmt_range"
+                };
+                (
+                    "(match (".to_string(),
+                    format!(
+                        ") {{ (__tmt_a, __tmt_b) => {{ #[allow(unused_imports)] use {rt}::{{AnyRange as _, RangePrim as _}}; \
+                         (&{rt}::Ar::new(__tmt_a, __tmt_b)).{method}({}u32) }} }})",
+                        site.id
+                    ),
+                )
+            }
+            SiteKind::Arm { guard, .. } => {
+                // The probe goes into the arm's guard, where it runs only when the
+                // pattern matched.
+                match guard {
+                    ArmGuard::None(arrow) => edits.push(Edit {
+                        pos: *arrow,
+                        end: *arrow,
+                        phase: 2,
+                        order: 0,
+                        text: format!("if {rt}::arm({}u32) ", site.id),
+                    }),
+                    ArmGuard::Existing(from, to) => {
+                        let wider = (to - from + 1) as i64;
+                        edits.push(Edit {
+                            pos: *from,
+                            end: *from,
+                            phase: 2,
+                            order: -wider,
+                            text: format!("{rt}::arm({}u32) && (", site.id),
+                        });
+                        edits.push(Edit {
+                            pos: *to,
+                            end: *to,
+                            phase: 0,
+                            order: wider,
+                            text: ")".into(),
+                        });
+                    }
+                }
+                (String::new(), String::new())
+            }
             SiteKind::Stmt => (
                 format!("if {rt}::live({}u32) {{ ", site.id),
                 " }".to_string(),
@@ -1060,6 +1306,7 @@ mod tests {
                 "a == 100",
                 "a == 101",
                 "matches!(a, 1..=2) || match a { 0..=9 => a == 102, _ => false }",
+                "0..=9 => ..",
                 "a == 102"
             ]
         );
@@ -1455,7 +1702,9 @@ mod tests {
         let returns: Vec<(&str, &str, usize)> = sites
             .iter()
             .filter_map(|s| match &s.kind {
-                SiteKind::Return { name, .. } => Some((name.as_str(), s.text.as_str(), s.line)),
+                SiteKind::Return {
+                    name, option: None, ..
+                } => Some((name.as_str(), s.text.as_str(), s.line)),
                 _ => None,
             })
             .collect();
@@ -1542,6 +1791,98 @@ mod tests {
             .map(|s| s.text)
             .collect();
         assert_eq!(texts, ["s.x = 1;", "s.x -= 1;", "s.call().await?;"]);
+    }
+
+    #[test]
+    fn ranges_match_arms_min_max_and_option_results() {
+        let src = r#"
+            fn find(v: &[u32], limit: u32) -> Option<u32> {
+                for i in 0..v.len() {
+                    let capped = v[i].min(limit).max(1);
+                    match capped {
+                        0 => return None,
+                        n if n > 5 => return Some(n),
+                        1..=3 => continue,
+                        other => { let _ = other; }
+                    }
+                }
+                let _ = &v[1..=2];
+                let _ = 'a'..'z';
+                let _ = v.iter().max();
+                None
+            }
+            fn exhaustive(k: Kind) -> u8 { match k { Kind::A => 1, Kind::B => 2 } }
+            fn hidden() -> Option<impl Sized> { Some(1) }
+        "#;
+        let sites = discover(src, 0).unwrap().sites;
+        let kinds: Vec<String> = sites
+            .iter()
+            .filter_map(|s| match &s.kind {
+                SiteKind::Return { name, option, .. } => Some(format!("return {name} {option:?}")),
+                SiteKind::Range {
+                    inclusive,
+                    lhs,
+                    rhs,
+                    ..
+                } => Some(format!("range {lhs} {rhs} inclusive={inclusive}")),
+                SiteKind::Arm { pattern, guard } => Some(format!(
+                    "arm {pattern} guarded={}",
+                    matches!(guard, ArmGuard::Existing(..))
+                )),
+                SiteKind::MinMax {
+                    max,
+                    receiver,
+                    argument,
+                    ..
+                } => Some(format!("minmax {receiver} {argument} max={max}")),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [
+                "return find Some(\"Option<u32>\")",
+                "range 0 v.len() inclusive=false",
+                "minmax v[i].min(limit) 1 max=true",
+                "minmax v[i] limit max=false",
+                // The catch-all arm and the last arm stay; a match without one is left alone.
+                "arm 0 guarded=false",
+                "arm n if n > 5 guarded=true",
+                "arm 1..=3 guarded=false",
+                "range 1 2 inclusive=true",
+                "range 'a' 'z' inclusive=false",
+            ]
+        );
+        let out = render(src, &sites, &all).text;
+        syn::parse_file(&out).expect("instrumented source parses");
+        assert_eq!(out.lines().count(), src.lines().count());
+        assert!(out.contains("let __tmt_v: Option<u32> = {"), "{out}");
+        assert!(
+            out.contains("crate::__tmt_rt::ret_opt(0u32, __tmt_v)"),
+            "{out}"
+        );
+        assert!(out.contains("0 if crate::__tmt_rt::arm("), "{out}");
+        assert!(
+            out.contains("n if crate::__tmt_rt::arm(") && out.contains(") && ("),
+            "{out}"
+        );
+        assert!(out.contains("1..=3 if crate::__tmt_rt::arm("), "{out}");
+        assert!(
+            out.contains(".tmt_range(") && out.contains(".tmt_range_inclusive("),
+            "{out}"
+        );
+        assert!(
+            out.contains(".tmt_min(") && out.contains(".tmt_max("),
+            "{out}"
+        );
+        assert!(
+            !out.contains(".min(limit)") && !out.contains(".max(1)"),
+            "{out}"
+        );
+        assert!(
+            out.contains("v.iter().max()"),
+            "an iterator's max is another method: {out}"
+        );
     }
 
     #[test]

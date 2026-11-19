@@ -131,6 +131,10 @@ pub enum Mutant {
     ArithSwap,
     /// `!x` becomes `x`.
     DropNot,
+    /// `a..b` becomes `a..=b` and the other way round.
+    RangeEnd,
+    /// `a.max(b)` becomes `a.min(b)` and the other way round.
+    MinMax,
 }
 
 pub fn parse_mutant(spec: &str) -> Option<(u32, Mutant)> {
@@ -146,6 +150,8 @@ pub fn parse_mutant(spec: &str) -> Option<(u32, Mutant)> {
         "ldl" => Mutant::LogicDropLhs,
         "asw" => Mutant::ArithSwap,
         "unn" => Mutant::DropNot,
+        "rng" => Mutant::RangeEnd,
+        "mmx" => Mutant::MinMax,
         _ if m.starts_with("op") => Mutant::Op(m[2..].parse().ok().filter(|c| *c <= NE)?),
         _ if m.starts_with("shf") => {
             Mutant::ShiftF(m[3..].parse().ok().filter(|s: &f64| s.is_finite())?)
@@ -854,4 +860,139 @@ pub fn ret(site: u32, value: bool) -> bool {
     }
     record_bits(b'B', site, if value { RET_TRUE } else { RET_FALSE });
     value
+}
+
+/// Normal exit of a function returning `Option<T>`: `Const(false)` replaces the value by
+/// `None`. (There is no value to replace `None` with.)
+pub fn ret_opt<T>(site: u32, value: Option<T>) -> Option<T> {
+    if mutant_at(site) == Some(Mutant::Const(false)) {
+        return None;
+    }
+    record_bits(
+        b'B',
+        site,
+        if value.is_some() { RET_TRUE } else { RET_FALSE },
+    );
+    value
+}
+
+/// Guard of a `match` arm: false when the active mutant removes the arm.
+pub fn arm(site: u32) -> bool {
+    if mutant_at(site) == Some(Mutant::Delete) {
+        return false;
+    }
+    record_bits(b'R', site, 1);
+    true
+}
+
+/// `a..b` and `a..=b` on integers: the `RangeEnd` mutant includes or excludes the end.
+pub trait RangePrim {
+    type T;
+    fn tmt_range(&self, site: u32) -> std::ops::Range<Self::T>;
+    fn tmt_range_inclusive(&self, site: u32) -> std::ops::RangeInclusive<Self::T>;
+}
+
+macro_rules! tmt_ranges {
+    ($($t:ty)*) => {$(
+        impl RangePrim for Ar<$t, $t> {
+            type T = $t;
+            fn tmt_range(&self, site: u32) -> std::ops::Range<$t> {
+                let (a, b) = self.take();
+                if mutant_at(site) == Some(Mutant::RangeEnd) {
+                    // At the top of the type there is no "one more": leave the range alone.
+                    return a..b.checked_add(1).unwrap_or(b);
+                }
+                record_bits(b'R', site, 1);
+                a..b
+            }
+            fn tmt_range_inclusive(&self, site: u32) -> std::ops::RangeInclusive<$t> {
+                let (a, b) = self.take();
+                if mutant_at(site) == Some(Mutant::RangeEnd) {
+                    return match b.checked_sub(1) {
+                        Some(end) => a..=end,
+                        // `a..0`: an empty range.
+                        None => 1..=0,
+                    };
+                }
+                record_bits(b'R', site, 1);
+                a..=b
+            }
+        }
+    )*};
+}
+tmt_ranges!(i8 i16 i32 i64 isize u8 u16 u32 u64 usize);
+
+/// Ranges of anything else (`'a'..'z'`, floats, user types): untouched.
+pub trait AnyRange {
+    type T;
+    fn tmt_range(&self, site: u32) -> std::ops::Range<Self::T>;
+    fn tmt_range_inclusive(&self, site: u32) -> std::ops::RangeInclusive<Self::T>;
+}
+
+impl<'r, T> AnyRange for &'r Ar<T, T> {
+    type T = T;
+    fn tmt_range(&self, site: u32) -> std::ops::Range<T> {
+        let (a, b) = self.take();
+        record_bits(b'A', site, ARITH_OPAQUE);
+        a..b
+    }
+    fn tmt_range_inclusive(&self, site: u32) -> std::ops::RangeInclusive<T> {
+        let (a, b) = self.take();
+        record_bits(b'A', site, ARITH_OPAQUE);
+        a..=b
+    }
+}
+
+/// `a.max(b)` / `a.min(b)` on numbers: the `MinMax` mutant takes the other one. The two
+/// only differ when the operands do.
+pub trait MinMaxPrim {
+    type T;
+    fn tmt_max(&self, site: u32) -> Self::T;
+    fn tmt_min(&self, site: u32) -> Self::T;
+}
+
+macro_rules! tmt_min_max {
+    ($($t:ty)*) => {$(
+        impl MinMaxPrim for Ar<$t, $t> {
+            type T = $t;
+            fn tmt_max(&self, site: u32) -> $t {
+                let (a, b) = self.take();
+                if mutant_at(site) == Some(Mutant::MinMax) {
+                    return a.min(b);
+                }
+                record_bits(b'A', site, if a == b { ARITH_SAME } else { ARITH_DIFFERS });
+                a.max(b)
+            }
+            fn tmt_min(&self, site: u32) -> $t {
+                let (a, b) = self.take();
+                if mutant_at(site) == Some(Mutant::MinMax) {
+                    return a.max(b);
+                }
+                record_bits(b'A', site, if a == b { ARITH_SAME } else { ARITH_DIFFERS });
+                a.min(b)
+            }
+        }
+    )*};
+}
+tmt_min_max!(i8 i16 i32 i64 isize u8 u16 u32 u64 usize f32 f64);
+
+/// `max` / `min` of any other ordered type: untouched.
+pub trait AnyMinMax {
+    type T;
+    fn tmt_max(&self, site: u32) -> Self::T;
+    fn tmt_min(&self, site: u32) -> Self::T;
+}
+
+impl<'r, T: Ord> AnyMinMax for &'r Ar<T, T> {
+    type T = T;
+    fn tmt_max(&self, site: u32) -> T {
+        let (a, b) = self.take();
+        record_bits(b'A', site, ARITH_OPAQUE);
+        Ord::max(a, b)
+    }
+    fn tmt_min(&self, site: u32) -> T {
+        let (a, b) = self.take();
+        record_bits(b'A', site, ARITH_OPAQUE);
+        Ord::min(a, b)
+    }
 }

@@ -1040,7 +1040,7 @@ fn surviving_mutants_are_traced_to_what_they_change() {
     assert_eq!(
         strings(&total["effects"]),
         [
-            "with the mutant, nothing else changes in these tests: they do not use the result of this code"
+            "with the mutant, these tests still reach the same code with the same outcomes: they do not use its result, or it is the same for their inputs"
         ]
     );
 
@@ -1048,4 +1048,89 @@ fn surviving_mutants_are_traced_to_what_they_change() {
     assert_eq!(sarif.code, 2);
     let sarif: Value = serde_json::from_str(&sarif.stdout).unwrap();
     assert_eq!(sarif["runs"][0]["results"][0]["ruleId"], "assertion-gap");
+}
+
+#[test]
+fn ranges_min_max_match_arms_and_option_results() {
+    let dir = fixture("shapes", "shapes");
+    let (code, report) = json(&dir);
+    assert_eq!(code, 2, "{report:#}");
+    assert_eq!(report["skipped_sites"], 0, "{report:#}");
+    let all = report["findings"].as_array().unwrap();
+    let at = |code: &str, kind: &str| {
+        all.iter()
+            .find(|f| f["code"] == code && f["kind"] == kind)
+            .unwrap_or_else(|| panic!("no {kind} at `{code}`: {report:#}"))
+    };
+    // One element too many adds a zero: the test cannot tell.
+    assert_eq!(
+        strings(&at("0..n", "assertion_gap")["survivors"]),
+        ["`0..=n`"]
+    );
+    // `min` and `max` agree when the operands are equal.
+    let clamp = at("level.min(cap)", "input_gap");
+    assert_eq!(strings(&clamp["survivors"]), ["`level.max(cap)`"]);
+    assert_eq!(
+        strings(&clamp["add_tests"]),
+        ["`level` different from `cap`"]
+    );
+    // Never `Some` in the tests.
+    let find = at("fn first_even(values: &[u32]) -> Option<u32>", "input_gap");
+    assert_eq!(
+        strings(&find["survivors"]),
+        ["`first_even` returning `None`"]
+    );
+    assert_eq!(
+        strings(&find["add_tests"]),
+        ["a case where `first_even` returns `Some`"]
+    );
+    // Without the arm the value falls through to "many", which is not "none" either.
+    assert_eq!(
+        strings(&at("few if few < 10 => ..", "assertion_gap")["survivors"]),
+        ["remove the arm `few if few < 10 => ..`"]
+    );
+
+    let codes: Vec<&str> = all.iter().map(|f| f["code"].as_str().unwrap()).collect();
+    // Killed: `max` with different operands, a `Some` that becomes `None`, the `0` arm.
+    for quiet in [
+        "level.max(floor)",
+        "fn position_of(values: &[u32], wanted: u32) -> Option<usize>",
+        "0 => ..",
+    ] {
+        assert!(
+            !codes.contains(&quiet),
+            "`{quiet}` should have no finding: {report:#}"
+        );
+    }
+
+    append(
+        &dir.join("src/lib.rs"),
+        r#"
+#[test]
+fn closes_the_gaps() {
+    assert_eq!(sum_first(&[1, 2, 9], 2), 3);
+    assert_eq!(clamp_level(9, 5), 5);
+    assert_eq!(first_even(&[1, 4]), Some(4));
+    assert_eq!(bucket(3), "few");
+}
+"#,
+    );
+    let (_, report) = json(&dir);
+    let codes: Vec<&str> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["code"].as_str().unwrap())
+        .collect();
+    for closed in [
+        "0..n",
+        "level.min(cap)",
+        "fn first_even(values: &[u32]) -> Option<u32>",
+        "few if few < 10 => ..",
+    ] {
+        assert!(
+            !codes.contains(&closed),
+            "`{closed}` should be closed: {report:#}"
+        );
+    }
 }

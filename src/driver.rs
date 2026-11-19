@@ -1061,10 +1061,14 @@ impl Session {
         Planned::Plan(match &site.kind {
             SiteKind::Stmt if reached => reach_plan(Mutation::Delete),
             SiteKind::Stmt => return Planned::Unreached,
+            SiteKind::Arm { .. } if reached => reach_plan(Mutation::Delete),
+            SiteKind::Arm { .. } => return Planned::Unreached,
             SiteKind::Not { .. } if reached => reach_plan(Mutation::DropNot),
-            // `!` on an integer or a user type is not negation of a condition.
-            SiteKind::Not { .. } if opaque => return Planned::Nothing,
-            SiteKind::Not { .. } => return Planned::Unreached,
+            SiteKind::Range { .. } if reached => reach_plan(Mutation::RangeEnd),
+            // `!` on an integer or a user type is not negation of a condition, and a range
+            // of something other than integers has no "one more".
+            SiteKind::Not { .. } | SiteKind::Range { .. } if opaque => return Planned::Nothing,
+            SiteKind::Not { .. } | SiteKind::Range { .. } => return Planned::Unreached,
             SiteKind::Cmp { op, literal, .. } => {
                 let op = *op;
                 let mut merged = Obs::default();
@@ -1150,24 +1154,36 @@ impl Session {
                     }),
                 }
             }
-            SiteKind::Arith { .. } => {
+            SiteKind::Arith { .. } | SiteKind::MinMax { .. } => {
+                // `max` / `min` are recorded like an operator and its swap: they agree
+                // exactly when the operands are equal.
+                let is_min_max = matches!(site.kind, SiteKind::MinMax { .. });
+                let mutation = if is_min_max {
+                    Mutation::MinMax
+                } else {
+                    Mutation::ArithSwap
+                };
                 let merged = self.merged(|t| t.arith.get(&id), plan::ArithObs::merge);
                 let (gaps, run) = match plan::plan_arith(&merged) {
                     plan::ArithPlan::Unreached => return Planned::Unreached,
                     // Not numbers (`String + &str`, `Duration + Duration`): nothing to mutate.
                     plan::ArithPlan::Opaque => return Planned::Nothing,
                     plan::ArithPlan::NeverDiffers => (
-                        report::arith_gap_finding(file, site, verify)
-                            .map(|finding| PlannedGap {
-                                finding,
-                                survivors: vec![Mutation::ArithSwap],
-                                constant_expr: None,
-                            })
-                            .into_iter()
-                            .collect(),
+                        if is_min_max {
+                            report::min_max_gap_finding(file, site, verify)
+                        } else {
+                            report::arith_gap_finding(file, site, verify)
+                        }
+                        .map(|finding| PlannedGap {
+                            finding,
+                            survivors: vec![mutation],
+                            constant_expr: None,
+                        })
+                        .into_iter()
+                        .collect(),
                         vec![],
                     ),
-                    plan::ArithPlan::Run => (vec![], vec![Mutation::ArithSwap]),
+                    plan::ArithPlan::Run => (vec![], vec![mutation]),
                 };
                 SitePlan {
                     gaps,
@@ -1182,10 +1198,17 @@ impl Session {
                     }),
                 }
             }
-            SiteKind::Return { sole_expr, .. } => {
+            SiteKind::Return {
+                sole_expr, option, ..
+            } => {
                 let sole_expr = *sole_expr;
+                let is_option = option.is_some();
                 let merged = self.merged(|t| t.returns.get(&id), plan::ReturnObs::merge);
-                let return_plan = plan::plan_return(&merged);
+                let return_plan = if is_option {
+                    plan::plan_option_return(&merged)
+                } else {
+                    plan::plan_return(&merged)
+                };
                 if return_plan.unreached {
                     return Planned::Unreached;
                 }
@@ -1446,14 +1469,13 @@ pub fn run(options: &Options) -> Result<Report> {
     let work = work.canonicalize()?;
     let copy = work.join("src");
     let marker = work.join(WORK_MARKER);
-    if copy.exists()
-        && !marker.exists() {
-            bail!(
-                "{} exists and was not created by tmt; refusing to delete it. \
+    if copy.exists() && !marker.exists() {
+        bail!(
+            "{} exists and was not created by tmt; refusing to delete it. \
                  Choose another --work-dir or remove it yourself.",
-                copy.display()
-            );
-        }
+            copy.display()
+        );
+    }
     fs::write(
         &marker,
         "Working directory of tmt (targeted-mutation). Safe to delete.\n",
@@ -1989,7 +2011,7 @@ fn describe_effects(
     }
     if by_change.is_empty() {
         return vec![
-            "with the mutant, nothing else changes in these tests: they do not use the result of this code".to_string(),
+            "with the mutant, these tests still reach the same code with the same outcomes: they do not use its result, or it is the same for their inputs".to_string(),
         ];
     }
     let mut out = vec![];
@@ -2413,7 +2435,7 @@ serde = { path = "../../serde-fork" }
         assert_eq!(
             describe_effects(&BTreeMap::new(), &sites),
             [
-                "with the mutant, nothing else changes in these tests: they do not use the result of this code"
+                "with the mutant, these tests still reach the same code with the same outcomes: they do not use its result, or it is the same for their inputs"
             ]
         );
     }
