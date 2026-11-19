@@ -20,7 +20,8 @@ impl Scope {
             }
             let (file, range) = match spec.rsplit_once(':') {
                 Some((file, lines))
-                    if !file.is_empty() && lines.starts_with(|c: char| c.is_ascii_digit()) =>
+                    // `file` is not empty: a spec that starts with `:` was refused above.
+                    if lines.starts_with(|c: char| c.is_ascii_digit()) =>
                 {
                     let (from, to) = lines.split_once('-').unwrap_or((lines, lines));
                     let parse = |text: &str| text.parse::<usize>().ok().filter(|n| *n > 0);
@@ -150,6 +151,7 @@ mod tests {
         for bad in [
             "src/a.rs:0",
             "src/a.rs:5-3",
+            "src/a.rs:4-3",
             "src/a.rs:1-x",
             ":3",
             "src/a.rs:3-",

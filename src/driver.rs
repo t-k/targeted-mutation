@@ -2351,6 +2351,25 @@ serde = { path = "../../serde-fork" }
         assert_eq!(core_range(0, "(a) && (b)"), (0, 10));
         assert_eq!(core_range(0, "f(a)"), (0, 4));
         assert_eq!(core_range(3, "()"), (4, 4));
+        // Text that is not balanced is left as it is.
+        assert_eq!(core_range(0, "(a"), (0, 2));
+        assert_eq!(core_range(0, "a)"), (0, 2));
+        assert_eq!(core_range(0, ")"), (0, 1));
+    }
+
+    #[test]
+    fn pool_never_uses_more_threads_than_asked() {
+        for workers in [1, 2] {
+            let seen = std::sync::Mutex::new(HashSet::new());
+            run_pool(6, workers, |_| {
+                seen.lock().unwrap().insert(std::thread::current().id());
+                // Long enough for an idle extra thread to take the next job.
+                std::thread::sleep(Duration::from_millis(30));
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(seen.lock().unwrap().len(), workers);
+        }
     }
 
     #[test]
@@ -2378,6 +2397,9 @@ serde = { path = "../../serde-fork" }
         assert_eq!(dependents_of("other", &packages), ["app", "cycle"]);
         assert!(dependents_of("app", &packages) == ["cycle"]);
         assert!(dependents_of("nobody", &packages).is_empty());
+        // A package is not its own dependent, whatever depends on what.
+        let mutual = [package("x", &["y"]), package("y", &["x"])];
+        assert_eq!(dependents_of("x", &mutual), ["y"]);
     }
 
     #[test]
@@ -2430,6 +2452,27 @@ serde = { path = "../../serde-fork" }
                 "with the mutant, `tests::a` (and 1 more) now runs `s.reset();` (src/lib.rs:1)",
                 "with the mutant, a test no longer runs `s.count > 1` (src/lib.rs:1)",
                 "(and 1 more such changes)",
+            ]
+        );
+        // Up to three changes are all listed, with nothing after them.
+        let mut few = BTreeMap::new();
+        few.insert(
+            "tests::a".to_string(),
+            set(&[
+                Change::NowRuns { site: 1 },
+                Change::NewOutcome { site: 2 },
+                Change::Returns {
+                    site: 0,
+                    value: false,
+                },
+            ]),
+        );
+        assert_eq!(
+            describe_effects(&few, &sites),
+            [
+                "with the mutant, `tests::a` gets `false` from `fn f(s: &mut S) -> bool` (src/lib.rs:1)",
+                "with the mutant, `tests::a` now runs `s.reset();` (src/lib.rs:1)",
+                "with the mutant, `tests::a` takes `s.count > 1` (src/lib.rs:1) a way it did not before",
             ]
         );
         assert_eq!(

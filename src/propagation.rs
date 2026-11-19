@@ -219,4 +219,108 @@ mod tests {
                 .all(|c| matches!(c, Change::NoLongerRuns { site: 5 }))
         );
     }
+    fn kinds(found: &BTreeMap<String, BTreeSet<Change>>) -> Vec<Change> {
+        found
+            .get("t")
+            .map(|c| c.iter().cloned().collect())
+            .unwrap_or_default()
+    }
+
+    fn cmp_line(rels: u8) -> String {
+        format!("O\t1\tt\t{rels}\t0\t-\t-\t1\t-\t-\n")
+    }
+
+    #[test]
+    fn a_site_of_any_kind_counts_as_run() {
+        let nothing = Trace::parse("");
+        for line in [
+            cmp_line(1),
+            cmp_line(2),
+            cmp_line(4),
+            cmp_line(8),
+            "L\t1\tt\t1\n".to_string(),
+            "L\t1\tt\t2\n".to_string(),
+            "L\t1\tt\t4\n".to_string(),
+            "A\t1\tt\t1\n".to_string(),
+            "A\t1\tt\t2\n".to_string(),
+            "A\t1\tt\t4\n".to_string(),
+            "B\t1\tt\t1\n".to_string(),
+            "B\t1\tt\t2\n".to_string(),
+        ] {
+            let ran = Trace::parse(&line);
+            assert_eq!(
+                kinds(&changes(&nothing, &ran, None, 9)),
+                [Change::NowRuns { site: 1 }],
+                "{line}"
+            );
+            assert_eq!(
+                kinds(&changes(&ran, &nothing, None, 9)),
+                [Change::NoLongerRuns { site: 1 }],
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_record_without_an_outcome_is_not_a_run() {
+        // A comparison record that saw no relation, as a truncated trace could give.
+        let nothing = Trace::parse("");
+        let empty = Trace::parse(&cmp_line(0));
+        assert!(changes(&nothing, &empty, None, 9).is_empty());
+        assert!(changes(&empty, &nothing, None, 9).is_empty());
+    }
+
+    #[test]
+    fn every_new_relation_and_condition_outcome_is_a_new_outcome() {
+        for (base, extra) in [(1u8, 2u8), (2, 1), (1, 4), (1, 8), (4, 2)] {
+            let found = changes(
+                &Trace::parse(&cmp_line(base)),
+                &Trace::parse(&cmp_line(base | extra)),
+                None,
+                9,
+            );
+            assert_eq!(
+                kinds(&found),
+                [Change::NewOutcome { site: 1 }],
+                "{base} {extra}"
+            );
+        }
+        for (base, extra) in [(1u8, 2u8), (2, 1), (1, 4), (4, 2)] {
+            let found = changes(
+                &Trace::parse(&format!("L\t1\tt\t{base}\n")),
+                &Trace::parse(&format!("L\t1\tt\t{}\n", base | extra)),
+                None,
+                9,
+            );
+            assert_eq!(
+                kinds(&found),
+                [Change::NewOutcome { site: 1 }],
+                "{base} {extra}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_new_result_of_a_called_function() {
+        let (only_true, only_false, both) = (
+            Trace::parse("B\t1\tt\t1\n"),
+            Trace::parse("B\t1\tt\t2\n"),
+            Trace::parse("B\t1\tt\t3\n"),
+        );
+        assert_eq!(
+            kinds(&changes(&only_true, &both, None, 9)),
+            [Change::Returns {
+                site: 1,
+                value: false
+            }]
+        );
+        assert_eq!(
+            kinds(&changes(&only_false, &both, None, 9)),
+            [Change::Returns {
+                site: 1,
+                value: true
+            }]
+        );
+        assert!(changes(&both, &only_true, None, 9).is_empty());
+    }
 }

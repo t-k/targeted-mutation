@@ -211,7 +211,8 @@ impl Obs {
     /// The gap around zero that no float observation fell into, when every observation
     /// was a float and both sides were seen.
     pub fn float_gap(&self) -> Option<(f64, f64)> {
-        if !self.reached() || self.unfloat || self.un {
+        // Nothing reached leaves both sides of the gap unset.
+        if self.unfloat || self.un {
             return None;
         }
         Some((self.f_max_neg?, self.f_min_pos?))
@@ -343,7 +344,6 @@ pub fn eval_mutated_d(op: CmpOp, m: Mutation, d: i128) -> bool {
 pub fn infects(op: CmpOp, m: Mutation, obs: &Obs) -> bool {
     match m {
         Mutation::Const(c) => obs.rels().any(|r| op.eval_rel(r) != c),
-        Mutation::Negate => obs.reached(),
         Mutation::Op(op2) => obs.rels().any(|r| op.eval_rel(r) != op2.eval_rel(r)),
         Mutation::Shift(s) => {
             let Some((lo, hi)) = shift_diff(op, s) else {
@@ -360,6 +360,7 @@ pub fn infects(op: CmpOp, m: Mutation, obs: &Obs) -> bool {
             Some((lo, hi)) => !(lo < s && s < hi) || obs.eq,
             None => obs.reached(),
         },
+        // Negation, and what is not a mutation of a comparison: every execution differs.
         _ => obs.reached(),
     }
 }

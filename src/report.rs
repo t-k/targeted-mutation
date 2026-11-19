@@ -192,6 +192,7 @@ pub fn describe(site: &Site, m: Mutation) -> String {
                         (CmpOp::Lt, 1) => format!("`{lhs} <= {rhs}`"),
                         // Meant as arithmetic on whole numbers: in the operands' own
                         // type the addition could overflow, the mutant that was run cannot.
+                        // tmt:ignore a shift of 0 is never planned, so `>=` is the same
                         (_, d) if d > 0 => format!("`{lhs} {sym} {rhs} + {d}` (without overflow)"),
                         (_, d) => format!("`{lhs} {sym} {rhs} - {}` (without overflow)", -d),
                     },
@@ -199,6 +200,7 @@ pub fn describe(site: &Site, m: Mutation) -> String {
                 Mutation::ShiftF(d) => match (float_literal(&lhs), float_literal(&rhs)) {
                     (None, Some(k)) => format!("`{lhs} {sym} {}`", show_float(k + d)),
                     (Some(k), None) => format!("`{} {sym} {rhs}`", show_float(k - d)),
+                    // tmt:ignore a shift of 0 is never planned, so any threshold near it is the same
                     _ if d > 0.0 => format!("`{lhs} {sym} {rhs} + {}`", show_float(d)),
                     _ => format!("`{lhs} {sym} {rhs} - {}`", show_float(-d)),
                 },
@@ -214,6 +216,7 @@ fn input_for(lhs: &str, rhs: &str, literal: LiteralSide, d: i128) -> String {
         (LiteralSide::Rhs(k), d) => format!("`{lhs}` = {}", k + d),
         (LiteralSide::Lhs(k), d) => format!("`{rhs}` = {}", k - d),
         (LiteralSide::None, 0) => format!("`{lhs}` equal to `{rhs}`"),
+        // tmt:ignore 0 is taken by the arm above, so `>=` is the same
         (LiteralSide::None, d) if d > 0 => format!("`{lhs}` = `{rhs}` + {d}"),
         (LiteralSide::None, d) => format!("`{lhs}` = `{rhs}` - {}", -d),
     }
@@ -266,25 +269,19 @@ pub fn input_gap_finding(
         return None;
     };
     let (lhs_text, rhs_text) = (one_line(lhs), one_line(rhs));
-    let original = format!("`{lhs_text} {} {rhs_text}`", op.symbol());
-    let mut survivors: Vec<String> = gap
+    // A float shift too small to move the literal is not a different program. The
+    // literal moves the way `describe` writes it.
+    let moves = |d: f64| match (float_literal(&lhs_text), float_literal(&rhs_text)) {
+        (None, Some(k)) => k + d != k,
+        (Some(k), None) => k - d != k,
+        _ => true,
+    };
+    let survivors: Vec<String> = gap
         .survivors()
         .into_iter()
+        .filter(|m| !matches!(m, Mutation::ShiftF(d) if !moves(*d)))
         .map(|m| describe(site, m))
         .collect();
-    // A float shift too small to move the literal is not a different program.
-    survivors.retain(|s| *s != original);
-    let literal_value = float_literal(&lhs_text).or(float_literal(&rhs_text));
-    let moved: Vec<String> = gap
-        .survivors()
-        .into_iter()
-        .filter(|m| match (m, literal_value) {
-            (Mutation::ShiftF(d), Some(k)) => k + d != k && k - d != k,
-            _ => true,
-        })
-        .map(|m| describe(site, m))
-        .collect();
-    survivors.retain(|s| moved.contains(s));
     let mut observed = observed_values(&lhs_text, &rhs_text, *literal, obs);
     let (survivor_count, add_tests) = match gap {
         InputGap::Unreached => return None,
@@ -1397,5 +1394,114 @@ mod tests {
         };
         assert!(!render_text(&nothing_unreached, false).contains("--show-unreached"));
         assert!(!Report::default().has_gaps());
+    }
+    #[test]
+    fn unstable_predictions_alone_are_something_to_act_on() {
+        let at = Location {
+            file: "src/lib.rs".into(),
+            line: 1,
+            column: 1,
+            code: "a > b".into(),
+        };
+        assert!(!Report::default().has_gaps());
+        assert!(
+            Report {
+                unstable: vec![at],
+                ..Report::default()
+            }
+            .has_gaps()
+        );
+    }
+
+    #[test]
+    fn what_counts_as_a_float_literal() {
+        assert_eq!(float_literal("30.5"), Some(30.5));
+        assert_eq!(float_literal(" 2.5_f32 "), Some(2.5));
+        assert_eq!(float_literal("-1e3"), Some(-1000.0));
+        // These parse as floats too, and are not literals: a variable called `inf`, and
+        // forms Rust does not accept.
+        for text in ["inf", "nan", "-inf", ".5", "+5", "e5", "limit", ""] {
+            assert_eq!(float_literal(text), None, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_float_shift_that_does_not_move_the_literal_is_dropped() {
+        // At 2^53 the next float below is 1 away and the next above 2 away.
+        let survivors_of = |source: &str| {
+            let site = site_of(source);
+            let mut obs = Obs::of_f(-4.0);
+            obs.merge(&Obs::of_f(4.0));
+            let gap = InputGap::EqualNeverObserved {
+                flipped: CmpOp::Ge,
+                float_gap: obs.float_gap(),
+            };
+            match input_gap_finding("f.rs", &site, &gap, &obs, true) {
+                Some(Finding::InputGap {
+                    survivors,
+                    survivor_count,
+                    ..
+                }) => (survivors, survivor_count),
+                _ => panic!(),
+            }
+        };
+        // Shifts of +2 and -2 are proposed. Both move the literal.
+        assert_eq!(
+            survivors_of("fn f(x: f64) -> bool { x > 9007199254740992.0 }"),
+            (
+                vec![
+                    "`x >= 9007199254740992.0`".to_string(),
+                    "`x > 9007199254740994.0`".to_string(),
+                    "`x > 9007199254740990.0`".to_string(),
+                ],
+                3
+            )
+        );
+        // At 2^54 only the step down is a different number, and on the left of the
+        // comparison the literal moves the other way.
+        assert_eq!(
+            survivors_of("fn f(x: f64) -> bool { x > 18014398509481984.0 }"),
+            (
+                vec![
+                    "`x >= 18014398509481984.0`".to_string(),
+                    "`x > 1.8014398509481982e16`".to_string(),
+                ],
+                2
+            )
+        );
+        assert_eq!(
+            survivors_of("fn f(x: f64) -> bool { 18014398509481984.0 > x }"),
+            (
+                vec![
+                    "`18014398509481984.0 >= x`".to_string(),
+                    "`1.8014398509481982e16 > x`".to_string(),
+                ],
+                2
+            )
+        );
+        // Far above, neither does.
+        assert_eq!(
+            survivors_of("fn f(x: f64) -> bool { x > 1e30 }"),
+            (vec!["`x >= 1e30`".to_string()], 1)
+        );
+    }
+
+    #[test]
+    fn lists_and_counts_at_their_limits() {
+        let items: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(list(&items, 3), "a, b, c");
+        assert_eq!(list(&items, 2), "a, b (+1 more)");
+        assert_eq!(list(&items, 1), "a (+2 more)");
+        let one = Report {
+            package: "p".into(),
+            suppressed: 1,
+            ..Report::default()
+        };
+        assert!(
+            render_text(&one, false).contains(", 1 findings suppressed"),
+            "{}",
+            render_text(&one, false)
+        );
+        assert!(!render_text(&Report::default(), false).contains("suppressed"));
     }
 }

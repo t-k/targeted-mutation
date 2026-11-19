@@ -133,13 +133,19 @@ fn f() {
     if a >= b { a } else { b }
     let x = 1; // tmt:ignore
     let y = 2;
+    let z = 3;
+    let w = 4; // tmt:ignore: with a colon
     // tmt:ignored is another word
     // not tmt:ignore here? it is: tmt:ignore must start the comment
     let url = \"http://tmt:ignore\";
 }
 ";
         let ignored = ignored_lines(source);
-        assert_eq!(ignored.keys().copied().collect::<Vec<_>>(), [2, 3, 4, 5]);
+        assert_eq!(
+            ignored.keys().copied().collect::<Vec<_>>(),
+            [2, 3, 4, 5, 7, 8]
+        );
+        assert_eq!(ignored[&7], "with a colon");
         assert_eq!(ignored[&2], "equivalent: both branches return the same");
         assert_eq!(ignored[&3], "equivalent: both branches return the same");
         assert_eq!(ignored[&4], "");
