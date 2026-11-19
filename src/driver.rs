@@ -4,6 +4,7 @@
 //! The user's tree is never modified: everything happens in a copy under
 //! `<target dir>/tmt/`.
 
+use std::cell::RefCell;
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -304,14 +305,171 @@ impl Drop for WorkLock {
     }
 }
 
-/// Paths of the working copy that the current run wants to exist.
-type Kept = std::cell::RefCell<HashSet<PathBuf>>;
+/// Name of the log of written files, beside the working copy.
+const WRITTEN_LOG: &str = ".tmt-written";
+
+/// The working copy and what the runs did to it (formal/tla/WorkCopy.tla).
+///
+/// Most of the copy is plain copies of the user's files. The files a run instruments
+/// are rewritten, and the log names them. The next run leaves those alone when it brings
+/// the copy up to date, renders them again from the user's files, and writes only what
+/// came out different: a file that keeps its modification time is not rebuilt by cargo.
+/// What the log names and the run did not write again goes back to a plain copy.
+struct WorkCopy {
+    root: PathBuf,
+    log: PathBuf,
+    /// Paths of the copy that the current run wants to exist.
+    kept: RefCell<HashSet<PathBuf>>,
+    /// Named by the log when the run started.
+    earlier: HashSet<PathBuf>,
+    /// Those of `earlier` that the user's tree still has.
+    visited: RefCell<HashSet<PathBuf>>,
+    /// Written by this run.
+    written: RefCell<HashSet<PathBuf>>,
+    /// What the log names now.
+    logged: RefCell<HashSet<PathBuf>>,
+}
+
+impl WorkCopy {
+    fn open(work: &Path, root: &Path) -> WorkCopy {
+        let log = work.join(WRITTEN_LOG);
+        let earlier: HashSet<PathBuf> = fs::read_to_string(&log)
+            .unwrap_or_default()
+            .lines()
+            .map(Path::new)
+            // Nothing but a path below the copy: the entries are deleted and overwritten.
+            .filter(|relative| {
+                let mut parts = relative.components();
+                parts.clone().next().is_some()
+                    && parts.all(|part| matches!(part, std::path::Component::Normal(_)))
+            })
+            .map(|relative| root.join(relative))
+            .collect();
+        WorkCopy {
+            root: root.to_path_buf(),
+            log,
+            kept: RefCell::default(),
+            logged: RefCell::new(earlier.clone()),
+            earlier,
+            visited: RefCell::default(),
+            written: RefCell::default(),
+        }
+    }
+
+    fn is_kept(&self, path: &Path) -> bool {
+        self.kept.borrow().contains(path) || self.earlier.contains(path)
+    }
+
+    /// The text of the user's file that `path` of the copy stands for. `None` for what
+    /// only an earlier run left there.
+    fn original(&self, path: &Path, workspace: &Path) -> Result<Option<String>> {
+        let source = if !self.earlier.contains(path) {
+            path.to_path_buf() // a plain copy
+        } else if !self.visited.borrow().contains(path) {
+            return Ok(None);
+        } else {
+            workspace.join(path.strip_prefix(&self.root).unwrap_or(path))
+        };
+        fs::read_to_string(&source)
+            .map(Some)
+            .with_context(|| format!("reading {}", source.display()))
+    }
+
+    /// Writes a file of the working copy. Refuses to write anywhere else, and never
+    /// through a symbolic link. The log names the file before it changes.
+    fn write(&self, path: &Path, content: &str) -> Result<()> {
+        if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
+            fs::remove_file(path)?;
+        }
+        let parent = path.parent().and_then(|p| p.canonicalize().ok());
+        let inside = match (parent, self.root.canonicalize()) {
+            (Some(parent), Ok(root)) => parent.starts_with(root),
+            _ => false,
+        };
+        if !inside {
+            bail!(
+                "refusing to write outside the working copy: {}",
+                path.display()
+            );
+        }
+        self.record(path)?;
+        if fs::read_to_string(path).is_ok_and(|existing| existing == content) {
+            return Ok(()); // keep the modification time: nothing to rebuild
+        }
+        fs::write(path, content).with_context(|| format!("writing {}", path.display()))
+    }
+
+    fn record(&self, path: &Path) -> Result<()> {
+        self.written.borrow_mut().insert(path.to_path_buf());
+        if self.logged.borrow().contains(path) {
+            return Ok(());
+        }
+        let line = path
+            .strip_prefix(&self.root)
+            .ok()
+            .and_then(Path::to_str)
+            .filter(|text| !text.chars().any(char::is_control));
+        let Some(line) = line else {
+            bail!(
+                "cannot instrument {}: its name cannot be written on a line of the log",
+                path.display()
+            );
+        };
+        use std::io::Write as _;
+        let mut log = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.log)
+            .with_context(|| format!("opening {}", self.log.display()))?;
+        writeln!(log, "{line}").with_context(|| format!("writing {}", self.log.display()))?;
+        self.logged.borrow_mut().insert(path.to_path_buf());
+        Ok(())
+    }
+
+    /// Before the build: what earlier runs wrote and this one did not is a plain copy
+    /// again (or gone, like its source), and only then leaves the log.
+    fn settle(&self, workspace: &Path) -> Result<()> {
+        let written = self.written.borrow();
+        for path in self.earlier.difference(&written) {
+            if fs::symlink_metadata(path).is_ok() {
+                fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
+            }
+            if self.visited.borrow().contains(path) {
+                let source = workspace.join(path.strip_prefix(&self.root).unwrap_or(path));
+                fs::copy(&source, path).with_context(|| format!("copying {}", source.display()))?;
+            }
+        }
+        let mut lines: Vec<&str> = written
+            .iter()
+            .filter_map(|path| path.strip_prefix(&self.root).ok()?.to_str())
+            .collect();
+        lines.sort_unstable();
+        let fresh = self.log.with_extension("new");
+        fs::write(
+            &fresh,
+            lines
+                .iter()
+                .map(|line| format!("{line}\n"))
+                .collect::<String>(),
+        )?;
+        fs::rename(&fresh, &self.log)?;
+        *self.logged.borrow_mut() = written.clone();
+        Ok(())
+    }
+}
 
 /// Makes `dst` a copy of the file `src`, leaving it alone if it already is one. A file
 /// that keeps its modification time is not rebuilt by cargo, so a second run only
 /// recompiles what changed.
-fn sync_file(src: &Path, dst: &Path, kept: &Kept) -> Result<()> {
-    kept.borrow_mut().insert(dst.to_path_buf());
+fn sync_file(src: &Path, dst: &Path, state: &WorkCopy) -> Result<()> {
+    state.kept.borrow_mut().insert(dst.to_path_buf());
+    if state.earlier.contains(dst) {
+        state.visited.borrow_mut().insert(dst.to_path_buf());
+        if fs::symlink_metadata(dst).is_ok_and(|m| m.is_file()) {
+            // Written by an earlier run: this one decides what becomes of it.
+            return Ok(());
+        }
+    }
     let up_to_date = match (fs::metadata(src), fs::symlink_metadata(dst)) {
         (Ok(from), Ok(to)) => {
             to.is_file()
@@ -335,18 +493,18 @@ fn sync_file(src: &Path, dst: &Path, kept: &Kept) -> Result<()> {
 }
 
 /// Removes from the working copy whatever the current run did not put there.
-fn prune(dir: &Path, kept: &Kept) -> Result<bool> {
+fn prune(dir: &Path, state: &WorkCopy) -> Result<bool> {
     let mut empty = true;
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
         let is_dir = fs::symlink_metadata(&path)?.is_dir();
         if is_dir {
-            if prune(&path, kept)? {
+            if prune(&path, state)? {
                 fs::remove_dir(&path)?;
             } else {
                 empty = false;
             }
-        } else if kept.borrow().contains(&path) {
+        } else if state.is_kept(&path) {
             empty = false;
         } else {
             fs::remove_file(&path)?;
@@ -366,7 +524,7 @@ fn copy_entry(
     dst: &Path,
     workspace: &Path,
     skip: &dyn Fn(&Path) -> bool,
-    kept: &Kept,
+    state: &WorkCopy,
 ) -> Result<()> {
     let kind = fs::symlink_metadata(src)?.file_type();
     if kind.is_symlink() {
@@ -380,16 +538,16 @@ fn copy_entry(
             if !target.starts_with(workspace) || contains_link || skip(&target) {
                 return Ok(());
             }
-            return copy_tree(&target, dst, workspace, skip, kept);
+            return copy_tree(&target, dst, workspace, skip, state);
         }
-        sync_file(&target, dst, kept)?;
+        sync_file(&target, dst, state)?;
     } else if kind.is_dir() {
         // Build output and other caches (cargo marks its target directories this way).
         if !src.join("CACHEDIR.TAG").exists() {
-            copy_tree(src, dst, workspace, skip, kept)?;
+            copy_tree(src, dst, workspace, skip, state)?;
         }
     } else {
-        sync_file(src, dst, kept)?;
+        sync_file(src, dst, state)?;
     }
     Ok(())
 }
@@ -399,7 +557,7 @@ fn copy_tree(
     to: &Path,
     workspace: &Path,
     skip: &dyn Fn(&Path) -> bool,
-    kept: &Kept,
+    state: &WorkCopy,
 ) -> Result<()> {
     fs::create_dir_all(to)?;
     for entry in fs::read_dir(from).with_context(|| format!("reading {}", from.display()))? {
@@ -410,32 +568,9 @@ fn copy_tree(
         let Some(name) = src.file_name() else {
             continue;
         };
-        copy_entry(&src, &to.join(name), workspace, skip, kept)?;
+        copy_entry(&src, &to.join(name), workspace, skip, state)?;
     }
     Ok(())
-}
-
-/// Writes a file of the working copy. Refuses to write anywhere else, and never through
-/// a symbolic link.
-fn write_in_copy(copy: &Path, path: &Path, content: &str) -> Result<()> {
-    if fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink()) {
-        fs::remove_file(path)?;
-    }
-    let parent = path.parent().and_then(|p| p.canonicalize().ok());
-    let inside = match (parent, copy.canonicalize()) {
-        (Some(parent), Ok(copy)) => parent.starts_with(copy),
-        _ => false,
-    };
-    if !inside {
-        bail!(
-            "refusing to write outside the working copy: {}",
-            path.display()
-        );
-    }
-    if fs::read_to_string(path).is_ok_and(|existing| existing == content) {
-        return Ok(()); // keep the modification time: nothing to rebuild
-    }
-    fs::write(path, content).with_context(|| format!("writing {}", path.display()))
 }
 
 fn rust_files(dir: &Path, skip: &dyn Fn(&Path) -> bool, out: &mut Vec<PathBuf>) -> Result<()> {
@@ -516,7 +651,7 @@ fn copy_git_visible(
     files: Vec<PathBuf>,
     workspace: &Path,
     skip: &dyn Fn(&Path) -> bool,
-    kept: &Kept,
+    state: &WorkCopy,
 ) -> Result<usize> {
     let mut copied = 0;
     for relative in files {
@@ -537,12 +672,12 @@ fn copy_git_visible(
         if kind.is_dir() {
             match git_visible_files(&src)? {
                 Some(inner) => {
-                    copied += copy_git_visible(&src, &dst, inner, workspace, skip, kept)?
+                    copied += copy_git_visible(&src, &dst, inner, workspace, skip, state)?
                 }
-                None => copy_tree(&src, &dst, workspace, skip, kept)?,
+                None => copy_tree(&src, &dst, workspace, skip, state)?,
             }
         } else {
-            copy_entry(&src, &dst, workspace, skip, kept)?;
+            copy_entry(&src, &dst, workspace, skip, state)?;
             copied += 1;
         }
     }
@@ -1491,7 +1626,7 @@ pub fn run(options: &Options) -> Result<Report> {
             || (path.parent() == Some(workspace.as_path())
                 && path.file_name().is_some_and(|n| n == "target"))
     };
-    let kept = Kept::default();
+    let state = WorkCopy::open(&work, &copy);
     fs::create_dir_all(&copy)?;
     let visible = if options.all_files {
         None
@@ -1502,14 +1637,14 @@ pub fn run(options: &Options) -> Result<Report> {
         // Only what git would not ignore: build output, caches, local notes and secrets
         // that are kept out of the repository stay out of the copy too.
         Some(files) => {
-            let copied = copy_git_visible(&workspace, &copy, files, &workspace, &skip, &kept)?;
+            let copied = copy_git_visible(&workspace, &copy, files, &workspace, &skip, &state)?;
             note(&format!(
                 "copied {copied} files (ignored files are left out)"
             ));
         }
-        None => copy_tree(&workspace, &copy, &workspace, &skip, &kept)?,
+        None => copy_tree(&workspace, &copy, &workspace, &skip, &state)?,
     }
-    prune(&copy, &kept)?;
+    prune(&copy, &state)?;
     // Relative path dependencies that leave the workspace would point nowhere from the copy.
     let mut manifests: Vec<&Path> = metadata
         .packages
@@ -1531,7 +1666,7 @@ pub fn run(options: &Options) -> Result<Report> {
         if let Some(rewritten) =
             absolutize_path_dependencies(&text, manifest_dir, &workspace, &copy)?
         {
-            write_in_copy(&copy, &copy.join(relative), &rewritten)?;
+            state.write(&copy.join(relative), &rewritten)?;
         }
     }
 
@@ -1581,8 +1716,9 @@ pub fn run(options: &Options) -> Result<Report> {
     let mut test_only = HashSet::new();
     let mut next_id = 0u32;
     for path in paths {
-        let original =
-            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        let Some(original) = state.original(&path, &workspace)? else {
+            continue; // left by an earlier run; gone or rewritten before the build
+        };
         let display = path
             .strip_prefix(&package_dir)
             .unwrap_or(&path)
@@ -1629,9 +1765,10 @@ pub fn run(options: &Options) -> Result<Report> {
     let total_sites: usize = files.iter().map(|f| f.sites.len()).sum();
     note(&format!("{} sites in {} files", total_sites, files.len()));
 
-    let root_source = fs::read_to_string(&root_file)?;
-    write_in_copy(
-        &copy,
+    let root_source = state
+        .original(&root_file, &workspace)?
+        .with_context(|| format!("{} is missing", root_target.src_path.display()))?;
+    state.write(
         &source_dir.join(format!("{RUNTIME_MOD}.rs")),
         crate::RUNTIME_SOURCE,
     )?;
@@ -1654,11 +1791,14 @@ pub fn run(options: &Options) -> Result<Report> {
             if file.path == root_file {
                 text.push_str(&root_suffix);
             }
-            write_in_copy(&copy, &file.path, &text)?;
+            state.write(&file.path, &text)?;
             file.rendered = Some(rendered);
         }
         if !files.iter().any(|f| f.path == root_file) {
-            write_in_copy(&copy, &root_file, &format!("{root_source}{root_suffix}"))?;
+            state.write(&root_file, &format!("{root_source}{root_suffix}"))?;
+        }
+        if rounds == 0 {
+            state.settle(&workspace)?;
         }
         note(if rounds == 0 {
             "building the instrumented crate"
@@ -2492,5 +2632,212 @@ serde = { path = "../../serde-fork" }
             mutant_timeout(Duration::from_secs(2)),
             Duration::from_secs(15)
         );
+    }
+    /// A scratch directory of its own for one test.
+    fn scratch(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("tmt-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(dir.join("ws/src")).unwrap();
+        fs::create_dir_all(dir.join("work/src")).unwrap();
+        dir.canonicalize().unwrap()
+    }
+
+    fn set_modified(path: &Path, time: std::time::SystemTime) {
+        fs::File::options()
+            .write(true)
+            .open(path)
+            .unwrap()
+            .set_modified(time)
+            .unwrap();
+    }
+
+    fn modified(path: &Path) -> std::time::SystemTime {
+        fs::metadata(path).unwrap().modified().unwrap()
+    }
+
+    /// What a run does to the working copy up to the build. `write` stands for the
+    /// instrumentation of the files in `selected`.
+    fn copy_run(dir: &Path, selected: &[&str], write: bool) -> WorkCopy {
+        let (workspace, work) = (dir.join("ws"), dir.join("work"));
+        let copy = work.join("src");
+        let state = WorkCopy::open(&work, &copy);
+        copy_tree(&workspace, &copy, &workspace, &|_| false, &state).unwrap();
+        prune(&copy, &state).unwrap();
+        for name in selected {
+            let path = copy.join(name);
+            let original = state.original(&path, &workspace).unwrap().unwrap();
+            assert_eq!(original, fs::read_to_string(workspace.join(name)).unwrap());
+            if write {
+                state
+                    .write(&path, &format!("instrumented {original}"))
+                    .unwrap();
+            } else {
+                state.record(&path).unwrap(); // interrupted before the write
+            }
+        }
+        if write {
+            state.settle(&workspace).unwrap();
+        }
+        state
+    }
+
+    /// Rows generated by `pict formal/pict/workcopy.pict /o:3 /e:formal/pict/workcopy.seed.tsv`.
+    #[test]
+    fn work_copy_table() {
+        let table = include_str!("../tests/data/workcopy.pict.tsv");
+        let hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+        let mut rows = 0;
+        for (index, line) in table.lines().skip(1).enumerate() {
+            let [earlier, source, selected] = line.split('\t').collect::<Vec<_>>()[..] else {
+                panic!("bad row: {line}");
+            };
+            let dir = scratch(&format!("copy-table-{index}"));
+            let (file, copied) = (dir.join("ws/src/a.rs"), dir.join("work/src/src/a.rs"));
+            let log = dir.join("work").join(WRITTEN_LOG);
+            fs::write(&file, "v1").unwrap();
+            set_modified(&file, hour_ago);
+            match earlier {
+                "none" => {}
+                "plain" => drop(copy_run(&dir, &[], true)),
+                "written" => drop(copy_run(&dir, &["src/a.rs"], true)),
+                "logged_only" => drop(copy_run(&dir, &["src/a.rs"], false)),
+                _ => panic!("{line}"),
+            }
+            if copied.exists() {
+                set_modified(&copied, hour_ago);
+            }
+            let before = fs::read_to_string(&copied).ok();
+            match source {
+                "same" => {}
+                "edited" => fs::write(&file, "version 2").unwrap(),
+                "deleted" => fs::remove_file(&file).unwrap(),
+                _ => panic!("{line}"),
+            }
+            let selected = selected == "yes";
+            copy_run(&dir, if selected { &["src/a.rs"] } else { &[] }, true);
+
+            let wanted = match (source, selected) {
+                ("deleted", _) => None,
+                ("same", true) => Some("instrumented v1".to_string()),
+                ("same", false) => Some("v1".to_string()),
+                (_, true) => Some("instrumented version 2".to_string()),
+                (_, false) => Some("version 2".to_string()),
+            };
+            assert_eq!(fs::read_to_string(&copied).ok(), wanted, "{line}");
+            assert_eq!(
+                fs::read_to_string(&log).unwrap_or_default(),
+                if selected { "src/a.rs\n" } else { "" },
+                "{line}"
+            );
+            // What did not change was not written again, apart from the copy an
+            // interrupted run left under a log entry.
+            if before == wanted && wanted.is_some() && earlier != "logged_only" {
+                assert_eq!(modified(&copied), hour_ago, "{line}");
+            }
+            // A further run that instruments nothing leaves a plain copy.
+            copy_run(&dir, &[], true);
+            assert_eq!(
+                fs::read_to_string(&copied).ok(),
+                fs::read_to_string(&file).ok(),
+                "{line}"
+            );
+            assert_eq!(fs::read_to_string(&log).unwrap(), "", "{line}");
+            fs::remove_dir_all(&dir).unwrap();
+            rows += 1;
+        }
+        assert_eq!(rows, 20);
+    }
+
+    #[test]
+    fn work_copy_keeps_modification_times() {
+        let dir = scratch("copy-times");
+        let hour_ago = std::time::SystemTime::now() - Duration::from_secs(3600);
+        let names = ["src/lib.rs", "src/plain.rs", "src/edited.rs"];
+        for name in names {
+            fs::write(dir.join("ws").join(name), format!("// {name}")).unwrap();
+            set_modified(&dir.join("ws").join(name), hour_ago);
+        }
+        let copy = dir.join("work/src");
+        let runtime = copy.join("src/__tmt_rt.rs");
+        let run = || {
+            let state = copy_run(&dir, &[], false);
+            for name in ["src/lib.rs", "src/edited.rs"] {
+                let original = state.original(&copy.join(name), &dir.join("ws")).unwrap();
+                state
+                    .write(&copy.join(name), &format!("probe {}", original.unwrap()))
+                    .unwrap();
+            }
+            // A file of the tool's own, with no source: not taken for one to instrument.
+            assert_eq!(state.original(&runtime, &dir.join("ws")).ok(), {
+                if runtime.exists() { Some(None) } else { None }
+            });
+            state.write(&runtime, "runtime").unwrap();
+            state.settle(&dir.join("ws")).unwrap();
+        };
+        run();
+        for name in names.iter().map(|n| copy.join(n)).chain([runtime.clone()]) {
+            set_modified(&name, hour_ago);
+        }
+        fs::write(dir.join("ws/src/edited.rs"), "// edited since").unwrap();
+        run();
+        // Nothing but the edited file was touched: cargo has one file to look at.
+        for name in ["src/lib.rs", "src/plain.rs", "src/__tmt_rt.rs"] {
+            assert_eq!(modified(&copy.join(name)), hour_ago, "{name}");
+        }
+        assert_ne!(modified(&copy.join("src/edited.rs")), hour_ago);
+        assert_eq!(
+            fs::read_to_string(copy.join("src/edited.rs")).unwrap(),
+            "probe // edited since"
+        );
+        assert_eq!(
+            fs::read_to_string(copy.join("src/lib.rs")).unwrap(),
+            "probe // src/lib.rs"
+        );
+        assert_eq!(
+            fs::read_to_string(dir.join("work").join(WRITTEN_LOG)).unwrap(),
+            "src/__tmt_rt.rs\nsrc/edited.rs\nsrc/lib.rs\n"
+        );
+        // A plain copy whose source got newer, or another size, is copied again.
+        let later = hour_ago + Duration::from_secs(60);
+        set_modified(&dir.join("ws/src/plain.rs"), later);
+        run();
+        assert!(modified(&copy.join("src/plain.rs")) >= later);
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn work_copy_log_is_not_trusted() {
+        let dir = scratch("copy-log");
+        let (workspace, work) = (dir.join("ws"), dir.join("work"));
+        let copy = work.join("src");
+        let outside = dir.join("outside.txt");
+        fs::write(&outside, "keep").unwrap();
+        fs::write(workspace.join("src/a.rs"), "a").unwrap();
+        // Entries that leave the copy are not entries.
+        fs::write(
+            work.join(WRITTEN_LOG),
+            format!(
+                "../../outside.txt\n{}\n\nsrc/../../../outside.txt\nsrc/a.rs\n",
+                outside.display()
+            ),
+        )
+        .unwrap();
+        let state = WorkCopy::open(&work, &copy);
+        assert_eq!(
+            state.earlier,
+            [copy.join("src/a.rs")].into_iter().collect::<HashSet<_>>()
+        );
+        copy_tree(&workspace, &copy, &workspace, &|_| false, &state).unwrap();
+        state.settle(&workspace).unwrap();
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "keep");
+        assert_eq!(fs::read_to_string(copy.join("src/a.rs")).unwrap(), "a");
+
+        // Nothing is written outside the copy, and a name that would break the log is refused.
+        let state = WorkCopy::open(&work, &copy);
+        assert!(state.write(&outside, "x").is_err());
+        assert!(state.write(&copy.join("src/a\nb.rs"), "x").is_err());
+        assert!(!copy.join("src/a\nb.rs").exists());
+        assert_eq!(fs::read_to_string(&outside).unwrap(), "keep");
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

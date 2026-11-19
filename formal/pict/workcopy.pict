@@ -1,0 +1,10 @@
+# One file of the working copy across two runs (src/driver.rs, WorkCopy; formal/tla/WorkCopy.tla).
+# Earlier: what the run before left. written = instrumented and logged, logged_only = it
+#   was interrupted between the log entry and the write, none = the file was not there.
+# Source: what the user did to the file between the runs.
+# Selected: whether the second run instruments the file.
+Earlier:  plain, written, logged_only, none
+Source:   same, edited, deleted
+Selected: yes, no
+
+IF [Source] = "deleted" THEN [Selected] = "no";
