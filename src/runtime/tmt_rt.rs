@@ -381,7 +381,7 @@ fn with_tracer(f: impl FnOnce(&mut Tracer, u32)) {
 
 /// Records observation bits of a statement (`R`), logic (`L`) or arithmetic (`A`) site.
 fn record_bits(kind: u8, site: u32, bits: u8) {
-    if state().mutant.is_some() || state().tracer.is_none() {
+    if state().tracer.is_none() {
         return;
     }
     with_tracer(|t, test| {
@@ -433,12 +433,10 @@ pub fn diff(av: Val, bv: Val, equal: bool) -> Diff {
 fn finish(site: u32, op: u8, orig: bool, rel: u8, av: Val, bv: Val) -> bool {
     let d = diff(av, bv, rel == REL_EQ);
     let st = state();
-    if let Some((target, m)) = st.mutant {
-        return if target == site {
-            apply(op, m, orig, rel, d)
-        } else {
-            orig
-        };
+    // The mutated site does not record while its mutant is active. Every other site
+    // does, so that a trace taken with a mutant shows what the mutant changes elsewhere.
+    if let Some(m) = mutant_at(site) {
+        return apply(op, m, orig, rel, d);
     }
     if st.tracer.is_some() {
         record_cmp(site, rel, d, av, bv);

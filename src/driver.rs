@@ -1602,6 +1602,7 @@ pub fn run(options: &Options) -> Result<Report> {
                 at,
                 survivors,
                 tests: passing_tests.into_iter().collect(),
+                effects: vec![],
             });
         }
     }

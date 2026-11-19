@@ -1,9 +1,12 @@
 //! Targeted mutation testing: find the wrong implementations your tests would let through.
 
+pub mod baseline;
 pub mod driver;
 pub mod instrument;
 pub mod plan;
+pub mod propagation;
 pub mod report;
+pub mod scope;
 pub mod trace;
 
 /// The runtime injected into the crate under test, compiled here so that its logic can be

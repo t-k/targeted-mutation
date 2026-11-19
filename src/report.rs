@@ -39,6 +39,9 @@ pub enum Finding {
         survivors: Vec<String>,
         /// Tests whose execution changed under the mutants but did not fail.
         tests: Vec<String>,
+        /// What the first surviving mutant changes later in those tests: the places an
+        /// assertion could catch it. Empty when that was not looked into.
+        effects: Vec<String>,
     },
 }
 
@@ -53,6 +56,8 @@ pub struct Report {
     /// Killed mutants that were stopped by the timeout (typically an endless loop).
     pub mutants_timed_out: usize,
     pub findings: Vec<Finding>,
+    /// Findings left out because of a `// tmt:ignore` comment or the baseline.
+    pub suppressed: usize,
     /// Code no test executes.
     pub unreached: Vec<Location>,
     /// Survivors predicted from the trace that a re-run killed: the tests are not deterministic.
@@ -421,6 +426,46 @@ pub fn arith_gap_finding(file: &str, site: &Site, verified: bool) -> Option<Find
     })
 }
 
+/// The report as SARIF 2.1.0, for code scanning UIs. `prefix` is put in front of the file
+/// names (the package's path inside the repository).
+pub fn render_sarif(report: &Report, prefix: &str) -> String {
+    let results: Vec<serde_json::Value> = report
+        .findings
+        .iter()
+        .map(|finding| {
+            let (kind, at) = finding_parts(finding);
+            let rule = if kind == "INPUT GAP" { "input-gap" } else { "assertion-gap" };
+            let text = format!("`{}`: {}", at.code, finding_body(finding).join("; "));
+            serde_json::json!({
+                "ruleId": rule,
+                "level": "warning",
+                "message": { "text": text },
+                "locations": [{
+                    "physicalLocation": {
+                        "artifactLocation": { "uri": format!("{prefix}{}", at.file) },
+                        "region": { "startLine": at.line, "startColumn": at.column }
+                    }
+                }]
+            })
+        })
+        .collect();
+    let sarif = serde_json::json!({
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+        "runs": [{
+            "tool": { "driver": {
+                "name": "tmt",
+                "rules": [
+                    { "id": "input-gap", "shortDescription": { "text": "No test input tells this mutant from the original" } },
+                    { "id": "assertion-gap", "shortDescription": { "text": "Tests run the mutated code and still pass" } }
+                ]
+            } },
+            "results": results
+        }]
+    });
+    serde_json::to_string_pretty(&sarif).expect("JSON values serialise")
+}
+
 fn list(items: &[String], limit: usize) -> String {
     let shown: Vec<&str> = items.iter().take(limit).map(String::as_str).collect();
     let more = items.len().saturating_sub(limit);
@@ -431,64 +476,60 @@ fn list(items: &[String], limit: usize) -> String {
     }
 }
 
-pub fn render_text(report: &Report, show_unreached: bool) -> String {
-    let mut out = String::new();
-    for finding in &report.findings {
-        match finding {
-            Finding::InputGap {
-                at,
-                survivors,
-                survivor_count,
-                add_tests,
-                observed,
-                verified,
-            } => {
-                out.push_str(&format!(
-                    "INPUT GAP  {}:{}:{}\n    {}\n",
-                    at.file, at.line, at.column, at.code
-                ));
-                let more = survivor_count.saturating_sub(survivors.len() as u128);
-                let more = if more > 0 {
-                    format!(" (+{more} more)")
-                } else {
-                    String::new()
-                };
-                let note = if *verified {
-                    "re-run: tests pass"
-                } else {
-                    "from the trace, not re-run"
-                };
-                out.push_str(&format!(
-                    "  passes every test as: {}{more}  [{note}]\n",
-                    survivors.join(", ")
-                ));
-                if let Some(observed) = observed {
-                    out.push_str(&format!("  {observed}\n"));
-                }
-                for test in add_tests {
-                    out.push_str(&format!("  add a test with {test}\n"));
-                }
-            }
-            Finding::AssertionGap {
-                at,
-                survivors,
-                tests,
-            } => {
-                out.push_str(&format!(
-                    "ASSERTION GAP  {}:{}:{}\n    {}\n",
-                    at.file, at.line, at.column, at.code
-                ));
-                out.push_str(&format!(
-                    "  passes every test as: {}\n",
-                    survivors.join(", ")
-                ));
-                out.push_str(&format!(
-                    "  these tests run the changed code and still pass: {}\n",
-                    list(tests, 5)
-                ));
-                out.push_str("  add an assertion on what this code is responsible for\n");
+/// The lines of one finding, without its header.
+fn finding_body(finding: &Finding) -> Vec<String> {
+    let mut lines = vec![];
+    match finding {
+        Finding::InputGap { survivors, survivor_count, add_tests, observed, verified, .. } => {
+            let more = survivor_count.saturating_sub(survivors.len() as u128);
+            let more = if more > 0 { format!(" (+{more} more)") } else { String::new() };
+            let note = if *verified { "re-run: tests pass" } else { "from the trace, not re-run" };
+            lines.push(format!("passes every test as: {}{more}  [{note}]", survivors.join(", ")));
+            lines.extend(observed.iter().cloned());
+            lines.extend(add_tests.iter().map(|test| format!("add a test with {test}")));
+        }
+        Finding::AssertionGap { survivors, tests, effects, .. } => {
+            lines.push(format!("passes every test as: {}", survivors.join(", ")));
+            lines.push(format!("these tests run the changed code and still pass: {}", list(tests, 5)));
+            if effects.is_empty() {
+                lines.push("add an assertion on what this code is responsible for".to_string());
+            } else {
+                lines.extend(effects.iter().map(|effect| format!("with the mutant, {effect}")));
             }
         }
+    }
+    lines
+}
+
+fn finding_parts(finding: &Finding) -> (&'static str, &Location) {
+    match finding {
+        Finding::InputGap { at, .. } => ("INPUT GAP", at),
+        Finding::AssertionGap { at, .. } => ("ASSERTION GAP", at),
+    }
+}
+
+pub fn render_text(report: &Report, show_unreached: bool) -> String {
+    let mut out = String::new();
+    let mut previous: Option<(&str, usize)> = None;
+    for finding in &report.findings {
+        let (kind, at) = finding_parts(finding);
+        // Findings on one line are usually one thought (a chain of conditions): they are
+        // printed as one block.
+        let same_line = previous == Some((at.file.as_str(), at.line));
+        if same_line {
+            out.push_str(&format!("  + {kind}  column {}\n    {}\n", at.column, at.code));
+        } else {
+            if previous.is_some() {
+                out.push('\n');
+            }
+            out.push_str(&format!("{kind}  {}:{}:{}\n    {}\n", at.file, at.line, at.column, at.code));
+        }
+        for line in finding_body(finding) {
+            out.push_str(&format!("  {line}\n"));
+        }
+        previous = Some((at.file.as_str(), at.line));
+    }
+    if previous.is_some() {
         out.push('\n');
     }
     if show_unreached {
@@ -521,6 +562,9 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
         report.mutants_killed,
         report.unreached.len()
     ));
+    if report.suppressed > 0 {
+        out.push_str(&format!(", {} findings suppressed", report.suppressed));
+    }
     if report.skipped_sites > 0 {
         out.push_str(&format!(
             ", {} sites skipped (probe did not compile)",
@@ -1010,16 +1054,13 @@ mod tests {
 
     #[test]
     fn text_report_is_exact() {
-        let at = Location {
-            file: "src/lib.rs".into(),
-            line: 3,
-            column: 9,
-            code: "a >= b".into(),
-        };
+        let at = Location { file: "src/lib.rs".into(), line: 3, column: 9, code: "a >= b".into() };
+        let below = Location { file: "src/lib.rs".into(), line: 7, column: 5, code: "s.reset();".into() };
         let report = Report {
             package: "p".into(),
             sites: 2,
             mutants_run: 1,
+            suppressed: 2,
             findings: vec![
                 Finding::InputGap {
                     at: at.clone(),
@@ -1038,30 +1079,56 @@ mod tests {
                     verified: true,
                 },
                 Finding::AssertionGap {
-                    at,
+                    at: Location { column: 4, ..at },
                     survivors: vec!["`!(a >= b)`".into()],
                     tests: vec!["t".into()],
+                    effects: vec![],
+                },
+                Finding::AssertionGap {
+                    at: below,
+                    survivors: vec!["delete `s.reset();`".into()],
+                    tests: vec!["t".into()],
+                    effects: vec!["`t` no longer runs `s.count = 0;` (src/lib.rs:12)".into()],
                 },
             ],
             ..Report::default()
         };
+        // Findings on one line form one block; a new line starts a new block.
         assert_eq!(
             render_text(&report, false),
             "INPUT GAP  src/lib.rs:3:9\n    a >= b\n\
              \x20 passes every test as: `a > b` (+3 more)  [from the trace, not re-run]\n\
              \x20 nearest values the tests passed: `a` - `b` = -1, 4\n\
              \x20 add a test with `a` equal to `b` (the original gives true)\n\
-             \n\
-             INPUT GAP  src/lib.rs:3:9\n    a >= b\n\
+             \x20 + INPUT GAP  column 9\n    a >= b\n\
              \x20 passes every test as: `true`  [re-run: tests pass]\n\
-             \n\
-             ASSERTION GAP  src/lib.rs:3:9\n    a >= b\n\
+             \x20 + ASSERTION GAP  column 4\n    a >= b\n\
              \x20 passes every test as: `!(a >= b)`\n\
              \x20 these tests run the changed code and still pass: t\n\
              \x20 add an assertion on what this code is responsible for\n\
              \n\
-             p: 2 sites, 2 input gaps, 1 assertion gaps, 1 mutants run (0 killed), 0 sites unreached\n"
+             ASSERTION GAP  src/lib.rs:7:5\n    s.reset();\n\
+             \x20 passes every test as: delete `s.reset();`\n\
+             \x20 these tests run the changed code and still pass: t\n\
+             \x20 with the mutant, `t` no longer runs `s.count = 0;` (src/lib.rs:12)\n\
+             \n\
+             p: 2 sites, 2 input gaps, 2 assertion gaps, 1 mutants run (0 killed), 0 sites unreached, 2 findings suppressed\n"
         );
+        assert_eq!(render_text(&Report { package: "q".into(), ..Report::default() }, false),
+            "q: 0 sites, 0 input gaps, 0 assertion gaps, 0 mutants run (0 killed), 0 sites unreached\n");
+
+        let sarif: serde_json::Value = serde_json::from_str(&render_sarif(&report, "crates/p/")).unwrap();
+        assert_eq!(sarif["version"], "2.1.0");
+        let results = sarif["runs"][0]["results"].as_array().unwrap();
+        assert_eq!(results.len(), 4);
+        assert_eq!(results[0]["ruleId"], "input-gap");
+        assert_eq!(results[3]["ruleId"], "assertion-gap");
+        let location = &results[3]["locations"][0]["physicalLocation"];
+        assert_eq!(location["artifactLocation"]["uri"], "crates/p/src/lib.rs");
+        assert_eq!((&location["region"]["startLine"], &location["region"]["startColumn"]), (&serde_json::json!(7), &serde_json::json!(5)));
+        assert!(results[3]["message"]["text"].as_str().unwrap().starts_with("`s.reset();`: passes every test as: delete `s.reset();`; "));
+        let rules = sarif["runs"][0]["tool"]["driver"]["rules"].as_array().unwrap();
+        assert_eq!(rules.len(), 2);
     }
 
     #[test]
@@ -1093,10 +1160,12 @@ mod tests {
             mutants_run: 3,
             mutants_killed: 2,
             mutants_timed_out: 0,
+            suppressed: 0,
             findings: vec![Finding::AssertionGap {
                 at: at.clone(),
                 survivors: vec!["delete `s.check()?;`".into()],
                 tests: (0..7).map(|i| format!("tests::t{i}")).collect(),
+                effects: vec![],
             }],
             unreached: vec![at.clone()],
             unstable: vec![at],
