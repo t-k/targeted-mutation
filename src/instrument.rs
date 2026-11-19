@@ -53,17 +53,28 @@ pub struct Site {
     pub text: String,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+pub struct TestModule {
+    pub name: String,
+    /// The `#[path = "..."]` of the declaration, relative to the declaring file's directory.
+    pub path: Option<String>,
+}
+
 #[derive(Debug, Default)]
 pub struct Discovery {
     pub sites: Vec<Site>,
     /// Out-of-line modules that only exist under `cfg(test)` (`#[cfg(test)] mod tests;`).
-    pub test_modules: Vec<String>,
+    pub test_modules: Vec<TestModule>,
 }
 
 /// Finds the sites in one source file, numbering them from `first_id`.
 pub fn discover(source: &str, first_id: u32) -> Result<Discovery> {
     let file = syn::parse_file(source).context("not parseable as a Rust source file")?;
-    let mut finder = Finder { source, next_id: first_id, found: Discovery::default() };
+    let mut finder = Finder {
+        source,
+        next_id: first_id,
+        found: Discovery::default(),
+    };
     finder.visit_file(&file);
     Ok(finder.found)
 }
@@ -78,7 +89,8 @@ impl Finder<'_> {
     fn range(&self, span: Span) -> Option<(usize, usize)> {
         let range = span.byte_range();
         // Spans produced by macro hygiene tricks or empty token streams carry no location.
-        (range.start < range.end && range.end <= self.source.len()
+        (range.start < range.end
+            && range.end <= self.source.len()
             && self.source.is_char_boundary(range.start)
             && self.source.is_char_boundary(range.end))
         .then_some((range.start, range.end))
@@ -115,8 +127,16 @@ fn is_assign_op(op: &syn::BinOp) -> bool {
     use syn::BinOp::*;
     matches!(
         op,
-        AddAssign(_) | SubAssign(_) | MulAssign(_) | DivAssign(_) | RemAssign(_) | BitXorAssign(_)
-            | BitAndAssign(_) | BitOrAssign(_) | ShlAssign(_) | ShrAssign(_)
+        AddAssign(_)
+            | SubAssign(_)
+            | MulAssign(_)
+            | DivAssign(_)
+            | RemAssign(_)
+            | BitXorAssign(_)
+            | BitAndAssign(_)
+            | BitOrAssign(_)
+            | ShlAssign(_)
+            | ShrAssign(_)
     )
 }
 
@@ -124,10 +144,15 @@ fn int_literal(expr: &syn::Expr) -> Option<i128> {
     match expr {
         syn::Expr::Paren(e) => int_literal(&e.expr),
         syn::Expr::Group(e) => int_literal(&e.expr),
-        syn::Expr::Lit(syn::ExprLit { lit: syn::Lit::Int(lit), .. }) => lit.base10_parse().ok(),
-        syn::Expr::Unary(syn::ExprUnary { op: syn::UnOp::Neg(_), expr, .. }) => {
-            int_literal(expr).and_then(i128::checked_neg)
-        }
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Int(lit),
+            ..
+        }) => lit.base10_parse().ok(),
+        syn::Expr::Unary(syn::ExprUnary {
+            op: syn::UnOp::Neg(_),
+            expr,
+            ..
+        }) => int_literal(expr).and_then(i128::checked_neg),
         _ => None,
     }
 }
@@ -171,7 +196,9 @@ fn is_test_only(attrs: &[syn::Attribute]) -> bool {
         if !path.is_ident("cfg") {
             return false;
         }
-        let syn::Meta::List(list) = &attr.meta else { return false };
+        let syn::Meta::List(list) = &attr.meta else {
+            return false;
+        };
         has_ident(list.tokens.clone(), "test") && !has_ident(list.tokens.clone(), "not")
     })
 }
@@ -198,7 +225,20 @@ impl<'ast> Visit<'ast> for Finder<'_> {
     fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
         if is_test_only(&node.attrs) {
             if node.content.is_none() {
-                self.found.test_modules.push(node.ident.to_string());
+                let path = node.attrs.iter().find_map(|attr| match &attr.meta {
+                    syn::Meta::NameValue(nv) if nv.path.is_ident("path") => match &nv.value {
+                        syn::Expr::Lit(syn::ExprLit {
+                            lit: syn::Lit::Str(s),
+                            ..
+                        }) => Some(s.value()),
+                        _ => None,
+                    },
+                    _ => None,
+                });
+                self.found.test_modules.push(TestModule {
+                    name: node.ident.to_string(),
+                    path,
+                });
             }
             return;
         }
@@ -279,19 +319,21 @@ impl<'ast> Visit<'ast> for Finder<'_> {
 #[derive(Debug, PartialEq)]
 pub struct Rendered {
     pub text: String,
-    /// `(output offset, original offset, length, copied)` per segment, in output order.
-    segments: Vec<(usize, usize, usize, bool)>,
+    /// `(output offset, original offset, length)` of each stretch copied from the original,
+    /// in output order.
+    segments: Vec<(usize, usize, usize)>,
 }
 
 impl Rendered {
     /// Maps a byte offset in the instrumented text to the original. Offsets inside inserted
     /// text map to the point of insertion.
     pub fn to_original(&self, offset: usize) -> usize {
-        let idx = self.segments.partition_point(|(out, _, _, _)| *out <= offset);
-        let Some((out, orig, len, copied)) = idx.checked_sub(1).map(|i| self.segments[i]) else {
+        let idx = self.segments.partition_point(|(out, _, _)| *out <= offset);
+        let Some((out, orig, len)) = idx.checked_sub(1).map(|i| self.segments[i]) else {
             return 0;
         };
-        if copied { orig + (offset - out).min(len) } else { orig }
+        // Past the end of the copied stretch is inserted text, which sits at its end.
+        orig + (offset - out).min(len)
     }
 }
 
@@ -314,7 +356,13 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
         let (open, close) = match &site.kind {
             SiteKind::Cmp { op, gap, .. } => {
                 let func = if op.is_ordering() { "ord" } else { "eq" };
-                edits.push(Edit { pos: gap.0, end: gap.1, phase: 1, order: 0, text: "), &(".into() });
+                edits.push(Edit {
+                    pos: gap.0,
+                    end: gap.1,
+                    phase: 1,
+                    order: 0,
+                    text: "), &(".into(),
+                });
                 (
                     "(match (&(".to_string(),
                     format!(
@@ -325,26 +373,41 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     ),
                 )
             }
-            SiteKind::Stmt => (format!("if {rt}::live({}u32) {{ ", site.id), " }".to_string()),
+            SiteKind::Stmt => (
+                format!("if {rt}::live({}u32) {{ ", site.id),
+                " }".to_string(),
+            ),
         };
-        edits.push(Edit { pos: site.start, end: site.start, phase: 2, order: -len, text: open });
-        edits.push(Edit { pos: site.end, end: site.end, phase: 0, order: len, text: close });
+        edits.push(Edit {
+            pos: site.start,
+            end: site.start,
+            phase: 2,
+            order: -len,
+            text: open,
+        });
+        edits.push(Edit {
+            pos: site.end,
+            end: site.end,
+            phase: 0,
+            order: len,
+            text: close,
+        });
     }
     edits.sort_by_key(|e| (e.pos, e.phase, e.order));
 
-    let mut text = String::with_capacity(source.len() + edits.iter().map(|e| e.text.len()).sum::<usize>());
+    let mut text =
+        String::with_capacity(source.len() + edits.iter().map(|e| e.text.len()).sum::<usize>());
     let mut segments = vec![];
     let mut cursor = 0;
     for edit in edits {
         if edit.pos > cursor {
-            segments.push((text.len(), cursor, edit.pos - cursor, true));
+            segments.push((text.len(), cursor, edit.pos - cursor));
             text.push_str(&source[cursor..edit.pos]);
         }
-        segments.push((text.len(), edit.pos, edit.text.len(), false));
         text.push_str(&edit.text);
         cursor = cursor.max(edit.end);
     }
-    segments.push((text.len(), cursor, source.len() - cursor, true));
+    segments.push((text.len(), cursor, source.len() - cursor));
     text.push_str(&source[cursor..]);
     Rendered { text, segments }
 }
@@ -352,11 +415,18 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
 /// The sites to blame for a compile error at `offset` (original coordinates): the smallest
 /// enabled sites that contain it.
 pub fn blame(sites: &[Site], enabled: &dyn Fn(u32) -> bool, offset: usize) -> Vec<u32> {
-    let containing = || sites.iter().filter(|s| enabled(s.id) && s.start <= offset && offset <= s.end);
+    let containing = || {
+        sites
+            .iter()
+            .filter(|s| enabled(s.id) && s.start <= offset && offset <= s.end)
+    };
     let Some(smallest) = containing().map(|s| s.end - s.start).min() else {
         return vec![];
     };
-    containing().filter(|s| s.end - s.start == smallest).map(|s| s.id).collect()
+    containing()
+        .filter(|s| s.end - s.start == smallest)
+        .map(|s| s.id)
+        .collect()
 }
 
 #[cfg(test)]
@@ -373,14 +443,30 @@ mod tests {
         let found = discover(src, 5).unwrap();
         assert_eq!(found.sites.len(), 1);
         let site = &found.sites[0];
-        assert_eq!((site.id, site.line, site.column, site.text.as_str()), (5, 2, 5, "age >= 18"));
-        let SiteKind::Cmp { op, lhs, rhs, literal, .. } = &site.kind else { panic!() };
-        assert_eq!((*op, lhs.as_str(), rhs.as_str(), *literal), (CmpOp::Ge, "age", "18", LiteralSide::Rhs(18)));
+        assert_eq!(
+            (site.id, site.line, site.column, site.text.as_str()),
+            (5, 2, 5, "age >= 18")
+        );
+        let SiteKind::Cmp {
+            op,
+            lhs,
+            rhs,
+            literal,
+            ..
+        } = &site.kind
+        else {
+            panic!()
+        };
+        assert_eq!(
+            (*op, lhs.as_str(), rhs.as_str(), *literal),
+            (CmpOp::Ge, "age", "18", LiteralSide::Rhs(18))
+        );
     }
 
     #[test]
     fn literal_sides() {
-        let src = "fn f(x: i32, y: i32) { let _ = (-5 < x, x == (3), 1 < 2, x <= y, x > 1.5 as i32); }";
+        let src =
+            "fn f(x: i32, y: i32) { let _ = (-5 < x, x == (3), 1 < 2, x <= y, x > 1.5 as i32); }";
         let literals: Vec<LiteralSide> = discover(src, 0)
             .unwrap()
             .sites
@@ -392,7 +478,13 @@ mod tests {
             .collect();
         assert_eq!(
             literals,
-            [LiteralSide::Lhs(-5), LiteralSide::Rhs(3), LiteralSide::None, LiteralSide::None, LiteralSide::None]
+            [
+                LiteralSide::Lhs(-5),
+                LiteralSide::Rhs(3),
+                LiteralSide::None,
+                LiteralSide::None,
+                LiteralSide::None
+            ]
         );
     }
 
@@ -415,16 +507,38 @@ mod tests {
         let src = "fn f(v: &mut Vec<u8>, a: u8) -> Result<(), ()> {\n    check((a < 3) == true)?;\n    v.push(a);v.clear();\n    Ok(())\n}";
         let sites = discover(src, 0).unwrap().sites;
         let kinds: Vec<&str> = sites.iter().map(|s| s.text.as_str()).collect();
-        assert_eq!(kinds, ["check((a < 3) == true)?;", "v.push(a);", "v.clear();", "(a < 3) == true", "a < 3"]);
+        assert_eq!(
+            kinds,
+            [
+                "check((a < 3) == true)?;",
+                "v.push(a);",
+                "v.clear();",
+                "(a < 3) == true",
+                "a < 3"
+            ]
+        );
         let out = render(src, &sites, &all);
-        assert_eq!(out.text.lines().count(), src.lines().count(), "line numbers are preserved");
-        assert!(out.text.contains("if crate::__tmt_rt::live(0u32) { check((match (&(((match (&(a), &(3))"), "{}", out.text);
+        assert_eq!(
+            out.text.lines().count(),
+            src.lines().count(),
+            "line numbers are preserved"
+        );
+        assert!(
+            out.text
+                .contains("if crate::__tmt_rt::live(0u32) { check((match (&(((match (&(a), &(3))"),
+            "{}",
+            out.text
+        );
         assert!(out.text.contains("if crate::__tmt_rt::live(1u32) { v.push(a); }if crate::__tmt_rt::live(2u32) { v.clear(); }"), "{}", out.text);
         syn::parse_file(&out.text).expect("instrumented source parses");
 
         // Only the inner comparison enabled.
         let inner = render(src, &sites, &|id| id == 4);
-        assert!(inner.text.contains("check(((match (&(a), &(3))"), "{}", inner.text);
+        assert!(
+            inner.text.contains("check(((match (&(a), &(3))"),
+            "{}",
+            inner.text
+        );
         assert!(inner.text.contains(") == true)?;"), "{}", inner.text);
         syn::parse_file(&inner.text).unwrap();
     }
@@ -443,6 +557,9 @@ mod tests {
             mod tests { fn t(a: u8) -> bool { a == 1 } }
             #[cfg(test)]
             mod more_tests;
+            #[cfg(test)]
+            #[path = "support/helpers.rs"]
+            mod helpers;
             #[cfg(all(test, feature = "x"))]
             fn helper(a: u8) -> bool { a != 1 }
             #[test]
@@ -458,7 +575,19 @@ mod tests {
         let found = discover(src, 0).unwrap();
         let texts: Vec<&str> = found.sites.iter().map(|s| s.text.as_str()).collect();
         assert_eq!(texts, ["a == 100", "a == 101", "a == 102"]);
-        assert_eq!(found.test_modules, ["more_tests"]);
+        assert_eq!(
+            found.test_modules,
+            [
+                TestModule {
+                    name: "more_tests".into(),
+                    path: None
+                },
+                TestModule {
+                    name: "helpers".into(),
+                    path: Some("support/helpers.rs".into())
+                },
+            ]
+        );
     }
 
     #[test]
@@ -486,7 +615,14 @@ mod tests {
             .collect();
         assert_eq!(
             texts,
-            ["s.validate()?;", "s.total += 1;", "s.flag = true;", "helper(s);", "s.flush().await?;", "s.sync().await;"]
+            [
+                "s.validate()?;",
+                "s.total += 1;",
+                "s.flag = true;",
+                "helper(s);",
+                "s.flush().await?;",
+                "s.sync().await;"
+            ]
         );
     }
 
@@ -503,7 +639,10 @@ mod tests {
                 .filter(|(o, c)| *c == ch && out.to_original(*o) == orig)
                 .map(|(o, _)| o)
                 .collect();
-            assert!(!hits.is_empty(), "original offset {orig} ({ch}) is unreachable");
+            assert!(
+                !hits.is_empty(),
+                "original offset {orig} ({ch}) is unreachable"
+            );
         }
         // An error inside the probe of `a < b` blames it, not the enclosing statement.
         let probe = out.text.find("ord(1u32").unwrap();
@@ -511,9 +650,54 @@ mod tests {
         assert_eq!(blame(&sites, &all, orig), [1]);
         // With the inner site disabled, the statement is next.
         assert_eq!(blame(&sites, &|id| id != 1, orig), [0]);
-        assert_eq!(blame(&sites, &all, src.find("fn").unwrap()), Vec::<u32>::new());
+        assert_eq!(
+            blame(&sites, &all, src.find("fn").unwrap()),
+            Vec::<u32>::new()
+        );
         assert_eq!(out.to_original(0), 0);
         assert_eq!(out.to_original(out.text.len()), src.len());
+    }
+
+    #[test]
+    fn blame_is_inclusive_at_both_ends() {
+        let src = "fn f(a: u8) -> bool { a > 1 }";
+        let sites = discover(src, 0).unwrap().sites;
+        let (start, end) = (sites[0].start, sites[0].end);
+        assert_eq!(blame(&sites, &all, start - 1), Vec::<u32>::new());
+        assert_eq!(blame(&sites, &all, start), [0]);
+        assert_eq!(blame(&sites, &all, end), [0]);
+        assert_eq!(blame(&sites, &all, end + 1), Vec::<u32>::new());
+        // The probe opens before the first original character and closes after the last.
+        let out = render(src, &sites, &all);
+        assert_eq!(out.to_original(out.text.find("(match").unwrap()), start);
+        assert_eq!(
+            out.to_original(out.text.find("tmt_val()) } })").unwrap()),
+            end
+        );
+        assert_eq!(
+            out.to_original(out.text.find("), &(").unwrap() + 2),
+            sites[0].start + 1
+        );
+    }
+
+    #[test]
+    fn finds_sites_in_impls_and_array_elements() {
+        let src = r#"
+            struct T(u8);
+            impl T { fn small(&self) -> bool { self.0 < 3 } }
+            #[cfg(test)]
+            impl T { fn only_in_tests(&self) -> bool { self.0 < 4 } }
+            trait Tr { fn provided(&self, a: u8) -> bool { a < 5 } }
+            fn arr(a: u8) -> [bool; 2] { [a < 6; 2] }
+            fn closure(a: u8) -> bool { (|| a < 7)() }
+        "#;
+        let texts: Vec<String> = discover(src, 0)
+            .unwrap()
+            .sites
+            .into_iter()
+            .map(|s| s.text)
+            .collect();
+        assert_eq!(texts, ["self.0 < 3", "a < 5", "a < 6", "a < 7"]);
     }
 
     #[test]

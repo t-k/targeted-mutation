@@ -41,11 +41,18 @@ fn main() -> ExitCode {
     match driver::run(&options) {
         Ok(result) => {
             if cli.json {
-                println!("{}", serde_json::to_string_pretty(&result).expect("report serialises"));
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&result).expect("report serialises")
+                );
             } else {
                 print!("{}", report::render_text(&result, cli.show_unreached));
             }
-            if result.has_gaps() { ExitCode::from(2) } else { ExitCode::SUCCESS }
+            if result.has_gaps() {
+                ExitCode::from(2)
+            } else {
+                ExitCode::SUCCESS
+            }
         }
         Err(err) => {
             eprintln!("tmt: error: {err:#}");

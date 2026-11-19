@@ -173,9 +173,15 @@ struct State {
 fn state() -> &'static State {
     static STATE: OnceLock<State> = OnceLock::new();
     STATE.get_or_init(|| {
-        let mutant = std::env::var("TMT_MUTANT").ok().and_then(|s| parse_mutant(&s));
+        let mutant = std::env::var("TMT_MUTANT")
+            .ok()
+            .and_then(|s| parse_mutant(&s));
         let tracer = std::env::var_os("TMT_TRACE").and_then(|path| {
-            let out = std::fs::OpenOptions::new().create(true).append(true).open(path).ok()?;
+            let out = std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(path)
+                .ok()?;
             Some(Mutex::new(Tracer {
                 out,
                 names: Vec::new(),
@@ -205,7 +211,9 @@ thread_local! {
 }
 
 fn with_tracer(f: impl FnOnce(&mut Tracer, u32)) {
-    let Some(tracer) = &state().tracer else { return };
+    let Some(tracer) = &state().tracer else {
+        return;
+    };
     let mut tracer = match tracer.lock() {
         Ok(t) => t,
         Err(poisoned) => poisoned.into_inner(),
@@ -258,7 +266,11 @@ fn finish(site: u32, op: u8, orig: bool, rel: u8, av: Val, bv: Val) -> bool {
     let d = diff(av, bv);
     let st = state();
     if let Some((target, m)) = st.mutant {
-        return if target == site { apply(op, m, orig, rel, d) } else { orig };
+        return if target == site {
+            apply(op, m, orig, rel, d)
+        } else {
+            orig
+        };
     }
     if st.tracer.is_some() {
         record_cmp(site, rel, d, av, bv);

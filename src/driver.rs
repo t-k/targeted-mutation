@@ -124,12 +124,18 @@ fn is_package(id: &str, name: &str) -> bool {
 fn parse_build_output(stdout: &str, package: &str) -> BuildOutput {
     let mut out = BuildOutput::default();
     for line in stdout.lines() {
-        let Ok(msg) = serde_json::from_str::<CargoMessage>(line) else { continue };
+        let Ok(msg) = serde_json::from_str::<CargoMessage>(line) else {
+            continue;
+        };
         match msg.reason.as_str() {
             "compiler-artifact" => {
-                if let (Some(exe), Some(target), Some(profile)) = (msg.executable, msg.target, msg.profile)
+                if let (Some(exe), Some(target), Some(profile)) =
+                    (msg.executable, msg.target, msg.profile)
                     && profile.test
-                    && msg.package_id.as_deref().is_some_and(|id| is_package(id, package))
+                    && msg
+                        .package_id
+                        .as_deref()
+                        .is_some_and(|id| is_package(id, package))
                 {
                     out.test_binaries.push((target.name, exe));
                 }
@@ -145,8 +151,18 @@ fn parse_build_output(stdout: &str, package: &str) -> BuildOutput {
                     line: s.line_start,
                 };
                 let error = CompileError {
-                    primary: diag.spans.iter().filter(|s| s.is_primary).map(span).collect(),
-                    secondary: diag.spans.iter().filter(|s| !s.is_primary).map(span).collect(),
+                    primary: diag
+                        .spans
+                        .iter()
+                        .filter(|s| s.is_primary)
+                        .map(span)
+                        .collect(),
+                    secondary: diag
+                        .spans
+                        .iter()
+                        .filter(|s| !s.is_primary)
+                        .map(span)
+                        .collect(),
                     rendered: diag.rendered.unwrap_or_default(),
                 };
                 // "aborting due to N previous errors" and friends carry no location, and the
@@ -210,8 +226,9 @@ fn copy_tree(from: &Path, to: &Path, skip: &dyn Fn(&Path) -> bool) -> Result<()>
 }
 
 fn rust_files(dir: &Path, skip: &dyn Fn(&Path) -> bool, out: &mut Vec<PathBuf>) -> Result<()> {
-    let mut entries: Vec<PathBuf> =
-        fs::read_dir(dir)?.map(|e| e.map(|e| e.path())).collect::<std::io::Result<_>>()?;
+    let mut entries: Vec<PathBuf> = fs::read_dir(dir)?
+        .map(|e| e.map(|e| e.path()))
+        .collect::<std::io::Result<_>>()?;
     entries.sort();
     for path in entries {
         if skip(&path) {
@@ -226,12 +243,20 @@ fn rust_files(dir: &Path, skip: &dyn Fn(&Path) -> bool, out: &mut Vec<PathBuf>) 
     Ok(())
 }
 
-/// Where the out-of-line module `name` declared in `file` lives.
-fn module_paths(file: &Path, name: &str) -> [PathBuf; 2] {
+/// Where the out-of-line module `module` declared in `file` lives.
+fn module_paths(file: &Path, module: &instrument::TestModule) -> Vec<PathBuf> {
     let dir = file.parent().unwrap_or(Path::new("."));
+    if let Some(path) = &module.path {
+        return vec![dir.join(path)];
+    }
+    let name = &module.name;
     let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-    let base = if matches!(stem, "lib" | "main" | "mod") { dir.to_path_buf() } else { dir.join(stem) };
-    [base.join(format!("{name}.rs")), base.join(name)]
+    let base = if matches!(stem, "lib" | "main" | "mod") {
+        dir.to_path_buf()
+    } else {
+        dir.join(stem)
+    };
+    vec![base.join(format!("{name}.rs")), base.join(name)]
 }
 
 /// Tests to pass to the binary, or `None` for "run everything".
@@ -254,7 +279,9 @@ fn run_binary(
     env: (&str, &str),
     timeout: Duration,
 ) -> Result<Outcome> {
-    let threads = std::thread::available_parallelism().map_or(2, |n| n.get()).max(2);
+    let threads = std::thread::available_parallelism()
+        .map_or(2, |n| n.get())
+        .max(2);
     let mut cmd = Command::new(&bin.exe);
     // With one test thread libtest runs tests on the main thread, and the runtime could
     // no longer tell which test it is in.
@@ -270,11 +297,17 @@ fn run_binary(
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    let mut child = cmd.spawn().with_context(|| format!("starting {}", bin.exe.display()))?;
+    let mut child = cmd
+        .spawn()
+        .with_context(|| format!("starting {}", bin.exe.display()))?;
     let started = Instant::now();
     loop {
         if let Some(status) = child.try_wait()? {
-            return Ok(if status.success() { Outcome::Pass } else { Outcome::Fail });
+            return Ok(if status.success() {
+                Outcome::Pass
+            } else {
+                Outcome::Fail
+            });
         }
         if started.elapsed() > timeout {
             let _ = child.kill();
@@ -288,7 +321,12 @@ fn run_binary(
 /// The sites to disable for one compile error, from the most to the least specific guess:
 /// the innermost site at a primary span, at a secondary span, any site on the line of a
 /// primary span, and finally every site of the file.
-fn blame_error(error: &CompileError, files: &[SourceFile], copy: &Path, disabled: &HashSet<u32>) -> Vec<u32> {
+fn blame_error(
+    error: &CompileError,
+    files: &[SourceFile],
+    copy: &Path,
+    disabled: &HashSet<u32>,
+) -> Vec<u32> {
     let enabled = |id: u32| !disabled.contains(&id);
     let file_of = |span: &ErrorSpan| {
         let path = copy.join(&span.file);
@@ -298,7 +336,11 @@ fn blame_error(error: &CompileError, files: &[SourceFile], copy: &Path, disabled
         let mut ids = vec![];
         for span in spans {
             if let Some(file) = file_of(span) {
-                let offset = file.rendered.as_ref().expect("rendered before building").to_original(span.byte_start);
+                let offset = file
+                    .rendered
+                    .as_ref()
+                    .expect("rendered before building")
+                    .to_original(span.byte_start);
                 ids.extend(instrument::blame(&file.sites, &enabled, offset));
             }
         }
@@ -318,14 +360,22 @@ fn blame_error(error: &CompileError, files: &[SourceFile], copy: &Path, disabled
         }
         ids
     };
-    [innermost(&error.primary), innermost(&error.secondary), widen(true), widen(false)]
-        .into_iter()
-        .find(|ids| !ids.is_empty())
-        .unwrap_or_default()
+    [
+        innermost(&error.primary),
+        innermost(&error.secondary),
+        widen(true),
+        widen(false),
+    ]
+    .into_iter()
+    .find(|ids| !ids.is_empty())
+    .unwrap_or_default()
 }
 
 /// Range of `D = lhs - rhs` that the operand types allow, when one side is a literal.
-fn domain_of(literal: LiteralSide, bounds: Option<&crate::trace::TypeBounds>) -> Option<(i128, i128)> {
+fn domain_of(
+    literal: LiteralSide,
+    bounds: Option<&crate::trace::TypeBounds>,
+) -> Option<(i128, i128)> {
     let bounds = bounds?;
     match literal {
         LiteralSide::Rhs(k) => Some((bounds.lhs.0.checked_sub(k)?, bounds.lhs.1.checked_sub(k)?)),
@@ -392,7 +442,10 @@ pub fn run(options: &Options) -> Result<Report> {
             eprintln!("tmt: {text}");
         }
     };
-    let dir = options.dir.canonicalize().with_context(|| format!("no such directory: {}", options.dir.display()))?;
+    let dir = options
+        .dir
+        .canonicalize()
+        .with_context(|| format!("no such directory: {}", options.dir.display()))?;
 
     // 1. Locate the package.
     let output = Command::new("cargo")
@@ -401,9 +454,13 @@ pub fn run(options: &Options) -> Result<Report> {
         .output()
         .context("running cargo metadata")?;
     if !output.status.success() {
-        bail!("cargo metadata failed:\n{}", String::from_utf8_lossy(&output.stderr));
+        bail!(
+            "cargo metadata failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     }
-    let metadata: Metadata = serde_json::from_slice(&output.stdout).context("parsing cargo metadata")?;
+    let metadata: Metadata =
+        serde_json::from_slice(&output.stdout).context("parsing cargo metadata")?;
     let package = match &options.package {
         Some(name) => metadata.packages.iter().find(|p| &p.name == name),
         None => metadata
@@ -434,8 +491,11 @@ pub fn run(options: &Options) -> Result<Report> {
     let target_dir = metadata.target_directory.clone();
     copy_tree(&workspace, &copy, &|path| {
         path == target_dir
-            || path.file_name().is_some_and(|n| n == ".git" || n == "node_modules")
-            || (path.parent() == Some(workspace.as_path()) && path.file_name().is_some_and(|n| n == "target"))
+            || path
+                .file_name()
+                .is_some_and(|n| n == ".git" || n == "node_modules")
+            || (path.parent() == Some(workspace.as_path())
+                && path.file_name().is_some_and(|n| n == "target"))
     })?;
     let in_copy = |path: &Path| -> Result<PathBuf> {
         let canonical = path.canonicalize()?;
@@ -444,9 +504,17 @@ pub fn run(options: &Options) -> Result<Report> {
             .with_context(|| format!("{} is outside the workspace", path.display()))?;
         Ok(copy.join(relative))
     };
-    let package_dir = in_copy(package.manifest_path.parent().expect("manifest has a parent"))?;
+    let package_dir = in_copy(
+        package
+            .manifest_path
+            .parent()
+            .expect("manifest has a parent"),
+    )?;
     let root_file = in_copy(&root_target.src_path)?;
-    let source_dir = root_file.parent().expect("source file has a parent").to_path_buf();
+    let source_dir = root_file
+        .parent()
+        .expect("source file has a parent")
+        .to_path_buf();
 
     // 3. Find the sites.
     let mut other_roots = HashSet::new();
@@ -464,22 +532,37 @@ pub fn run(options: &Options) -> Result<Report> {
     let mut paths = vec![];
     rust_files(
         &source_dir,
-        &|p| other_roots.contains(p) || other_dirs.contains(p) || p.file_name().is_some_and(|n| n == "target"),
+        &|p| {
+            other_roots.contains(p)
+                || other_dirs.contains(p)
+                || p.file_name().is_some_and(|n| n == "target")
+        },
         &mut paths,
     )?;
     let mut files = vec![];
     let mut test_only = HashSet::new();
     let mut next_id = 0u32;
     for path in paths {
-        let original = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-        let display = path.strip_prefix(&package_dir).unwrap_or(&path).display().to_string();
+        let original =
+            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        let display = path
+            .strip_prefix(&package_dir)
+            .unwrap_or(&path)
+            .display()
+            .to_string();
         match instrument::discover(&original, next_id) {
             Ok(found) => {
                 next_id += found.sites.len() as u32;
-                for name in &found.test_modules {
-                    test_only.extend(module_paths(&path, name));
+                for module in &found.test_modules {
+                    test_only.extend(module_paths(&path, module));
                 }
-                files.push(SourceFile { display, path, original, sites: found.sites, rendered: None });
+                files.push(SourceFile {
+                    display,
+                    path,
+                    original,
+                    sites: found.sites,
+                    rendered: None,
+                });
             }
             Err(err) => note(&format!("skipping {display}: {err:#}")),
         }
@@ -492,7 +575,10 @@ pub fn run(options: &Options) -> Result<Report> {
     if root_source.contains("#![no_std]") {
         bail!("`{}` is no_std; the probes need std", package.name);
     }
-    fs::write(source_dir.join(format!("{RUNTIME_MOD}.rs")), crate::RUNTIME_SOURCE)?;
+    fs::write(
+        source_dir.join(format!("{RUNTIME_MOD}.rs")),
+        crate::RUNTIME_SOURCE,
+    )?;
     let root_suffix = format!("\n#[doc(hidden)]\nmod {RUNTIME_MOD};\n");
 
     // 4. Build, disabling the sites whose probe does not compile (formal/tla/RepairLoop.tla).
@@ -501,7 +587,8 @@ pub fn run(options: &Options) -> Result<Report> {
     let mut rounds = 0;
     let build = loop {
         for file in &mut files {
-            let rendered = instrument::render(&file.original, &file.sites, &|id| !disabled.contains(&id));
+            let rendered =
+                instrument::render(&file.original, &file.sites, &|id| !disabled.contains(&id));
             let mut text = rendered.text.clone();
             if file.path == root_file {
                 text.push_str(&root_suffix);
@@ -512,9 +599,19 @@ pub fn run(options: &Options) -> Result<Report> {
         if !files.iter().any(|f| f.path == root_file) {
             fs::write(&root_file, format!("{root_source}{root_suffix}"))?;
         }
-        note(if rounds == 0 { "building the instrumented crate" } else { "rebuilding without the sites that failed to compile" });
+        note(if rounds == 0 {
+            "building the instrumented crate"
+        } else {
+            "rebuilding without the sites that failed to compile"
+        });
         let output = Command::new("cargo")
-            .args(["test", "--no-run", "--message-format=json", "-p", &package.name])
+            .args([
+                "test",
+                "--no-run",
+                "--message-format=json",
+                "-p",
+                &package.name,
+            ])
             .current_dir(&copy)
             .env("CARGO_TARGET_DIR", &build_target)
             .stderr(Stdio::piped())
@@ -525,7 +622,10 @@ pub fn run(options: &Options) -> Result<Report> {
             break build;
         }
         if build.errors.is_empty() {
-            bail!("the build failed:\n{}", String::from_utf8_lossy(&output.stderr));
+            bail!(
+                "the build failed:\n{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
         }
         rounds += 1;
         let before = disabled.len();
@@ -543,7 +643,11 @@ pub fn run(options: &Options) -> Result<Report> {
         }
         disabled.extend(blamed_now);
         if disabled.len() == before || rounds > MAX_REPAIR_ROUNDS {
-            let shown = unexplained.first().copied().or(build.errors.first()).map_or("", |e| e.rendered.as_str());
+            let shown = unexplained
+                .first()
+                .copied()
+                .or(build.errors.first())
+                .map_or("", |e| e.rendered.as_str());
             bail!(
                 "the crate does not build after instrumentation, and the error is not at a probe.\n\
                  Does `cargo test --no-run` pass on the original?\n{shown}"
@@ -555,17 +659,37 @@ pub fn run(options: &Options) -> Result<Report> {
     }
 
     // 5. Trace run: what does each test observe?
-    let mut session = Session { progress: options.progress, package_dir, binaries: vec![], mutants_run: 0, mutants_killed: 0 };
+    let mut session = Session {
+        progress: options.progress,
+        package_dir,
+        binaries: vec![],
+        mutants_run: 0,
+        mutants_killed: 0,
+    };
     for (index, (name, exe)) in build.test_binaries.into_iter().enumerate() {
         let trace_path = work.join(format!("trace-{index}.tsv"));
         let _ = fs::remove_file(&trace_path);
-        let mut bin = TestBinary { name, exe, baseline: Duration::ZERO, trace: Trace::default() };
+        let mut bin = TestBinary {
+            name,
+            exe,
+            baseline: Duration::ZERO,
+            trace: Trace::default(),
+        };
         session.note(&format!("tracing `{}`", bin.name));
         let started = Instant::now();
         let trace_env = trace_path.to_string_lossy().into_owned();
-        let outcome = run_binary(&bin, &session.package_dir, None, ("TMT_TRACE", &trace_env), Duration::from_secs(3600))?;
+        let outcome = run_binary(
+            &bin,
+            &session.package_dir,
+            None,
+            ("TMT_TRACE", &trace_env),
+            Duration::from_secs(3600),
+        )?;
         if outcome != Outcome::Pass {
-            bail!("the tests in `{}` do not pass on the unmutated code; fix them first", bin.name);
+            bail!(
+                "the tests in `{}` do not pass on the unmutated code; fix them first",
+                bin.name
+            );
         }
         bin.baseline = started.elapsed();
         bin.trace = Trace::parse(&fs::read_to_string(&trace_path).unwrap_or_default());
@@ -584,12 +708,16 @@ pub fn run(options: &Options) -> Result<Report> {
             let at = report::location(&file.display, site);
             let id = site.id;
             let SiteKind::Cmp { op, literal, .. } = &site.kind else {
-                let reached = session.binaries.iter().any(|b| b.trace.reach.contains_key(&id));
+                let reached = session
+                    .binaries
+                    .iter()
+                    .any(|b| b.trace.reach.contains_key(&id));
                 if !reached {
                     report.unreached.push(at);
                     continue;
                 }
-                let tests_of = |bin: &TestBinary| bin.trace.reach.get(&id).cloned().unwrap_or_default();
+                let tests_of =
+                    |bin: &TestBinary| bin.trace.reach.get(&id).cloned().unwrap_or_default();
                 if let Some(tests) = session.survives(id, Mutation::Delete, &tests_of)? {
                     report.findings.push(Finding::AssertionGap {
                         at,
@@ -603,7 +731,10 @@ pub fn run(options: &Options) -> Result<Report> {
             for bin in &session.binaries {
                 merged.merge(&bin.trace.merged(id));
             }
-            let bounds = session.binaries.iter().find_map(|b| b.trace.bounds.get(&id));
+            let bounds = session
+                .binaries
+                .iter()
+                .find_map(|b| b.trace.bounds.get(&id));
             let cmp_plan = plan::plan_cmp(*op, &merged, domain_of(*literal, bounds));
             let infected_tests = |bin: &TestBinary, m: Mutation| -> BTreeSet<String> {
                 let empty = BTreeMap::new();
@@ -626,7 +757,9 @@ pub fn run(options: &Options) -> Result<Report> {
                     // The trace says no test can notice. Confirm by running every test
                     // that reaches the site against the nearest survivor.
                     let mut confirmed = true;
-                    if options.verify && let Some(m) = gap.representative() {
+                    if options.verify
+                        && let Some(m) = gap.representative()
+                    {
                         let reaching = |bin: &TestBinary| infected_tests(bin, Mutation::Negate);
                         confirmed = session.survives(id, m, &reaching)?.is_some();
                     }
@@ -671,23 +804,42 @@ mod tests {
     #[test]
     fn parses_cargo_json_messages() {
         let stdout = concat!(
-            r#"{"reason":"compiler-artifact","package_id":"p 0.1.0","target":{"name":"p","kind":["lib"]},"profile":{"test":false},"executable":null}"#, "\n",
-            r#"{"reason":"compiler-artifact","package_id":"p 0.1.0","target":{"name":"p","kind":["lib"]},"profile":{"test":true},"executable":"/t/p-abc"}"#, "\n",
-            r#"{"reason":"compiler-artifact","package_id":"dep 1.0.0","target":{"name":"dep","kind":["lib"]},"profile":{"test":true},"executable":"/t/dep-abc"}"#, "\n",
-            r#"{"reason":"compiler-message","message":{"level":"warning","rendered":"w","spans":[{"file_name":"src/lib.rs","byte_start":1,"line_start":1,"is_primary":true}]}}"#, "\n",
-            r#"{"reason":"compiler-message","message":{"level":"error","rendered":"E0308","spans":[{"file_name":"src/lib.rs","byte_start":40,"line_start":3,"is_primary":true},{"file_name":"src/lib.rs","byte_start":2,"line_start":1,"is_primary":false}]}}"#, "\n",
-            r#"{"reason":"compiler-message","message":{"level":"error","rendered":"E0308","spans":[{"file_name":"src/lib.rs","byte_start":40,"line_start":3,"is_primary":true},{"file_name":"src/lib.rs","byte_start":2,"line_start":1,"is_primary":false}]}}"#, "\n",
-            r#"{"reason":"compiler-message","message":{"level":"error","rendered":"aborting","spans":[]}}"#, "\n",
+            r#"{"reason":"compiler-artifact","package_id":"p 0.1.0","target":{"name":"p","kind":["lib"]},"profile":{"test":false},"executable":null}"#,
+            "\n",
+            r#"{"reason":"compiler-artifact","package_id":"p 0.1.0","target":{"name":"p","kind":["lib"]},"profile":{"test":true},"executable":"/t/p-abc"}"#,
+            "\n",
+            r#"{"reason":"compiler-artifact","package_id":"dep 1.0.0","target":{"name":"dep","kind":["lib"]},"profile":{"test":true},"executable":"/t/dep-abc"}"#,
+            "\n",
+            r#"{"reason":"compiler-message","message":{"level":"warning","rendered":"w","spans":[{"file_name":"src/lib.rs","byte_start":1,"line_start":1,"is_primary":true}]}}"#,
+            "\n",
+            r#"{"reason":"compiler-message","message":{"level":"error","rendered":"E0308","spans":[{"file_name":"src/lib.rs","byte_start":40,"line_start":3,"is_primary":true},{"file_name":"src/lib.rs","byte_start":2,"line_start":1,"is_primary":false}]}}"#,
+            "\n",
+            r#"{"reason":"compiler-message","message":{"level":"error","rendered":"E0308","spans":[{"file_name":"src/lib.rs","byte_start":40,"line_start":3,"is_primary":true},{"file_name":"src/lib.rs","byte_start":2,"line_start":1,"is_primary":false}]}}"#,
+            "\n",
+            r#"{"reason":"compiler-message","message":{"level":"error","rendered":"aborting","spans":[]}}"#,
+            "\n",
             "not json\n",
-            r#"{"reason":"build-finished","success":false}"#, "\n",
+            r#"{"reason":"build-finished","success":false}"#,
+            "\n",
         );
         let out = parse_build_output(stdout, "p");
-        assert_eq!(out.test_binaries, [("p".to_string(), PathBuf::from("/t/p-abc"))]);
+        assert_eq!(
+            out.test_binaries,
+            [("p".to_string(), PathBuf::from("/t/p-abc"))]
+        );
         assert_eq!(
             out.errors,
             [CompileError {
-                primary: vec![ErrorSpan { file: "src/lib.rs".into(), byte_start: 40, line: 3 }],
-                secondary: vec![ErrorSpan { file: "src/lib.rs".into(), byte_start: 2, line: 1 }],
+                primary: vec![ErrorSpan {
+                    file: "src/lib.rs".into(),
+                    byte_start: 40,
+                    line: 3
+                }],
+                secondary: vec![ErrorSpan {
+                    file: "src/lib.rs".into(),
+                    byte_start: 2,
+                    line: 1
+                }],
                 rendered: "E0308".into(),
             }]
         );
@@ -695,17 +847,38 @@ mod tests {
 
     #[test]
     fn package_ids_are_matched_by_name() {
-        assert!(is_package("path+file:///w/target/tmt/src#eligibility@0.0.0", "eligibility"));
-        assert!(is_package("path+file:///w/eligibility#0.1.0", "eligibility"));
-        assert!(is_package("eligibility 0.1.0 (path+file:///w)", "eligibility"));
-        assert!(!is_package("path+file:///w/eligibility#other@0.1.0", "eligibility-core"));
-        assert!(!is_package("registry+https://github.com/rust-lang/crates.io-index#serde@1.0.0", "eligibility"));
+        assert!(is_package(
+            "path+file:///w/target/tmt/src#eligibility@0.0.0",
+            "eligibility"
+        ));
+        assert!(is_package(
+            "path+file:///w/eligibility#0.1.0",
+            "eligibility"
+        ));
+        assert!(is_package(
+            "eligibility 0.1.0 (path+file:///w)",
+            "eligibility"
+        ));
+        assert!(!is_package(
+            "path+file:///w/eligibility#other@0.1.0",
+            "eligibility-core"
+        ));
+        assert!(!is_package(
+            "registry+https://github.com/rust-lang/crates.io-index#serde@1.0.0",
+            "eligibility"
+        ));
     }
 
     #[test]
     fn test_filter_falls_back_to_the_whole_binary() {
-        let some: BTreeSet<String> = ["tests::a", "tests::b"].into_iter().map(String::from).collect();
-        assert_eq!(test_filter(&some), Some(vec!["tests::a".to_string(), "tests::b".to_string()]));
+        let some: BTreeSet<String> = ["tests::a", "tests::b"]
+            .into_iter()
+            .map(String::from)
+            .collect();
+        assert_eq!(
+            test_filter(&some),
+            Some(vec!["tests::a".to_string(), "tests::b".to_string()])
+        );
         let mut unknown = some.clone();
         unknown.insert(UNKNOWN_TEST.to_string());
         assert_eq!(test_filter(&unknown), None);
@@ -717,34 +890,71 @@ mod tests {
 
     #[test]
     fn domains_from_type_bounds() {
-        let u8s = crate::trace::TypeBounds { lhs: (0, 255), rhs: (0, 255) };
-        assert_eq!(domain_of(LiteralSide::Rhs(18), Some(&u8s)), Some((-18, 237)));
-        assert_eq!(domain_of(LiteralSide::Lhs(18), Some(&u8s)), Some((-237, 18)));
+        let u8s = crate::trace::TypeBounds {
+            lhs: (0, 255),
+            rhs: (0, 255),
+        };
+        assert_eq!(
+            domain_of(LiteralSide::Rhs(18), Some(&u8s)),
+            Some((-18, 237))
+        );
+        assert_eq!(
+            domain_of(LiteralSide::Lhs(18), Some(&u8s)),
+            Some((-237, 18))
+        );
         assert_eq!(domain_of(LiteralSide::None, Some(&u8s)), None);
         assert_eq!(domain_of(LiteralSide::Rhs(18), None), None);
-        let wide = crate::trace::TypeBounds { lhs: (i128::MIN, 0), rhs: (0, 0) };
-        assert_eq!(domain_of(LiteralSide::Rhs(1), Some(&wide)), None, "overflow is not a domain");
+        let wide = crate::trace::TypeBounds {
+            lhs: (i128::MIN, 0),
+            rhs: (0, 0),
+        };
+        assert_eq!(
+            domain_of(LiteralSide::Rhs(1), Some(&wide)),
+            None,
+            "overflow is not a domain"
+        );
     }
 
     #[test]
     fn out_of_line_module_locations() {
+        let tests = instrument::TestModule {
+            name: "tests".into(),
+            path: None,
+        };
         assert_eq!(
-            module_paths(Path::new("src/lib.rs"), "tests"),
+            module_paths(Path::new("src/lib.rs"), &tests),
             [PathBuf::from("src/tests.rs"), PathBuf::from("src/tests")]
         );
         assert_eq!(
-            module_paths(Path::new("src/store.rs"), "tests"),
-            [PathBuf::from("src/store/tests.rs"), PathBuf::from("src/store/tests")]
+            module_paths(Path::new("src/store.rs"), &tests),
+            [
+                PathBuf::from("src/store/tests.rs"),
+                PathBuf::from("src/store/tests")
+            ]
         );
         assert_eq!(
-            module_paths(Path::new("src/store/mod.rs"), "tests"),
-            [PathBuf::from("src/store/tests.rs"), PathBuf::from("src/store/tests")]
+            module_paths(Path::new("src/store/mod.rs"), &tests),
+            [
+                PathBuf::from("src/store/tests.rs"),
+                PathBuf::from("src/store/tests")
+            ]
+        );
+        let with_path = instrument::TestModule {
+            name: "rt".into(),
+            path: Some("runtime/rt.rs".into()),
+        };
+        assert_eq!(
+            module_paths(Path::new("src/lib.rs"), &with_path),
+            [PathBuf::from("src/runtime/rt.rs")]
         );
     }
 
     #[test]
     fn mutant_timeout_scales_with_the_baseline() {
         assert_eq!(mutant_timeout(Duration::ZERO), Duration::from_secs(5));
-        assert_eq!(mutant_timeout(Duration::from_secs(2)), Duration::from_secs(15));
+        assert_eq!(
+            mutant_timeout(Duration::from_secs(2)),
+            Duration::from_secs(15)
+        );
     }
 }
