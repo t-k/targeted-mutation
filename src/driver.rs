@@ -30,6 +30,9 @@ pub struct Options {
     pub progress: bool,
 }
 
+/// How far from an error to look for the probe that caused it (a probe can break type
+/// inference a few lines further down).
+const NEARBY_LINES: usize = 6;
 /// Name under which the crate root re-declares `std` for the runtime module.
 const STD_ALIAS: &str = "__tmt_std";
 /// More rebuilds than this means the blame logic is not converging.
@@ -410,14 +413,14 @@ fn blame_error(
         }
         ids
     };
-    let widen = |same_line_only: bool| -> Vec<u32> {
+    let widen = |lines: usize| -> Vec<u32> {
         let mut ids = vec![];
         for span in &error.primary {
             if let Some(file) = file_of(span) {
                 ids.extend(
                     file.sites
                         .iter()
-                        .filter(|s| enabled(s.id) && (!same_line_only || s.line == span.line))
+                        .filter(|s| enabled(s.id) && s.line.abs_diff(span.line) <= lines)
                         .map(|s| s.id),
                 );
             }
@@ -427,8 +430,9 @@ fn blame_error(
     [
         innermost(&error.primary),
         innermost(&error.secondary),
-        widen(true),
-        widen(false),
+        widen(0),
+        widen(NEARBY_LINES),
+        widen(usize::MAX),
     ]
     .into_iter()
     .find(|ids| !ids.is_empty())
@@ -499,6 +503,171 @@ impl Session {
             }
         }
         Ok(Some(ran_against))
+    }
+}
+
+/// The tests of one binary whose observations satisfy `pick`.
+fn tests_where<T>(per_test: Option<&BTreeMap<String, T>>, pick: impl Fn(&T) -> bool) -> BTreeSet<String> {
+    per_test
+        .into_iter()
+        .flatten()
+        .filter(|(_, obs)| pick(obs))
+        .map(|(test, _)| test.clone())
+        .collect()
+}
+
+/// What the planner decided for one site, in the form the session executes.
+struct SitePlan<'a> {
+    /// Predicted survivors: the finding to report and the mutations to confirm it with.
+    gaps: Vec<(Finding, Vec<Mutation>)>,
+    /// Mutations some test observes differently.
+    run: Vec<Mutation>,
+    /// Tests of a binary whose execution the mutation can change.
+    infected: Box<dyn Fn(&TestBinary, Mutation) -> BTreeSet<String> + 'a>,
+    /// Tests of a binary that execute the site at all.
+    reaching: Box<dyn Fn(&TestBinary) -> BTreeSet<String> + 'a>,
+}
+
+impl Session {
+    fn analyse(&mut self, report: &mut Report, file: &str, site: &Site, verify: bool) -> Result<()> {
+        let at = report::location(file, site);
+        let id = site.id;
+        let plan = match &site.kind {
+            SiteKind::Stmt => {
+                if !self.binaries.iter().any(|b| b.trace.reach.contains_key(&id)) {
+                    report.unreached.push(at);
+                    return Ok(());
+                }
+                SitePlan {
+                    gaps: vec![],
+                    run: vec![Mutation::Delete],
+                    infected: Box::new(move |bin, _| bin.trace.reach.get(&id).cloned().unwrap_or_default()),
+                    reaching: Box::new(move |bin| bin.trace.reach.get(&id).cloned().unwrap_or_default()),
+                }
+            }
+            SiteKind::Cmp { op, literal, .. } => {
+                let op = *op;
+                let mut merged = Obs::default();
+                for bin in &self.binaries {
+                    merged.merge(&bin.trace.merged(id));
+                }
+                let bounds = self.binaries.iter().find_map(|b| b.trace.bounds.get(&id));
+                let cmp_plan = plan::plan_cmp(op, &merged, domain_of(*literal, bounds));
+                let mut gaps = vec![];
+                match &cmp_plan.gap {
+                    Some(plan::InputGap::Unreached) => {
+                        report.unreached.push(at);
+                        return Ok(());
+                    }
+                    Some(gap) => {
+                        if let Some(finding) = report::input_gap_finding(file, site, gap, &merged, verify) {
+                            gaps.push((finding, gap.survivors()));
+                        }
+                    }
+                    None => {}
+                }
+                SitePlan {
+                    gaps,
+                    run: cmp_plan.run,
+                    infected: Box::new(move |bin, m| {
+                        tests_where(bin.trace.cmp.get(&id), |obs| plan::infects(op, m, obs))
+                    }),
+                    reaching: Box::new(move |bin| tests_where(bin.trace.cmp.get(&id), Obs::reached)),
+                }
+            }
+            SiteKind::Logic { and, .. } => {
+                let and = *and;
+                let mut merged = plan::LogicObs::default();
+                for obs in self.binaries.iter().filter_map(|b| b.trace.logic.get(&id)).flat_map(|t| t.values()) {
+                    merged.merge(obs);
+                }
+                let logic_plan = plan::plan_logic(and, &merged);
+                if logic_plan.gaps.contains(&plan::LogicGap::Unreached) {
+                    report.unreached.push(at);
+                    return Ok(());
+                }
+                let gaps = logic_plan
+                    .gaps
+                    .iter()
+                    .filter_map(|gap| {
+                        let mutation = match gap {
+                            plan::LogicGap::RhsNeverDecides => Mutation::LogicDropRhs,
+                            _ => Mutation::LogicDropLhs,
+                        };
+                        Some((report::logic_gap_finding(file, site, *gap, verify)?, vec![mutation]))
+                    })
+                    .collect();
+                SitePlan {
+                    gaps,
+                    run: logic_plan.run,
+                    infected: Box::new(move |bin, m| {
+                        tests_where(bin.trace.logic.get(&id), |obs| plan::logic_infects(and, m, obs))
+                    }),
+                    reaching: Box::new(move |bin| tests_where(bin.trace.logic.get(&id), plan::LogicObs::reached)),
+                }
+            }
+            SiteKind::Arith { .. } => {
+                let mut merged = plan::ArithObs::default();
+                for obs in self.binaries.iter().filter_map(|b| b.trace.arith.get(&id)).flat_map(|t| t.values()) {
+                    merged.merge(obs);
+                }
+                let (gaps, run) = match plan::plan_arith(&merged) {
+                    plan::ArithPlan::Unreached => {
+                        report.unreached.push(at);
+                        return Ok(());
+                    }
+                    // Not numbers (`String + &str`, `Duration + Duration`): nothing to mutate.
+                    plan::ArithPlan::Opaque => return Ok(()),
+                    plan::ArithPlan::NeverDiffers => (
+                        report::arith_gap_finding(file, site, verify)
+                            .map(|finding| (finding, vec![Mutation::ArithSwap]))
+                            .into_iter()
+                            .collect(),
+                        vec![],
+                    ),
+                    plan::ArithPlan::Run => (vec![], vec![Mutation::ArithSwap]),
+                };
+                SitePlan {
+                    gaps,
+                    run,
+                    infected: Box::new(move |bin, _| tests_where(bin.trace.arith.get(&id), |obs| obs.differs)),
+                    reaching: Box::new(move |bin| tests_where(bin.trace.arith.get(&id), |obs| obs.same || obs.differs)),
+                }
+            }
+        };
+
+        for (finding, survivors) in plan.gaps {
+            // The trace says no test can notice. Confirm by running every test that
+            // reaches the site against the listed survivors.
+            let mut confirmed = true;
+            if verify {
+                for m in survivors {
+                    confirmed &= self.survives(id, m, &*plan.reaching)?.is_some();
+                }
+            }
+            if confirmed {
+                report.findings.push(finding);
+            } else {
+                report.unstable.push(at.clone());
+            }
+        }
+        let mut survivors = vec![];
+        let mut passing_tests = BTreeSet::new();
+        for m in plan.run {
+            let infected = &plan.infected;
+            if let Some(tests) = self.survives(id, m, &|bin| infected(bin, m))? {
+                survivors.push(report::describe(site, m));
+                passing_tests.extend(tests);
+            }
+        }
+        if !survivors.is_empty() {
+            report.findings.push(Finding::AssertionGap {
+                at,
+                survivors,
+                tests: passing_tests.into_iter().collect(),
+            });
+        }
+        Ok(())
     }
 }
 
@@ -793,91 +962,7 @@ pub fn run(options: &Options) -> Result<Report> {
     };
     for file in &files {
         for site in file.sites.iter().filter(|s| !disabled.contains(&s.id)) {
-            let at = report::location(&file.display, site);
-            let id = site.id;
-            let SiteKind::Cmp { op, literal, .. } = &site.kind else {
-                let reached = session
-                    .binaries
-                    .iter()
-                    .any(|b| b.trace.reach.contains_key(&id));
-                if !reached {
-                    report.unreached.push(at);
-                    continue;
-                }
-                let tests_of =
-                    |bin: &TestBinary| bin.trace.reach.get(&id).cloned().unwrap_or_default();
-                if let Some(tests) = session.survives(id, Mutation::Delete, &tests_of)? {
-                    report.findings.push(Finding::AssertionGap {
-                        at,
-                        survivors: vec![report::describe(site, Mutation::Delete)],
-                        tests,
-                    });
-                }
-                continue;
-            };
-            let mut merged = Obs::default();
-            for bin in &session.binaries {
-                merged.merge(&bin.trace.merged(id));
-            }
-            let bounds = session
-                .binaries
-                .iter()
-                .find_map(|b| b.trace.bounds.get(&id));
-            let cmp_plan = plan::plan_cmp(*op, &merged, domain_of(*literal, bounds));
-            let infected_tests = |bin: &TestBinary, m: Mutation| -> BTreeSet<String> {
-                let empty = BTreeMap::new();
-                bin.trace
-                    .cmp
-                    .get(&id)
-                    .unwrap_or(&empty)
-                    .iter()
-                    .filter(|(_, obs)| plan::infects(*op, m, obs))
-                    .map(|(test, _)| test.clone())
-                    .collect()
-            };
-
-            match &cmp_plan.gap {
-                Some(plan::InputGap::Unreached) => {
-                    report.unreached.push(at);
-                    continue;
-                }
-                Some(gap) => {
-                    // The trace says no test can notice. Confirm by running every test
-                    // that reaches the site against the nearest survivor.
-                    let mut confirmed = true;
-                    if options.verify
-                        && let Some(m) = gap.representative()
-                    {
-                        let reaching = |bin: &TestBinary| infected_tests(bin, Mutation::Negate);
-                        confirmed = session.survives(id, m, &reaching)?.is_some();
-                    }
-                    if !confirmed {
-                        report.unstable.push(at.clone());
-                    } else if let Some(finding) =
-                        report::input_gap_finding(&file.display, site, gap, &merged, options.verify)
-                    {
-                        report.findings.push(finding);
-                    }
-                }
-                None => {}
-            }
-
-            let mut survivors = vec![];
-            let mut passing_tests = BTreeSet::new();
-            for m in &cmp_plan.run {
-                let tests_of = |bin: &TestBinary| infected_tests(bin, *m);
-                if let Some(tests) = session.survives(id, *m, &tests_of)? {
-                    survivors.push(report::describe(site, *m));
-                    passing_tests.extend(tests);
-                }
-            }
-            if !survivors.is_empty() {
-                report.findings.push(Finding::AssertionGap {
-                    at,
-                    survivors,
-                    tests: passing_tests.into_iter().collect(),
-                });
-            }
+            session.analyse(&mut report, &file.display, site, options.verify)?;
         }
     }
     report.mutants_run = session.mutants_run;

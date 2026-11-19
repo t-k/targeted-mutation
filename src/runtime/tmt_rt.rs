@@ -15,14 +15,20 @@ use std::collections::{HashMap, HashSet};
 use std::io::Write;
 use std::sync::{Mutex, OnceLock};
 
-/// Integer value of an operand with the bounds of its type: `(value, MIN, MAX)`.
-pub type Val = Option<(i128, i128, i128)>;
+/// Numeric value of a comparison operand.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Val {
+    None,
+    /// `(value, MIN, MAX)` of an integer type.
+    Int(i128, i128, i128),
+    Float(f64),
+}
 
-// Autoref specialisation: `(&W(x)).tmt_val()` resolves to `ValInt` for integers
+// Autoref specialisation: `(&W(x)).tmt_val()` resolves to `ValNum` for primitive numbers
 // and falls back to `ValAny` for every other type.
 pub struct W<'a, T: ?Sized>(pub &'a T);
 
-pub trait ValInt {
+pub trait ValNum {
     fn tmt_val(&self) -> Val;
 }
 
@@ -32,23 +38,39 @@ pub trait ValAny {
 
 macro_rules! tmt_ints {
     ($($t:ty)*) => {$(
-        impl<'a> ValInt for W<'a, $t> {
+        impl<'a> ValNum for W<'a, $t> {
             fn tmt_val(&self) -> Val {
-                Some((*self.0 as i128, <$t>::MIN as i128, <$t>::MAX as i128))
+                Val::Int(*self.0 as i128, <$t>::MIN as i128, <$t>::MAX as i128)
             }
         }
-        impl<'a, 'b> ValInt for W<'a, &'b $t> {
+        impl<'a, 'b> ValNum for W<'a, &'b $t> {
             fn tmt_val(&self) -> Val {
-                Some((**self.0 as i128, <$t>::MIN as i128, <$t>::MAX as i128))
+                Val::Int(**self.0 as i128, <$t>::MIN as i128, <$t>::MAX as i128)
             }
         }
     )*};
 }
 tmt_ints!(i8 i16 i32 i64 isize u8 u16 u32 u64 usize);
 
+macro_rules! tmt_floats {
+    ($($t:ty)*) => {$(
+        impl<'a> ValNum for W<'a, $t> {
+            fn tmt_val(&self) -> Val {
+                Val::Float(*self.0 as f64)
+            }
+        }
+        impl<'a, 'b> ValNum for W<'a, &'b $t> {
+            fn tmt_val(&self) -> Val {
+                Val::Float(**self.0 as f64)
+            }
+        }
+    )*};
+}
+tmt_floats!(f32 f64);
+
 impl<'a, 'r, T: ?Sized> ValAny for &'r W<'a, T> {
     fn tmt_val(&self) -> Val {
-        None
+        Val::None
     }
 }
 
@@ -64,13 +86,40 @@ const REL_EQ: u8 = 2;
 const REL_GT: u8 = 4;
 const REL_UN: u8 = 8;
 
+pub const ADD: u8 = 0;
+pub const SUB: u8 = 1;
+pub const MUL: u8 = 2;
+pub const DIV: u8 = 3;
+pub const REM: u8 = 4;
+
+/// Logic observations: the left operand decided alone, the right operand was true / false.
+pub const LOGIC_SHORT: u8 = 1;
+pub const LOGIC_RHS_TRUE: u8 = 2;
+pub const LOGIC_RHS_FALSE: u8 = 4;
+
+/// Arithmetic observations: the swapped operator gave the same / a different result,
+/// or the operands are not primitive numbers.
+pub const ARITH_SAME: u8 = 1;
+pub const ARITH_DIFFERS: u8 = 2;
+pub const ARITH_OPAQUE: u8 = 4;
+
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Mutant {
     Const(bool),
     Negate,
     Op(u8),
     Shift(i128),
+    /// Shift of a float comparison's threshold.
+    ShiftF(f64),
     Delete,
+    /// `&&` <-> `||`.
+    LogicSwap,
+    /// The right operand is evaluated but its value is ignored.
+    LogicDropRhs,
+    /// The left operand is evaluated but its value is ignored.
+    LogicDropLhs,
+    /// `+` <-> `-`, `*` <-> `/`, `%` -> `/`.
+    ArithSwap,
 }
 
 pub fn parse_mutant(spec: &str) -> Option<(u32, Mutant)> {
@@ -81,7 +130,14 @@ pub fn parse_mutant(spec: &str) -> Option<(u32, Mutant)> {
         "c1" => Mutant::Const(true),
         "neg" => Mutant::Negate,
         "del" => Mutant::Delete,
+        "lsw" => Mutant::LogicSwap,
+        "ldr" => Mutant::LogicDropRhs,
+        "ldl" => Mutant::LogicDropLhs,
+        "asw" => Mutant::ArithSwap,
         _ if m.starts_with("op") => Mutant::Op(m[2..].parse().ok().filter(|c| *c <= NE)?),
+        _ if m.starts_with("shf") => {
+            Mutant::ShiftF(m[3..].parse().ok().filter(|s: &f64| s.is_finite())?)
+        }
         _ if m.starts_with("sh") => Mutant::Shift(m[2..].parse().ok()?),
         _ => return None,
     };
@@ -111,17 +167,35 @@ fn rel_of_d(d: i128) -> u8 {
     }
 }
 
+fn rel_of_f(d: f64) -> u8 {
+    if d < 0.0 {
+        REL_LT
+    } else if d == 0.0 {
+        REL_EQ
+    } else if d > 0.0 {
+        REL_GT
+    } else {
+        REL_UN
+    }
+}
+
+/// Difference of the operands of a comparison, when they are numbers.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum Diff {
+    None,
+    Int(i128),
+    Float(f64),
+}
+
 /// Result of the comparison under a mutant. `orig` is what the real operator returned.
-pub fn apply(op: u8, m: Mutant, orig: bool, rel: u8, d: Option<i128>) -> bool {
-    match m {
-        Mutant::Const(c) => c,
-        Mutant::Negate => !orig,
-        Mutant::Op(op2) => eval_rel(op2, rel),
-        Mutant::Shift(s) => match d {
-            Some(d) => eval_rel(op, rel_of_d(d - s)),
-            None => orig,
-        },
-        Mutant::Delete => orig,
+pub fn apply(op: u8, m: Mutant, orig: bool, rel: u8, d: Diff) -> bool {
+    match (m, d) {
+        (Mutant::Const(c), _) => c,
+        (Mutant::Negate, _) => !orig,
+        (Mutant::Op(op2), _) => eval_rel(op2, rel),
+        (Mutant::Shift(s), Diff::Int(d)) => eval_rel(op, rel_of_d(d - s)),
+        (Mutant::ShiftF(s), Diff::Float(d)) => eval_rel(op, rel_of_f(d - s)),
+        _ => orig,
     }
 }
 
@@ -129,35 +203,59 @@ pub fn apply(op: u8, m: Mutant, orig: bool, rel: u8, d: Option<i128>) -> bool {
 #[derive(Clone, Copy, PartialEq, Default, Debug)]
 pub struct Summary {
     pub rels: u8,
+    /// Some observation had no integer values / no float values.
     pub unvalued: bool,
+    pub unfloat: bool,
     pub max_neg: Option<i128>,
     pub min_pos: Option<i128>,
+    pub f_max_neg: Option<f64>,
+    pub f_min_pos: Option<f64>,
 }
 
 impl Summary {
     /// Folds one observation in; returns whether the summary changed.
-    pub fn observe(&mut self, rel: u8, d: Option<i128>) -> bool {
+    pub fn observe(&mut self, rel: u8, d: Diff) -> bool {
         let before = *self;
         self.rels |= rel;
         match d {
-            None => self.unvalued = true,
-            Some(d) if d < 0 => self.max_neg = Some(self.max_neg.map_or(d, |m| m.max(d))),
-            Some(d) if d > 0 => self.min_pos = Some(self.min_pos.map_or(d, |p| p.min(d))),
-            Some(_) => {}
+            Diff::None => {
+                self.unvalued = true;
+                self.unfloat = true;
+            }
+            Diff::Int(d) => {
+                self.unfloat = true;
+                if d < 0 {
+                    self.max_neg = Some(self.max_neg.map_or(d, |m| m.max(d)));
+                } else if d > 0 {
+                    self.min_pos = Some(self.min_pos.map_or(d, |p| p.min(d)));
+                }
+            }
+            Diff::Float(d) => {
+                self.unvalued = true;
+                if d < 0.0 {
+                    self.f_max_neg = Some(self.f_max_neg.map_or(d, |m| m.max(d)));
+                } else if d > 0.0 {
+                    self.f_min_pos = Some(self.f_min_pos.map_or(d, |p| p.min(d)));
+                }
+            }
         }
         *self != before
     }
 
     pub fn line(&self, site: u32, test: &str) -> String {
-        let opt = |v: Option<i128>| v.map_or("-".to_string(), |v| v.to_string());
+        let int = |v: Option<i128>| v.map_or("-".to_string(), |v| v.to_string());
+        let float = |v: Option<f64>| v.map_or("-".to_string(), |v| format!("{:?}", v));
         format!(
-            "O\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "O\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             site,
             test,
             self.rels,
             self.unvalued as u8,
-            opt(self.max_neg),
-            opt(self.min_pos)
+            int(self.max_neg),
+            int(self.min_pos),
+            self.unfloat as u8,
+            float(self.f_max_neg),
+            float(self.f_min_pos)
         )
     }
 }
@@ -167,7 +265,8 @@ struct Tracer {
     names: Vec<String>,
     ids: HashMap<String, u32>,
     cmp: HashMap<(u32, u32), Summary>,
-    reach: HashSet<(u32, u32)>,
+    /// Bits already written per (kind, site, test) for statement, logic and arithmetic sites.
+    bits: HashMap<(u8, u32, u32), u8>,
     typed: HashSet<u32>,
 }
 
@@ -193,12 +292,19 @@ fn state() -> &'static State {
                 names: Vec::new(),
                 ids: HashMap::new(),
                 cmp: HashMap::new(),
-                reach: HashSet::new(),
+                bits: HashMap::new(),
                 typed: HashSet::new(),
             }))
         });
         State { mutant, tracer }
     })
+}
+
+fn mutant_at(site: u32) -> Option<Mutant> {
+    match state().mutant {
+        Some((target, m)) if target == site => Some(m),
+        _ => None,
+    }
 }
 
 /// libtest names each test thread after the test. Anything else is reported as `?`,
@@ -245,11 +351,29 @@ fn with_tracer(f: impl FnOnce(&mut Tracer, u32)) {
     f(&mut tracer, id);
 }
 
-fn record_cmp(site: u32, rel: u8, d: Option<i128>, av: Val, bv: Val) {
+/// Records observation bits of a statement (`R`), logic (`L`) or arithmetic (`A`) site.
+fn record_bits(kind: u8, site: u32, bits: u8) {
+    if state().mutant.is_some() || state().tracer.is_none() {
+        return;
+    }
     with_tracer(|t, test| {
-        if let (Some(a), Some(b)) = (av, bv) {
+        let seen = t.bits.entry((kind, site, test)).or_insert(0);
+        if *seen | bits != *seen {
+            *seen |= bits;
+            let line = format!(
+                "{}\t{}\t{}\t{}\n",
+                kind as char, site, t.names[test as usize], *seen
+            );
+            let _ = t.out.write_all(line.as_bytes());
+        }
+    });
+}
+
+fn record_cmp(site: u32, rel: u8, d: Diff, av: Val, bv: Val) {
+    with_tracer(|t, test| {
+        if let (Val::Int(_, amin, amax), Val::Int(_, bmin, bmax)) = (av, bv) {
             if t.typed.insert(site) {
-                let line = format!("T\t{}\t{}\t{}\t{}\t{}\n", site, a.1, a.2, b.1, b.2);
+                let line = format!("T\t{}\t{}\t{}\t{}\t{}\n", site, amin, amax, bmin, bmax);
                 let _ = t.out.write_all(line.as_bytes());
             }
         }
@@ -261,15 +385,25 @@ fn record_cmp(site: u32, rel: u8, d: Option<i128>, av: Val, bv: Val) {
     });
 }
 
-fn diff(av: Val, bv: Val) -> Option<i128> {
+/// `equal` is what the real operator said about equality; it wins over float rounding
+/// (`inf - inf` is NaN although the operands are equal).
+pub fn diff(av: Val, bv: Val, equal: bool) -> Diff {
     match (av, bv) {
-        (Some(a), Some(b)) => a.0.checked_sub(b.0),
-        _ => None,
+        (Val::Int(a, ..), Val::Int(b, ..)) => a.checked_sub(b).map_or(Diff::None, Diff::Int),
+        (Val::Float(a), Val::Float(b)) => {
+            let d = if equal { 0.0 } else { a - b };
+            if d.is_finite() && (equal || d != 0.0) {
+                Diff::Float(d)
+            } else {
+                Diff::None
+            }
+        }
+        _ => Diff::None,
     }
 }
 
 fn finish(site: u32, op: u8, orig: bool, rel: u8, av: Val, bv: Val) -> bool {
-    let d = diff(av, bv);
+    let d = diff(av, bv, rel == REL_EQ);
     let st = state();
     if let Some((target, m)) = st.mutant {
         return if target == site {
@@ -323,9 +457,9 @@ pub fn eq<A: ?Sized + PartialEq<B>, B: ?Sized>(
 ) -> bool {
     let orig = if op == EQ { a == b } else { a != b };
     let equal = orig == (op == EQ);
-    let rel = match (equal, diff(av, bv)) {
+    let rel = match (equal, diff(av, bv, equal)) {
         (true, _) => REL_EQ,
-        (false, Some(d)) if d != 0 => rel_of_d(d),
+        (false, Diff::Int(d)) if d != 0 => rel_of_d(d),
         (false, _) => REL_UN,
     };
     finish(site, op, orig, rel, av, bv)
@@ -333,17 +467,181 @@ pub fn eq<A: ?Sized + PartialEq<B>, B: ?Sized>(
 
 /// Guards a statement: false when the active mutant deletes it.
 pub fn live(site: u32) -> bool {
-    let st = state();
-    if let Some((target, m)) = st.mutant {
-        return !(target == site && m == Mutant::Delete);
+    if mutant_at(site) == Some(Mutant::Delete) {
+        return false;
     }
-    if st.tracer.is_some() {
-        with_tracer(|t, test| {
-            if t.reach.insert((site, test)) {
-                let line = format!("R\t{}\t{}\n", site, t.names[test as usize]);
-                let _ = t.out.write_all(line.as_bytes());
-            }
-        });
-    }
+    record_bits(b'R', site, 1);
     true
 }
+
+/// What the left operand of `a && b` / `a || b` decides: 0 or 1 when the result is
+/// already false / true, 2 when the right operand has to be evaluated.
+pub fn lhs_code(and: bool, a: bool, m: Option<Mutant>) -> u8 {
+    let code = |and: bool| match (and, a) {
+        (true, false) => 0,
+        (false, true) => 1,
+        _ => 2,
+    };
+    match m {
+        Some(Mutant::LogicSwap) => code(!and),
+        Some(Mutant::LogicDropLhs) => 2,
+        _ => code(and),
+    }
+}
+
+/// Value of the right operand as the expression sees it.
+pub fn rhs_value(and: bool, b: bool, m: Option<Mutant>) -> bool {
+    match m {
+        // `a && true` / `a || false`: the right operand never decides.
+        Some(Mutant::LogicDropRhs) => and,
+        _ => b,
+    }
+}
+
+/// Left operand of `a && b` / `a || b`.
+pub fn lhs(site: u32, and: bool, a: bool) -> u8 {
+    let m = mutant_at(site);
+    let c = lhs_code(and, a, m);
+    if m.is_none() && c != 2 {
+        record_bits(b'L', site, LOGIC_SHORT);
+    }
+    c
+}
+
+/// Right operand of `a && b` / `a || b`, evaluated because `lhs` returned 2.
+pub fn rhs(site: u32, and: bool, b: bool) -> bool {
+    let m = mutant_at(site);
+    if m.is_none() {
+        record_bits(b'L', site, if b { LOGIC_RHS_TRUE } else { LOGIC_RHS_FALSE });
+    }
+    rhs_value(and, b, m)
+}
+
+/// Operands of an arithmetic operator, taken out once by the probe method.
+pub struct Ar<L, R>(Cell<Option<(L, R)>>);
+
+impl<L, R> Ar<L, R> {
+    pub fn new(l: L, r: R) -> Self {
+        Ar(Cell::new(Some((l, r))))
+    }
+
+    fn take(&self) -> (L, R) {
+        self.0.take().expect("operands are taken once")
+    }
+}
+
+/// Probe for primitive numbers: can compute the swapped operator.
+pub trait ArithPrim {
+    type O;
+    fn tmt_add(&self, site: u32) -> Self::O;
+    fn tmt_sub(&self, site: u32) -> Self::O;
+    fn tmt_mul(&self, site: u32) -> Self::O;
+    fn tmt_div(&self, site: u32) -> Self::O;
+    fn tmt_rem(&self, site: u32) -> Self::O;
+}
+
+/// The operator the `ArithSwap` mutant uses.
+pub fn arith_swapped(op: u8) -> u8 {
+    match op {
+        ADD => SUB,
+        SUB => ADD,
+        MUL => DIV,
+        DIV => MUL,
+        _ => DIV,
+    }
+}
+
+pub trait ArithNum: Copy {
+    fn tmt_real(op: u8, a: Self, b: Self) -> Self;
+    /// The result as bits, or `None` where the real operator would overflow or divide by zero.
+    fn tmt_safe(op: u8, a: Self, b: Self) -> Option<u64>;
+
+    /// Whether the swapped operator gives the same result on these operands.
+    fn tmt_same(op: u8, a: Self, b: Self) -> bool {
+        Self::tmt_safe(op, a, b) == Self::tmt_safe(arith_swapped(op), a, b)
+    }
+
+    fn tmt_run(site: u32, op: u8, a: Self, b: Self) -> Self {
+        if mutant_at(site) == Some(Mutant::ArithSwap) {
+            return Self::tmt_real(arith_swapped(op), a, b);
+        }
+        let bits = if Self::tmt_same(op, a, b) { ARITH_SAME } else { ARITH_DIFFERS };
+        record_bits(b'A', site, bits);
+        Self::tmt_real(op, a, b)
+    }
+}
+
+macro_rules! tmt_arith_prim {
+    ($($t:ty)*) => {$(
+        impl ArithPrim for Ar<$t, $t> {
+            type O = $t;
+            fn tmt_add(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, ADD, a, b) }
+            fn tmt_sub(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, SUB, a, b) }
+            fn tmt_mul(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, MUL, a, b) }
+            fn tmt_div(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, DIV, a, b) }
+            fn tmt_rem(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, REM, a, b) }
+        }
+    )*};
+}
+
+macro_rules! tmt_arith_ints {
+    ($($t:ty)*) => {$(
+        impl ArithNum for $t {
+            fn tmt_real(op: u8, a: $t, b: $t) -> $t {
+                match op { ADD => a + b, SUB => a - b, MUL => a * b, DIV => a / b, _ => a % b }
+            }
+            fn tmt_safe(op: u8, a: $t, b: $t) -> Option<u64> {
+                match op {
+                    ADD => a.checked_add(b),
+                    SUB => a.checked_sub(b),
+                    MUL => a.checked_mul(b),
+                    DIV => a.checked_div(b),
+                    _ => a.checked_rem(b),
+                }
+                .map(|v| v as u64)
+            }
+        }
+    )*};
+}
+
+macro_rules! tmt_arith_floats {
+    ($($t:ty)*) => {$(
+        impl ArithNum for $t {
+            fn tmt_real(op: u8, a: $t, b: $t) -> $t {
+                match op { ADD => a + b, SUB => a - b, MUL => a * b, DIV => a / b, _ => a % b }
+            }
+            fn tmt_safe(op: u8, a: $t, b: $t) -> Option<u64> {
+                Some((Self::tmt_real(op, a, b) as f64).to_bits())
+            }
+        }
+    )*};
+}
+
+tmt_arith_prim!(i8 i16 i32 i64 isize u8 u16 u32 u64 usize f32 f64);
+tmt_arith_ints!(i8 i16 i32 i64 isize u8 u16 u32 u64 usize);
+tmt_arith_floats!(f32 f64);
+
+// Fallbacks for every other pair of operand types: the original operator, untouched.
+macro_rules! tmt_arith_any {
+    ($($name:ident $method:ident $bound:ident $call:ident)*) => {$(
+        pub trait $name {
+            type O;
+            fn $method(&self, site: u32) -> Self::O;
+        }
+        impl<'r, L: std::ops::$bound<R>, R> $name for &'r Ar<L, R> {
+            type O = L::Output;
+            fn $method(&self, site: u32) -> L::Output {
+                let (a, b) = self.take();
+                record_bits(b'A', site, ARITH_OPAQUE);
+                std::ops::$bound::$call(a, b)
+            }
+        }
+    )*};
+}
+tmt_arith_any!(
+    AnyAdd tmt_add Add add
+    AnySub tmt_sub Sub sub
+    AnyMul tmt_mul Mul mul
+    AnyDiv tmt_div Div div
+    AnyRem tmt_rem Rem rem
+);
