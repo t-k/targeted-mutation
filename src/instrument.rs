@@ -709,8 +709,11 @@ impl<'ast> Visit<'ast> for Finder<'_> {
     }
 
     fn visit_expr_range(&mut self, node: &'ast syn::ExprRange) {
+        // With two literals nothing fixes the integer type before the probe is resolved,
+        // and it would be taken for `i32` (`for i in 0..16 { words[i] }`).
         if let (Some(from), Some(to)) = (&node.start, &node.end)
             && node.attrs.is_empty()
+            && !(is_literal(from) && is_literal(to))
             && let (Some((start, lhs_end)), Some((rhs_start, end))) =
                 (self.range(from.span()), self.range(to.span()))
             && lhs_end <= rhs_start
@@ -1807,6 +1810,7 @@ mod tests {
                     }
                 }
                 let _ = &v[1..=2];
+                let _ = &v[1..=limit as usize];
                 let _ = 'a'..'z';
                 let _ = v.iter().max();
                 None
@@ -1849,8 +1853,8 @@ mod tests {
                 "arm 0 guarded=false",
                 "arm n if n > 5 guarded=true",
                 "arm 1..=3 guarded=false",
-                "range 1 2 inclusive=true",
-                "range 'a' 'z' inclusive=false",
+                // `1..=2` and `'a'..'z'` have literals at both ends.
+                "range 1 limit as usize inclusive=true",
             ]
         );
         let out = render(src, &sites, &all).text;
