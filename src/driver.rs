@@ -89,11 +89,19 @@ struct DiagnosticSpan {
     is_primary: bool,
 }
 
-#[derive(Debug, PartialEq)]
-struct CompileError {
+#[derive(Debug, PartialEq, Clone)]
+struct ErrorSpan {
     file: String,
     byte_start: usize,
     line: usize,
+}
+
+/// One compiler error. The primary spans say where it was detected, the secondary ones
+/// often point at the cause (for "possibly-uninitialized", at the guard we inserted).
+#[derive(Debug, PartialEq)]
+struct CompileError {
+    primary: Vec<ErrorSpan>,
+    secondary: Vec<ErrorSpan>,
     rendered: String,
 }
 
@@ -131,19 +139,20 @@ fn parse_build_output(stdout: &str, package: &str) -> BuildOutput {
                 if diag.level != "error" {
                     continue;
                 }
-                let rendered = diag.rendered.unwrap_or_default();
-                let primary: Vec<&DiagnosticSpan> = diag.spans.iter().filter(|s| s.is_primary).collect();
-                if primary.is_empty() {
-                    // "aborting due to N previous errors" and friends carry no location.
-                    continue;
-                }
-                for span in primary {
-                    out.errors.push(CompileError {
-                        file: span.file_name.clone(),
-                        byte_start: span.byte_start,
-                        line: span.line_start,
-                        rendered: rendered.clone(),
-                    });
+                let span = |s: &DiagnosticSpan| ErrorSpan {
+                    file: s.file_name.clone(),
+                    byte_start: s.byte_start,
+                    line: s.line_start,
+                };
+                let error = CompileError {
+                    primary: diag.spans.iter().filter(|s| s.is_primary).map(span).collect(),
+                    secondary: diag.spans.iter().filter(|s| !s.is_primary).map(span).collect(),
+                    rendered: diag.rendered.unwrap_or_default(),
+                };
+                // "aborting due to N previous errors" and friends carry no location, and the
+                // lib is compiled twice (plain and test), which reports everything twice.
+                if !error.primary.is_empty() && !out.errors.contains(&error) {
+                    out.errors.push(error);
                 }
             }
             _ => {}
@@ -274,6 +283,45 @@ fn run_binary(
         }
         std::thread::sleep(Duration::from_millis(5));
     }
+}
+
+/// The sites to disable for one compile error, from the most to the least specific guess:
+/// the innermost site at a primary span, at a secondary span, any site on the line of a
+/// primary span, and finally every site of the file.
+fn blame_error(error: &CompileError, files: &[SourceFile], copy: &Path, disabled: &HashSet<u32>) -> Vec<u32> {
+    let enabled = |id: u32| !disabled.contains(&id);
+    let file_of = |span: &ErrorSpan| {
+        let path = copy.join(&span.file);
+        files.iter().find(|f| f.path == path)
+    };
+    let innermost = |spans: &[ErrorSpan]| -> Vec<u32> {
+        let mut ids = vec![];
+        for span in spans {
+            if let Some(file) = file_of(span) {
+                let offset = file.rendered.as_ref().expect("rendered before building").to_original(span.byte_start);
+                ids.extend(instrument::blame(&file.sites, &enabled, offset));
+            }
+        }
+        ids
+    };
+    let widen = |same_line_only: bool| -> Vec<u32> {
+        let mut ids = vec![];
+        for span in &error.primary {
+            if let Some(file) = file_of(span) {
+                ids.extend(
+                    file.sites
+                        .iter()
+                        .filter(|s| enabled(s.id) && (!same_line_only || s.line == span.line))
+                        .map(|s| s.id),
+                );
+            }
+        }
+        ids
+    };
+    [innermost(&error.primary), innermost(&error.secondary), widen(true), widen(false)]
+        .into_iter()
+        .find(|ids| !ids.is_empty())
+        .unwrap_or_default()
 }
 
 /// Range of `D = lhs - rhs` that the operand types allow, when one side is a literal.
@@ -482,26 +530,18 @@ pub fn run(options: &Options) -> Result<Report> {
         rounds += 1;
         let before = disabled.len();
         let mut unexplained = vec![];
+        let mut blamed_now: HashSet<u32> = HashSet::new();
         for error in &build.errors {
-            let error_path = copy.join(&error.file);
-            let Some(file) = files.iter().find(|f| f.path == error_path) else {
-                unexplained.push(error);
-                continue;
-            };
-            let enabled = |id: u32| !disabled.contains(&id);
-            let offset = file.rendered.as_ref().expect("rendered above").to_original(error.byte_start);
-            let mut blamed = instrument::blame(&file.sites, &enabled, offset);
-            if blamed.is_empty() {
-                blamed = file.sites.iter().filter(|s| enabled(s.id) && s.line == error.line).map(|s| s.id).collect();
-            }
-            if blamed.is_empty() {
-                blamed = file.sites.iter().filter(|s| enabled(s.id)).map(|s| s.id).collect();
+            let blamed = blame_error(error, &files, &copy, &disabled);
+            if std::env::var_os("TMT_DEBUG").is_some() {
+                eprintln!("tmt: debug: blaming {blamed:?} for\n{}", error.rendered);
             }
             if blamed.is_empty() {
                 unexplained.push(error);
             }
-            disabled.extend(blamed);
+            blamed_now.extend(blamed);
         }
+        disabled.extend(blamed_now);
         if disabled.len() == before || rounds > MAX_REPAIR_ROUNDS {
             let shown = unexplained.first().copied().or(build.errors.first()).map_or("", |e| e.rendered.as_str());
             bail!(
@@ -636,6 +676,7 @@ mod tests {
             r#"{"reason":"compiler-artifact","package_id":"dep 1.0.0","target":{"name":"dep","kind":["lib"]},"profile":{"test":true},"executable":"/t/dep-abc"}"#, "\n",
             r#"{"reason":"compiler-message","message":{"level":"warning","rendered":"w","spans":[{"file_name":"src/lib.rs","byte_start":1,"line_start":1,"is_primary":true}]}}"#, "\n",
             r#"{"reason":"compiler-message","message":{"level":"error","rendered":"E0308","spans":[{"file_name":"src/lib.rs","byte_start":40,"line_start":3,"is_primary":true},{"file_name":"src/lib.rs","byte_start":2,"line_start":1,"is_primary":false}]}}"#, "\n",
+            r#"{"reason":"compiler-message","message":{"level":"error","rendered":"E0308","spans":[{"file_name":"src/lib.rs","byte_start":40,"line_start":3,"is_primary":true},{"file_name":"src/lib.rs","byte_start":2,"line_start":1,"is_primary":false}]}}"#, "\n",
             r#"{"reason":"compiler-message","message":{"level":"error","rendered":"aborting","spans":[]}}"#, "\n",
             "not json\n",
             r#"{"reason":"build-finished","success":false}"#, "\n",
@@ -644,7 +685,11 @@ mod tests {
         assert_eq!(out.test_binaries, [("p".to_string(), PathBuf::from("/t/p-abc"))]);
         assert_eq!(
             out.errors,
-            [CompileError { file: "src/lib.rs".into(), byte_start: 40, line: 3, rendered: "E0308".into() }]
+            [CompileError {
+                primary: vec![ErrorSpan { file: "src/lib.rs".into(), byte_start: 40, line: 3 }],
+                secondary: vec![ErrorSpan { file: "src/lib.rs".into(), byte_start: 2, line: 1 }],
+                rendered: "E0308".into(),
+            }]
         );
     }
 

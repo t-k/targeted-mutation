@@ -156,7 +156,7 @@ pub fn input_gap_finding(
         InputGap::OneSided { always } => (
             vec![describe(site, Mutation::Const(*always))],
             1,
-            vec![format!("a case where `{}` is {}", one_line(&site.text), !always)],
+            vec![format!("an input that makes `{}` {}", one_line(&site.text), !always)],
         ),
         InputGap::EqualNeverObserved { flipped } => (
             vec![describe(site, Mutation::Op(*flipped))],
@@ -388,7 +388,7 @@ mod tests {
             panic!()
         };
         assert_eq!(survivors, ["`true`"]);
-        assert_eq!(add_tests, ["a case where `a < b` is false"]);
+        assert_eq!(add_tests, ["an input that makes `a < b` false"]);
 
         assert_eq!(input_gap_finding("f.rs", &site, &InputGap::Unreached, &obs, false), None);
     }
