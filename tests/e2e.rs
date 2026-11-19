@@ -1175,8 +1175,9 @@ fn the_mutants_of_cargo_mutants() {
     let (code, report) = json(&dir);
     assert_eq!(code, 2, "{report:#}");
     assert_eq!(report["skipped_sites"], 0, "{report:#}");
-    // `Default::default()` for a type without a default is not a mutant.
-    assert_eq!(report["unviable_mutants"], 1, "{report:#}");
+    // `Default::default()` for a type without a default is not a mutant: `Token`, and
+    // the three functions that return a `Below`.
+    assert_eq!(report["unviable_mutants"], 4, "{report:#}");
     let all = report["findings"].as_array().unwrap();
     let survivors = |code: &str, kind: &str| -> Vec<&str> {
         all.iter()
@@ -1269,13 +1270,19 @@ fn the_mutants_of_cargo_mutants() {
     }
     assert_eq!(report["unreached"].as_array().unwrap().len(), 1);
 
+    // A minus that changes the type: its probe does not compile, so the mutant is built
+    // on its own instead of the site being skipped.
+    assert_eq!(survivors("-above", "assertion_gap"), ["`above`"]);
+    let built = all.iter().find(|f| f["code"] == "-above").unwrap();
+    assert_eq!(built["tests"].as_array().unwrap().len(), 0, "{built:#}");
+
     // An iterator of another type cannot be returned beside the body's own, so the
     // three replacements of `evens` are built one by one. They can be left out.
     let run = tmt(&dir, &["--json", "--quiet", "--no-rebuild"]);
     let quick: Value = serde_json::from_str(&run.stdout).unwrap();
     assert_eq!(
         report["mutants_run"].as_u64().unwrap(),
-        quick["mutants_run"].as_u64().unwrap() + 3,
+        quick["mutants_run"].as_u64().unwrap() + 4,
         "{quick:#}"
     );
     assert_eq!(
@@ -1283,5 +1290,11 @@ fn the_mutants_of_cargo_mutants() {
         quick["mutants_killed"].as_u64().unwrap() + 3,
         "{quick:#}"
     );
-    assert_eq!(quick["findings"], report["findings"]);
+    // Left out, the site with the probe that did not compile is a skipped one.
+    assert_eq!(quick["skipped_sites"], 1, "{quick:#}");
+    assert_eq!(
+        quick["findings"].as_array().unwrap().len() + 1,
+        all.len(),
+        "{quick:#}"
+    );
 }

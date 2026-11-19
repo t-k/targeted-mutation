@@ -71,3 +71,9 @@ src/lib.rs:104:5: replace evens -> impl Iterator<Item = u32> with ::std::iter::o
 src/lib.rs:104:33: replace == with != in evens
 src/lib.rs:104:29: replace % with / in evens
 src/lib.rs:104:29: replace % with + in evens
+src/lib.rs:113:9: replace <impl std::ops::Neg for Above>::neg -> Below with Default::default()
+src/lib.rs:113:17: replace - with + in <impl std::ops::Neg for Above>::neg
+src/lib.rs:113:17: replace - with / in <impl std::ops::Neg for Above>::neg
+src/lib.rs:119:9: replace <impl From<Above> for Below>::from -> Below with Default::default()
+src/lib.rs:126:5: replace mirrored -> Below with Default::default()
+src/lib.rs:126:6: delete - in mirrored

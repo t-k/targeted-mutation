@@ -93,6 +93,7 @@ Running:
 - `--all-files`: copy files that git ignores too. Use it when the build needs generated files that are not tracked.
 - `--no-verify`: trust the trace; do not re-run tests against predicted survivors.
 - `--no-effects`: do not trace surviving mutants to say what they change.
+- `--no-rebuild`: leave out the mutants that need a build of their own (see "How it works", step 5).
 
 Output: text by default, `--json`, or `--sarif` (SARIF 2.1.0 for code scanning). `--show-unreached` lists the code no test executes, `--quiet` drops the progress lines.
 
@@ -107,6 +108,8 @@ Your source tree is never modified. In a git repository only the files git does 
 3. **Plan.** An integer comparison is a threshold on `lhs - rhs`. Every threshold between the nearest observation below and the nearest observation above gives the same result on all observed values, so every test executes such a mutant exactly as it executes the original. Those mutants are input gaps, found by arithmetic. By default one of them is re-run to confirm (`--no-verify` skips that).
 4. **Run.** The remaining mutants change the outcome of some observation. Each is run only against the tests whose observations it changes. If they all pass, no assertion noticed: an assertion gap.
 
+5. **Build the rest one by one.** Some code cannot carry a probe: nothing in a `const fn` can ask at run time which mutant is on, a function that returns `impl Iterator` cannot return an iterator of another type beside its own, and for a compound assignment to more than a variable (`*map.entry(k).or_insert(0) += 1`) the order of evaluation depends on the type. The mutants of such code, and of every site whose probe did not compile, are written into the source, built and run against all tests, one after the other, the way cargo-mutants does it. This is the slow part; `--no-rebuild` skips it.
+
 Mutants that cannot differ from the original within the operand types (`x >= 0` for an unsigned `x`) are not reported.
 
 ### What is mutated
@@ -118,9 +121,13 @@ Mutants that cannot differ from the original within the operand types (`x >= 0` 
 | comparisons of other types | `<` and `<=` swapped, negation | the operands were never equal in a test |
 | `a == b`, `a != b` | negation, `true` / `false` | the result is the same in every test |
 | `a && b`, `a \|\| b` | one operand's value ignored (`a && { b; true }`, `{ a; b }`), the other operator | the ignored operand never decided the result in a test |
-| `a + b`, `-`, `*`, `/`, `%` on primitive numbers, and `+=` etc. | `+` and `-` swapped, `*` and `/` swapped, `%` to `/` | the two operators agree on every pair of operands the tests pass (`fee` is always 0, `factor` is always 1) |
-| `a & b`, `\|`, `^`, `<<`, `>>` on integers, and `&=` etc. | `&` and `\|` swapped, `^` to `&`, `<<` and `>>` swapped | as above |
+| `a + b`, `-`, `*`, `/`, `%` on primitive numbers, and `+=` etc. | two other operators each: `+` to `-` and `*`, `-` to `+` and `/`, `*` to `/` and `+`, `/` to `*` and `%`, `%` to `/` and `+` | the two operators agree on every pair of operands the tests pass (`fee` is always 0, `factor` is always 1) |
+| `a & b`, `\|`, `^`, `<<`, `>>` on integers, and `&=` etc. | `&` to `\|` and `^`, `\|` to `&` and `^`, `^` to `&` and `\|`, `<<` and `>>` swapped | as above |
 | `!x` on `bool` | `x` | never: always run |
+| `-x`, `-1` | `x`, `1` | never: always run |
+| any function | its body replaced by each value its return type suggests, without running it: `()`, `0` / `1` / `-1`, `true` / `false`, `String::new()` / `"xyzzy".into()`, `None` / `Some(..)`, `Ok(..)`, `vec![]` / `vec![..]`, empty and one-element collections, `Box::new(..)`, tuples and arrays of those, `Default::default()` for the rest | never: always run |
+| the guard of a `match` arm | `true`, `false` | the guard had the same value in every test |
+| a field of a struct literal with a base (`S { depth, ..base }`) | the field left to the base | never: always run |
 | a function returning `bool` | the value at its normal exit replaced by `true` / `false` | the function returned the same value in every test |
 | `a.max(b)`, `a.min(b)` on numbers | the other of the two | the operands were equal in every test |
 | `a..b`, `a..=b` on integers | the end included or excluded | never: always run |
@@ -134,7 +141,15 @@ A finding is not repeated by what encloses it: if `a > 0` is true in every test,
 
 Code in the arguments of `assert_eq!`, `assert_ne!`, `vec!`, `format!`, `print!`, `println!`, `eprint!`, `eprintln!`, `write!`, `writeln!`, `panic!`, `unreachable!`, `todo!`, `unimplemented!`, `format_args!` and `matches!` is mutated like any other code. `assert!`, `debug_assert!` and `dbg!` put the source text of their argument into their output, so their arguments are not touched.
 
-A probe that does not compile at some site (for example a guarded `let x; x = ...;`) is dropped and the build is retried; the summary line counts those sites.
+A probe that does not compile at some site is dropped and the build is retried. The mutants of that site are then built one by one (step 5); only a site that has no mutant in source form (a deleted `let x; x = ...;`) is counted as skipped in the summary line. A value that does not have the function's return type (`Default::default()` for a type without a default) is not a mutant; the summary counts those as left out.
+
+Functions, `impl` blocks and modules marked `#[mutants::skip]` (also inside `cfg_attr`) are not mutated.
+
+### Compared with cargo-mutants
+
+Every mutant that cargo-mutants 27.1.0 lists for the crates in `fixtures/` has a counterpart here: `tests/parity.rs` checks the stored lists (`tests/data/cargo-mutants`) against the sites this tool finds, and names the few exceptions with their reason (a `||` inside a let chain, which does not compile; an empty body where deleting the only statement is the same mutant). On top of those come the mutants that need the trace: shifted boundaries, an ignored operand of `&&` / `||`, a result replaced after the body ran, deleted statements, `min` / `max`, range ends.
+
+The difference is in how they are run. cargo-mutants builds every mutant and runs all tests against it. Here one build carries all mutants that a probe can carry, each is run only against the tests that execute it, and those that provably pass every test are not run at all but reported with the input that is missing. Only the rest (step 5) costs a build each.
 
 ## What "guaranteed to survive" rests on
 
@@ -155,6 +170,8 @@ The probes are written to leave the unmutated program alone: every operand is ev
 - `formal/pict/planner.pict`: 3-way combinations of operator, observation shape, literal position and type range. The generated table (`tests/data/planner.pict.tsv`) is replayed against a brute-force oracle in `plan::tests::pict_table`.
 - `formal/tla/RepairLoop.tla`: the instrument, build, disable-failing-probes loop terminates and never ships a probe that does not compile. Checked with TLC. The model covers compile errors only; that a probe which compiles also behaves like the code it replaces is what `fixtures/semantics` tests.
 - `formal/tla/JobPool.tla`: the parallel runner runs every mutant exactly once and has every result when the workers stop. Checked with TLC.
+- `formal/tla/WorkCopy.tla`: the working copy across runs. Whatever earlier runs left behind, and wherever one was interrupted, the build of a run sees exactly the files that run wants, and instrumented text is never in the copy without the log naming it. Checked with TLC.
+- `formal/pict/workcopy.pict`: what a file was after the last run, what the user did to it since, and whether this run instruments it. The table (`tests/data/workcopy.pict.tsv`) is replayed in `driver::tests::work_copy_table`.
 
 ```text
 lean formal/lean/Planner.lean
@@ -168,8 +185,10 @@ java -jar tla2tools.jar formal/tla/RepairLoop.tla
 - A module that two targets of the package both declare (`mod common;` in `lib.rs` and in `main.rs`) cannot be probed; its sites are counted as skipped.
 - Source files that start with a byte order mark or a `#!` line are not instrumented.
 - A macro that shadows a standard one is only recognised when it is defined at the top level of the same file.
-- Code in the arguments of macros other than the ones listed above, in `const` contexts and in test code is not mutated.
-- Unary minus, casts, and return values other than `bool` and `Option` are not mutated. A result is replaced only at the function's normal exit, not at an early `return`.
+- Code in the arguments of macros other than the ones listed above, in `const` and `static` items, array lengths and other constant expressions, and in test code is not mutated. (`const fn` is: step 5.)
+- Casts are not mutated. The result of a `bool` or `Option` function is replaced only at its normal exit, not at an early `return` (the replaced body covers that case).
+- The body of a function that returns an `impl Trait` other than an iterator is not replaced: no value of the hidden type can be made up.
+- Two mutants can be the same program: a body replaced by `true` and a result that is always `true`. Both are reported, on the same line.
 - For floats, a gap is reported only while no test compares equal operands. After that, thresholds within rounding distance of the constant still survive and are not reported.
 - Strings and other non-numeric types have no notion of "next value": only `<` versus `<=` is checked.
 - The survivor prediction assumes deterministic tests. A wrong prediction shows up as `UNSTABLE`.
@@ -181,7 +200,8 @@ java -jar tla2tools.jar formal/tla/RepairLoop.tla
 
 - The crate is built once; mutants are switched on by an environment variable.
 - A mutant is run only against the tests whose observations it changes, and the run stops at the first test that fails.
-- The working copy is kept between runs and only changed files are rewritten, so cargo rebuilds the analysed crate and nothing else.
+- The working copy is kept between runs. A file is rewritten only when its instrumented text changed, so cargo rebuilds what changed and nothing else.
+- Mutants that need a build of their own (step 5) cost a build and a full test run each. Their number is printed before they start.
 - `--since` and `--lines` cut the work down to the code under review.
 
 ## Evaluating against other tools
@@ -195,9 +215,11 @@ The idea of generating mutants with knowledge of the tests is called *test-aware
 ## Development
 
 ```text
-cargo test          # unit tests, PICT table, end-to-end runs on fixtures/
+cargo test          # unit tests, PICT tables, end-to-end runs on fixtures/, parity with cargo-mutants
 cargo run -- .      # the tool on itself
 ```
+
+The lists in `tests/data/cargo-mutants` are `cargo mutants --list` run in a copy of each fixture.
 
 ## License
 

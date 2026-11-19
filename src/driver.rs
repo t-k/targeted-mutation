@@ -2218,6 +2218,10 @@ pub fn run(options: &Options) -> Result<Report> {
                 text.to_string()
             }
         };
+        // All tests are run against each of them; the quick ones first, since one
+        // failure is enough.
+        let mut by_speed: Vec<&TestBinary> = session.binaries.iter().collect();
+        by_speed.sort_by_key(|bin| bin.baseline);
         let mut survivors: Vec<(report::Location, Vec<String>)> = vec![];
         for (file, site, mutant) in &built {
             let mutated = format!(
@@ -2231,7 +2235,7 @@ pub fn run(options: &Options) -> Result<Report> {
             let mut survived = viable;
             if viable {
                 report.mutants_run += 1;
-                for bin in &session.binaries {
+                for bin in &by_speed {
                     let outcome = run_binary(bin, None, &[], mutant_timeout(bin.baseline), true)?;
                     if outcome != Outcome::Pass {
                         survived = false;

@@ -104,6 +104,28 @@ pub fn evens(limit: u32) -> impl Iterator<Item = u32> {
     (0..limit).filter(|n| n % 2 == 0)
 }
 
+pub struct Above(pub i32);
+pub struct Below(pub i32);
+
+impl std::ops::Neg for Above {
+    type Output = Below;
+    fn neg(self) -> Below {
+        Below(0 - self.0)
+    }
+}
+
+impl From<Above> for Below {
+    fn from(above: Above) -> Below {
+        Below(above.0)
+    }
+}
+
+/// The minus turns one type into another, which no probe can stand in for: with it the
+/// value is a `Below`, without it an `Above`.
+pub fn mirrored(above: Above) -> Below {
+    (-above).into()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -116,6 +138,7 @@ mod tests {
         assert_eq!(untouched(1), 2);
         assert_eq!(evens(5).count(), 3);
         assert_eq!(token(3).0, 3);
+        assert_eq!(mirrored(Above(0)).0, 0);
     }
 
     #[test]
