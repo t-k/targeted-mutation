@@ -58,10 +58,11 @@ tmt [DIR] [--package NAME] [--doc] [--work-dir DIR] [--json] [--show-unreached] 
 - `--package NAME`: the workspace member to analyse. Not needed when `DIR` is the member's own directory.
 - `--doc`: also run the doc tests. rustdoc recompiles them for every mutant they reach, so this is slow.
 - `--work-dir DIR`: where the working copy and its build go.
+- `--all-files`: copy files that git ignores too. Use it when the build needs generated files that are not tracked.
 
 Exit status: `0` no gaps, `2` gaps found, `1` the analysis could not run (tests fail on the unmutated code, the crate does not build, ...).
 
-Your source tree is never modified. The workspace is copied to `<target dir>/tmt/src` (or `--work-dir`) and built in a `target` directory next to that copy. Path dependencies that point outside the workspace are rewritten to absolute paths in the copy.
+Your source tree is never modified. In a git repository only the files git does not ignore are copied, so build output, caches and local files kept out of the repository stay where they are. The workspace is copied to `<target dir>/tmt/src` (or `--work-dir`) and built in a `target` directory next to that copy. Path dependencies that point outside the workspace are rewritten to absolute paths in the copy.
 
 ## How it works
 
