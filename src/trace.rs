@@ -104,7 +104,11 @@ impl Trace {
             }
             [kind @ ("R" | "L" | "A" | "B"), site, test, bits] => {
                 let site: u32 = site.parse().ok()?;
-                let limit = if kind == "B" { 4 } else { 8 };
+                let limit = match kind {
+                    "B" => 4,
+                    "A" => 32,
+                    _ => 8,
+                };
                 let bits: u8 = bits.parse().ok().filter(|b| (1..limit).contains(b))?;
                 (!test.is_empty()).then_some(())?;
                 let test = test.to_string();
@@ -343,6 +347,7 @@ mod tests {
             (Mutation::LogicDropRhs, tmt_rt::Mutant::LogicDropRhs),
             (Mutation::LogicDropLhs, tmt_rt::Mutant::LogicDropLhs),
             (Mutation::ArithSwap, tmt_rt::Mutant::ArithSwap),
+            (Mutation::ArithSwap2, tmt_rt::Mutant::ArithSwap2),
             (Mutation::ShiftF(-10.25), tmt_rt::Mutant::ShiftF(-10.25)),
             (Mutation::ShiftF(1e-7), tmt_rt::Mutant::ShiftF(1e-7)),
         ] {
@@ -510,30 +515,64 @@ mod tests {
                     };
                     // Equal only when both are defined: a fault on either side has to be run.
                     let same = matches!((real(op), real(swapped)), (Some(x), Some(y)) if x == y);
-                    assert_eq!(i32::tmt_same(op, a, b), same, "op={op} {a} {b}");
+                    assert_eq!(
+                        i32::tmt_same(op, tmt_rt::arith_swapped(op), a, b),
+                        same,
+                        "op={op} {a} {b}"
+                    );
                     if let Some(value) = real(op) {
                         assert_eq!(i32::tmt_real(op, a, b), value);
                     }
                 }
             }
         }
-        assert!(u8::tmt_same(tmt_rt::ADD, 9, 0));
+        assert!(u8::tmt_same(
+            tmt_rt::ADD,
+            tmt_rt::arith_swapped(tmt_rt::ADD),
+            9,
+            0
+        ));
         // Both shifts overflow: not "the same", the tests decide.
-        assert!(!u8::tmt_same(tmt_rt::SHL, 2, 9));
-        assert!(u8::tmt_same(tmt_rt::SHL, 2, 0));
-        assert!(!u8::tmt_same(tmt_rt::DIV, 4, 0));
+        assert!(!u8::tmt_same(
+            tmt_rt::SHL,
+            tmt_rt::arith_swapped(tmt_rt::SHL),
+            2,
+            9
+        ));
+        assert!(u8::tmt_same(
+            tmt_rt::SHL,
+            tmt_rt::arith_swapped(tmt_rt::SHL),
+            2,
+            0
+        ));
+        assert!(!u8::tmt_same(
+            tmt_rt::DIV,
+            tmt_rt::arith_swapped(tmt_rt::DIV),
+            4,
+            0
+        ));
         assert!(
-            !u8::tmt_same(tmt_rt::ADD, 250, 9),
+            !u8::tmt_same(tmt_rt::ADD, tmt_rt::arith_swapped(tmt_rt::ADD), 250, 9),
             "overflow in one of the two counts as different"
         );
         assert!(
-            !u8::tmt_same(tmt_rt::MUL, 4, 0),
+            !u8::tmt_same(tmt_rt::MUL, tmt_rt::arith_swapped(tmt_rt::MUL), 4, 0),
             "division by zero counts as different"
         );
-        assert!(f64::tmt_same(tmt_rt::MUL, 4.0, 1.0));
-        assert!(!f64::tmt_same(tmt_rt::ADD, 4.0, 0.5));
+        assert!(f64::tmt_same(
+            tmt_rt::MUL,
+            tmt_rt::arith_swapped(tmt_rt::MUL),
+            4.0,
+            1.0
+        ));
+        assert!(!f64::tmt_same(
+            tmt_rt::ADD,
+            tmt_rt::arith_swapped(tmt_rt::ADD),
+            4.0,
+            0.5
+        ));
         assert!(
-            !f32::tmt_same(tmt_rt::MUL, 4.0, 0.0),
+            !f32::tmt_same(tmt_rt::MUL, tmt_rt::arith_swapped(tmt_rt::MUL), 4.0, 0.0),
             "4*0 is 0, 4/0 is infinite"
         );
     }
@@ -667,7 +706,8 @@ mod tests {
             crate::plan::ArithObs {
                 same: true,
                 differs: false,
-                opaque: false
+                opaque: false,
+                ..Default::default()
             }
         );
         assert_eq!(
@@ -675,7 +715,8 @@ mod tests {
             crate::plan::ArithObs {
                 same: false,
                 differs: true,
-                opaque: true
+                opaque: true,
+                ..Default::default()
             }
         );
         assert!(trace.reach[&3].contains("t"));

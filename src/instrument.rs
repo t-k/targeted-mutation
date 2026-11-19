@@ -9,7 +9,9 @@
 
 use anyhow::{Context, Result};
 use proc_macro2::{Span, TokenStream, TokenTree};
+use quote::ToTokens;
 use serde::Serialize;
+use std::collections::HashSet;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
@@ -95,6 +97,36 @@ pub enum SiteKind {
     },
     /// A call or assignment statement that can be deleted.
     Stmt,
+    /// `-operand`: the minus is dropped.
+    Neg {
+        /// Byte range of the `-` and whatever separates it from the operand.
+        minus: (usize, usize),
+        operand: String,
+        /// The operand is a literal: its type is whatever the context asks for.
+        literal: bool,
+    },
+    /// The guard of a match arm: replaced by `true` or `false`.
+    Guard {
+        /// Whether `false` is a mutant of its own. It is not where the arm can be removed,
+        /// which is the same thing.
+        can_be_false: bool,
+    },
+    /// A field of a struct literal with a base (`..base`): the field is left to the base.
+    Field {
+        name: String,
+        /// Written without its name (`S { name, ..base }`).
+        shorthand: bool,
+        /// The expression that reads the field from the base.
+        from_base: String,
+    },
+    /// The whole body of a function, replaced by a value of its return type. The site's
+    /// range is the inside of the body's braces and its text is the function signature.
+    Body {
+        name: String,
+        value: String,
+        /// As for `Return`: the body when it is one expression.
+        sole_expr: Option<(usize, usize)>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -163,6 +195,20 @@ impl ArithOp {
             ArithOp::Shl => ArithOp::Shr,
             ArithOp::Shr => ArithOp::Shl,
         }
+    }
+
+    /// The second operator a mutant uses instead. The shifts have none.
+    pub fn swapped2(self) -> Option<ArithOp> {
+        Some(match self {
+            ArithOp::Add => ArithOp::Mul,
+            ArithOp::Sub => ArithOp::Div,
+            ArithOp::Mul => ArithOp::Add,
+            ArithOp::Div => ArithOp::Rem,
+            ArithOp::Rem => ArithOp::Add,
+            ArithOp::BitAnd | ArithOp::BitOr => ArithOp::BitXor,
+            ArithOp::BitXor => ArithOp::BitOr,
+            ArithOp::Shl | ArithOp::Shr => return None,
+        })
     }
 
     /// Bit operators exist for integers only, the others for floats too.
@@ -278,32 +324,9 @@ struct Finder<'s> {
 }
 
 impl Finder<'_> {
-    /// Registers the body of a function that returns `bool` or `Option<T>` as a site.
-    fn result_function(&mut self, sig: &syn::Signature, body: &syn::Block) {
-        let syn::ReturnType::Type(_, ty) = &sig.output else {
-            return;
-        };
-        let option = match &**ty {
-            // `<T>::bool` and `<T as Tr>::bool` are not a single identifier either.
-            syn::Type::Path(p) if p.path.is_ident("bool") => None,
-            syn::Type::Path(p)
-                if p.qself.is_none()
-                    && p.path.segments.last().is_some_and(|s| {
-                        s.ident == "Option"
-                            && matches!(s.arguments, syn::PathArguments::AngleBracketed(_))
-                    }) =>
-            {
-                match self
-                    .range(ty.span())
-                    .map(|(from, to)| &self.source[from..to])
-                {
-                    // `impl Trait` cannot be written in a `let`.
-                    Some(written) if !written.contains("impl ") => Some(written.to_string()),
-                    _ => return,
-                }
-            }
-            _ => return,
-        };
+    /// Registers the sites of a function as a whole: its result (for `bool` and
+    /// `Option<T>`), and its body replaced by each value its return type suggests.
+    fn function_sites(&mut self, sig: &syn::Signature, body: &syn::Block) {
         if body.stmts.is_empty() {
             return;
         }
@@ -319,23 +342,81 @@ impl Finder<'_> {
             return;
         }
         let at = sig.span().start();
-        self.found.sites.push(Site {
-            id: self.next_id,
-            kind: SiteKind::Return {
-                name: sig.ident.to_string(),
+        let text = self.source[sig_start..sig_end].to_string();
+        let sole_expr = match &body.stmts[..] {
+            [syn::Stmt::Expr(expr, None)] => self.range(expr.span()),
+            _ => None,
+        };
+        let push = |finder: &mut Self, kind: SiteKind| {
+            finder.found.sites.push(Site {
+                id: finder.next_id,
+                kind,
+                line: at.line,
+                column: at.column + 1,
+                start,
+                end,
+                text: text.clone(),
+            });
+            finder.next_id += 1;
+        };
+        let name = sig.ident.to_string();
+        if let Some(option) = self.result_kind(&sig.output) {
+            let kind = SiteKind::Return {
+                name: name.clone(),
                 option,
-                sole_expr: match &body.stmts[..] {
-                    [syn::Stmt::Expr(expr, None)] => self.range(expr.span()),
+                sole_expr,
+            };
+            push(self, kind);
+        }
+        // Deleting the only statement of a function that returns nothing is the same
+        // mutant as an empty body.
+        let one_deletable_statement = matches!(sig.output, syn::ReturnType::Default)
+            && matches!(&body.stmts[..], [syn::Stmt::Expr(expr, Some(_))] if deletable(expr));
+        if sig.unsafety.is_some() || one_deletable_statement {
+            return;
+        }
+        let written = sole_expr.map(|(from, to)| squeezed(&self.source[from..to]));
+        for value in body_values(&sig.output) {
+            if written.as_deref() != Some(squeezed(&value).as_str()) {
+                push(
+                    self,
+                    SiteKind::Body {
+                        name: name.clone(),
+                        value,
+                        sole_expr,
+                    },
+                );
+            }
+        }
+    }
+
+    /// `Some(None)` for a function that returns `bool`, `Some(Some(type))` for one that
+    /// returns `Option<T>` written in a way a `let` can repeat.
+    fn result_kind(&self, output: &syn::ReturnType) -> Option<Option<String>> {
+        let syn::ReturnType::Type(_, ty) = output else {
+            return None;
+        };
+        match &**ty {
+            // `<T>::bool` and `<T as Tr>::bool` are not a single identifier either.
+            syn::Type::Path(p) if p.path.is_ident("bool") => Some(None),
+            syn::Type::Path(p)
+                if p.qself.is_none()
+                    && p.path.segments.last().is_some_and(|s| {
+                        s.ident == "Option"
+                            && matches!(s.arguments, syn::PathArguments::AngleBracketed(_))
+                    }) =>
+            {
+                match self
+                    .range(ty.span())
+                    .map(|(from, to)| &self.source[from..to])
+                {
+                    // `impl Trait` cannot be written in a `let`.
+                    Some(written) if !written.contains("impl ") => Some(Some(written.to_string())),
                     _ => None,
-                },
-            },
-            line: at.line,
-            column: at.column + 1,
-            start,
-            end,
-            text: self.source[sig_start..sig_end].to_string(),
-        });
-        self.next_id += 1;
+                }
+            }
+            _ => None,
+        }
     }
     fn range(&self, span: Span) -> Option<(usize, usize)> {
         let range = span.byte_range();
@@ -546,6 +627,183 @@ fn has_ident(tokens: TokenStream, name: &str) -> bool {
     })
 }
 
+/// Text without its white space, to compare two ways of writing one expression.
+fn squeezed(text: &str) -> String {
+    text.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// The values to replace a function's body with, by its return type. The table is that
+/// of cargo-mutants (https://mutants.rs/mutants.html), applied to the type as written.
+pub fn body_values(output: &syn::ReturnType) -> Vec<String> {
+    match output {
+        syn::ReturnType::Default => vec!["()".to_string()],
+        syn::ReturnType::Type(_, ty) => {
+            // What an `impl Trait` stands for is the type of the body: no other value
+            // can be returned beside it.
+            if has_ident(ty.to_token_stream(), "impl") {
+                return vec![];
+            }
+            let mut values = values_of(ty);
+            let mut seen = HashSet::new();
+            values.retain(|value| seen.insert(value.clone()));
+            values
+        }
+    }
+}
+
+fn product(parts: &[Vec<String>]) -> Vec<Vec<String>> {
+    parts.iter().fold(vec![vec![]], |rows, part| {
+        rows.iter()
+            .flat_map(|row| {
+                part.iter().map(move |value| {
+                    let mut row = row.clone();
+                    row.push(value.clone());
+                    row
+                })
+            })
+            .collect()
+    })
+}
+
+fn values_of(ty: &syn::Type) -> Vec<String> {
+    let each = |inner: &syn::Type, wrap: &dyn Fn(&str) -> String| -> Vec<String> {
+        values_of(inner).iter().map(|v| wrap(v)).collect()
+    };
+    match ty {
+        syn::Type::Paren(t) => values_of(&t.elem),
+        syn::Type::Group(t) => values_of(&t.elem),
+        syn::Type::Never(_) => vec![],
+        syn::Type::Tuple(t) if t.elems.is_empty() => vec!["()".to_string()],
+        syn::Type::Tuple(t) => {
+            let parts: Vec<Vec<String>> = t.elems.iter().map(values_of).collect();
+            product(&parts)
+                .into_iter()
+                .map(|row| match &row[..] {
+                    [one] => format!("({one},)"),
+                    _ => format!("({})", row.join(", ")),
+                })
+                .collect()
+        }
+        syn::Type::Array(t) => {
+            let len = t.len.to_token_stream().to_string();
+            each(&t.elem, &|v| format!("[{v}; {len}]"))
+        }
+        syn::Type::Reference(t) => match &*t.elem {
+            syn::Type::Path(p) if p.path.is_ident("str") && t.mutability.is_none() => {
+                vec!["\"\"".to_string(), "\"xyzzy\"".to_string()]
+            }
+            syn::Type::Slice(slice) => {
+                let mut values = vec!["Vec::leak(Vec::new())".to_string()];
+                values.extend(each(&slice.elem, &|v| format!("Vec::leak(vec![{v}])")));
+                values
+            }
+            inner => each(inner, &|v| format!("Box::leak(Box::new({v}))")),
+        },
+        syn::Type::Path(p) if p.qself.is_none() => {
+            let Some(last) = p.path.segments.last() else {
+                return vec!["Default::default()".to_string()];
+            };
+            // The type as written, without its generic arguments: `std::rc::Rc`.
+            let mut bare = p.path.clone();
+            if let Some(segment) = bare.segments.last_mut() {
+                segment.arguments = syn::PathArguments::None;
+            }
+            let bare = squeezed(&bare.to_token_stream().to_string());
+            let arguments: Vec<&syn::Type> = match &last.arguments {
+                syn::PathArguments::AngleBracketed(list) => list
+                    .args
+                    .iter()
+                    .filter_map(|arg| match arg {
+                        syn::GenericArgument::Type(ty) => Some(ty),
+                        _ => None,
+                    })
+                    .collect(),
+                _ => vec![],
+            };
+            let name = last.ident.to_string();
+            let texts = |list: &[&str]| list.iter().map(|v| v.to_string()).collect::<Vec<_>>();
+            let one = |text: String| "1.try_into().unwrap()".replace('1', &text);
+            match (name.as_str(), &arguments[..]) {
+                ("bool", []) => texts(&["true", "false"]),
+                ("i8" | "i16" | "i32" | "i64" | "i128" | "isize", []) => texts(&["0", "1", "-1"]),
+                ("u8" | "u16" | "u32" | "u64" | "u128" | "usize", []) => texts(&["0", "1"]),
+                ("f32" | "f64", []) => texts(&["0.0", "1.0", "-1.0"]),
+                (
+                    "NonZeroI8" | "NonZeroI16" | "NonZeroI32" | "NonZeroI64" | "NonZeroI128"
+                    | "NonZeroIsize",
+                    [],
+                ) => vec![one("1".into()), one("(-1)".into())],
+                (
+                    "NonZeroU8" | "NonZeroU16" | "NonZeroU32" | "NonZeroU64" | "NonZeroU128"
+                    | "NonZeroUsize",
+                    [],
+                ) => vec![one("1".into())],
+                ("NonZero", [inner]) => {
+                    let unsigned = squeezed(&inner.to_token_stream().to_string()).starts_with('u');
+                    let mut values = vec![one("1".into())];
+                    if !unsigned {
+                        values.push(one("(-1)".into()));
+                    }
+                    values
+                }
+                ("String", []) => texts(&["String::new()", "\"xyzzy\".into()"]),
+                ("Result", [ok, ..]) => each(ok, &|v| format!("Ok({v})")),
+                ("Option", [inner]) => {
+                    let mut values = vec!["None".to_string()];
+                    values.extend(each(inner, &|v| format!("Some({v})")));
+                    values
+                }
+                ("Vec", [inner]) => {
+                    let mut values = vec!["vec![]".to_string()];
+                    values.extend(each(inner, &|v| format!("vec![{v}]")));
+                    values
+                }
+                ("Box" | "Rc" | "Arc" | "Cell" | "RefCell" | "Mutex", [inner]) => {
+                    each(inner, &|v| format!("{bare}::new({v})"))
+                }
+                ("BinaryHeap" | "BTreeSet" | "HashSet" | "LinkedList" | "VecDeque", [inner]) => {
+                    let mut values = vec![format!("{bare}::new()")];
+                    values.extend(each(inner, &|v| format!("{bare}::from_iter([{v}])")));
+                    values
+                }
+                ("BTreeMap" | "HashMap", [key, value]) => {
+                    let mut values = vec![format!("{bare}::new()")];
+                    values.extend(
+                        product(&[values_of(key), values_of(value)])
+                            .into_iter()
+                            .map(|row| format!("{bare}::from_iter([({})])", row.join(", "))),
+                    );
+                    values
+                }
+                ("Cow", [inner]) => {
+                    let borrowed: syn::Type = syn::parse_quote!(&#inner);
+                    values_of(&borrowed)
+                        .iter()
+                        .flat_map(|v| {
+                            [
+                                format!("{bare}::Borrowed({v})"),
+                                format!("{bare}::Owned({v}.to_owned())"),
+                            ]
+                        })
+                        .collect()
+                }
+                ("HttpResponse", []) => vec![format!("{bare}::Ok().finish()")],
+                _ => vec!["Default::default()".to_string()],
+            }
+        }
+        _ => vec!["Default::default()".to_string()],
+    }
+}
+
+/// `#[mutants::skip]`, also inside `cfg_attr`: the mark cargo-mutants uses for code that
+/// is not to be mutated.
+fn is_skipped(attrs: &[syn::Attribute]) -> bool {
+    attrs.iter().any(|attr| {
+        let tokens = attr.meta.to_token_stream();
+        has_ident(tokens.clone(), "mutants") && has_ident(tokens, "skip")
+    })
+}
+
 /// `#[test]`, `#[tokio::test]`, `#[cfg(test)]`, `#[cfg(all(test, ...))]`; not `#[cfg(not(test))]`.
 fn is_test_only(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attr| {
@@ -632,34 +890,36 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             }
             return;
         }
-        visit::visit_item_mod(self, node);
+        if !is_skipped(&node.attrs) {
+            visit::visit_item_mod(self, node);
+        }
     }
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
-        if !is_test_only(&node.attrs) && node.sig.constness.is_none() {
-            self.result_function(&node.sig, &node.block);
+        if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) && node.sig.constness.is_none() {
+            self.function_sites(&node.sig, &node.block);
             visit::visit_item_fn(self, node);
         }
     }
 
     fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
-        if !is_test_only(&node.attrs) && node.sig.constness.is_none() {
-            self.result_function(&node.sig, &node.block);
+        if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) && node.sig.constness.is_none() {
+            self.function_sites(&node.sig, &node.block);
             visit::visit_impl_item_fn(self, node);
         }
     }
 
     fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
-        if !is_test_only(&node.attrs) && node.sig.constness.is_none() {
+        if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) && node.sig.constness.is_none() {
             if let Some(body) = &node.default {
-                self.result_function(&node.sig, body);
+                self.function_sites(&node.sig, body);
             }
             visit::visit_trait_item_fn(self, node);
         }
     }
 
     fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
-        if !is_test_only(&node.attrs) {
+        if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) {
             visit::visit_item_impl(self, node);
         }
     }
@@ -798,7 +1058,87 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                 self.next_id += 1;
             }
         }
+        // Any guard can be `true` or `false` instead: a guarded arm never counts for
+        // the match being exhaustive. A `let` in a guard binds names for the arm.
+        let removable: Vec<usize> = self
+            .found
+            .sites
+            .iter()
+            .filter(|s| matches!(s.kind, SiteKind::Arm { .. }))
+            .map(|s| s.start)
+            .collect();
+        for arm in node.arms.iter().filter(|arm| arm.attrs.is_empty()) {
+            if let Some((_, guard)) = &arm.guard
+                && !matches!(**guard, syn::Expr::Let(_))
+                && !in_let_chain(guard)
+                && let (Some((start, end)), Some((pattern, _))) =
+                    (self.range(guard.span()), self.range(arm.pat.span()))
+            {
+                let kind = SiteKind::Guard {
+                    can_be_false: !removable.contains(&pattern),
+                };
+                self.push(kind, start, end, guard.span());
+            }
+        }
         visit::visit_expr_match(self, node);
+    }
+
+    fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
+        // The base is read a second time by the mutant, so it has to be something that
+        // can be: a place, or a call without arguments (`Default::default()`).
+        let from_base = node.rest.as_deref().and_then(|base| {
+            let (from, to) = self.range(base.span())?;
+            let written = &self.source[from..to];
+            match base {
+                base if is_plain_place(base) => Some(format!("({written})")),
+                syn::Expr::Call(call)
+                    if call.args.is_empty() && matches!(*call.func, syn::Expr::Path(_)) =>
+                {
+                    let (from, to) = self.range(node.path.span())?;
+                    Some(format!("({} {{ ..{written} }})", &self.source[from..to]))
+                }
+                _ => None,
+            }
+        });
+        if let Some(from_base) = from_base
+            && node.attrs.is_empty()
+            && node.qself.is_none()
+        {
+            for field in node.fields.iter().filter(|field| field.attrs.is_empty()) {
+                let name = match &field.member {
+                    syn::Member::Named(ident) => ident.to_string(),
+                    syn::Member::Unnamed(index) => index.index.to_string(),
+                };
+                let (Some((start, _)), Some((_, end))) = (
+                    self.range(field.member.span()),
+                    self.range(field.expr.span()),
+                ) else {
+                    continue;
+                };
+                let Some((value, _)) = self.range(field.expr.span()) else {
+                    continue;
+                };
+                let shorthand = field.colon_token.is_none();
+                let kind = SiteKind::Field {
+                    from_base: format!("{from_base}.{name}"),
+                    name,
+                    shorthand,
+                };
+                let at = field.member.span().start();
+                self.found.sites.push(Site {
+                    id: self.next_id,
+                    kind,
+                    line: at.line,
+                    column: at.column + 1,
+                    // The probe goes around the value; the report shows the whole field.
+                    start: value,
+                    end,
+                    text: self.source[start..end].to_string(),
+                });
+                self.next_id += 1;
+            }
+        }
+        visit::visit_expr_struct(self, node);
     }
 
     fn visit_expr_unary(&mut self, node: &'ast syn::ExprUnary) {
@@ -813,6 +1153,32 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                 operand: self.source[operand_start..end].to_string(),
             };
             self.push(kind, start, end, bang.span());
+        }
+        if let syn::UnOp::Neg(minus) = &node.op
+            && node.attrs.is_empty()
+            && let (Some((start, _)), Some((operand_start, end))) =
+                (self.range(minus.span()), self.range(node.expr.span()))
+            && in_order(start, operand_start)
+        {
+            let zero = match &*node.expr {
+                syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Int(lit),
+                    ..
+                }) => lit.base10_parse::<u128>().is_ok_and(|v| v == 0),
+                syn::Expr::Lit(syn::ExprLit {
+                    lit: syn::Lit::Float(lit),
+                    ..
+                }) => lit.base10_parse::<f64>().is_ok_and(|v| v == 0.0),
+                _ => false,
+            };
+            if !zero {
+                let kind = SiteKind::Neg {
+                    minus: (start, operand_start),
+                    operand: self.source[operand_start..end].to_string(),
+                    literal: matches!(*node.expr, syn::Expr::Lit(_)),
+                };
+                self.push(kind, start, end, minus.span());
+            }
         }
         visit::visit_expr_unary(self, node);
     }
@@ -889,11 +1255,20 @@ pub struct Rendered {
     /// `(output offset, original offset, length)` of each stretch copied from the original,
     /// in output order.
     segments: Vec<(usize, usize, usize)>,
+    /// `(output offset, length, site)` of each piece of text a probe added, in output order.
+    inserted: Vec<(usize, usize, u32)>,
 }
 
 impl Rendered {
     /// Maps a byte offset in the instrumented text to the original. Offsets inside inserted
     /// text map to the point of insertion.
+    /// The site whose probe text contains the byte at `offset` of the instrumented text.
+    pub fn inserted_by(&self, offset: usize) -> Option<u32> {
+        let idx = self.inserted.partition_point(|(out, _, _)| *out <= offset);
+        let (out, len, site) = self.inserted[idx.checked_sub(1)?];
+        (offset - out < len).then_some(site)
+    }
+
     pub fn to_original(&self, offset: usize) -> usize {
         let idx = self.segments.partition_point(|(out, _, _)| *out <= offset);
         let Some((out, orig, len)) = idx.checked_sub(1).map(|i| self.segments[i]) else {
@@ -912,6 +1287,8 @@ struct Edit {
     /// Closers: innermost first. Openers: outermost first.
     order: i64,
     text: String,
+    /// The site the text belongs to.
+    site: u32,
 }
 
 /// Rewrites `source` with probes for the sites that `enabled` accepts.
@@ -919,7 +1296,17 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
     let rt = format!("crate::{RUNTIME_MOD}");
     let mut edits = vec![];
     for site in sites.iter().filter(|s| enabled(s.id)) {
-        let len = (site.end - site.start) as i64;
+        // Edits at one position are ordered by the length of their site, doubled to leave
+        // room: a site that wraps a whole expression goes around a site of that very
+        // expression (`if a > b` as a guard and as a comparison).
+        let wraps = matches!(
+            site.kind,
+            SiteKind::Return { .. }
+                | SiteKind::Body { .. }
+                | SiteKind::Guard { .. }
+                | SiteKind::Field { .. }
+        );
+        let len = 2 * (site.end - site.start) as i64 + wraps as i64;
         let (open, close) = match &site.kind {
             SiteKind::Cmp { op, gap, .. } => {
                 let func = if op.is_ordering() { "ord" } else { "eq" };
@@ -929,6 +1316,7 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     phase: 1,
                     order: 0,
                     text: "), &(".into(),
+                    site: site.id,
                 });
                 (
                     "(match (&(".to_string(),
@@ -954,6 +1342,7 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     phase: 1,
                     order: 0,
                     text: format!("); __tmt_c }} {{ 2u8 => {rt}::rhs({id}u32, {and}, "),
+                    site: site.id,
                 });
                 (
                     // Each operand of `&&` / `||` drops its temporaries when it is done.
@@ -977,6 +1366,7 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     phase: 1,
                     order: 0,
                     text: format!("{lhs_close}, "),
+                    site: site.id,
                 });
                 (
                     format!("(match ({lhs_open}"),
@@ -998,6 +1388,7 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     phase: 1,
                     order: 0,
                     text: String::new(),
+                    site: site.id,
                 });
                 (
                     "(match (".to_string(),
@@ -1027,6 +1418,7 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     phase: 1,
                     order: 0,
                     text: ", ".into(),
+                    site: site.id,
                 });
                 // The call's own `)` (and a trailing comma) is replaced by the probe.
                 let method = if *max { "tmt_max" } else { "tmt_min" };
@@ -1040,6 +1432,7 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                          (&{rt}::Ar::new(__tmt_a, __tmt_b)).{method}({}u32) }} }})",
                         site.id
                     ),
+                    site: site.id,
                 });
                 ("(match (".to_string(), String::new())
             }
@@ -1050,6 +1443,7 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     phase: 1,
                     order: 0,
                     text: ", ".into(),
+                    site: site.id,
                 });
                 let method = if *inclusive {
                     "tmt_range_inclusive"
@@ -1075,15 +1469,17 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                         phase: 2,
                         order: 0,
                         text: format!("if {rt}::arm({}u32) ", site.id),
+                        site: site.id,
                     }),
                     ArmGuard::Existing(from, to) => {
-                        let wider = (to - from + 1) as i64;
+                        let wider = 2 * (to - from + 1) as i64;
                         edits.push(Edit {
                             pos: *from,
                             end: *from,
                             phase: 2,
                             order: -wider,
                             text: format!("{rt}::arm({}u32) && (", site.id),
+                            site: site.id,
                         });
                         edits.push(Edit {
                             pos: *to,
@@ -1091,6 +1487,7 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                             phase: 0,
                             order: wider,
                             text: ")".into(),
+                            site: site.id,
                         });
                     }
                 }
@@ -1100,6 +1497,53 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                 format!("if {rt}::live({}u32) {{ ", site.id),
                 " }".to_string(),
             ),
+            // A literal takes its type from where it stands, so it stays where it is.
+            SiteKind::Neg {
+                operand,
+                literal: true,
+                ..
+            } => (
+                format!("(if {rt}::live({}u32) {{ ", site.id),
+                format!(" }} else {{ {operand} }})"),
+            ),
+            SiteKind::Neg { minus, .. } => {
+                edits.push(Edit {
+                    pos: minus.0,
+                    end: minus.1,
+                    phase: 1,
+                    order: 0,
+                    text: String::new(),
+                    site: site.id,
+                });
+                (
+                    "(match (".to_string(),
+                    format!(
+                        ") {{ __tmt_a => if {rt}::live({}u32) {{ -__tmt_a }} else {{ __tmt_a }} }})",
+                        site.id
+                    ),
+                )
+            }
+            SiteKind::Guard { .. } => (format!("{rt}::ret({}u32, ", site.id), ")".to_string()),
+            SiteKind::Field {
+                name,
+                shorthand,
+                from_base,
+            } => (
+                format!(
+                    "{}if {rt}::live({}u32) {{ ",
+                    if *shorthand {
+                        format!("{name}: ")
+                    } else {
+                        String::new()
+                    },
+                    site.id
+                ),
+                format!(" }} else {{ {from_base} }}"),
+            ),
+            SiteKind::Body { value, .. } => (
+                format!(" if !{rt}::live({}u32) {{ return {value}; }}", site.id),
+                String::new(),
+            ),
         };
         edits.push(Edit {
             pos: site.start,
@@ -1107,6 +1551,7 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
             phase: 2,
             order: -len,
             text: open,
+            site: site.id,
         });
         edits.push(Edit {
             pos: site.end,
@@ -1114,6 +1559,7 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
             phase: 0,
             order: len,
             text: close,
+            site: site.id,
         });
     }
     edits.sort_by_key(|e| (e.pos, e.phase, e.order));
@@ -1121,6 +1567,7 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
     let mut text =
         String::with_capacity(source.len() + edits.iter().map(|e| e.text.len()).sum::<usize>());
     let mut segments = vec![];
+    let mut inserted = vec![];
     let mut cursor = 0;
     for edit in edits {
         // Also when nothing lies between two edits: text inserted right after a replaced
@@ -1129,21 +1576,31 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
             segments.push((text.len(), cursor, edit.pos - cursor));
             text.push_str(&source[cursor..edit.pos]);
         }
+        inserted.push((text.len(), edit.text.len(), edit.site));
         text.push_str(&edit.text);
         cursor = cursor.max(edit.end);
     }
     segments.push((text.len(), cursor, source.len() - cursor));
     text.push_str(&source[cursor..]);
-    Rendered { text, segments }
+    Rendered {
+        text,
+        segments,
+        inserted,
+    }
 }
 
 /// The sites to blame for a compile error at `offset` (original coordinates): the smallest
 /// enabled sites that contain it.
 pub fn blame(sites: &[Site], enabled: &dyn Fn(u32) -> bool, offset: usize) -> Vec<u32> {
+    // A replaced body is blamed for what is wrong in its own text only (`inserted_by`):
+    // by position it would answer for everything in the function.
     let containing = || {
-        sites
-            .iter()
-            .filter(|s| enabled(s.id) && s.start <= offset && offset <= s.end)
+        sites.iter().filter(|s| {
+            enabled(s.id)
+                && s.start <= offset
+                && offset <= s.end
+                && !matches!(s.kind, SiteKind::Body { .. })
+        })
     };
     let Some(smallest) = containing().map(|s| s.end - s.start).min() else {
         return vec![];
@@ -1167,7 +1624,7 @@ mod tests {
     fn found(src: &str, first_id: u32) -> Result<Discovery> {
         let mut all = discover(src, 0)?;
         all.sites
-            .retain(|s| !matches!(s.kind, SiteKind::Return { .. }));
+            .retain(|s| !matches!(s.kind, SiteKind::Return { .. } | SiteKind::Body { .. }));
         for (index, site) in all.sites.iter_mut().enumerate() {
             site.id = first_id + index as u32;
         }
@@ -1208,8 +1665,9 @@ mod tests {
             .unwrap()
             .sites
             .iter()
-            .map(|s| match &s.kind {
-                SiteKind::Cmp { literal, .. } => *literal,
+            .filter_map(|s| match &s.kind {
+                SiteKind::Cmp { literal, .. } => Some(*literal),
+                SiteKind::Neg { .. } => None,
                 _ => panic!(),
             })
             .collect();
@@ -1730,7 +2188,11 @@ mod tests {
         let out = render(src, &sites, &all).text;
         syn::parse_file(&out).expect("instrumented source parses");
         assert!(
-            out.contains("pub fn is_ok(a: u8) -> bool { let __tmt_v: bool = { let b = a; (match"),
+            out.contains(
+                "pub fn is_ok(a: u8) -> bool { let __tmt_v: bool = { \
+                 if !crate::__tmt_rt::live(1u32) { return true; } \
+                 if !crate::__tmt_rt::live(2u32) { return false; } let b = a; (match"
+            ),
             "{out}"
         );
         assert!(
@@ -1745,7 +2207,12 @@ mod tests {
         // A compile error in the wrapper is blamed on the function's site.
         let rendered = render(src, &sites, &all);
         let wrapper = rendered.text.find("ret(0u32").unwrap();
-        assert_eq!(blame(&sites, &all, rendered.to_original(wrapper)), [0]);
+        assert_eq!(rendered.inserted_by(wrapper), Some(0));
+        // And one in a replaced body on that replacement alone: by position they are
+        // all the same place.
+        let replaced = rendered.text.find("return false; } let b").unwrap();
+        assert_eq!(rendered.inserted_by(replaced), Some(2));
+        assert_eq!(blame(&sites, &all, rendered.to_original(replaced)), [0]);
     }
 
     #[test]
@@ -1758,7 +2225,11 @@ mod tests {
         let sites = discover(src, 10).unwrap().sites;
         let ids: Vec<u32> = sites.iter().map(|s| s.id).collect();
         assert_eq!(ids, (10..10 + sites.len() as u32).collect::<Vec<_>>());
-        let texts: Vec<&str> = sites.iter().map(|s| s.text.as_str()).collect();
+        let texts: Vec<&str> = sites
+            .iter()
+            .filter(|s| !matches!(s.kind, SiteKind::Body { .. }))
+            .map(|s| s.text.as_str())
+            .collect();
         assert_eq!(
             texts,
             [
@@ -1943,12 +2414,13 @@ mod tests {
     fn unparseable_source_is_an_error() {
         assert!(discover("fn f( {", 0).is_err());
     }
-    /// Every site as `kind text`, in discovery order.
+    /// Every site as `kind text`, in discovery order, without the replaced bodies.
     fn labelled(src: &str) -> Vec<String> {
         discover(src, 0)
             .unwrap()
             .sites
             .iter()
+            .filter(|s| !matches!(s.kind, SiteKind::Body { .. }))
             .map(|s| {
                 let kind = match &s.kind {
                     SiteKind::Cmp { .. } => "cmp",
@@ -1960,6 +2432,10 @@ mod tests {
                     SiteKind::Range { .. } => "range",
                     SiteKind::Arm { .. } => "arm",
                     SiteKind::Stmt => "stmt",
+                    SiteKind::Neg { .. } => "neg",
+                    SiteKind::Guard { .. } => "guard",
+                    SiteKind::Field { .. } => "field",
+                    SiteKind::Body { .. } => "body",
                 };
                 format!("{kind} {}", s.text)
             })
@@ -2078,14 +2554,16 @@ mod tests {
                 "range 1..b",
                 "range (a + 1)..(b * 2)",
                 "arith a + 1",
-                "arith b * 2"
+                "arith b * 2",
+                // Two literal ends are no range site; the minus in one is still a minus.
+                "neg -6"
             ]
         );
         let out = render(src, &discover(src, 0).unwrap().sites, &all).text;
         // The `..` itself is gone: the ends are the two arguments of the probe.
         assert!(out.contains("&v[(match (a, 10) {"), "{out}");
         assert!(!out.contains("a..10") && !out.contains("1..b"), "{out}");
-        assert!(out.contains("3..4") && out.contains("(5)..(-6)"), "{out}");
+        assert!(out.contains("3..4") && out.contains("(5)..((if "), "{out}");
     }
 
     #[test]
@@ -2112,9 +2590,10 @@ mod tests {
         assert_eq!(
             arms,
             [
-                (7, 2, 23, "1 => ..".to_string()),
-                (8, 2, 39, "2 => ..".to_string()),
-                (9, 6, 9, "1 => ..".to_string()),
+                // After the two replaced bodies of a function that returns `u8`.
+                (9, 2, 23, "1 => ..".to_string()),
+                (10, 2, 39, "2 => ..".to_string()),
+                (11, 6, 9, "1 => ..".to_string()),
             ]
         );
     }
@@ -2146,6 +2625,16 @@ mod tests {
             out.text
         );
         assert_eq!(out.to_original(inner_probe), src.find("b + 1").unwrap());
-        assert_eq!(blame(&sites, &all, out.to_original(inner_probe)), [1]);
+        let arith = sites
+            .iter()
+            .find(|s| matches!(s.kind, SiteKind::Arith { .. }))
+            .unwrap();
+        assert_eq!(
+            blame(&sites, &all, out.to_original(inner_probe)),
+            [arith.id]
+        );
+        // The text of a probe knows its site without going through the original.
+        assert_eq!(out.inserted_by(inner_probe), Some(arith.id));
+        assert_eq!(out.inserted_by(out.text.find("b, 1").unwrap()), None);
     }
 }

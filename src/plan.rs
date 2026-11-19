@@ -299,6 +299,9 @@ pub enum Mutation {
     LogicDropLhs,
     /// `+` <-> `-`, `*` <-> `/`, `%` -> `/`, `&` <-> `|`, `^` -> `&`, `<<` <-> `>>`.
     ArithSwap,
+    /// The second replacement of an operator: `+` -> `*`, `-` -> `/`, `*` -> `+`,
+    /// `/` -> `%`, `%` -> `+`, `&` -> `^`, `|` -> `^`, `^` -> `|`.
+    ArithSwap2,
     /// `!x` becomes `x`.
     DropNot,
     /// `a..b` becomes `a..=b` and the other way round.
@@ -321,6 +324,7 @@ impl Mutation {
             Mutation::LogicDropRhs => "ldr".to_string(),
             Mutation::LogicDropLhs => "ldl".to_string(),
             Mutation::ArithSwap => "asw".to_string(),
+            Mutation::ArithSwap2 => "as2".to_string(),
             Mutation::DropNot => "unn".to_string(),
             Mutation::RangeEnd => "rng".to_string(),
             Mutation::MinMax => "mmx".to_string(),
@@ -664,6 +668,9 @@ pub struct ArithObs {
     pub differs: bool,
     /// The operands were not primitive numbers: nothing can be said.
     pub opaque: bool,
+    /// The same for the operator's second replacement, where it has one.
+    pub same2: bool,
+    pub differs2: bool,
 }
 
 impl ArithObs {
@@ -672,6 +679,8 @@ impl ArithObs {
             same: bits & 1 != 0,
             differs: bits & 2 != 0,
             opaque: bits & 4 != 0,
+            same2: bits & 8 != 0,
+            differs2: bits & 16 != 0,
         }
     }
 
@@ -679,6 +688,28 @@ impl ArithObs {
         self.same |= other.same;
         self.differs |= other.differs;
         self.opaque |= other.opaque;
+        self.same2 |= other.same2;
+        self.differs2 |= other.differs2;
+    }
+
+    /// The observations as they are for the second replacement.
+    pub fn second(&self) -> ArithObs {
+        ArithObs {
+            same: self.same2,
+            differs: self.differs2,
+            opaque: self.opaque,
+            same2: false,
+            differs2: false,
+        }
+    }
+
+    /// Whether mutation `m` computes another value in this test.
+    pub fn infected_by(&self, m: Mutation) -> bool {
+        if m == Mutation::ArithSwap2 {
+            self.differs2
+        } else {
+            self.differs
+        }
     }
 }
 
@@ -1168,7 +1199,8 @@ mod tests {
             ArithObs {
                 same: true,
                 differs: false,
-                opaque: true
+                opaque: true,
+                ..Default::default()
             }
         );
     }

@@ -111,6 +111,9 @@ pub const LOGIC_RHS_FALSE: u8 = 4;
 pub const ARITH_SAME: u8 = 1;
 pub const ARITH_DIFFERS: u8 = 2;
 pub const ARITH_OPAQUE: u8 = 4;
+/// The same two for the second operator a mutant can use instead.
+pub const ARITH_SAME2: u8 = 8;
+pub const ARITH_DIFFERS2: u8 = 16;
 
 #[derive(Clone, Copy, PartialEq, Debug)]
 pub enum Mutant {
@@ -129,6 +132,8 @@ pub enum Mutant {
     LogicDropLhs,
     /// `+` <-> `-`, `*` <-> `/`, `%` -> `/`, `&` <-> `|`, `^` -> `&`, `<<` <-> `>>`.
     ArithSwap,
+    /// `+` -> `*`, `-` -> `/`, `*` -> `+`, `/` -> `%`, `%` -> `+`, `&` -> `^`, `|` -> `^`, `^` -> `|`.
+    ArithSwap2,
     /// `!x` becomes `x`.
     DropNot,
     /// `a..b` becomes `a..=b` and the other way round.
@@ -149,6 +154,7 @@ pub fn parse_mutant(spec: &str) -> Option<(u32, Mutant)> {
         "ldr" => Mutant::LogicDropRhs,
         "ldl" => Mutant::LogicDropLhs,
         "asw" => Mutant::ArithSwap,
+        "as2" => Mutant::ArithSwap2,
         "unn" => Mutant::DropNot,
         "rng" => Mutant::RangeEnd,
         "mmx" => Mutant::MinMax,
@@ -592,6 +598,21 @@ pub fn arith_swapped(op: u8) -> u8 {
     }
 }
 
+/// The operator the `ArithSwap2` mutant uses. The shifts have one alternative only.
+pub fn arith_swapped2(op: u8) -> Option<u8> {
+    Some(match op {
+        ADD => MUL,
+        SUB => DIV,
+        MUL => ADD,
+        DIV => REM,
+        REM => ADD,
+        BITAND => BITXOR,
+        BITOR => BITXOR,
+        BITXOR => BITOR,
+        _ => return None,
+    })
+}
+
 pub trait ArithNum: Copy {
     fn tmt_real(op: u8, a: Self, b: Self) -> Self;
     /// The result as bits, or `None` where the real operator would overflow or divide by zero.
@@ -602,25 +623,32 @@ pub trait ArithNum: Copy {
     /// An overflow or a division by zero on either side counts as different: what such
     /// an operation does (panic or wrap, and with which message) is not modelled here, so
     /// only running the tests can tell.
-    fn tmt_same(op: u8, a: Self, b: Self) -> bool {
-        match (
-            Self::tmt_safe(op, a, b),
-            Self::tmt_safe(arith_swapped(op), a, b),
-        ) {
+    fn tmt_same(op: u8, other: u8, a: Self, b: Self) -> bool {
+        match (Self::tmt_safe(op, a, b), Self::tmt_safe(other, a, b)) {
             (Some(x), Some(y)) => x == y,
             _ => false,
         }
     }
 
     fn tmt_run(site: u32, op: u8, a: Self, b: Self) -> Self {
-        if mutant_at(site) == Some(Mutant::ArithSwap) {
-            return Self::tmt_real(arith_swapped(op), a, b);
+        let second = arith_swapped2(op);
+        match (mutant_at(site), second) {
+            (Some(Mutant::ArithSwap), _) => return Self::tmt_real(arith_swapped(op), a, b),
+            (Some(Mutant::ArithSwap2), Some(other)) => return Self::tmt_real(other, a, b),
+            _ => {}
         }
-        let bits = if Self::tmt_same(op, a, b) {
+        let mut bits = if Self::tmt_same(op, arith_swapped(op), a, b) {
             ARITH_SAME
         } else {
             ARITH_DIFFERS
         };
+        if let Some(other) = second {
+            bits |= if Self::tmt_same(op, other, a, b) {
+                ARITH_SAME2
+            } else {
+                ARITH_DIFFERS2
+            };
+        }
         record_bits(b'A', site, bits);
         Self::tmt_real(op, a, b)
     }

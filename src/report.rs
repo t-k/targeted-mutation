@@ -51,6 +51,9 @@ pub struct Report {
     pub sites: usize,
     /// Sites that could not be instrumented (the probe did not compile there).
     pub skipped_sites: usize,
+    /// Values a function's body was to be replaced by that do not have its type
+    /// (`Default::default()` for a type without a default): those mutants do not exist.
+    pub unviable_mutants: usize,
     pub mutants_run: usize,
     pub mutants_killed: usize,
     /// Killed mutants that were stopped by the timeout (typically an endless loop).
@@ -130,6 +133,18 @@ fn show_float(v: f64) -> String {
 pub fn describe(site: &Site, m: Mutation) -> String {
     match &site.kind {
         SiteKind::Stmt => format!("delete `{}`", one_line(&site.text)),
+        SiteKind::Neg { operand, .. } => format!("`{}`", one_line(operand)),
+        SiteKind::Guard { .. } => match m {
+            Mutation::Const(value) => {
+                format!("the guard `{}` replaced by `{value}`", one_line(&site.text))
+            }
+            _ => format!("another guard than `{}`", one_line(&site.text)),
+        },
+        SiteKind::Field { from_base, .. } => format!(
+            "without the field `{}` (it is then `{from_base}`)",
+            one_line(&site.text)
+        ),
+        SiteKind::Body { name, value, .. } => format!("the body of `{name}` replaced by `{value}`"),
         SiteKind::Not { operand, .. } => format!("`{}`", one_line(operand)),
         SiteKind::Return { name, option, .. } => match (m, option) {
             (Mutation::Const(false), Some(_)) => format!("`{name}` returning `None`"),
@@ -174,10 +189,14 @@ pub fn describe(site: &Site, m: Mutation) -> String {
             ..
         } => {
             let eq = if *assign { "=" } else { "" };
+            let other = match m {
+                Mutation::ArithSwap2 => op.swapped2().unwrap_or(op.swapped()),
+                _ => op.swapped(),
+            };
             format!(
                 "`{} {}{eq} {}`",
                 one_line(lhs),
-                op.swapped().symbol(),
+                other.symbol(),
                 one_line(rhs)
             )
         }
@@ -449,9 +468,30 @@ pub fn return_gap_finding(
     })
 }
 
+/// Input gap at the guard of a match arm that had the same value in every test.
+pub fn guard_gap_finding(file: &str, site: &Site, always: bool, verified: bool) -> Finding {
+    Finding::InputGap {
+        at: location(file, site),
+        survivors: vec![describe(site, Mutation::Const(always))],
+        survivor_count: 1,
+        add_tests: vec![format!(
+            "a case where the guard `{}` is {}",
+            one_line(&site.text),
+            !always
+        )],
+        observed: None,
+        verified,
+    }
+}
+
 /// Input gap at an arithmetic operator: the swapped operator computes the same value on
 /// every pair of operands the tests pass.
-pub fn arith_gap_finding(file: &str, site: &Site, verified: bool) -> Option<Finding> {
+pub fn arith_gap_finding(
+    file: &str,
+    site: &Site,
+    mutation: Mutation,
+    verified: bool,
+) -> Option<Finding> {
     let SiteKind::Arith {
         op,
         assign,
@@ -464,17 +504,23 @@ pub fn arith_gap_finding(file: &str, site: &Site, verified: bool) -> Option<Find
     };
     let (lhs, rhs) = (one_line(lhs), one_line(rhs));
     let eq = if *assign { "=" } else { "" };
-    let add = match op {
-        ArithOp::Add | ArithOp::Sub => format!("`{rhs}` other than 0"),
+    let other = match mutation {
+        Mutation::ArithSwap2 => op.swapped2()?,
+        _ => op.swapped(),
+    };
+    let add = match (op, other) {
+        (ArithOp::Add, ArithOp::Sub) | (ArithOp::Sub, ArithOp::Add) => {
+            format!("`{rhs}` other than 0")
+        }
         _ => format!(
             "operands for which `{lhs} {}{eq} {rhs}` and `{lhs} {}{eq} {rhs}` differ",
             op.symbol(),
-            op.swapped().symbol()
+            other.symbol()
         ),
     };
     Some(Finding::InputGap {
         at: location(file, site),
-        survivors: vec![describe(site, Mutation::ArithSwap)],
+        survivors: vec![describe(site, mutation)],
         survivor_count: 1,
         add_tests: vec![add],
         observed: None,
@@ -667,6 +713,12 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
             report.skipped_sites
         ));
     }
+    if report.unviable_mutants > 0 {
+        out.push_str(&format!(
+            ", {} replaced bodies left out (the value does not have the type)",
+            report.unviable_mutants
+        ));
+    }
     out.push('\n');
     if !show_unreached && !report.unreached.is_empty() {
         out.push_str("(--show-unreached lists the code no test executes)\n");
@@ -698,7 +750,7 @@ mod tests {
             .unwrap()
             .sites
             .into_iter()
-            .find(|s| !matches!(s.kind, SiteKind::Return { .. }))
+            .find(|s| !matches!(s.kind, SiteKind::Return { .. } | SiteKind::Body { .. }))
             .unwrap()
     }
 
@@ -1006,7 +1058,10 @@ mod tests {
             logic_gap_finding("f.rs", &and, LogicGap::Unreached, true),
             None
         );
-        assert_eq!(arith_gap_finding("f.rs", &and, true), None);
+        assert_eq!(
+            arith_gap_finding("f.rs", &and, Mutation::ArithSwap, true),
+            None
+        );
 
         let add = site_of("fn f(total: u32, fee: u32) -> u32 { total + fee }");
         assert_eq!(describe(&add, Mutation::ArithSwap), "`total - fee`");
@@ -1014,7 +1069,7 @@ mod tests {
             survivors,
             add_tests,
             ..
-        }) = arith_gap_finding("f.rs", &add, true)
+        }) = arith_gap_finding("f.rs", &add, Mutation::ArithSwap, true)
         else {
             panic!()
         };
@@ -1027,7 +1082,7 @@ mod tests {
             survivors,
             add_tests,
             ..
-        }) = arith_gap_finding("f.rs", &mul, true)
+        }) = arith_gap_finding("f.rs", &mul, Mutation::ArithSwap, true)
         else {
             panic!()
         };
@@ -1041,7 +1096,8 @@ mod tests {
             ..add.clone()
         };
         assert_eq!(describe(&assign, Mutation::ArithSwap), "`*total -= fee`");
-        let Some(Finding::InputGap { add_tests, .. }) = arith_gap_finding("f.rs", &assign, true)
+        let Some(Finding::InputGap { add_tests, .. }) =
+            arith_gap_finding("f.rs", &assign, Mutation::ArithSwap, true)
         else {
             panic!()
         };
@@ -1057,7 +1113,8 @@ mod tests {
             ..assign.clone()
         };
         assert_eq!(describe(&shift, Mutation::ArithSwap), "`bits >>= n`");
-        let Some(Finding::InputGap { add_tests, .. }) = arith_gap_finding("f.rs", &shift, true)
+        let Some(Finding::InputGap { add_tests, .. }) =
+            arith_gap_finding("f.rs", &shift, Mutation::ArithSwap, true)
         else {
             panic!()
         };
@@ -1359,6 +1416,7 @@ mod tests {
             package: "p".into(),
             sites: 4,
             skipped_sites: 1,
+            unviable_mutants: 2,
             mutants_run: 3,
             mutants_killed: 2,
             mutants_timed_out: 0,
@@ -1382,6 +1440,10 @@ mod tests {
         assert!(!text.contains("UNREACHED"), "{text}");
         assert!(
             text.contains("3 mutants run (2 killed), 1 sites unreached, 1 sites skipped"),
+            "{text}"
+        );
+        assert!(
+            text.contains(", 2 replaced bodies left out (the value does not have the type)\n"),
             "{text}"
         );
         assert!(text.contains("--show-unreached"), "{text}");

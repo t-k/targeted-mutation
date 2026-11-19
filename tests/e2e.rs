@@ -153,11 +153,16 @@ fn missing_assertion_is_an_assertion_gap_until_the_state_is_checked() {
     let (code, report) = json(&dir);
     assert_eq!(code, 2, "{report:#}");
     let gaps = findings(&report, "assertion_gap");
-    assert_eq!(gaps.len(), 1, "{report:#}");
+    assert_eq!(gaps.len(), 2, "{report:#}");
     assert_eq!(gaps[0]["code"], "self.check_preconditions(batch)?;");
     assert_eq!(
         strings(&gaps[0]["survivors"]),
         ["delete `self.check_preconditions(batch)?;`"]
+    );
+    // The check that always passes is the same hole seen from the function.
+    assert_eq!(
+        strings(&gaps[1]["survivors"]),
+        ["the body of `check_preconditions` replaced by `Ok(())`"]
     );
     assert!(
         strings(&gaps[0]["tests"])
@@ -282,7 +287,15 @@ fn awkward_constructs() {
         .iter()
         .map(|u| u["code"].as_str().unwrap())
         .collect();
-    assert_eq!(unreached, ["fn never_called(x: u8) -> bool", "x == 7"]);
+    // `total` is a getter no test calls: nothing to probe in it, but a body to replace.
+    assert_eq!(
+        unreached,
+        [
+            "fn total(&self) -> u32",
+            "fn never_called(x: u8) -> bool",
+            "x == 7"
+        ]
+    );
     // `unsigned_floor` is `x >= 0` on an unsigned value: constant for a reason no test can
     // change, so neither the comparison nor the function is reported.
     assert!(
@@ -357,10 +370,11 @@ fn endless_loop_mutant_is_killed_by_the_timeout() {
     let started = std::time::Instant::now();
     let (code, report) = json(&dir);
     assert_eq!(code, 0, "{report:#}");
-    // Deleting `i += 1` loops forever; `i -= 1` and the negated condition fail quickly.
-    assert_eq!(report["mutants_run"], 3, "{report:#}");
-    assert_eq!(report["mutants_killed"], 3, "{report:#}");
-    assert_eq!(report["mutants_timed_out"], 1, "{report:#}");
+    // Deleting `i += 1` loops forever, and so does `i *= 1`; `i -= 1`, the negated
+    // condition and the two constant results fail quickly.
+    assert_eq!(report["mutants_run"], 6, "{report:#}");
+    assert_eq!(report["mutants_killed"], 6, "{report:#}");
+    assert_eq!(report["mutants_timed_out"], 2, "{report:#}");
     assert!(
         started.elapsed() >= std::time::Duration::from_secs(5),
         "the timeout was waited for"
@@ -408,7 +422,7 @@ fn workspace_member_by_name_and_by_directory() {
     let (code, report) = json(&ws.join("app"));
     assert_eq!(report["package"], "ws-app");
     assert_eq!(
-        report["sites"], 2,
+        report["sites"], 4,
         "only the member's own code is mutated: {report:#}"
     );
     // The dependency outside the workspace always answers true, so it never decides.
@@ -580,7 +594,7 @@ fn doc_tests_are_used_on_request() {
     assert_eq!(code, 0, "{report:#}");
     assert_eq!(
         report["unreached"].as_array().unwrap().len(),
-        4,
+        5,
         "{report:#}"
     );
     assert_eq!(report["mutants_run"], 0, "{report:#}");
@@ -593,12 +607,14 @@ fn doc_tests_are_used_on_request() {
         0,
         "{report:#}"
     );
-    // `double(2) == 4` kills `x / 2`; `is_even` is only ever called with an even number.
+    // `double(2) == 4` kills `x / 2` but not `x + 2`; `is_even` is only ever called with
+    // an even number.
     let gaps = findings(&report, "input_gap");
     // The function is that one expression, so "it always returns true" is not repeated.
     let gap_codes: Vec<&str> = gaps.iter().map(|g| g["code"].as_str().unwrap()).collect();
-    assert_eq!(gap_codes, ["x % 2 == 0"], "{report:#}");
-    assert_eq!(strings(&gaps[0]["survivors"]), ["`true`"]);
+    assert_eq!(gap_codes, ["x * 2", "x % 2 == 0"], "{report:#}");
+    assert_eq!(strings(&gaps[0]["survivors"]), ["`x + 2`"]);
+    assert_eq!(strings(&gaps[1]["survivors"]), ["`true`"]);
     assert_eq!(findings(&report, "assertion_gap").len(), 0, "{report:#}");
     assert!(
         report["mutants_killed"].as_u64().unwrap() >= 2,
@@ -868,8 +884,9 @@ fn only_changed_code_is_analysed_on_request() {
         .map(|f| f["code"].as_str().unwrap())
         .collect();
     assert_eq!(codes, ["celsius > 31.5"], "{report:#}");
-    // The changed comparison, its function, and the two sites of the new file.
-    assert_eq!(report["sites"], 4, "{report:#}");
+    // The changed comparison, its function (its result and the two bodies it can be
+    // replaced by), and the same four of the new file.
+    assert_eq!(report["sites"], 8, "{report:#}");
     let unreached: Vec<&str> = report["unreached"]
         .as_array()
         .unwrap()
@@ -988,7 +1005,7 @@ fn tests_of_dependent_packages_can_close_a_gap() {
             "{report:#}"
         );
         assert_eq!(
-            report["sites"], 2,
+            report["sites"], 4,
             "still only the core package's code: {report:#}"
         );
         assert!(

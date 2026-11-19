@@ -990,12 +990,19 @@ fn blame_error(
         let mut ids = vec![];
         for span in spans {
             if let Some(file) = file_of(span) {
-                let offset = file
-                    .rendered
-                    .as_ref()
-                    .expect("rendered before building")
-                    .to_original(span.byte_start);
-                ids.extend(instrument::blame(&file.sites, &enabled, offset));
+                let rendered = file.rendered.as_ref().expect("rendered before building");
+                // Inside the text of a probe, that probe is the one that does not fit.
+                match rendered
+                    .inserted_by(span.byte_start)
+                    .filter(|id| enabled(*id))
+                {
+                    Some(id) => ids.push(id),
+                    None => ids.extend(instrument::blame(
+                        &file.sites,
+                        &enabled,
+                        rendered.to_original(span.byte_start),
+                    )),
+                }
             }
         }
         ids
@@ -1194,8 +1201,53 @@ impl Session {
             .merged(|t| t.arith.get(&id), plan::ArithObs::merge)
             .opaque;
         Planned::Plan(match &site.kind {
-            SiteKind::Stmt if reached => reach_plan(Mutation::Delete),
-            SiteKind::Stmt => return Planned::Unreached,
+            SiteKind::Stmt
+            | SiteKind::Neg { .. }
+            | SiteKind::Field { .. }
+            | SiteKind::Body { .. }
+                if reached =>
+            {
+                reach_plan(Mutation::Delete)
+            }
+            SiteKind::Stmt
+            | SiteKind::Neg { .. }
+            | SiteKind::Field { .. }
+            | SiteKind::Body { .. } => return Planned::Unreached,
+            SiteKind::Guard { can_be_false } => {
+                let can_be_false = *can_be_false;
+                let allowed = move |m: &Mutation| can_be_false || *m != Mutation::Const(false);
+                let merged = self.merged(|t| t.returns.get(&id), plan::ReturnObs::merge);
+                let guard_plan = plan::plan_return(&merged);
+                if guard_plan.unreached {
+                    return Planned::Unreached;
+                }
+                let gaps = guard_plan
+                    .always
+                    .filter(|always| allowed(&Mutation::Const(*always)))
+                    .map(|always| PlannedGap {
+                        finding: report::guard_gap_finding(file, site, always, verify),
+                        survivors: vec![Mutation::Const(always)],
+                        // The guard is the condition it consists of.
+                        constant_expr: Some((site.start, site.end)),
+                    })
+                    .into_iter()
+                    .collect();
+                SitePlan {
+                    constant: false,
+                    cannot_differ: false,
+                    gaps,
+                    run: guard_plan.run.into_iter().filter(allowed).collect(),
+                    infected: Box::new(move |bin, m| {
+                        tests_where(bin.trace.returns.get(&id), |obs| match m {
+                            Mutation::Const(value) => obs.infected_by_const(value),
+                            _ => obs.reached(),
+                        })
+                    }),
+                    reaching: Box::new(move |bin| {
+                        tests_where(bin.trace.returns.get(&id), plan::ReturnObs::reached)
+                    }),
+                }
+            }
             SiteKind::Arm { .. } if reached => reach_plan(Mutation::Delete),
             SiteKind::Arm { .. } => return Planned::Unreached,
             SiteKind::Not { .. } if reached => reach_plan(Mutation::DropNot),
@@ -1292,41 +1344,43 @@ impl Session {
             SiteKind::Arith { .. } | SiteKind::MinMax { .. } => {
                 // `max` / `min` are recorded like an operator and its swap: they agree
                 // exactly when the operands are equal.
-                let is_min_max = matches!(site.kind, SiteKind::MinMax { .. });
-                let mutation = if is_min_max {
-                    Mutation::MinMax
-                } else {
-                    Mutation::ArithSwap
-                };
                 let merged = self.merged(|t| t.arith.get(&id), plan::ArithObs::merge);
-                let (gaps, run) = match plan::plan_arith(&merged) {
-                    plan::ArithPlan::Unreached => return Planned::Unreached,
-                    // Not numbers (`String + &str`, `Duration + Duration`): nothing to mutate.
-                    plan::ArithPlan::Opaque => return Planned::Nothing,
-                    plan::ArithPlan::NeverDiffers => (
-                        if is_min_max {
-                            report::min_max_gap_finding(file, site, verify)
-                        } else {
-                            report::arith_gap_finding(file, site, verify)
-                        }
-                        .map(|finding| PlannedGap {
-                            finding,
-                            survivors: vec![mutation],
-                            constant_expr: None,
-                        })
-                        .into_iter()
-                        .collect(),
-                        vec![],
-                    ),
-                    plan::ArithPlan::Run => (vec![], vec![mutation]),
+                let mutations: Vec<(Mutation, plan::ArithObs)> = match &site.kind {
+                    SiteKind::MinMax { .. } => vec![(Mutation::MinMax, merged)],
+                    SiteKind::Arith { op, .. } if op.swapped2().is_some() => vec![
+                        (Mutation::ArithSwap, merged),
+                        (Mutation::ArithSwap2, merged.second()),
+                    ],
+                    _ => vec![(Mutation::ArithSwap, merged)],
                 };
+                let (mut gaps, mut run) = (vec![], vec![]);
+                for (mutation, seen) in mutations {
+                    match plan::plan_arith(&seen) {
+                        plan::ArithPlan::Unreached => return Planned::Unreached,
+                        // Not numbers (`String + &str`, `Duration + Duration`): nothing to mutate.
+                        plan::ArithPlan::Opaque => return Planned::Nothing,
+                        plan::ArithPlan::NeverDiffers => {
+                            let finding = if mutation == Mutation::MinMax {
+                                report::min_max_gap_finding(file, site, verify)
+                            } else {
+                                report::arith_gap_finding(file, site, mutation, verify)
+                            };
+                            gaps.extend(finding.map(|finding| PlannedGap {
+                                finding,
+                                survivors: vec![mutation],
+                                constant_expr: None,
+                            }));
+                        }
+                        plan::ArithPlan::Run => run.push(mutation),
+                    }
+                }
                 SitePlan {
                     gaps,
                     constant: false,
                     cannot_differ: false,
                     run,
-                    infected: Box::new(move |bin, _| {
-                        tests_where(bin.trace.arith.get(&id), |obs| obs.differs)
+                    infected: Box::new(move |bin, m| {
+                        tests_where(bin.trace.arith.get(&id), |obs| obs.infected_by(m))
                     }),
                     reaching: Box::new(move |bin| {
                         tests_where(bin.trace.arith.get(&id), |obs| obs.same || obs.differs)
@@ -1949,9 +2003,16 @@ pub fn run(options: &Options) -> Result<Report> {
     let mut report = Report {
         package: package.name.clone(),
         sites: total_sites,
-        skipped_sites: disabled.len(),
         ..Report::default()
     };
+    for site in files.iter().flat_map(|f| &f.sites) {
+        if disabled.contains(&site.id) {
+            match site.kind {
+                SiteKind::Body { .. } => report.unviable_mutants += 1,
+                _ => report.skipped_sites += 1,
+            }
+        }
+    }
     let scratch = work.clone();
     let mut jobs: Vec<Job> = vec![];
     let mut work: Vec<SiteWork> = vec![];
@@ -1961,7 +2022,11 @@ pub fn run(options: &Options) -> Result<Report> {
         for site in file.sites.iter().filter(|s| !disabled.contains(&s.id)) {
             let plan = match session.plan(&file.display, site, options.verify) {
                 Planned::Unreached => {
-                    report.unreached.push(report::location(&file.display, site));
+                    // A function is one place, however many sites it is.
+                    let at = report::location(&file.display, site);
+                    if report.unreached.last() != Some(&at) {
+                        report.unreached.push(at);
+                    }
                     continue;
                 }
                 Planned::Nothing => continue,
@@ -2045,6 +2110,16 @@ pub fn run(options: &Options) -> Result<Report> {
             } else if !repeats {
                 report.findings.push(finding.clone());
             }
+        }
+        // A body that is one expression, constant in the tests: replacing the body by
+        // that constant was said at the expression (or cannot be told apart at all).
+        if let SiteKind::Body {
+            sole_expr: Some((start, end)),
+            ..
+        } = item.site.kind
+            && constants.contains(&(item.file, start, end))
+        {
+            continue;
         }
         let mut survivors = vec![];
         let mut passing_tests = BTreeSet::new();
@@ -2561,7 +2636,11 @@ serde = { path = "../../serde-fork" }
     #[test]
     fn effects_in_words() {
         let source = "fn f(s: &mut S) -> bool { s.reset(); s.count > 1 }";
-        let found = instrument::discover(source, 0).unwrap().sites;
+        let mut found = instrument::discover(source, 0).unwrap().sites;
+        found.retain(|s| !matches!(s.kind, SiteKind::Body { .. }));
+        for (id, site) in found.iter_mut().enumerate() {
+            site.id = id as u32;
+        }
         let sites: BTreeMap<u32, (&str, &Site)> =
             found.iter().map(|s| (s.id, ("src/lib.rs", s))).collect();
         let texts: Vec<&str> = found.iter().map(|s| s.text.as_str()).collect();
