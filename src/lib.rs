@@ -1,5 +1,6 @@
 //! Targeted mutation testing: find the wrong implementations your tests would let through.
 
+pub mod instrument;
 pub mod plan;
 pub mod trace;
 
