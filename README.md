@@ -65,7 +65,7 @@ Findings on the same source line are printed as one block.
 ## Usage
 
 ```text
-cargo install --git https://github.com/t-k/targeted-mutation   # installs `cargo-tmt`
+cargo install targeted-mutation
 cargo tmt [DIR] [OPTIONS]
 ```
 
