@@ -74,7 +74,7 @@ fn track_with_reporter<T>(
     let progress = Progress(Some(Mutex::default()));
     let counts = progress.0.as_ref().unwrap();
     thread::scope(|scope| {
-        let (active, finished) = mpsc::channel::<()>();
+        let (_active, finished) = mpsc::channel::<()>();
         scope.spawn(move || {
             let mut report = || {
                 let snapshot = *counts.lock().unwrap();
@@ -85,10 +85,8 @@ fn track_with_reporter<T>(
             }
             report();
         });
-        // The sender is also dropped on unwind so the reporter can return before the scope joins it.
-        let result = run(&progress);
-        drop(active);
-        result
+        // The sender drops before the scope joins the reporter, including on unwind.
+        run(&progress)
     })
 }
 

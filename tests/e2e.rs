@@ -1923,6 +1923,13 @@ fn cli_boundary() {
     assert_eq!(probe.code, 3, "{}", probe.stderr);
     let report: Value = serde_json::from_str(&probe.stdout).unwrap();
     assert_eq!(report["evaluation"], "no_mutants_executed", "{report:#}");
+    let text = tmt(&dir, &["--quiet", "--lines", "src/main.rs:3"]);
+    assert_eq!(text.code, 3, "{}", text.stderr);
+    assert!(
+        text.stdout.contains("No mutants executed."),
+        "{}",
+        text.stdout
+    );
     let rebuilt = tmt(&dir, &[args.as_slice(), &["--source-only"]].concat());
     assert_ne!(rebuilt.code, 1, "{}", rebuilt.stderr);
     let report: Value = serde_json::from_str(&rebuilt.stdout).unwrap();

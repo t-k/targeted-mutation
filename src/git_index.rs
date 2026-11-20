@@ -101,8 +101,11 @@ pub(crate) fn snapshot(workspace: &Path, copy: &Path) -> Result<()> {
         .take()
         .expect("stdin is piped")
         .write_all(&entries);
-    output(child.wait_with_output()?, "update-index --index-info")?;
-    written.context("writing the isolated Git index")
+    let updated = child
+        .wait_with_output()
+        .context("waiting for Git to write the isolated index")?;
+    output(updated, "update-index --index-info")
+        .and_then(|_| written.context("writing the isolated Git index"))
 }
 
 #[cfg(test)]
@@ -140,6 +143,26 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         output.stdout
+    }
+
+    #[test]
+    fn every_copy_command_excludes_ambient_repository_overrides() {
+        let command = super::git(Path::new("."));
+        let overrides = command
+            .get_envs()
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for name in [
+            "GIT_DIR",
+            "GIT_INDEX_FILE",
+            "GIT_WORK_TREE",
+            "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+        ] {
+            assert_eq!(
+                overrides.get(std::ffi::OsStr::new(name)),
+                Some(&None),
+                "{name}"
+            );
+        }
     }
 
     #[test]
