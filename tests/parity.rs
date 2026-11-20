@@ -91,10 +91,11 @@ fn keys_of(source: &str, site: &Site) -> Vec<Key> {
             SiteKind::Field { name, .. } => key("field", site.line, name, ""),
             // Not mutants of cargo-mutants: results replaced after the body ran, the
             // other of `min` / `max`, the end of a range, a deleted statement.
-            SiteKind::Return { .. }
-            | SiteKind::MinMax { .. }
-            | SiteKind::Range { .. }
-            | SiteKind::Stmt => unreachable!("no source mutants"),
+            // Not one of cargo-mutants either, but it can be written in the source.
+            SiteKind::Range { .. } => key("range", site.line, &mutant.what, &mutant.into),
+            SiteKind::Return { .. } | SiteKind::MinMax { .. } | SiteKind::Stmt => {
+                unreachable!("no source mutants")
+            }
         })
         .collect();
     // Where the arm can be removed, that is its guard being `false`.

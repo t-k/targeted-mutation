@@ -106,6 +106,14 @@ pub const SHR: u8 = 9;
 pub const RET_TRUE: u8 = 1;
 pub const RET_FALSE: u8 = 2;
 
+/// The exit status of a test run that cannot go on as the mutant it was started with.
+/// The driver counts such a mutant as not evaluated: neither found out nor passed.
+pub const CANNOT_EVALUATE: i32 = 86;
+
+fn cannot_evaluate() -> ! {
+    std::process::exit(CANNOT_EVALUATE)
+}
+
 /// With the reach bit of a range `a..b`: `b` was the largest value of its type, where
 /// `a..=b` cannot be written as a range of the same kind.
 pub const RANGE_AT_TOP: u8 = 2;
@@ -1305,10 +1313,15 @@ macro_rules! tmt_ranges {
             fn tmt_range(&self, site: u32) -> std::ops::Range<$t> {
                 let (a, b) = self.take();
                 if mutant_at(site) == Some(Mutant::RangeEnd) {
-                    // At the top of the type there is no "one more". The range is left
-                    // alone, and the driver does not run this mutant where that happens
-                    // (see `RANGE_AT_TOP`): it would pass for having done nothing.
-                    return a..b.checked_add(1).unwrap_or(b);
+                    // At the top of the type there is no "one more", and no range of this
+                    // kind that includes the end. The driver does not run this mutant
+                    // where the tests get here as they are (see `RANGE_AT_TOP`); a run
+                    // that only gets here with the mutant on is given up, because going
+                    // on with the range as it is would not be the mutant.
+                    return match b.checked_add(1) {
+                        Some(end) => a..end,
+                        None => cannot_evaluate(),
+                    };
                 }
                 record_bits(b'R', site, if b == <$t>::MAX { 1 | RANGE_AT_TOP } else { 1 });
                 a..b

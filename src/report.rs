@@ -143,8 +143,13 @@ pub struct Audit {
     /// Test binaries whose second recorded run was not like the first, with the number
     /// of records (what one test saw at one site) that differ.
     pub trace_differences: Vec<TraceDifference>,
-    /// Mutants that were run as probes and, for the audit, also built from the source.
+    /// Mutants that were run as probes and chosen to be built from the source as well.
     pub rebuilt: usize,
+    /// Of those, the ones that built and whose two results could be compared.
+    pub compared: usize,
+    /// And the ones that did not build (or whose probe run could not be evaluated):
+    /// nothing is known about them.
+    pub not_compared: usize,
     /// Where the two did not agree on whether the tests pass.
     pub source_disagreements: Vec<SourceDisagreement>,
 }
@@ -905,9 +910,11 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
         }
         if audit.rebuilt > 0 {
             out.push_str(&format!(
-                "audit: {} mutants also built from the source, {} with another result than as a probe\n",
+                "audit: {} mutants chosen to be built from the source as well: {} compared, {} with another result than as a probe, {} that could not be compared\n",
                 audit.rebuilt,
-                audit.source_disagreements.len()
+                audit.compared,
+                audit.source_disagreements.len(),
+                audit.not_compared
             ));
         }
         for differs in &audit.source_disagreements {
@@ -1943,15 +1950,17 @@ mod tests {
         assert!(!text.contains("built from the source"), "{text}");
         let audit = report.audit.as_mut().unwrap();
         audit.rebuilt = 1;
+        audit.not_compared = 1;
         let text = render_text(&report, false);
         assert!(
             text.contains(
-                "\naudit: 1 mutants also built from the source, 0 with another result than as a probe\n"
+                "\naudit: 1 mutants chosen to be built from the source as well: 0 compared, 0 with another result than as a probe, 1 that could not be compared\n"
             ),
             "{text}"
         );
         let audit = report.audit.as_mut().unwrap();
         audit.rebuilt = 5;
+        audit.compared = 4;
         audit.source_disagreements.push(SourceDisagreement {
             at: Location {
                 file: "src/lib.rs".into(),
@@ -1967,7 +1976,7 @@ mod tests {
         let text = render_text(&report, false);
         assert!(
             text.contains(
-                "\naudit: 5 mutants also built from the source, 1 with another result than as a probe\n\
+                "\naudit: 5 mutants chosen to be built from the source as well: 4 compared, 1 with another result than as a probe, 1 that could not be compared\n\
                  \x20 src/lib.rs:9:14  the guard `note(asked)` replaced by `true`: passes as a probe, fails built\n"
             ),
             "{text}"

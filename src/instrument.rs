@@ -973,10 +973,16 @@ pub fn source_mutants(site: &Site) -> Vec<SourceMutant> {
                 name,
             )]
         }
-        SiteKind::Return { .. }
-        | SiteKind::MinMax { .. }
-        | SiteKind::Range { .. }
-        | SiteKind::Stmt => vec![],
+        // The end taken in or left out: the two dots and the `=` are all that changes.
+        SiteKind::Range { inclusive, gap, .. } => {
+            let (from, to) = if *inclusive {
+                ("..=", "..")
+            } else {
+                ("..", "..=")
+            };
+            vec![change(gap.0, gap.1, to.to_string(), from, to)]
+        }
+        SiteKind::Return { .. } | SiteKind::MinMax { .. } | SiteKind::Stmt => vec![],
     }
 }
 
@@ -1885,12 +1891,15 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
             SiteKind::MinMax {
                 max, call, close, ..
             } => {
+                // The receiver is borrowed, as a method call borrows it: a `max` that takes
+                // `&self` leaves it where it is, and one that takes it by value copies it
+                // out (or, for a type that cannot be copied, does not compile: no probe).
                 edits.push(Edit {
                     pos: call.0,
                     end: call.1,
                     phase: 1,
                     order: 0,
-                    text: ", ".into(),
+                    text: "), ".into(),
                     site: site.id,
                 });
                 // The call's own `)` (and a trailing comma) is replaced by the probe.
@@ -1904,12 +1913,12 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     order: 0,
                     text: format!(
                         ") {{ (__tmt_a, __tmt_b) => {{ #[allow(unused_imports)] use {rt}::{{AnyMinMax as _, MinMaxPrim as _}}; \
-                         if (&{rt}::Mm(&__tmt_a, &__tmt_b)).tmt_other({}u32) {{ __tmt_a.{other}(__tmt_b) }} else {{ __tmt_a.{same}(__tmt_b) }} }} }})",
+                         if (&{rt}::Mm(__tmt_a, &__tmt_b)).tmt_other({}u32) {{ (*__tmt_a).{other}(__tmt_b) }} else {{ (*__tmt_a).{same}(__tmt_b) }} }} }})",
                         site.id
                     ),
                     site: site.id,
                 });
-                ("(match (".to_string(), String::new())
+                ("(match (&(".to_string(), String::new())
             }
             SiteKind::Range { inclusive, gap, .. } => {
                 edits.push(Edit {
@@ -2838,11 +2847,14 @@ mod tests {
             "{out}"
         );
         // The call that was written, and the other one for the mutant, on the operands
-        // as they were evaluated once.
+        // as they were evaluated once; the receiver is borrowed, not moved.
         assert!(
-            out.contains(".tmt_other(6u32) { __tmt_a.max(__tmt_b) } else { __tmt_a.min(__tmt_b) }")
+            out.contains("(match (&(v[i]), limit) {")
                 && out.contains(
-                    ".tmt_other(5u32) { __tmt_a.min(__tmt_b) } else { __tmt_a.max(__tmt_b) }"
+                    "Mm(__tmt_a, &__tmt_b)).tmt_other(6u32) { (*__tmt_a).max(__tmt_b) } else { (*__tmt_a).min(__tmt_b) }"
+                )
+                && out.contains(
+                    ".tmt_other(5u32) { (*__tmt_a).min(__tmt_b) } else { (*__tmt_a).max(__tmt_b) }"
                 ),
             "{out}"
         );
@@ -3686,13 +3698,29 @@ mod tests {
         for site in &sites {
             let none = matches!(
                 site.kind,
-                SiteKind::Return { .. }
-                    | SiteKind::Stmt
-                    | SiteKind::Range { .. }
-                    | SiteKind::MinMax { .. }
+                SiteKind::Return { .. } | SiteKind::Stmt | SiteKind::MinMax { .. }
             );
             assert_eq!(source_mutants(site).is_empty(), none, "{:?}", site.kind);
         }
+        // A range has its end taken in or left out, whichever it is not.
+        let ends = |src: &str| -> Vec<String> {
+            discover(src, 0)
+                .unwrap()
+                .sites
+                .iter()
+                .filter(|site| matches!(site.kind, SiteKind::Range { .. }))
+                .flat_map(source_mutants)
+                .map(|m| format!("{}{}{}", &src[..m.start], m.replacement, &src[m.end..]))
+                .collect()
+        };
+        assert_eq!(
+            ends("fn f(a: u8, b: u8) { for _ in a..b {} }"),
+            ["fn f(a: u8, b: u8) { for _ in a..=b {} }"]
+        );
+        assert_eq!(
+            ends("fn f(a: u8, b: u8) { for _ in a ..= b {} }"),
+            ["fn f(a: u8, b: u8) { for _ in a..b {} }"]
+        );
     }
 
     #[test]

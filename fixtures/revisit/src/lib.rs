@@ -44,6 +44,59 @@ pub fn capped(a: Level, b: Level) -> Level {
     a.max(b)
 }
 
+/// A range that reaches the last value of its type only once its end is taken in: the
+/// first count is then 1, and the second range would be `255..=255`.
+pub fn last_count() -> usize {
+    let mut end = 0u8;
+    let mut n = 0;
+    for _ in 0..2 {
+        n = (end..end).count();
+        if n > 0 {
+            end = u8::MAX;
+        }
+    }
+    n
+}
+
+/// A type that cannot be copied, says when it is dropped, and has a `max` that only
+/// looks at it.
+pub struct Gauge<'a> {
+    pub level: u32,
+    pub dropped: &'a std::cell::Cell<bool>,
+}
+
+impl Drop for Gauge<'_> {
+    fn drop(&mut self) {
+        self.dropped.set(true);
+    }
+}
+
+impl Gauge<'_> {
+    pub fn max(&self, floor: u32) -> u32 {
+        if self.level > floor {
+            self.level
+        } else {
+            floor
+        }
+    }
+
+    pub fn min(&self, ceiling: u32) -> u32 {
+        if self.level < ceiling {
+            self.level
+        } else {
+            ceiling
+        }
+    }
+}
+
+/// The reading, and whether the gauge was gone when it was taken (it is not: the gauge
+/// lives to the end of the function).
+pub fn reading(dropped: &std::cell::Cell<bool>) -> (u32, bool) {
+    let gauge = Gauge { level: 3, dropped };
+    let high = gauge.max(1);
+    (high, dropped.get())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -56,6 +109,24 @@ mod tests {
     #[test]
     fn counts_up_to_the_top() {
         assert_eq!(top_count(254, u8::MAX), 1);
+    }
+
+    #[test]
+    fn nothing_is_counted_in_the_end() {
+        assert_eq!(last_count(), 0);
+    }
+
+    #[test]
+    fn the_gauge_outlives_its_reading() {
+        let dropped = std::cell::Cell::new(false);
+        assert_eq!(reading(&dropped), (3, false));
+        assert!(dropped.get());
+        assert_eq!(Gauge { level: 1, dropped: &dropped }.max(4), 4);
+        assert_eq!(Gauge { level: 4, dropped: &dropped }.max(4), 4);
+        assert_eq!(Gauge { level: 5, dropped: &dropped }.max(4), 5);
+        assert_eq!(Gauge { level: 1, dropped: &dropped }.min(4), 1);
+        assert_eq!(Gauge { level: 4, dropped: &dropped }.min(4), 4);
+        assert_eq!(Gauge { level: 5, dropped: &dropped }.min(4), 4);
     }
 
     #[test]

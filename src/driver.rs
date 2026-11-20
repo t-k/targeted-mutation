@@ -315,7 +315,12 @@ enum Outcome {
     Pass,
     Fail,
     Timeout,
+    /// The run gave up: it could not go on as the mutant it was started with.
+    Unable,
 }
+
+/// The exit status by which the injected runtime says so (`tmt_rt::CANNOT_EVALUATE`).
+const CANNOT_EVALUATE: i32 = 86;
 
 /// Keeps two runs from rebuilding the same working copy under each other.
 struct WorkLock(PathBuf);
@@ -997,6 +1002,8 @@ fn run_binary(
         if let Some(status) = child.try_wait()? {
             break if status.success() {
                 Outcome::Pass
+            } else if status.code() == Some(CANNOT_EVALUATE) {
+                Outcome::Unable
             } else {
                 Outcome::Fail
             };
@@ -1168,6 +1175,8 @@ struct JobResult {
     /// The tests the mutant passed, when it passed all of them.
     survived: Option<Vec<String>>,
     timed_out: bool,
+    /// The mutant could not be run as what it is: neither found out nor passed.
+    unable: bool,
 }
 
 /// The tests of one binary whose observations satisfy `pick`.
@@ -1599,6 +1608,7 @@ impl Session {
                 return Ok(JobResult {
                     survived: None,
                     timed_out: outcome == Outcome::Timeout,
+                    unable: outcome == Outcome::Unable,
                 });
             }
             match filter {
@@ -1609,6 +1619,7 @@ impl Session {
         Ok(JobResult {
             survived: Some(passed),
             timed_out: false,
+            unable: false,
         })
     }
 
@@ -2152,7 +2163,7 @@ pub fn run(options: &Options) -> Result<Report> {
                      from running them",
                     bin.name
                 ),
-                Outcome::Timeout => {}
+                Outcome::Timeout | Outcome::Unable => {}
             }
         }
         // No file means no probe was reached. Anything else unreadable or malformed means
@@ -2350,8 +2361,10 @@ pub fn run(options: &Options) -> Result<Report> {
         }
         report.audit = Some(audit);
     }
-    report.mutants_run = results.len();
-    report.mutants_killed = results.iter().filter(|r| r.survived.is_none()).count();
+    let unable = results.iter().filter(|r| r.unable).count();
+    report.mutants_not_evaluated += unable;
+    report.mutants_run = results.len() - unable;
+    report.mutants_killed = results.iter().filter(|r| r.survived.is_none()).count() - unable;
     report.mutants_timed_out = results.iter().filter(|r| r.timed_out).count();
 
     // Expressions known to be constant in the tests: comparisons with a confirmed
@@ -2546,9 +2559,16 @@ pub fn run(options: &Options) -> Result<Report> {
             if let Some(job) = twin {
                 // Only compared: the probe's run is the one that is counted and reported.
                 let as_probe = results[*job].survived.is_some();
-                if outcome.is_some_and(|built| (built == Outcome::Pass) != as_probe)
-                    && let Some(audit) = report.audit.as_mut()
-                {
+                let Some(audit) = report.audit.as_mut() else {
+                    continue;
+                };
+                // What does not build, and what the probe could not be, says nothing.
+                let comparable = outcome.filter(|_| !results[*job].unable);
+                match comparable {
+                    Some(_) => audit.compared += 1,
+                    None => audit.not_compared += 1,
+                }
+                if comparable.is_some_and(|built| (built == Outcome::Pass) != as_probe) {
                     let verdict = |passes: bool| if passes { "passes" } else { "fails" };
                     audit.source_disagreements.push(report::SourceDisagreement {
                         at: report::location(&file.display, site),
@@ -2711,7 +2731,11 @@ fn mutation_of(site: &Site, mutant: &instrument::SourceMutant) -> Mutation {
             }
         }
         SiteKind::Guard { .. } => Mutation::Const(mutant.into == "true"),
-        // The other kinds have one mutant of the source, described whatever it is called.
+        SiteKind::Logic { .. } => Mutation::LogicSwap,
+        SiteKind::Not { .. } => Mutation::DropNot,
+        SiteKind::Range { .. } => Mutation::RangeEnd,
+        // The other kinds have one mutant of the source: a statement, an arm, a field or
+        // a minus that is not there, a body that is another.
         _ => Mutation::Delete,
     }
 }
@@ -3671,6 +3695,54 @@ serde = { path = "../../serde-fork" }
         assert_eq!(spread(10, 5), [0, 2, 4, 6, 8]);
         assert_eq!(spread(4, 3), [0, 1, 2]);
         assert_eq!(spread(7, 6), [0, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn a_mutant_of_the_source_is_the_mutation_its_probe_runs() {
+        // The runtime and the driver have to mean the same status.
+        assert_eq!(CANNOT_EVALUATE, crate::tmt_rt::CANNOT_EVALUATE);
+        let source = "fn f(a: i32, b: i32, ok: bool, k: Option<i32>, base: O) -> O { \
+                      go(); \
+                      let x = match k { Some(n) if n > 1 => !ok && a < b, _ => -a + b > 0 || ok }; \
+                      for _ in a..b {} for _ in a..=b {} \
+                      O { on: x, ..base } }";
+        let found = instrument::discover(source, 0).unwrap().sites;
+        let mut seen = BTreeSet::new();
+        for site in &found {
+            for mutant in instrument::source_mutants(site) {
+                let kind = format!("{:?}", site.kind);
+                let kind = kind.split([' ', '{', '(']).next().unwrap().to_string();
+                seen.insert((
+                    kind,
+                    mutant.into.clone(),
+                    format!("{:?}", mutation_of(site, &mutant)),
+                ));
+            }
+        }
+        let expected = [
+            ("Arith", "*", "ArithSwap2"),
+            ("Arith", "-", "ArithSwap"),
+            ("Arm", "Some(n) if n > 1", "Delete"),
+            ("Body", "Default::default()", "Delete"),
+            ("Cmp", "<", "Op(Lt)"),
+            ("Cmp", "<=", "Op(Le)"),
+            ("Cmp", "==", "Op(Eq)"),
+            ("Cmp", ">", "Op(Gt)"),
+            ("Cmp", ">=", "Op(Ge)"),
+            ("Field", "on", "Delete"),
+            ("Guard", "true", "Const(true)"),
+            ("Logic", "&&", "LogicSwap"),
+            ("Logic", "||", "LogicSwap"),
+            ("Neg", "", "Delete"),
+            ("Not", "", "DropNot"),
+            ("Range", "..", "RangeEnd"),
+            ("Range", "..=", "RangeEnd"),
+        ];
+        let seen: Vec<(&str, &str, &str)> = seen
+            .iter()
+            .map(|(kind, into, mutation)| (kind.as_str(), into.as_str(), mutation.as_str()))
+            .collect();
+        assert_eq!(seen, expected);
     }
 
     #[test]

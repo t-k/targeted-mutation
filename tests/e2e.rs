@@ -1568,10 +1568,17 @@ fn mutants_are_run_as_what_they_are() {
     assert_eq!(survivors("x < 1"), ["`x > 1`"], "{report:#}");
     // `from..=to` cannot be made of `from..to` where `to` is the largest value there is:
     // the mutant is not run and not reported as passing.
-    assert_eq!(report["mutants_not_evaluated"], 1, "{report:#}");
+    // The same where the tests only get to the largest value with the mutant on
+    // (`last_count`): that run is given up, not taken for a pass.
+    assert_eq!(report["mutants_not_evaluated"], 2, "{report:#}");
     assert!(survivors("from..to").is_empty(), "{report:#}");
+    assert!(survivors("end..end").is_empty(), "{report:#}");
+    // `Gauge` cannot be copied and says when it is dropped; its `max` only looks at it.
+    // The probe borrows it as the call did (the test would see it dropped otherwise),
+    // and it is a probe: nothing was left out for not compiling.
+    assert_eq!(report["skipped_sites"], 0, "{report:#}");
     let text = tmt(&dir, &["--quiet"]).stdout;
-    assert!(text.contains("(1 mutants not evaluated: a range"), "{text}");
+    assert!(text.contains("(2 mutants not evaluated: a range"), "{text}");
 }
 
 #[test]
@@ -1602,8 +1609,16 @@ fn probes_agree_with_the_source(names: &[&str]) {
         let report: Value = serde_json::from_str(&run.stdout)
             .unwrap_or_else(|e| panic!("{name}: {e}: {}{}", run.stdout, run.stderr));
         let audit = &report["audit"];
+        let count = |what: &str| audit[what].as_u64().unwrap();
+        assert!(count("rebuilt") >= 10, "{name}: {audit:#}");
+        // Every one of them is accounted for, and most could be compared.
+        assert_eq!(
+            count("compared") + count("not_compared"),
+            count("rebuilt"),
+            "{name}"
+        );
         assert!(
-            audit["rebuilt"].as_u64().unwrap() >= 10,
+            count("compared") * 10 >= count("rebuilt") * 9,
             "{name}: {audit:#}"
         );
         assert_eq!(
@@ -1634,6 +1649,12 @@ fn probes_agree_with_the_source_on_the_larger_fixtures() {
 #[test]
 fn an_audit_builds_mutants_from_the_source_and_compares() {
     probes_agree_with_the_source(&["revisit"]);
+    // One of `revisit` cannot be compared: the range whose probe gives up at the largest
+    // value. Built from the source it is found out, which the probe could not show.
+    let dir = fixture("revisit", "audit-revisit-counts");
+    let run = tmt(&dir, &["--json", "--quiet", "--audit", "1000"]);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(report["audit"]["not_compared"], 1, "{report:#}");
 
     // A guard that does something: taken for `true` as a probe it is still evaluated,
     // replaced by `true` in the source it is not, and the test notices.
