@@ -143,6 +143,21 @@ pub struct Audit {
     /// Test binaries whose second recorded run was not like the first, with the number
     /// of records (what one test saw at one site) that differ.
     pub trace_differences: Vec<TraceDifference>,
+    /// Mutants that were run as probes and, for the audit, also built from the source.
+    pub rebuilt: usize,
+    /// Where the two did not agree on whether the tests pass.
+    pub source_disagreements: Vec<SourceDisagreement>,
+}
+
+/// A mutant on which its probe and its source form do not agree.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct SourceDisagreement {
+    #[serde(flatten)]
+    pub at: Location,
+    pub mutant: String,
+    /// `passes` or `fails`: what the tests did with the probe, and with the source.
+    pub as_probe: String,
+    pub built: String,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -886,6 +901,24 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
             out.push_str(&format!(
                 "  {}:{}:{}  {}\n",
                 at.file, at.line, at.column, at.code
+            ));
+        }
+        if audit.rebuilt > 0 {
+            out.push_str(&format!(
+                "audit: {} mutants also built from the source, {} with another result than as a probe\n",
+                audit.rebuilt,
+                audit.source_disagreements.len()
+            ));
+        }
+        for differs in &audit.source_disagreements {
+            out.push_str(&format!(
+                "  {}:{}:{}  {}: {} as a probe, {} built\n",
+                differs.at.file,
+                differs.at.line,
+                differs.at.column,
+                differs.mutant,
+                differs.as_probe,
+                differs.built
             ));
         }
         if audit.trace_differences.is_empty() {

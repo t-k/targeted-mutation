@@ -2459,7 +2459,8 @@ pub fn run(options: &Options) -> Result<Report> {
 
     // 7b. What a probe cannot be put in is mutated in the source, built and run: code in
     // a `const fn`, and the sites whose probe did not compile.
-    let mut built: Vec<(&SourceFile, &Site, instrument::SourceMutant)> = vec![];
+    // The last of the four: for an audit, the job that ran the same mutant as a probe.
+    let mut built: Vec<(&SourceFile, &Site, instrument::SourceMutant, Option<usize>)> = vec![];
     for file in &files {
         let retried = file.sites.iter().filter(|site| {
             disabled.contains(&site.id) && !matches!(site.kind, SiteKind::Body { .. })
@@ -2468,16 +2469,39 @@ pub fn run(options: &Options) -> Result<Report> {
             built.extend(
                 instrument::source_mutants(site)
                     .into_iter()
-                    .map(|mutant| (file, site, mutant)),
+                    .map(|mutant| (file, site, mutant, None)),
             );
         }
     }
     if !options.rebuild {
         report.mutants_not_built = built.len();
+        built.clear();
     }
-    if options.rebuild && !built.is_empty() {
+    // An audit also builds some of the mutants that were run as probes, from the source
+    // as a person would write them, to see whether a probe and the real thing agree.
+    if let (Some(wanted), Some(audit)) = (options.audit, report.audit.as_mut()) {
+        let mut twins = vec![];
+        for file in &files {
+            for site in file.sites.iter().filter(|s| !disabled.contains(&s.id)) {
+                for mutant in instrument::source_mutants(site) {
+                    let mutation = mutation_of(site, &mutant);
+                    let job = jobs
+                        .iter()
+                        .position(|job| job.site == site.id && job.mutation == mutation);
+                    if let Some(job) = job {
+                        twins.push((file, site, mutant, Some(job)));
+                    }
+                }
+            }
+        }
+        let chosen = spread(twins.len(), wanted);
+        audit.rebuilt = chosen.len();
+        let mut twins: Vec<Option<_>> = twins.into_iter().map(Some).collect();
+        built.extend(chosen.into_iter().filter_map(|nth| twins[nth].take()));
+    }
+    if !built.is_empty() {
         session.note(&format!(
-            "building {} mutants one by one (code a probe cannot be put in)",
+            "building {} mutants one by one (code a probe cannot be put in, or to compare with the probe)",
             built.len()
         ));
         let instrumented = |file: &SourceFile, text: &str| {
@@ -2492,7 +2516,7 @@ pub fn run(options: &Options) -> Result<Report> {
         let mut by_speed: Vec<&TestBinary> = session.binaries.iter().collect();
         by_speed.sort_by_key(|bin| bin.baseline);
         let mut survivors: Vec<(report::Location, Vec<String>)> = vec![];
-        for (file, site, mutant) in &built {
+        for (file, site, mutant, twin) in &built {
             let mutated = format!(
                 "{}{}{}",
                 &file.original[..mutant.start],
@@ -2519,6 +2543,22 @@ pub fn run(options: &Options) -> Result<Report> {
             let rendered = file.rendered.as_ref().expect("rendered before building");
             state.write(&file.path, &instrumented(file, &rendered.text))?;
             let outcome = attempted?;
+            if let Some(job) = twin {
+                // Only compared: the probe's run is the one that is counted and reported.
+                let as_probe = results[*job].survived.is_some();
+                if outcome.is_some_and(|built| (built == Outcome::Pass) != as_probe)
+                    && let Some(audit) = report.audit.as_mut()
+                {
+                    let verdict = |passes: bool| if passes { "passes" } else { "fails" };
+                    audit.source_disagreements.push(report::SourceDisagreement {
+                        at: report::location(&file.display, site),
+                        mutant: report::describe(site, mutation_of(site, mutant)),
+                        as_probe: verdict(as_probe).to_string(),
+                        built: verdict(!as_probe).to_string(),
+                    });
+                }
+                continue;
+            }
             match outcome {
                 None => report.unviable_mutants += 1,
                 Some(outcome) => {

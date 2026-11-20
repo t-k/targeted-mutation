@@ -1593,3 +1593,67 @@ fn a_part_of_a_file_numbers_its_findings_as_the_whole_does() {
         "{report:#}"
     );
 }
+
+/// What a probe does and what the same change does in the source agree, mutant by mutant.
+fn probes_agree_with_the_source(names: &[&str]) {
+    for name in names {
+        let dir = fixture(name, &format!("audit-{name}"));
+        let run = tmt(&dir, &["--json", "--quiet", "--audit", "1000"]);
+        let report: Value = serde_json::from_str(&run.stdout)
+            .unwrap_or_else(|e| panic!("{name}: {e}: {}{}", run.stdout, run.stderr));
+        let audit = &report["audit"];
+        assert!(
+            audit["rebuilt"].as_u64().unwrap() >= 10,
+            "{name}: {audit:#}"
+        );
+        assert_eq!(
+            audit["source_disagreements"].as_array().unwrap().len(),
+            0,
+            "{name}: {audit:#}"
+        );
+        assert_eq!(
+            audit["disagreements"].as_array().unwrap().len(),
+            0,
+            "{name}: {audit:#}"
+        );
+        // The built ones are only compared: the counts are those of a run without them.
+        let (_, plain) = json(&dir);
+        assert_eq!(report["mutants_run"], plain["mutants_run"], "{name}");
+        assert_eq!(report["findings"], plain["findings"], "{name}");
+    }
+}
+
+/// The same on the fixtures made of the constructs a probe has to be careful with. It
+/// builds some two hundred mutants: `cargo test -- --ignored`.
+#[test]
+#[ignore = "builds every mutant of four fixtures; takes minutes"]
+fn probes_agree_with_the_source_on_the_larger_fixtures() {
+    probes_agree_with_the_source(&["operators", "semantics", "shapes", "kitchen-sink"]);
+}
+
+#[test]
+fn an_audit_builds_mutants_from_the_source_and_compares() {
+    probes_agree_with_the_source(&["revisit"]);
+
+    // A guard that does something: taken for `true` as a probe it is still evaluated,
+    // replaced by `true` in the source it is not, and the test notices.
+    let dir = fixture("guarded", "audit-guarded");
+    let run = tmt(&dir, &["--json", "--quiet", "--audit", "1000"]);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    let differ = report["audit"]["source_disagreements"].as_array().unwrap();
+    assert_eq!(differ.len(), 1, "{report:#}");
+    assert_eq!(differ[0]["code"], "note(asked)");
+    assert_eq!(
+        differ[0]["mutant"],
+        "the guard `note(asked)` replaced by `true`"
+    );
+    assert_eq!(
+        (differ[0]["as_probe"].as_str(), differ[0]["built"].as_str()),
+        (Some("passes"), Some("fails"))
+    );
+    let text = tmt(&dir, &["--quiet", "--audit", "1000"]).stdout;
+    assert!(
+        text.contains("the guard `note(asked)` replaced by `true`: passes as a probe, fails built"),
+        "{text}"
+    );
+}

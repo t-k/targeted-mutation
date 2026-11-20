@@ -94,7 +94,7 @@ Running:
 - `--no-verify`: trust the trace; do not re-run tests against predicted survivors.
 - `--no-effects`: do not trace surviving mutants to say what they change. (Where several mutants survive at one place, one of them is followed through the tests; the report says which, in the text and as `effects_of`.)
 - `--features A,B`, `--all-features`, `--no-default-features`, `--locked`: as for `cargo test`, and told to every cargo command of the run.
-- `--audit N`: check the run itself. Up to N of the surviving mutants (spread evenly, the same ones every time) are run once more against every test of every binary, not only the tests chosen for them; one that fails is counted as found out and listed. The tests are also recorded a second time, and binaries whose two recordings differ are listed: their tests do not always do the same.
+- `--audit N`: check the run itself, three ways. Up to N of the surviving mutants (spread evenly, the same ones every time) are run once more against every test of every binary, not only the tests chosen for them; one that fails is counted as found out and listed. Up to N of the mutants that were run as probes are also built from the source, as a person would write them, and run against all tests; where the result is not the one of the probe, both are listed (a build and a full test run each: slow). And the tests are recorded a second time; binaries whose two recordings differ are listed, since their tests do not always do the same.
 - `--opt-level N`: build the tests at optimisation level N (0 to 3) instead of the profile's own. Worth it when tests spend their time in loops (see "Speed").
 - `--rebuild`: also run the mutants that need a build of their own (see "How it works", step 5). Without it the summary says how many were left out.
 
@@ -150,7 +150,7 @@ Functions, `impl` blocks and modules marked `#[mutants::skip]` (also inside `cfg
 
 ### Compared with cargo-mutants
 
-For `<` and `>`, `==` and the reverse operator are run as well, unless another mutant that is run gives the same answer for every relation the tests saw (without equal operands, `<` in place of `>` is the negation).
+For `<` and `>`, `==` and the reverse operator are run as well. Only a replacement that answers like the original for everything the tests saw is not run (it passes them all, and the gap says so). Two mutants that both change an outcome are never taken for one, even where they answer alike for all that was seen: once the code goes another way, the comparison meets values the tests never gave it.
 
 Every mutant that cargo-mutants 27.1.0 lists for the crates in `fixtures/` has a counterpart here: `tests/parity.rs` checks the stored lists (`tests/data/cargo-mutants`) against the sites this tool finds, and names the exceptions with their reason (a `||` inside a let chain, which does not compile). An empty body is not made for a function that consists of one statement, because deleting that statement is the same mutant. The same test checks any other crate on request (see its last function); that is how the table above was completed against real code. On top of those come the mutants that need the trace: shifted boundaries, an ignored operand of `&&` / `||`, a result replaced after the body ran, deleted statements, `min` / `max`, range ends.
 
@@ -205,6 +205,8 @@ java -jar tla2tools.jar formal/tla/RepairLoop.tla
 - A probe keeps the order of evaluation and the life of temporaries of the code it stands for, with two exceptions that need unusual code to be seen: a temporary with a destructor inside the value of a field of a struct literal with a base (`S { x: guard().value(), ..base }`) is dropped before the next field is evaluated, and `*p += f()` on a number takes the place before it calls `f`, which a `DerefMut` with side effects can observe.
 - A thread that a test names exactly like another test of the same binary is taken for that test, and mutants are then run against the wrong test. `--audit` shows it.
 - A replaced operator in a mutant that is built keeps its operands by parentheses where the new operator binds otherwise (`8 - (2 + 3)`). A crate that denies `unused_parens` rejects those where they turn out not to be needed; they are then counted as not compiling.
+- `a..b` cannot be made into `a..=b` by a probe where `b` is the largest value of its type. Where a test runs such a range the mutant is not run; the summary says how many were not evaluated.
+- A mutant that was built on its own (`--rebuild`) and passes every test is reported as `SURVIVOR`: nothing is recorded for such code, so it is not known whether a test runs it at all.
 - With `--jobs N` each test binary gets its share of the cores (never fewer than two test threads), and a mutant that ran out of time while others were running is run once more on its own; the second run counts. A machine that is loaded by something else can still turn a slow mutant into a timeout (counted as killed, and said in the summary).
 
 ## Speed
@@ -230,6 +232,7 @@ The idea of generating mutants with knowledge of the tests is called *test-aware
 
 ```text
 cargo test          # unit tests, PICT tables, end-to-end runs on fixtures/, parity with cargo-mutants
+cargo test -- --ignored   # also: every mutant of four fixtures built from the source and compared with its probe (minutes)
 cargo run -- .      # the tool on itself
 ```
 
