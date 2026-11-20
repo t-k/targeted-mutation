@@ -1507,7 +1507,13 @@ fn the_features_asked_for_are_the_ones_analysed() {
 
 #[test]
 fn a_finding_is_known_by_where_it_is() {
-    let dir = fixture("twins", "twins");
+    let repository = Path::new(env!("CARGO_TARGET_TMPDIR")).join("twins-repository");
+    let _ = fs::remove_dir_all(&repository);
+    let dir = repository.join("twins");
+    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("fixtures/twins");
+    copy(&source, &dir);
+    fs::write(repository.join(".gitignore"), "target/\n").unwrap();
+    git_output(&repository, &["init", "-q"]);
     let ids = |report: &Value| -> Vec<String> {
         report["findings"]
             .as_array()
@@ -1542,10 +1548,7 @@ fn a_finding_is_known_by_where_it_is() {
     let uri = result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
         .as_str()
         .unwrap();
-    assert!(
-        uri.ends_with("twins/src/lib.rs") && uri.len() > "src/lib.rs".len(),
-        "{uri}"
-    );
+    assert_eq!(uri, "twins/src/lib.rs");
 
     // Known findings stay known when the code moves and a new twin appears; only the
     // new one is reported.
