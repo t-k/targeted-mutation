@@ -244,6 +244,10 @@ cargo run -- .      # the tool on itself
 
 The lists in `tests/data/cargo-mutants` are `cargo mutants --list` run in a copy of each fixture.
 
+### Releasing
+
+Update `Cargo.toml` and `Cargo.lock`, then push the release commit to `main` and check CI. Run the [Release workflow](https://github.com/t-k/targeted-mutation/actions/workflows/release.yml) manually to verify the package. To publish, push a tag matching the package version, such as `v0.1.1`. The tag run verifies the package again and publishes it to crates.io using Trusted Publishing.
+
 ## License
 
 Apache License, Version 2.0. See [LICENSE](LICENSE).
