@@ -926,6 +926,16 @@ fn run_binary(
 
     let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
     let threads = test_threads(cores, sharing);
+    // Where the runtime leaves a mark when a run cannot go on as its mutant. The exit
+    // status says so too, but only that of the tests themselves: a program a test
+    // started gives its status to the test, which fails for it.
+    static RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let unable_mark = std::env::temp_dir().join(format!(
+        "tmt-unable-{}-{}",
+        std::process::id(),
+        RUNS.fetch_add(1, Ordering::SeqCst)
+    ));
+    let _ = fs::remove_file(&unable_mark);
     let mut cmd = match &bin.runner {
         Runner::Exe(exe) => {
             let mut cmd = Command::new(exe);
@@ -957,6 +967,7 @@ fn run_binary(
     };
     cmd.env_remove("TMT_TRACE")
         .env_remove("TMT_MUTANT")
+        .env("TMT_UNABLE", &unable_mark)
         .envs(env.iter().copied())
         .stdin(Stdio::null())
         .stdout(if stop_at_first_failure {
@@ -1020,6 +1031,10 @@ fn run_binary(
     };
     if let Some(watcher) = watcher {
         let _ = watcher.join();
+    }
+    // Whatever the tests made of it, a run that left the mark was not the mutant's.
+    if fs::remove_file(&unable_mark).is_ok() {
+        return Ok(Outcome::Unable);
     }
     Ok(outcome)
 }
@@ -2512,7 +2527,11 @@ pub fn run(options: &Options) -> Result<Report> {
             for site in file.sites.iter().filter(|s| !disabled.contains(&s.id)) {
                 for mutant in instrument::source_mutants(site) {
                     // The first of the mutations that are this change and that was run.
-                    let job = mutations_like(site, &mutant)
+                    let unordered = session
+                        .binaries
+                        .iter()
+                        .any(|bin| bin.trace.merged(site.id).un);
+                    let job = mutations_like(site, &mutant, unordered)
                         .into_iter()
                         .find_map(|mutation| {
                             jobs.iter()
@@ -2761,10 +2780,18 @@ fn mutation_of(site: &Site, mutant: &instrument::SourceMutant) -> Mutation {
 /// its own name first. A comparison is planned in other words than it is written in:
 /// `a != b` for `a == b` is run as the negation, and on integers `a <= b` for `a < b` as
 /// the bound moved by one.
-fn mutations_like(site: &Site, mutant: &instrument::SourceMutant) -> Vec<Mutation> {
+///
+/// `unordered`: the tests gave the comparison operands without an order (NaN). The
+/// negation of `>=` is then true where `<` is false, and is not the same change.
+fn mutations_like(
+    site: &Site,
+    mutant: &instrument::SourceMutant,
+    unordered: bool,
+) -> Vec<Mutation> {
     let mut all = vec![mutation_of(site, mutant)];
     if let (SiteKind::Cmp { op, .. }, Mutation::Op(into)) = (&site.kind, all[0]) {
-        if into == op.negated() {
+        let an_order_is_needed = matches!(op, plan::CmpOp::Le | plan::CmpOp::Ge);
+        if into == op.negated() && !(unordered && an_order_is_needed) {
             all.push(Mutation::Negate);
         }
         match (op, into) {
@@ -3790,7 +3817,7 @@ serde = { path = "../../serde-fork" }
                 .into_iter()
                 .find(|mutant| mutant.into == into)
                 .unwrap();
-            mutations_like(site, &mutant)
+            mutations_like(site, &mutant, false)
         };
         use plan::CmpOp::*;
         for (op, into, expected) in [
@@ -3808,6 +3835,24 @@ serde = { path = "../../serde-fork" }
             let source = format!("fn f(a: i32, b: i32) -> bool {{ a {op} b }}");
             assert_eq!(like(&source, into), expected, "{op} as {into}");
         }
+        // Where the tests gave operands without an order, the negation of `>=` is not
+        // `<`: only the operator itself is the same change. `!=` is still the negation.
+        let unordered = |op: &str, into: &str| -> Vec<Mutation> {
+            let source = format!("fn f(a: f64, b: f64) -> bool {{ a {op} b }}");
+            let sites = instrument::discover(&source, 0).unwrap().sites;
+            let site = sites
+                .iter()
+                .find(|site| matches!(site.kind, SiteKind::Cmp { .. }))
+                .unwrap();
+            let mutant = instrument::source_mutants(site)
+                .into_iter()
+                .find(|mutant| mutant.into == into)
+                .unwrap();
+            mutations_like(site, &mutant, true)
+        };
+        assert_eq!(unordered(">=", "<"), [Mutation::Op(Lt)]);
+        assert_eq!(unordered("<=", ">"), [Mutation::Op(Gt)]);
+        assert_eq!(unordered("==", "!="), [Mutation::Op(Ne), Mutation::Negate]);
         // The moved bound is the operator it is taken for, at every distance.
         for d in -3..=3 {
             assert_eq!(

@@ -110,7 +110,15 @@ pub const RET_FALSE: u8 = 2;
 /// The driver counts such a mutant as not evaluated: neither found out nor passed.
 pub const CANNOT_EVALUATE: i32 = 86;
 
+/// The run may be that of a program a test started, whose exit status the test takes for
+/// a failure of its own: the driver also names a file (`TMT_UNABLE`) to leave a mark in.
 fn cannot_evaluate() -> ! {
+    if let Some(path) = std::env::var_os("TMT_UNABLE") {
+        let _ = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path);
+    }
     std::process::exit(CANNOT_EVALUATE)
 }
 

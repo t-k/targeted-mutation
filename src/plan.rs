@@ -502,6 +502,15 @@ pub fn plan_cmp(op: CmpOp, obs: &Obs, domain: Option<(i128, i128)>) -> CmpPlan {
             plan.run.push(Mutation::Op(*other));
         }
     }
+    // `>` for `<=` and `<` for `>=` are the negation, except for operands that have no
+    // order (NaN): there the negation is true and the other operator false. Where the
+    // tests saw such operands the two are different mutants, and both are run.
+    if matches!(op, CmpOp::Le | CmpOp::Ge)
+        && obs.rels().any(|rel| rel == Rel::Unordered)
+        && answers(op.negated()) != answers(op)
+    {
+        plan.run.push(Mutation::Op(op.negated()));
+    }
     plan
 }
 
@@ -942,6 +951,29 @@ mod tests {
         for op in [CmpOp::Le, CmpOp::Ge, CmpOp::Eq, CmpOp::Ne] {
             assert!(op.mistaken_for().is_empty());
         }
+        // `>` for `<=` and `<` for `>=` are the negation unless the operands have no
+        // order. Where the tests saw such operands and the operator answers otherwise
+        // than the original somewhere, it is run beside the negation.
+        let seen = |rels: &[Rel]| {
+            let mut obs = Obs::default();
+            for rel in rels {
+                obs.merge(&Obs::of_rel(*rel));
+            }
+            obs
+        };
+        for (op, reverse) in [(CmpOp::Ge, CmpOp::Lt), (CmpOp::Le, CmpOp::Gt)] {
+            let run = |rels: &[Rel]| plan_cmp(op, &seen(rels), None).run;
+            let both = vec![Mutation::Negate, Mutation::Op(reverse)];
+            assert_eq!(run(&[Rel::Unordered, Rel::Less]), both, "{op:?}");
+            assert_eq!(run(&[Rel::Unordered, Rel::Greater]), both, "{op:?}");
+            // Only operands without an order: the operator is false like the original.
+            assert_eq!(run(&[Rel::Unordered]), vec![Mutation::Negate], "{op:?}");
+            // An order everywhere: the negation is the operator.
+            assert!(!run(&[Rel::Less, Rel::Greater]).contains(&Mutation::Op(reverse)));
+        }
+        // `!=` for `==` is the negation with and without an order.
+        let run = plan_cmp(CmpOp::Eq, &seen(&[Rel::Unordered, Rel::Equal]), None).run;
+        assert_eq!(run, vec![Mutation::Negate]);
         // Seen above the bound only, `>=` and `>` in place of `<` answer alike, and
         // both are run: the first step they change, they go different ways.
         let plan = plan_cmp(CmpOp::Lt, &Obs::of_rel(Rel::Greater), None);

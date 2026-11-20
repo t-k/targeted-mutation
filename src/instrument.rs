@@ -1475,7 +1475,6 @@ impl<'ast> Visit<'ast> for Finder<'_> {
         // and it would be taken for `i32` (`for i in 0..16 { words[i] }`).
         if let (Some(from), Some(to)) = (&node.start, &node.end)
             && node.attrs.is_empty()
-            && !(is_literal(from) && is_literal(to))
             && let (Some((start, lhs_end)), Some((rhs_start, end))) =
                 (self.range(from.span()), self.range(to.span()))
             && in_order(lhs_end, rhs_start)
@@ -1490,7 +1489,9 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             // all a `for` takes from its range. Anywhere else the two are told apart (by
             // their type, by `end_bound`, by a field): there the mutant is the range as it
             // is written in the source, and it is built like the code of a `const fn`.
-            let built = !self.for_ranges.contains(&start);
+            // So is a range of two literals, wherever it is: nothing fixes their type
+            // before a probe is resolved, and it would be taken for `i32`.
+            let built = !self.for_ranges.contains(&start) || (is_literal(from) && is_literal(to));
             self.const_depth += built as usize;
             self.push(kind, start, end, from.span());
             self.const_depth -= built as usize;
@@ -3918,6 +3919,8 @@ mod tests {
                    let kept = a..b;\n\
                    let _ = &v[a as usize..b as usize];\n\
                    for _ in kept.clone() {}\n\
+                   for _ in 0..3 {}\n\
+                   let _ = &v[0..3];\n\
                    (a..=b).count() }";
         let all = discover(src, 0).unwrap();
         let ranges = |sites: &[Site]| -> Vec<usize> {
@@ -3930,7 +3933,22 @@ mod tests {
         // Run through directly by a `for`, with or without parentheses.
         assert_eq!(ranges(&all.sites), [2, 3]);
         // Kept, indexed with, or given to a method: built, as the source says them.
-        assert_eq!(ranges(&all.rebuild_sites), [4, 5, 6, 8]);
+        // And two literals wherever they are: nothing gives a probe their type.
+        assert_eq!(ranges(&all.rebuild_sites), [4, 5, 6, 8, 9, 10]);
+        let literal: Vec<(&str, String)> = all
+            .rebuild_sites
+            .iter()
+            .filter(|site| site.line == 8 || site.line == 9)
+            .flat_map(|site| {
+                source_mutants(site)
+                    .into_iter()
+                    .map(move |mutant| (site.text.as_str(), mutant.replacement))
+            })
+            .collect();
+        assert_eq!(
+            literal,
+            [("0..3", "..=".to_string()), ("0..3", "..=".to_string())]
+        );
     }
 
     #[test]

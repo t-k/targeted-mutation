@@ -1587,21 +1587,35 @@ fn mutants_are_run_as_what_they_are() {
     // A range that is looked at instead of run through (`takes_its_end_in` asks for its
     // `end_bound`) is no probe at all: `0..end + 1` would hold the numbers of `0..=end`
     // and still not be it. It waits for a build with the two that were not evaluated.
-    assert_eq!(report["mutants_not_built"], 3, "{report:#}");
+    // So do the two `0..2` of the loops: two literals have no type a probe could take.
+    assert_eq!(report["mutants_not_built"], 5, "{report:#}");
     assert!(survivors("0u8..end").is_empty(), "{report:#}");
-    // Built from the source, all three are what they say, and each fails its test.
+    // Built from the source, the three are what they say, and each fails its test. The
+    // two loops run a third time without the tests noticing: those two pass.
     let run = tmt(&dir, &["--json", "--quiet", "--rebuild"]);
     let built: Value = serde_json::from_str(&run.stdout).unwrap();
     assert_eq!(built["mutants_not_evaluated"], 0, "{built:#}");
     assert_eq!(built["mutants_not_built"], 0, "{built:#}");
-    for count in ["mutants_run", "mutants_killed"] {
+    for (count, more) in [("mutants_run", 5), ("mutants_killed", 3)] {
         assert_eq!(
             built[count].as_u64().unwrap(),
-            report[count].as_u64().unwrap() + 3,
+            report[count].as_u64().unwrap() + more,
             "{count}: {built:#}"
         );
     }
-    assert_eq!(built["findings"], report["findings"], "{built:#}");
+    let passed: Vec<&str> = built["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["kind"] == "survivor")
+        .map(|f| f["code"].as_str().unwrap())
+        .collect();
+    assert_eq!(passed, ["0..2", "0..2"], "{built:#}");
+    assert_eq!(
+        built["findings"].as_array().unwrap().len(),
+        report["findings"].as_array().unwrap().len() + 2,
+        "{built:#}"
+    );
 }
 
 #[test]
@@ -1699,5 +1713,36 @@ fn an_audit_builds_mutants_from_the_source_and_compares() {
     assert!(
         text.contains("the guard `note(asked)` replaced by `true`: passes as a probe, fails built"),
         "{text}"
+    );
+}
+
+#[test]
+fn a_run_given_up_inside_a_program_a_test_started_is_not_a_failed_test() {
+    let dir = fixture("spawned", "spawned");
+    // The range is only run by the program the test starts, and the test only asks
+    // whether that program ends well. With the end of the range taken in, the program
+    // gets to a range no probe can make and stops; the test fails for it. That is not
+    // the mutant found out: it is the mutant not run.
+    let (_, report) = json(&dir);
+    assert_eq!(report["mutants_not_evaluated"], 1, "{report:#}");
+    let at_the_range = |report: &Value| -> Vec<String> {
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["code"] == "end..end")
+            .map(|f| f["kind"].as_str().unwrap().to_string())
+            .collect()
+    };
+    assert!(at_the_range(&report).is_empty(), "{report:#}");
+    // Built from the source it is run for what it is, and passes: the program ends well
+    // whatever it prints.
+    let run = tmt(&dir, &["--json", "--quiet", "--rebuild"]);
+    let built: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(built["mutants_not_evaluated"], 0, "{built:#}");
+    assert_eq!(at_the_range(&built), ["survivor"], "{built:#}");
+    assert_eq!(
+        built["mutants_killed"], report["mutants_killed"],
+        "{built:#}"
     );
 }

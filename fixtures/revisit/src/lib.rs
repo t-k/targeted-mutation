@@ -69,6 +69,12 @@ pub fn takes_its_end_in(end: u8) -> bool {
     matches!(range.end_bound(), Bound::Included(_))
 }
 
+/// A number that is not one has no order: `x >= 0.0` is false for it, and so is
+/// `x < 0.0`, while "not `x >= 0.0`" is true.
+pub fn not_negative(x: f64) -> bool {
+    x >= 0.0
+}
+
 /// A type that cannot be copied, says when it is dropped, and has a `max` that only
 /// looks at it.
 pub struct Gauge<'a> {
@@ -143,6 +149,11 @@ mod tests {
     #[test]
     fn a_range_written_with_two_dots_leaves_its_end_out() {
         assert!(!takes_its_end_in(3));
+    }
+
+    #[test]
+    fn what_is_not_a_number_is_not_not_negative() {
+        assert!(!not_negative(f64::NAN));
     }
 
     #[test]
