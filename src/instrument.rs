@@ -3828,6 +3828,12 @@ mod tests {
         assert_eq!(enclosing_item(&items, at("mod m")), "");
         assert_eq!(enclosing_item(&items, at("= 2") + 2), "Store::LIMIT");
         assert_eq!(enclosing_item(&items, src.len()), "");
+        // An item is its first byte to its last, and not a byte more on either side.
+        let (first, after) = (at("pub fn in_mod"), at("pub fn in_mod() {}") + 18);
+        assert_eq!(enclosing_item(&items, first - 1), "");
+        assert_eq!(enclosing_item(&items, first), "m::in_mod");
+        assert_eq!(enclosing_item(&items, after - 1), "m::in_mod");
+        assert_eq!(enclosing_item(&items, after), "");
         // Lines and columns count from one, columns in characters.
         let text = "ab\nçd e\n";
         assert_eq!(offset_of(text, 1, 1), Some(0));

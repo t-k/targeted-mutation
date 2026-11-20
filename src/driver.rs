@@ -2590,9 +2590,7 @@ fn repository_prefix(dir: &Path) -> String {
 /// `wanted` of the numbers below `count`, spread evenly and the same every time; all of
 /// them where there are no more.
 fn spread(count: usize, wanted: usize) -> Vec<usize> {
-    if wanted >= count {
-        return (0..count).collect();
-    }
+    let wanted = wanted.min(count);
     (0..wanted).map(|nth| nth * count / wanted).collect()
 }
 
