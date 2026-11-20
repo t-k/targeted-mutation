@@ -72,7 +72,7 @@ tmt [DIR] [OPTIONS]
 What to analyse:
 
 - `--package NAME`: the workspace member to analyse. Not needed when `DIR` is the member's own directory.
-- `--since REV`: only the code changed since a git revision, plus untracked files. This is the mode for a pull request: `tmt --since origin/main`.
+- `--since REV`: only the code changed since a git revision, plus untracked files. This is the mode for a pull request: `tmt --since "$(git merge-base origin/main HEAD)"` (the merge base, so that what others added to the main branch meanwhile is not taken for yours). A run of a part can tell that a finding is new; it cannot tell that one outside of it is gone, which takes a run of the whole.
 - `--lines FILE:FROM-TO`: only these lines (repeatable; `FILE` is relative to the package).
 
 Which tests to use:
@@ -84,7 +84,7 @@ Which tests to use:
 Findings you have already dealt with:
 
 - A comment `// tmt:ignore <reason>` on the line, or on the line above, silences the findings of that line.
-- `--write-baseline FILE` records the findings of a run; `--baseline FILE` leaves the recorded ones out. Entries do not contain line numbers, so they survive code moving around. Suppressed findings are counted in the summary and do not affect the exit status.
+- `--write-baseline FILE` records the findings of a run; `--baseline FILE` leaves the recorded ones out. A finding is known by its `id`: its kind, file, the function or constant it is in, its code, and which of the places with that code in that item it is. No line numbers and none of the words that describe the mutants are in it, so it survives code moving around and this tool wording things differently. (All findings of one kind at one place share an id.) Files written before version 2 of the format, which list fingerprints, are still read. Suppressed findings are counted in the summary and do not affect the exit status.
 
 Running:
 
@@ -92,11 +92,13 @@ Running:
 - `--work-dir DIR`: where the working copy and its build go. It must be a directory of its own: the tool deletes files from the copy inside it, and refuses a directory that contains the workspace or a `src` it did not create.
 - `--all-files`: copy files that git ignores too. Use it when the build needs generated files that are not tracked.
 - `--no-verify`: trust the trace; do not re-run tests against predicted survivors.
-- `--no-effects`: do not trace surviving mutants to say what they change.
+- `--no-effects`: do not trace surviving mutants to say what they change. (Where several mutants survive at one place, one of them is followed through the tests; the report says which, in the text and as `effects_of`.)
+- `--features A,B`, `--all-features`, `--no-default-features`, `--locked`: as for `cargo test`, and told to every cargo command of the run.
+- `--audit N`: check the run itself. Up to N of the surviving mutants (spread evenly, the same ones every time) are run once more against every test of every binary, not only the tests chosen for them; one that fails is counted as found out and listed. The tests are also recorded a second time, and binaries whose two recordings differ are listed: their tests do not always do the same.
 - `--opt-level N`: build the tests at optimisation level N (0 to 3) instead of the profile's own. Worth it when tests spend their time in loops (see "Speed").
 - `--rebuild`: also run the mutants that need a build of their own (see "How it works", step 5). Without it the summary says how many were left out.
 
-Output: text by default, `--json`, or `--sarif` (SARIF 2.1.0 for code scanning). `--show-unreached` lists the code no test executes, `--quiet` drops the progress lines.
+Output: text by default, `--json`, or `--sarif` (SARIF 2.1.0 for code scanning: paths from the top of the git repository, the finding's id as `partialFingerprints`, and what the run looked at under the run's `properties`). The JSON report has the same under `analysis`: package, `--since` and `--lines`, features, and whether mutants were built and predictions re-run. `--show-unreached` lists the code no test executes, `--quiet` drops the progress lines.
 
 Exit status: `0` no gaps, `2` gaps found or a prediction failed its re-run (`UNSTABLE`), `1` the analysis could not run (tests fail on the unmutated code, the crate does not build, ...).
 
@@ -201,9 +203,9 @@ java -jar tla2tools.jar formal/tla/RepairLoop.tla
 - A thread without a name, and the main thread, write every observation at once (slow in a loop); a thread with a name keeps distances back as described under "Speed". If such a thread is still running when the process exits, what it observed in its last 20 ms can be missing from the trace, as anything it would have observed a moment later is. A survivor predicted from that is re-run like every other and shows up as `UNSTABLE` if the prediction was wrong.
 - A comparison, a guard or an operand that a mutant replaces by a constant is still evaluated, and so is a field's value when the mutant takes the field from the base (which is then evaluated twice). A test that only notices that a call inside them no longer happens does not count against these mutants; built with `--rebuild`, a guard or a field is replaced outright.
 - A probe keeps the order of evaluation and the life of temporaries of the code it stands for, with two exceptions that need unusual code to be seen: a temporary with a destructor inside the value of a field of a struct literal with a base (`S { x: guard().value(), ..base }`) is dropped before the next field is evaluated, and `*p += f()` on a number takes the place before it calls `f`, which a `DerefMut` with side effects can observe.
-- A thread that a test names exactly like another test of the same binary is taken for that test.
+- A thread that a test names exactly like another test of the same binary is taken for that test, and mutants are then run against the wrong test. `--audit` shows it.
 - A replaced operator in a mutant that is built keeps its operands by parentheses where the new operator binds otherwise (`8 - (2 + 3)`). A crate that denies `unused_parens` rejects those where they turn out not to be needed; they are then counted as not compiling.
-- With `--jobs`, a mutant's time limit is still derived from the unloaded test run, so a heavily loaded machine can turn a slow mutant into a timeout (counted as killed).
+- With `--jobs N` each test binary gets its share of the cores (never fewer than two test threads), and a mutant that ran out of time while others were running is run once more on its own; the second run counts. A machine that is loaded by something else can still turn a slow mutant into a timeout (counted as killed, and said in the summary).
 
 ## Speed
 

@@ -54,7 +54,50 @@ fn optional<T: std::str::FromStr>(text: &str) -> Option<Option<T>> {
     }
 }
 
+/// How many keys of two maps of maps have another value in one than in the other.
+fn differing<T: PartialEq>(
+    a: &BTreeMap<u32, BTreeMap<String, T>>,
+    b: &BTreeMap<u32, BTreeMap<String, T>>,
+) -> usize {
+    let one_way = |from: &BTreeMap<u32, BTreeMap<String, T>>,
+                   to: &BTreeMap<u32, BTreeMap<String, T>>,
+                   both: bool| {
+        from.iter()
+            .flat_map(|(site, tests)| tests.iter().map(move |(test, seen)| (site, test, seen)))
+            .filter(
+                |(site, test, seen)| match to.get(site).and_then(|tests| tests.get(*test)) {
+                    Some(other) => both && other != *seen,
+                    None => true,
+                },
+            )
+            .count()
+    };
+    one_way(a, b, true) + one_way(b, a, false)
+}
+
 impl Trace {
+    /// How many records (what one test saw at one site) are not the same in two traces
+    /// of the same tests. Tests that always do the same give none.
+    pub fn differences(&self, other: &Trace) -> usize {
+        let reach = |from: &Trace, to: &Trace| {
+            from.reach
+                .iter()
+                .flat_map(|(site, tests)| tests.iter().map(move |test| (site, test)))
+                .filter(|(site, test)| {
+                    !to.reach
+                        .get(site)
+                        .is_some_and(|tests| tests.contains(*test))
+                })
+                .count()
+        };
+        differing(&self.cmp, &other.cmp)
+            + differing(&self.logic, &other.logic)
+            + differing(&self.arith, &other.arith)
+            + differing(&self.returns, &other.returns)
+            + reach(self, other)
+            + reach(other, self)
+    }
+
     pub fn parse(text: &str) -> Trace {
         let mut trace = Trace::default();
         for line in text.lines() {
@@ -899,6 +942,32 @@ mod tests {
     }
 
     /// A probe in a loop asks the tracer only when it has something new to say.
+    #[test]
+    fn two_traces_differ_by_the_records_that_are_not_the_same() {
+        let text =
+            "O\t1\ta\t3\t0\t-2\t-\t1\t-\t-\nL\t2\ta\t1\nA\t3\ta\t1\nB\t4\ta\t1\nR\t5\ta\t1\n";
+        let base = Trace::parse(text);
+        assert_eq!(base.malformed_lines, 0);
+        assert_eq!(base.differences(&Trace::parse(text)), 0);
+        // Each kind of record counts, in whichever of the two it is missing or other.
+        for (other, differing) in [
+            ("O\t1\ta\t3\t0\t-1\t-\t1\t-\t-\n", 1), // a nearer value
+            ("O\t1\tb\t3\t0\t-2\t-\t1\t-\t-\n", 1), // seen by another test too
+            ("O\t9\ta\t3\t0\t-2\t-\t1\t-\t-\n", 1), // at another site too
+            ("L\t2\ta\t2\n", 1),
+            ("A\t3\ta\t2\n", 1),
+            ("B\t4\ta\t2\n", 1),
+            ("R\t5\tb\t1\n", 1),
+            ("R\t6\ta\t1\nL\t2\tb\t1\n", 2),
+        ] {
+            let more = Trace::parse(&format!("{text}{other}"));
+            assert_eq!(base.differences(&more), differing, "{other:?}");
+            assert_eq!(more.differences(&base), differing, "{other:?}");
+        }
+        assert_eq!(base.differences(&Trace::default()), 5);
+        assert_eq!(Trace::default().differences(&base), 5);
+    }
+
     #[test]
     fn only_a_known_distance_coming_closer_can_wait() {
         use tmt_rt::{Diff, News, Summary};

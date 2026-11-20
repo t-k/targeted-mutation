@@ -49,6 +49,8 @@ pub struct Options {
     pub rebuild: bool,
     /// Optimisation level to build the tests with, instead of the profile's own.
     pub opt_level: Option<u8>,
+    /// Run this many surviving mutants against all tests and record the tests twice.
+    pub audit: Option<usize>,
     /// Cargo's choice of features and of the lock file, the same for every cargo command.
     pub cargo: CargoConfig,
     /// How many mutants to run at the same time.
@@ -2252,7 +2254,72 @@ pub fn run(options: &Options) -> Result<Report> {
         jobs.len(),
         options.jobs.max(1)
     ));
-    let results = session.run_jobs(&jobs, options.jobs)?;
+    let mut results = session.run_jobs(&jobs, options.jobs)?;
+
+    // 6b. On request, check what the run rests on: that the tests chosen for a mutant
+    // are the ones that could fail with it, and that the tests do the same twice.
+    if let Some(wanted) = options.audit {
+        let survivors: Vec<usize> = (0..jobs.len())
+            .filter(|job| results[*job].survived.is_some())
+            .collect();
+        let chosen: Vec<usize> = spread(survivors.len(), wanted)
+            .into_iter()
+            .map(|nth| survivors[nth])
+            .collect();
+        session.note(&format!(
+            "audit: running {} of {} surviving mutants against all tests",
+            chosen.len(),
+            survivors.len()
+        ));
+        let against_all: Vec<Job> = chosen
+            .iter()
+            .map(|job| Job {
+                site: jobs[*job].site,
+                mutation: jobs[*job].mutation,
+                tests: (0..session.binaries.len()).map(|bin| (bin, None)).collect(),
+            })
+            .collect();
+        let mut audit = report::Audit {
+            sampled: chosen.len(),
+            survivors: survivors.len(),
+            ..report::Audit::default()
+        };
+        for (job, again) in chosen
+            .iter()
+            .zip(session.run_jobs(&against_all, options.jobs)?)
+        {
+            if again.survived.is_none() {
+                // The verdict of all tests is the one that counts.
+                results[*job] = again;
+                let site = files
+                    .iter()
+                    .find_map(|f| Some((f, f.sites.iter().find(|s| s.id == jobs[*job].site)?)));
+                if let Some((file, site)) = site {
+                    audit
+                        .disagreements
+                        .push(report::location(&file.display, site));
+                }
+            }
+        }
+        session.note("audit: recording the tests once more");
+        for (index, bin) in session.binaries.iter().enumerate() {
+            let path = scratch.join(format!("trace-{index}-audit.tsv"));
+            let _ = fs::remove_file(&path);
+            let trace_env = path.to_string_lossy().into_owned();
+            let limit = Duration::from_secs(3600);
+            let outcome = run_binary(bin, None, &[("TMT_TRACE", &trace_env)], limit, false, 1)?;
+            let again = Trace::parse(&fs::read_to_string(&path).unwrap_or_default());
+            let _ = fs::remove_file(&path);
+            let records = bin.trace.differences(&again);
+            if outcome != Outcome::Pass || records > 0 {
+                audit.trace_differences.push(report::TraceDifference {
+                    binary: bin.name.clone(),
+                    records,
+                });
+            }
+        }
+        report.audit = Some(audit);
+    }
     report.mutants_run = results.len();
     report.mutants_killed = results.iter().filter(|r| r.survived.is_none()).count();
     report.mutants_timed_out = results.iter().filter(|r| r.timed_out).count();
@@ -2518,6 +2585,15 @@ fn repository_prefix(dir: &Path) -> String {
         }
         _ => String::new(),
     }
+}
+
+/// `wanted` of the numbers below `count`, spread evenly and the same every time; all of
+/// them where there are no more.
+fn spread(count: usize, wanted: usize) -> Vec<usize> {
+    if wanted >= count {
+        return (0..count).collect();
+    }
+    (0..wanted).map(|nth| nth * count / wanted).collect()
 }
 
 /// What naming the findings of a file needs to know of it.
@@ -3522,6 +3598,19 @@ serde = { path = "../../serde-fork" }
         );
         // A finding of a file that is not among the given ones is left without a name.
         assert_eq!(name(&findings[2]), (String::new(), String::new()));
+    }
+
+    #[test]
+    fn an_audit_takes_its_sample_evenly_and_the_same_every_time() {
+        assert_eq!(spread(0, 3), Vec::<usize>::new());
+        assert_eq!(spread(5, 0), Vec::<usize>::new());
+        assert_eq!(spread(3, 3), [0, 1, 2]);
+        assert_eq!(spread(3, 10), [0, 1, 2]);
+        assert_eq!(spread(10, 1), [0]);
+        assert_eq!(spread(10, 3), [0, 3, 6]);
+        assert_eq!(spread(10, 5), [0, 2, 4, 6, 8]);
+        assert_eq!(spread(4, 3), [0, 1, 2]);
+        assert_eq!(spread(7, 6), [0, 1, 2, 3, 4, 5]);
     }
 
     #[test]

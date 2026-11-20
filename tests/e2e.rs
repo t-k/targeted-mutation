@@ -1494,3 +1494,47 @@ fn a_finding_is_known_by_where_it_is() {
     );
     assert_eq!(after["suppressed"], 4, "{after:#}");
 }
+
+#[test]
+fn an_audit_runs_survivors_against_all_tests() {
+    let dir = fixture("namesake", "namesake");
+    // A thread with the name of another test: what it sees is taken for that test's,
+    // and the mutants are run against the wrong one. They seem to survive.
+    let (code, report) = json(&dir);
+    assert_eq!(code, 2, "{report:#}");
+    assert_eq!(findings(&report, "assertion_gap").len(), 3, "{report:#}");
+    assert!(report.get("audit").is_none(), "{report:#}");
+
+    // Run against every test, four of them fail the test that does the work.
+    let run = tmt(&dir, &["--json", "--quiet", "--audit", "100"]);
+    let audited: Value = serde_json::from_str(&run.stdout).unwrap();
+    let audit = &audited["audit"];
+    assert_eq!(audit["survivors"], 7, "{audited:#}");
+    assert_eq!(audit["sampled"], 7, "{audited:#}");
+    assert_eq!(
+        audit["disagreements"].as_array().unwrap().len(),
+        4,
+        "{audited:#}"
+    );
+    assert_eq!(audit["trace_differences"].as_array().unwrap().len(), 0);
+    // The verdict of all tests counts: the false findings are gone, the true one stays.
+    assert_eq!(findings(&audited, "assertion_gap").len(), 0, "{audited:#}");
+    assert_eq!(findings(&audited, "input_gap").len(), 1, "{audited:#}");
+    assert_eq!(
+        audited["mutants_killed"].as_u64().unwrap(),
+        report["mutants_killed"].as_u64().unwrap() + 4
+    );
+
+    // A smaller sample is taken evenly, and is the same every time.
+    let sample = |n: &str| -> Value {
+        let run = tmt(&dir, &["--json", "--quiet", "--audit", n]);
+        serde_json::from_str::<Value>(&run.stdout).unwrap()["audit"].clone()
+    };
+    let two = sample("2");
+    assert_eq!(two["sampled"], 2, "{two:#}");
+    assert_eq!(two, sample("2"));
+    assert_eq!(sample("0")["sampled"], 0);
+    // Without the re-run of predicted survivors there is nothing to stand on.
+    let bad = tmt(&dir, &["--quiet", "--audit", "1", "--no-verify"]);
+    assert!(bad.stderr.contains("--no-verify"), "{}", bad.stderr);
+}

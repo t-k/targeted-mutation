@@ -140,7 +140,7 @@ mod tests {
         };
         let one = named("assertion_gap|src/lib.rs|f|a > b|0", &["`a >= b`"]);
         let other = named("assertion_gap|src/lib.rs|g|a > b|0", &["`a >= b`"]);
-        let written = render(&[one.clone()]);
+        let written = render(std::slice::from_ref(&one));
         let baseline = parse(&written).unwrap();
         assert!(baseline.knows(&one));
         // The same code in another function is another finding.

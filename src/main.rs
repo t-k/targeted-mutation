@@ -79,6 +79,11 @@ struct Cli {
     /// Do not let cargo change the lock file.
     #[arg(long)]
     locked: bool,
+    /// Check the run itself: run up to N of the surviving mutants once more against
+    /// every test (not only the ones chosen for them), and record the tests a second
+    /// time to see whether they do the same.
+    #[arg(long, value_name = "N", conflicts_with = "no_verify")]
+    audit: Option<usize>,
     /// Print the report as SARIF 2.1.0.
     #[arg(long, conflicts_with = "json")]
     sarif: bool,
@@ -108,6 +113,7 @@ fn main() -> ExitCode {
         effects: !cli.no_effects,
         rebuild: cli.rebuild,
         opt_level: cli.opt_level,
+        audit: cli.audit,
         cargo: driver::CargoConfig {
             features: cli.features,
             all_features: cli.all_features,

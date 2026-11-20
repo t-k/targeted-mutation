@@ -90,10 +90,34 @@ pub struct Analysis {
     pub doc_tests: bool,
 }
 
+/// What a run that was asked to check itself found (`--audit`).
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct Audit {
+    /// Surviving mutants that were run once more, against every test of every binary.
+    pub sampled: usize,
+    /// How many surviving mutants there were to choose from.
+    pub survivors: usize,
+    /// Where one of those failed a test it had not been run against: the tests were not
+    /// chosen as they should have been, or do not always do the same.
+    pub disagreements: Vec<Location>,
+    /// Test binaries whose second recorded run was not like the first, with the number
+    /// of records (what one test saw at one site) that differ.
+    pub trace_differences: Vec<TraceDifference>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct TraceDifference {
+    pub binary: String,
+    pub records: usize,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct Report {
     pub package: String,
     pub analysis: Analysis,
+    /// Present when the run was asked to check itself.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub audit: Option<Audit>,
     pub sites: usize,
     /// Sites that could not be instrumented (the probe did not compile there).
     pub skipped_sites: usize,
@@ -794,6 +818,29 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
         ));
     }
     out.push('\n');
+    if let Some(audit) = &report.audit {
+        out.push_str(&format!(
+            "audit: {} of {} surviving mutants run against all tests, {} failed one they had not been run against\n",
+            audit.sampled,
+            audit.survivors,
+            audit.disagreements.len()
+        ));
+        for at in &audit.disagreements {
+            out.push_str(&format!(
+                "  {}:{}:{}  {}\n",
+                at.file, at.line, at.column, at.code
+            ));
+        }
+        if audit.trace_differences.is_empty() {
+            out.push_str("audit: recorded once more, the tests did the same\n");
+        }
+        for binary in &audit.trace_differences {
+            out.push_str(&format!(
+                "audit: recorded once more, `{}` differs in {} records: its tests do not always do the same\n",
+                binary.binary, binary.records
+            ));
+        }
+    }
     if report.mutants_not_built > 0 {
         out.push_str(&format!(
             "({} more mutants need a build of their own: --rebuild runs them)\n",
@@ -1515,6 +1562,7 @@ mod tests {
         let report = Report {
             package: "p".into(),
             analysis: Analysis::default(),
+            audit: None,
             sites: 4,
             skipped_sites: 1,
             unviable_mutants: 2,
@@ -1716,6 +1764,49 @@ mod tests {
             assert_eq!(body.len(), 3, "{body:?}");
             assert!(body[2].starts_with("with the mutant"), "{body:?}");
         }
+    }
+
+    #[test]
+    fn an_audit_is_said_in_the_summary() {
+        let mut report = Report {
+            package: "p".into(),
+            audit: Some(Audit {
+                sampled: 2,
+                survivors: 7,
+                ..Audit::default()
+            }),
+            ..Report::default()
+        };
+        let text = render_text(&report, false);
+        assert!(
+            text.ends_with(
+                "\naudit: 2 of 7 surviving mutants run against all tests, 0 failed one they had not been run against\n\
+                 audit: recorded once more, the tests did the same\n"
+            ),
+            "{text}"
+        );
+        let audit = report.audit.as_mut().unwrap();
+        audit.disagreements.push(Location {
+            file: "src/lib.rs".into(),
+            line: 3,
+            column: 5,
+            code: "x > 5".into(),
+            ..Location::default()
+        });
+        audit.trace_differences.push(TraceDifference {
+            binary: "p".into(),
+            records: 4,
+        });
+        let text = render_text(&report, false);
+        assert!(
+            text.ends_with(
+                "all tests, 1 failed one they had not been run against\n\
+                 \x20 src/lib.rs:3:5  x > 5\n\
+                 audit: recorded once more, `p` differs in 4 records: its tests do not always do the same\n"
+            ),
+            "{text}"
+        );
+        assert!(!render_text(&Report::default(), false).contains("audit"));
     }
 
     #[test]
