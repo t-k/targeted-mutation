@@ -1939,6 +1939,39 @@ mod tests {
             ),
             "{text}"
         );
+        // Mutants built from the source are said only where some were, with what differs.
+        assert!(!text.contains("built from the source"), "{text}");
+        let audit = report.audit.as_mut().unwrap();
+        audit.rebuilt = 1;
+        let text = render_text(&report, false);
+        assert!(
+            text.contains(
+                "\naudit: 1 mutants also built from the source, 0 with another result than as a probe\n"
+            ),
+            "{text}"
+        );
+        let audit = report.audit.as_mut().unwrap();
+        audit.rebuilt = 5;
+        audit.source_disagreements.push(SourceDisagreement {
+            at: Location {
+                file: "src/lib.rs".into(),
+                line: 9,
+                column: 14,
+                code: "note(asked)".into(),
+                ..Location::default()
+            },
+            mutant: "the guard `note(asked)` replaced by `true`".into(),
+            as_probe: "passes".into(),
+            built: "fails".into(),
+        });
+        let text = render_text(&report, false);
+        assert!(
+            text.contains(
+                "\naudit: 5 mutants also built from the source, 1 with another result than as a probe\n\
+                 \x20 src/lib.rs:9:14  the guard `note(asked)` replaced by `true`: passes as a probe, fails built\n"
+            ),
+            "{text}"
+        );
         assert!(!render_text(&Report::default(), false).contains("audit"));
     }
 
