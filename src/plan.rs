@@ -503,11 +503,11 @@ pub fn plan_cmp(op: CmpOp, obs: &Obs, domain: Option<(i128, i128)>) -> CmpPlan {
         }
     }
     // `>` for `<=` and `<` for `>=` are the negation, except for operands that have no
-    // order (NaN): there the negation is true and the other operator false. Where the
-    // tests saw such operands the two are different mutants, and both are run.
-    if matches!(op, CmpOp::Le | CmpOp::Ge)
-        && obs.rels().any(|rel| rel == Rel::Unordered)
-        && answers(op.negated()) != answers(op)
+    // order (NaN): there the negation is true and the other operator false. Only
+    // integers are known to always have an order. For anything else the two are
+    // different mutants and both are run, whether or not the tests gave the comparison
+    // such operands: a mutant that changes the way the code goes can be the first to.
+    if matches!(op, CmpOp::Le | CmpOp::Ge) && !obs.valued() && answers(op.negated()) != answers(op)
     {
         plan.run.push(Mutation::Op(op.negated()));
     }
@@ -952,8 +952,9 @@ mod tests {
             assert!(op.mistaken_for().is_empty());
         }
         // `>` for `<=` and `<` for `>=` are the negation unless the operands have no
-        // order. Where the tests saw such operands and the operator answers otherwise
-        // than the original somewhere, it is run beside the negation.
+        // order, and only integers are known to always have one. For anything else the
+        // operator is run beside the negation wherever it answers otherwise than the
+        // original, whether or not the tests gave operands without an order.
         let seen = |rels: &[Rel]| {
             let mut obs = Obs::default();
             for rel in rels {
@@ -963,13 +964,22 @@ mod tests {
         };
         for (op, reverse) in [(CmpOp::Ge, CmpOp::Lt), (CmpOp::Le, CmpOp::Gt)] {
             let run = |rels: &[Rel]| plan_cmp(op, &seen(rels), None).run;
-            let both = vec![Mutation::Negate, Mutation::Op(reverse)];
-            assert_eq!(run(&[Rel::Unordered, Rel::Less]), both, "{op:?}");
-            assert_eq!(run(&[Rel::Unordered, Rel::Greater]), both, "{op:?}");
-            // Only operands without an order: the operator is false like the original.
+            let reversed = |rels: &[Rel]| run(rels).contains(&Mutation::Op(reverse));
+            assert!(reversed(&[Rel::Unordered, Rel::Less]), "{op:?}");
+            assert!(reversed(&[Rel::Less, Rel::Greater]), "{op:?}");
+            assert!(reversed(&[Rel::Less, Rel::Equal, Rel::Greater]), "{op:?}");
+            // Where the operator answers like the original for all that was seen, it
+            // passes and is not run: only operands without an order, or only the side
+            // on which both are false.
             assert_eq!(run(&[Rel::Unordered]), vec![Mutation::Negate], "{op:?}");
-            // An order everywhere: the negation is the operator.
-            assert!(!run(&[Rel::Less, Rel::Greater]).contains(&Mutation::Op(reverse)));
+            // Integers: the negation is the operator, at every distance.
+            for ds in [&[-1i128, 1][..], &[-2, 0, 3], &[0, 1]] {
+                let plan = plan_cmp(op, &obs_of(ds), None);
+                assert!(!plan.run.contains(&Mutation::Op(reverse)), "{op:?} {ds:?}");
+            }
+            for d in -3..=3 {
+                assert_eq!(eval_mutated_d(op, Mutation::Negate, d), reverse.eval_d(d));
+            }
         }
         // `!=` for `==` is the negation with and without an order.
         let run = plan_cmp(CmpOp::Eq, &seen(&[Rel::Unordered, Rel::Equal]), None).run;

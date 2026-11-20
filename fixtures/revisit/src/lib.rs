@@ -75,6 +75,13 @@ pub fn not_negative(x: f64) -> bool {
     x >= 0.0
 }
 
+/// The same comparison, in a test that only gets to what is not a number once the
+/// comparison has answered otherwise: with `y < 0.0` the test passes, with "not
+/// `y >= 0.0`" it fails.
+pub fn at_least_zero(y: f64) -> bool {
+    y >= 0.0
+}
+
 /// A type that cannot be copied, says when it is dropped, and has a `max` that only
 /// looks at it.
 pub struct Gauge<'a> {
@@ -154,6 +161,11 @@ mod tests {
     #[test]
     fn what_is_not_a_number_is_not_not_negative() {
         assert!(!not_negative(f64::NAN));
+    }
+
+    #[test]
+    fn one_is_at_least_zero() {
+        assert!(at_least_zero(1.0) || !at_least_zero(f64::NAN));
     }
 
     #[test]

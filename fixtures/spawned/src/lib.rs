@@ -19,3 +19,9 @@ pub fn rounds() -> usize {
     }
     n
 }
+
+/// Checked by a test that ends the whole test program when the answer is wrong, with a
+/// status of its own choosing.
+pub fn double(x: u32) -> u32 {
+    x * 2
+}

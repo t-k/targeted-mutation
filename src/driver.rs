@@ -319,9 +319,6 @@ enum Outcome {
     Unable,
 }
 
-/// The exit status by which the injected runtime says so (`tmt_rt::CANNOT_EVALUATE`).
-const CANNOT_EVALUATE: i32 = 86;
-
 /// Keeps two runs from rebuilding the same working copy under each other.
 struct WorkLock(PathBuf);
 
@@ -935,6 +932,9 @@ fn run_binary(
         std::process::id(),
         RUNS.fetch_add(1, Ordering::SeqCst)
     ));
+    // The tests run in a directory of their own, and so does what they start: a place
+    // given from here (`TMPDIR=.`) has to be the same place there.
+    let unable_mark = std::path::absolute(&unable_mark).unwrap_or(unable_mark);
     let _ = fs::remove_file(&unable_mark);
     let mut cmd = match &bin.runner {
         Runner::Exe(exe) => {
@@ -1013,8 +1013,6 @@ fn run_binary(
         if let Some(status) = child.try_wait()? {
             break if status.success() {
                 Outcome::Pass
-            } else if status.code() == Some(CANNOT_EVALUATE) {
-                Outcome::Unable
             } else {
                 Outcome::Fail
             };
@@ -1032,7 +1030,9 @@ fn run_binary(
     if let Some(watcher) = watcher {
         let _ = watcher.join();
     }
-    // Whatever the tests made of it, a run that left the mark was not the mutant's.
+    // Whatever the tests made of it, a run that left the mark was not the mutant's. The
+    // mark alone says so: a status is the tests' to choose, and one of them may well end
+    // with the runtime's when it finds a mutant out.
     if fs::remove_file(&unable_mark).is_ok() {
         return Ok(Outcome::Unable);
     }
@@ -2525,21 +2525,40 @@ pub fn run(options: &Options) -> Result<Report> {
         let mut twins = vec![];
         for file in &files {
             for site in file.sites.iter().filter(|s| !disabled.contains(&s.id)) {
+                // Only integers are known to always have an order.
+                let integers = session.binaries.iter().all(|bin| {
+                    let seen = bin.trace.merged(site.id);
+                    !seen.reached() || seen.valued()
+                });
+                let job_of = |mutation: Mutation| {
+                    jobs.iter()
+                        .position(|job| job.site == site.id && job.mutation == mutation)
+                };
+                let mut compared = vec![];
                 for mutant in instrument::source_mutants(site) {
                     // The first of the mutations that are this change and that was run.
-                    let unordered = session
-                        .binaries
-                        .iter()
-                        .any(|bin| bin.trace.merged(site.id).un);
-                    let job = mutations_like(site, &mutant, unordered)
+                    let job = mutations_like(site, &mutant, integers)
                         .into_iter()
-                        .find_map(|mutation| {
-                            jobs.iter()
-                                .position(|job| job.site == site.id && job.mutation == mutation)
-                        });
+                        .find_map(job_of);
                     if let Some(job) = job {
+                        compared.push(job);
                         twins.push((file, site, mutant, Some(job)));
                     }
+                }
+                // A negated comparison that no mutant of the source stands for (on
+                // floats `<` is not "not `>=`") is compared with the negation written out.
+                if let (SiteKind::Cmp { op, .. }, Some(job)) =
+                    (&site.kind, job_of(Mutation::Negate))
+                    && !compared.contains(&job)
+                {
+                    let negated = instrument::SourceMutant {
+                        start: site.start,
+                        end: site.end,
+                        replacement: format!("!({})", site.text),
+                        what: op.symbol().to_string(),
+                        into: "!".to_string(),
+                    };
+                    twins.push((file, site, negated, Some(job)));
                 }
             }
         }
@@ -2781,17 +2800,14 @@ fn mutation_of(site: &Site, mutant: &instrument::SourceMutant) -> Mutation {
 /// `a != b` for `a == b` is run as the negation, and on integers `a <= b` for `a < b` as
 /// the bound moved by one.
 ///
-/// `unordered`: the tests gave the comparison operands without an order (NaN). The
-/// negation of `>=` is then true where `<` is false, and is not the same change.
-fn mutations_like(
-    site: &Site,
-    mutant: &instrument::SourceMutant,
-    unordered: bool,
-) -> Vec<Mutation> {
+/// `integers`: the operands are integers, which always have an order. For anything
+/// else (a float can be NaN) the negation of `>=` is true where `<` is false, and is
+/// not the same change.
+fn mutations_like(site: &Site, mutant: &instrument::SourceMutant, integers: bool) -> Vec<Mutation> {
     let mut all = vec![mutation_of(site, mutant)];
     if let (SiteKind::Cmp { op, .. }, Mutation::Op(into)) = (&site.kind, all[0]) {
         let an_order_is_needed = matches!(op, plan::CmpOp::Le | plan::CmpOp::Ge);
-        if into == op.negated() && !(unordered && an_order_is_needed) {
+        if into == op.negated() && (integers || !an_order_is_needed) {
             all.push(Mutation::Negate);
         }
         match (op, into) {
@@ -3767,7 +3783,8 @@ serde = { path = "../../serde-fork" }
     #[test]
     fn a_mutant_of_the_source_is_the_mutation_its_probe_runs() {
         // The runtime and the driver have to mean the same status.
-        assert_eq!(CANNOT_EVALUATE, crate::tmt_rt::CANNOT_EVALUATE);
+        // The runtime ends a run it gives up as a failed one: the mark says which it was.
+        assert_ne!(crate::tmt_rt::CANNOT_EVALUATE, 0);
         let source = "fn f(a: i32, b: i32, ok: bool, k: Option<i32>, base: O) -> O { \
                       go(); \
                       let x = match k { Some(n) if n > 1 => !ok && a < b, _ => -a + b > 0 || ok }; \
@@ -3817,7 +3834,7 @@ serde = { path = "../../serde-fork" }
                 .into_iter()
                 .find(|mutant| mutant.into == into)
                 .unwrap();
-            mutations_like(site, &mutant, false)
+            mutations_like(site, &mutant, true)
         };
         use plan::CmpOp::*;
         for (op, into, expected) in [
@@ -3848,7 +3865,7 @@ serde = { path = "../../serde-fork" }
                 .into_iter()
                 .find(|mutant| mutant.into == into)
                 .unwrap();
-            mutations_like(site, &mutant, true)
+            mutations_like(site, &mutant, false)
         };
         assert_eq!(unordered(">=", "<"), [Mutation::Op(Lt)]);
         assert_eq!(unordered("<=", ">"), [Mutation::Op(Gt)]);

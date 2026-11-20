@@ -1581,6 +1581,10 @@ fn mutants_are_run_as_what_they_are() {
     // The probe borrows it as the call did (the test would see it dropped otherwise),
     // and it is a probe: nothing was left out for not compiling.
     assert_eq!(report["skipped_sites"], 0, "{report:#}");
+    // A float can be what is not a number, for which `y < 0.0` is false and "not
+    // `y >= 0.0`" true. The test only gets there once the comparison has answered
+    // otherwise, so nothing recorded shows it; `<` is run all the same, and passes.
+    assert_eq!(survivors("y >= 0.0"), ["`y < 0.0`"], "{report:#}");
     let text = tmt(&dir, &["--quiet"]).stdout;
     assert!(text.contains("(2 mutants not evaluated: a range"), "{text}");
 
@@ -1744,5 +1748,34 @@ fn a_run_given_up_inside_a_program_a_test_started_is_not_a_failed_test() {
     assert_eq!(
         built["mutants_killed"], report["mutants_killed"],
         "{built:#}"
+    );
+
+    // A test that ends the test program itself, with the very status the runtime uses,
+    // has found its mutant out: the mark tells the two apart, not the status.
+    let at_the_product: Vec<&Value> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["code"] == "x * 2")
+        .collect();
+    assert!(at_the_product.is_empty(), "{report:#}");
+
+    // The mark is found wherever the temporary directory is said to be, also where that
+    // is said from the directory the run was started in.
+    let output = Command::new(env!("CARGO_BIN_EXE_tmt"))
+        .arg(".")
+        .args(["--json", "--quiet"])
+        .current_dir(&dir)
+        .env("TMPDIR", ".")
+        .env_remove("TMT_TRACE")
+        .env_remove("TMT_MUTANT")
+        .output()
+        .unwrap();
+    let relative: Value = serde_json::from_slice(&output.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}", String::from_utf8_lossy(&output.stderr)));
+    assert_eq!(relative["mutants_not_evaluated"], 1, "{relative:#}");
+    assert_eq!(
+        relative["mutants_killed"], report["mutants_killed"],
+        "{relative:#}"
     );
 }
