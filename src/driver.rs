@@ -1065,10 +1065,6 @@ fn run_binary(
     output: RunOutput<'_>,
     sharing: usize,
 ) -> Result<Outcome> {
-    use std::io::BufRead;
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, Ordering};
-
     let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
     let threads = test_threads(cores, sharing);
     static RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1135,12 +1131,17 @@ fn run_binary(
     if let Runner::Isolated { test, .. } = &bin.runner {
         cmd.env("TMT_TEST", test);
     }
+    let mut output_to_watch = None;
     match output {
         RunOutput::Capture(file) => {
             cmd.stdout(file.try_clone()?).stderr(file.try_clone()?);
         }
         RunOutput::FirstFailure if !matches!(bin.runner, Runner::Isolated { .. }) => {
-            cmd.stdout(Stdio::piped()).stderr(Stdio::null());
+            // A regular file has a readable end even if a descendant keeps stdout.
+            // Reuse the per-run marker, whose contents are never interpreted by probes.
+            let writer = fs::OpenOptions::new().append(true).open(&unable_mark)?;
+            output_to_watch = Some(FailureOutput::new(fs::File::open(&unable_mark)?));
+            cmd.stdout(writer).stderr(Stdio::null());
         }
         RunOutput::Quiet | RunOutput::FirstFailure => {
             cmd.stdout(Stdio::null()).stderr(Stdio::null());
@@ -1152,22 +1153,6 @@ fn run_binary(
     let mut child = cmd
         .spawn()
         .with_context(|| format!("starting the tests of `{}`", bin.name))?;
-    // One failed test is enough to know the mutant is killed: libtest reports each test as
-    // it finishes, so the rest of the run does not have to be waited for.
-    let failed = Arc::new(AtomicBool::new(false));
-    let watcher = child.stdout.take().map(|stdout| {
-        let failed = Arc::clone(&failed);
-        std::thread::spawn(move || {
-            for line in std::io::BufReader::new(stdout)
-                .lines()
-                .map_while(|l| l.ok())
-            {
-                if is_failure_line(&line) {
-                    failed.store(true, Ordering::SeqCst);
-                }
-            }
-        })
-    });
     let group = child.id();
     let kill = |child: &mut std::process::Child| {
         kill_test_group(group);
@@ -1175,32 +1160,39 @@ fn run_binary(
         let _ = child.wait();
     };
     let started = Instant::now();
-    let outcome = loop {
+    let result: Result<Outcome> = (|| loop {
         if let Some(status) = child.try_wait()? {
-            if matches!(bin.runner, Runner::Isolated { .. })
-                || watcher.as_ref().is_some_and(|thread| !thread.is_finished())
-            {
+            if matches!(bin.runner, Runner::Isolated { .. }) || output_to_watch.is_some() {
                 kill_test_group(group);
             }
-            break if status.success() {
+            return Ok(if status.success() {
                 Outcome::Pass
             } else {
                 Outcome::Fail
-            };
+            });
         }
-        if failed.load(Ordering::SeqCst) {
+        if output_to_watch
+            .as_mut()
+            .map(FailureOutput::failed)
+            .transpose()?
+            .unwrap_or(false)
+        {
             kill(&mut child);
-            break Outcome::Fail;
+            return Ok(Outcome::Fail);
         }
         if started.elapsed() > timeout {
             kill(&mut child);
-            break Outcome::Timeout;
+            return Ok(Outcome::Timeout);
         }
         std::thread::sleep(Duration::from_millis(5));
-    };
-    if let Some(watcher) = watcher {
-        let _ = watcher.join();
+    })();
+    drop(output_to_watch);
+    if result.is_err() {
+        kill(&mut child);
+        let _ = release_mark(&unable_mark);
     }
+    let outcome = result?;
+
     // Whatever the tests made of it, a run that left the mark was not the mutant's. The
     // mark alone says so: a status is the tests' to choose, and one of them may well end
     // with the runtime's when it finds a mutant out.
@@ -1210,8 +1202,59 @@ fn run_binary(
     Ok(outcome)
 }
 
+struct FailureOutput {
+    file: fs::File,
+    line: Vec<u8>,
+    discarded: bool,
+}
+
+impl FailureOutput {
+    fn new(file: fs::File) -> Self {
+        Self {
+            file,
+            line: Vec::new(),
+            discarded: false,
+        }
+    }
+
+    fn failed(&mut self) -> std::io::Result<bool> {
+        use std::io::Read as _;
+        const MAX_LINE: usize = 8 * 1024;
+        let mut chunk = [0; MAX_LINE];
+        let read = self.file.read(&mut chunk)?;
+        for part in chunk[..read].split_inclusive(|byte| *byte == b'\n') {
+            self.discarded |= self.line.len() + part.len() > MAX_LINE;
+            if !self.discarded {
+                self.line.extend_from_slice(part);
+            }
+            if part.ends_with(b"\n") {
+                if !self.discarded
+                    && is_failure_line(String::from_utf8_lossy(&self.line).trim_end())
+                {
+                    return Ok(true);
+                }
+                self.discarded = false;
+                self.line.clear();
+            }
+        }
+        Ok(false)
+    }
+}
+
 fn kill_test_group(id: u32) {
-    #[cfg(unix)]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        unsafe extern "C" {
+            fn killpg(group: std::ffi::c_int, signal: std::ffi::c_int) -> std::ffi::c_int;
+        }
+        const SIGKILL: std::ffi::c_int = 9;
+        if let Ok(group) = std::ffi::c_int::try_from(id) {
+            // SAFETY: the argument is the child PID used to create its own test group.
+            // SIGKILL is 9 on Linux and macOS.
+            unsafe { killpg(group, SIGKILL) };
+        }
+    }
+    #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     let _ = Command::new("kill")
         .args(["-KILL", "--", &format!("-{id}")])
         .stdout(Stdio::null())
@@ -2437,7 +2480,7 @@ pub fn run(options: &Options) -> Result<Report> {
         if let Some(path) = &options.write_baseline {
             crate::baseline::write(path, &[])?;
         }
-        report.evaluation = Some(report::Evaluation::NoSites);
+        report.record_evaluation();
         return Ok(report);
     }
 
@@ -3201,11 +3244,7 @@ pub fn run(options: &Options) -> Result<Report> {
         );
     }
 
-    report.evaluation = match (report.sites, report.mutants_run) {
-        (0, _) => Some(report::Evaluation::NoSites),
-        (_, 0) => Some(report::Evaluation::NoMutantsExecuted),
-        _ => None,
-    };
+    report.record_evaluation();
     report.sort_findings();
     let places: Vec<FilePlaces> = files
         .iter()
@@ -3938,6 +3977,70 @@ serde = { path = "../../serde-fork" }
             "a descendant held the output pipe open"
         );
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_detached_descendant_does_not_hold_the_runner_open() {
+        let dir = scratch("detached-output");
+        let work = dir.join("work");
+        let source = work.join("runner.rs");
+        let exe = work.join("runner");
+        fs::write(
+            &source,
+            r#"
+use std::os::unix::process::CommandExt;
+fn main() {
+    let child = std::process::Command::new("sleep").arg("8").process_group(0).spawn().unwrap();
+    std::fs::write("child.pid", child.id().to_string()).unwrap();
+}
+"#,
+        )
+        .unwrap();
+        let output = Command::new("rustc")
+            .arg(&source)
+            .arg("-o")
+            .arg(&exe)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let bin = TestBinary {
+            name: "runner".into(),
+            cwd: work.join("src"),
+            marks: marks_dir(&work).unwrap(),
+            git_ceiling: work,
+            tests: BTreeSet::new(),
+            runner: Runner::Exe(exe),
+            baseline: Duration::ZERO,
+            traced: Duration::ZERO,
+            trace: Trace::default(),
+        };
+        let started = Instant::now();
+        let outcome = run_binary(
+            &bin,
+            None,
+            &[],
+            Duration::from_secs(2),
+            RunOutput::FirstFailure,
+            1,
+        );
+        let elapsed = started.elapsed();
+        // This test alone owns the separate child group.
+        let pid = fs::read_to_string(bin.cwd.join("child.pid"))
+            .unwrap()
+            .parse()
+            .unwrap();
+        kill_test_group(pid);
+        fs::remove_dir_all(dir).unwrap();
+        assert_eq!(outcome.unwrap(), Outcome::Pass);
+        assert!(
+            elapsed < Duration::from_secs(6),
+            "a detached descendant held the output pipe open"
+        );
     }
 
     fn set_modified(path: &Path, time: std::time::SystemTime) {

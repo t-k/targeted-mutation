@@ -270,6 +270,14 @@ pub struct Report {
 }
 
 impl Report {
+    pub(crate) fn record_evaluation(&mut self) {
+        self.evaluation = match (self.sites, self.mutants_run, self.skipped.is_empty()) {
+            (_, 1.., _) => None,
+            (0, 0, true) => Some(Evaluation::NoSites),
+            _ => Some(Evaluation::NoMutantsExecuted),
+        };
+    }
+
     /// Puts the findings in reading order. Sites are numbered as they are discovered, and
     /// a statement is discovered before the expressions of the statements above it.
     pub fn sort_findings(&mut self) {
@@ -1024,7 +1032,7 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
         ));
     }
     if report.evaluation == Some(Evaluation::NoMutantsExecuted) {
-        out.push_str("No mutants executed. A subprocess that clears the environment cannot report probes; use --source-only on the affected lines if needed.\n");
+        out.push_str("No mutants executed. See any skipped entries in --json. For a subprocess that clears the probe environment, try --source-only.\n");
     }
     if !show_unreached && !report.unreached.is_empty() {
         out.push_str("(--show-unreached lists the code no test executes)\n");

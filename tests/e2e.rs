@@ -655,7 +655,7 @@ fn doc_tests_are_used_on_request() {
     let dir = fixture("doc-tested", "doc-tested");
     // Without --doc nothing executes the code.
     let (code, report) = json(&dir);
-    assert_eq!(code, 0, "{report:#}");
+    assert_eq!(code, 3, "{report:#}");
     assert_eq!(
         report["unreached"].as_array().unwrap().len(),
         5,
@@ -2090,4 +2090,17 @@ fn main() {
     let run = tmt(&dir, &["--json", "--quiet"]);
     assert_ne!(run.code, 1, "{}", run.stderr);
     let _: Value = serde_json::from_str(&run.stdout).unwrap();
+}
+
+#[test]
+fn an_unparseable_selection_is_not_a_successful_empty_selection() {
+    let dir = fixture("eligibility", "skipped-bom");
+    let source = dir.join("src/lib.rs");
+    let old = fs::read_to_string(&source).unwrap();
+    fs::write(source, format!("\u{feff}{old}")).unwrap();
+    let run = tmt(&dir, &["--lines", "src/lib.rs", "--json", "--quiet"]);
+    assert_eq!(run.code, 3, "{}\n{}", run.stdout, run.stderr);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(report["evaluation"], "no_mutants_executed");
+    assert_eq!(report["skipped"][0]["reason"], "unparseable_source");
 }
