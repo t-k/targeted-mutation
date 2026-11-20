@@ -626,6 +626,9 @@ pub struct LogicObs {
     pub short: bool,
     pub rhs_true: bool,
     pub rhs_false: bool,
+    /// The right operand was started. Where it gave no value (a panic, a `?`, a
+    /// `return`) this is all there is to see of the expression having been executed.
+    pub rhs_started: bool,
 }
 
 impl LogicObs {
@@ -634,6 +637,7 @@ impl LogicObs {
             short: bits & 1 != 0,
             rhs_true: bits & 2 != 0,
             rhs_false: bits & 4 != 0,
+            rhs_started: bits & 8 != 0,
         }
     }
 
@@ -641,10 +645,11 @@ impl LogicObs {
         self.short |= other.short;
         self.rhs_true |= other.rhs_true;
         self.rhs_false |= other.rhs_false;
+        self.rhs_started |= other.rhs_started;
     }
 
     pub fn reached(&self) -> bool {
-        self.short || self.rhs_true || self.rhs_false
+        self.short || self.rhs_true || self.rhs_false || self.rhs_started
     }
 
     /// The value of the whole expression, if it was the same in every observation.
@@ -1149,12 +1154,32 @@ mod tests {
                 assert!(logic_infects(and, Mutation::LogicSwap, &obs), "{ctx}");
             }
         }
+        // A right operand that was started and gave no value (it panicked, or left the
+        // function): the expression was executed, the operator swapped is run against
+        // this test, and the other two change nothing in it.
+        let started = LogicObs::from_bits(8);
+        assert!(started.rhs_started && started.reached());
+        for and in [true, false] {
+            let plan = plan_logic(and, &started);
+            assert_eq!(plan.run, vec![Mutation::LogicSwap]);
+            assert_eq!(
+                plan.gaps,
+                vec![LogicGap::RhsNeverDecides, LogicGap::LhsNeverDecides]
+            );
+            assert!(logic_infects(and, Mutation::LogicSwap, &started));
+            assert!(!logic_infects(and, Mutation::LogicDropRhs, &started));
+            assert!(!logic_infects(and, Mutation::LogicDropLhs, &started));
+        }
+        let mut merged = LogicObs::from_bits(2);
+        merged.merge(&started);
+        assert_eq!(merged, LogicObs::from_bits(10));
         assert_eq!(
             LogicObs::from_bits(5),
             LogicObs {
                 short: true,
                 rhs_true: false,
-                rhs_false: true
+                rhs_false: true,
+                rhs_started: false,
             }
         );
         assert_eq!(
@@ -1162,7 +1187,8 @@ mod tests {
             LogicObs {
                 short: false,
                 rhs_true: true,
-                rhs_false: false
+                rhs_false: false,
+                rhs_started: false,
             }
         );
     }

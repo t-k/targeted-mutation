@@ -728,7 +728,7 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
     }
     if report.unviable_mutants > 0 {
         out.push_str(&format!(
-            ", {} replaced bodies left out (the value does not have the type)",
+            ", {} mutants left out (they do not compile)",
             report.unviable_mutants
         ));
     }
@@ -1463,7 +1463,7 @@ mod tests {
             "{text}"
         );
         assert!(
-            text.contains(", 2 replaced bodies left out (the value does not have the type)\n"),
+            text.contains(", 2 mutants left out (they do not compile)\n"),
             "{text}"
         );
         assert!(text.contains("--show-unreached"), "{text}");
@@ -1612,7 +1612,7 @@ mod tests {
             ..Report::default()
         };
         assert!(
-            render_text(&one, false).contains(", 1 replaced bodies left out"),
+            render_text(&one, false).contains(", 1 mutants left out (they do not compile)"),
             "{}",
             render_text(&one, false)
         );

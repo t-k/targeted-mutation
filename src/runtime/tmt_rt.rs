@@ -110,6 +110,9 @@ pub const RET_FALSE: u8 = 2;
 pub const LOGIC_SHORT: u8 = 1;
 pub const LOGIC_RHS_TRUE: u8 = 2;
 pub const LOGIC_RHS_FALSE: u8 = 4;
+/// The right operand was started. It may not give a value: it can panic or leave the
+/// function (`a && check()?`), and the expression was executed all the same.
+pub const LOGIC_RHS_STARTED: u8 = 8;
 
 /// Arithmetic observations: the swapped operator gave the same / a different result,
 /// or the operands are not primitive numbers.
@@ -859,8 +862,16 @@ pub fn lhs(site: u32, and: bool, a: bool) -> u8 {
     }
     let m = mutant_at(site);
     let c = lhs_code(and, a, m);
-    if m.is_none() && c != 2 {
-        record_bits(b'L', site, LOGIC_SHORT);
+    if m.is_none() {
+        record_bits(
+            b'L',
+            site,
+            if c == 2 {
+                LOGIC_RHS_STARTED
+            } else {
+                LOGIC_SHORT
+            },
+        );
     }
     c
 }

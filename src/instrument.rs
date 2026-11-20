@@ -123,7 +123,9 @@ pub enum SiteKind {
     Body {
         name: String,
         value: String,
-        /// As for `Return`: the body when it is one expression.
+        /// The body when it is one expression that only computes its value (no call,
+        /// no macro, nothing assigned, no early exit): replacing the body by the value
+        /// that expression always had is then the same program for the tests.
         sole_expr: Option<(usize, usize)>,
     },
 }
@@ -152,6 +154,18 @@ pub enum ArithOp {
 }
 
 impl ArithOp {
+    /// How tightly the operator binds: a higher number before a lower one.
+    pub fn binding(self) -> u8 {
+        match self {
+            ArithOp::Mul | ArithOp::Div | ArithOp::Rem => 5,
+            ArithOp::Add | ArithOp::Sub => 4,
+            ArithOp::Shl | ArithOp::Shr => 3,
+            ArithOp::BitAnd => 2,
+            ArithOp::BitXor => 1,
+            ArithOp::BitOr => 0,
+        }
+    }
+
     pub const ALL: [ArithOp; 10] = [
         ArithOp::Add,
         ArithOp::Sub,
@@ -363,9 +377,12 @@ impl Finder<'_> {
         }
         let at = sig.span().start();
         let text = self.source[sig_start..sig_end].to_string();
-        let sole_expr = match &body.stmts[..] {
-            [syn::Stmt::Expr(expr, None)] => self.range(expr.span()),
-            _ => None,
+        let (sole_expr, sole_plain) = match &body.stmts[..] {
+            [syn::Stmt::Expr(expr, None)] => {
+                let range = self.range(expr.span());
+                (range, range.filter(|_| does_nothing_else(expr)))
+            }
+            _ => (None, None),
         };
         let push = |finder: &mut Self, kind: SiteKind| {
             finder.add(Site {
@@ -398,7 +415,7 @@ impl Finder<'_> {
             self.found.single_statement_bodies.push(name);
             return;
         }
-        let written = sole_expr.map(|(from, to)| squeezed(&self.source[from..to]));
+        let written = sole_expr.map(|(from, to)| tokens_of(&self.source[from..to]));
         // An iterator of another type cannot be returned beside the body's own.
         for value in iterator_values(&sig.output) {
             self.found.rebuild_sites.push(Site {
@@ -406,7 +423,7 @@ impl Finder<'_> {
                 kind: SiteKind::Body {
                     name: name.clone(),
                     value,
-                    sole_expr,
+                    sole_expr: sole_plain,
                 },
                 line: at.line,
                 column: at.column + 1,
@@ -416,13 +433,13 @@ impl Finder<'_> {
             });
         }
         for value in body_values(&sig.output) {
-            if written.as_deref() != Some(squeezed(&value).as_str()) {
+            if written.as_deref() != Some(tokens_of(&value).as_str()) {
                 push(
                     self,
                     SiteKind::Body {
                         name: name.clone(),
                         value,
-                        sole_expr,
+                        sole_expr: sole_plain,
                     },
                 );
             }
@@ -715,9 +732,38 @@ pub fn source_mutants(site: &Site) -> Vec<SourceMutant> {
             what: what.to_string(),
             into: into.to_string(),
         };
-    let operator = |gap: &(usize, usize), from: String, to: String| {
-        change(gap.0, gap.1, format!(" {to} "), &from, &to)
+    // A replacement that binds otherwise than the original keeps the operands it had:
+    // `2 * 3` in `8 - 2 * 3` becomes `(2 + 3)`, and `8 - 2 * 3` becomes `(8) / (2 * 3)`.
+    let operator = |gap: &(usize, usize), from: String, to: String, binds: std::cmp::Ordering| {
+        let inside =
+            site.start <= gap.0 && gap.1 <= site.end && site.text.len() == site.end - site.start;
+        let (left, right) = if inside {
+            (
+                site.text[..gap.0 - site.start].trim_end(),
+                site.text[gap.1 - site.start..].trim_start(),
+            )
+        } else {
+            ("", "")
+        };
+        match binds {
+            std::cmp::Ordering::Less if inside => change(
+                site.start,
+                site.end,
+                format!("({left} {to} {right})"),
+                &from,
+                &to,
+            ),
+            std::cmp::Ordering::Greater if inside => change(
+                site.start,
+                site.end,
+                format!("({left}) {to} ({right})"),
+                &from,
+                &to,
+            ),
+            _ => change(gap.0, gap.1, format!(" {to} "), &from, &to),
+        }
     };
+    let same = std::cmp::Ordering::Equal;
     match &site.kind {
         SiteKind::Cmp { op, gap, .. } => {
             let others: &[CmpOp] = match op {
@@ -730,12 +776,17 @@ pub fn source_mutants(site: &Site) -> Vec<SourceMutant> {
             };
             others
                 .iter()
-                .map(|other| operator(gap, op.symbol().into(), other.symbol().into()))
+                .map(|other| operator(gap, op.symbol().into(), other.symbol().into(), same))
                 .collect()
         }
         SiteKind::Logic { and, gap, .. } => {
-            let (from, to) = if *and { ("&&", "||") } else { ("||", "&&") };
-            vec![operator(gap, from.into(), to.into())]
+            // `&&` binds tighter than `||`.
+            let (from, to, binds) = if *and {
+                ("&&", "||", std::cmp::Ordering::Less)
+            } else {
+                ("||", "&&", std::cmp::Ordering::Greater)
+            };
+            vec![operator(gap, from.into(), to.into(), binds)]
         }
         SiteKind::Arith {
             op, assign, gap, ..
@@ -749,6 +800,12 @@ pub fn source_mutants(site: &Site) -> Vec<SourceMutant> {
                         gap,
                         format!("{}{eq}", op.symbol()),
                         format!("{}{eq}", other.symbol()),
+                        // An assignment has nothing around it and its operands to itself.
+                        if *assign {
+                            same
+                        } else {
+                            other.binding().cmp(&op.binding())
+                        },
                     )
                 })
                 .collect()
@@ -845,9 +902,70 @@ pub fn iterator_values(output: &syn::ReturnType) -> Vec<String> {
     values
 }
 
-/// Text without its white space, to compare two ways of writing one expression.
+/// Text without its white space.
 fn squeezed(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
+}
+
+/// The tokens of an expression, to compare two ways of writing it: the white space
+/// between them does not count, the one inside a literal does (`" "` is not `""`).
+fn tokens_of(text: &str) -> String {
+    match text.parse::<TokenStream>() {
+        Ok(tokens) => tokens.to_string(),
+        Err(_) => text.to_string(),
+    }
+}
+
+/// Whether evaluating the expression does nothing but give its value, as far as the
+/// source says: operators on a user's type can do anything, which is not assumed.
+fn does_nothing_else(expr: &syn::Expr) -> bool {
+    struct Effects(bool);
+    impl<'ast> Visit<'ast> for Effects {
+        fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+            match expr {
+                syn::Expr::Binary(_)
+                | syn::Expr::Unary(_)
+                | syn::Expr::Paren(_)
+                | syn::Expr::Group(_)
+                | syn::Expr::Path(_)
+                | syn::Expr::Lit(_)
+                | syn::Expr::Field(_)
+                | syn::Expr::Reference(_)
+                | syn::Expr::Cast(_)
+                | syn::Expr::Tuple(_) => syn::visit::visit_expr(self, expr),
+                _ => self.0 = true,
+            }
+        }
+        fn visit_bin_op(&mut self, op: &'ast syn::BinOp) {
+            use syn::BinOp::*;
+            if !matches!(
+                op,
+                Add(_)
+                    | Sub(_)
+                    | Mul(_)
+                    | Div(_)
+                    | Rem(_)
+                    | And(_)
+                    | Or(_)
+                    | BitXor(_)
+                    | BitAnd(_)
+                    | BitOr(_)
+                    | Shl(_)
+                    | Shr(_)
+                    | Eq(_)
+                    | Lt(_)
+                    | Le(_)
+                    | Ne(_)
+                    | Ge(_)
+                    | Gt(_)
+            ) {
+                self.0 = true; // an assignment
+            }
+        }
+    }
+    let mut effects = Effects(false);
+    effects.visit_expr(expr);
+    !effects.0
 }
 
 /// The values to replace a function's body with, by its return type. The table is that
@@ -3427,17 +3545,17 @@ mod tests {
                 "arm -> K::B | `` becomes `if false `",
                 "guard -> true | `n >= 1` becomes `true`",
                 ">= -> < | ` >= ` becomes ` < `",
-                "|| -> && | ` || ` becomes ` && `",
+                "|| -> && | `!(a != b) || a <= -b` becomes `(!(a != b)) && (a <= -b)`",
                 "! ->  | `!` becomes ``",
                 "!= -> == | ` != ` becomes ` == `",
                 "<= -> > | ` <= ` becomes ` > `",
                 "- ->  | `-` becomes ``",
-                "&& -> || | ` && ` becomes ` || `",
+                "&& -> || | `a % b > 0 && a == b` becomes `(a % b > 0 || a == b)`",
                 "> -> == | ` > ` becomes ` == `",
                 "> -> < | ` > ` becomes ` < `",
                 "> -> >= | ` > ` becomes ` >= `",
                 "% -> / | ` % ` becomes ` / `",
-                "% -> + | ` % ` becomes ` + `",
+                "% -> + | `a % b` becomes `(a + b)`",
                 "== -> != | ` == ` becomes ` != `",
                 "field -> on | `x` becomes `(base).on`",
                 "field -> a | `a` becomes `a: (base).a`",
@@ -3499,6 +3617,121 @@ mod tests {
         }
         let unit: syn::ItemFn = syn::parse_str("fn f() {}").unwrap();
         assert!(iterator_values(&unit.sig.output).is_empty());
+    }
+
+    /// The source with each mutant of its sites that are built, one after the other.
+    fn built(src: &str) -> Vec<String> {
+        let found = discover(src, 0).unwrap();
+        found
+            .rebuild_sites
+            .iter()
+            .flat_map(source_mutants)
+            .map(|m| format!("{}{}{}", &src[..m.start], m.replacement, &src[m.end..]))
+            .collect()
+    }
+
+    #[test]
+    fn a_body_that_is_written_as_the_value_and_one_that_only_computes() {
+        let bodies = |src: &str| -> Vec<(String, bool)> {
+            discover(src, 0)
+                .unwrap()
+                .sites
+                .iter()
+                .filter_map(|site| match &site.kind {
+                    SiteKind::Body {
+                        value, sole_expr, ..
+                    } => Some((value.clone(), sole_expr.is_some())),
+                    _ => None,
+                })
+                .collect()
+        };
+        let values = |src: &str| -> Vec<String> { bodies(src).into_iter().map(|b| b.0).collect() };
+        // The value the body already is makes no mutant, however it is spaced.
+        assert_eq!(values("fn t() -> bool { true }"), ["false"]);
+        assert_eq!(values("fn n() -> u8 {  0  }"), ["1"]);
+        assert_eq!(
+            values("fn s() -> String { String :: new () }"),
+            ["\"xyzzy\".into()"]
+        );
+        // White space inside a literal is not spacing: `" "` is not the empty string.
+        assert_eq!(
+            values("fn s() -> &'static str { \" \" }"),
+            ["\"\"", "\"xyzzy\""]
+        );
+        // A body that only computes its value can be said at that expression; one
+        // that calls, assigns or leaves early does more than give a value.
+        for (body, only_computes) in [
+            ("n > 0", true),
+            ("!(self.limit < n) && n as u8 != 3", true),
+            ("(n, 1).0 > *&n", true),
+            ("self.push(n) > 0", false),
+            ("next() > 0", false),
+            ("matches!(n, 1)", false),
+            ("(if n > 1 { n } else { 0 }) > 0", false),
+            ("list[n] > 0", false),
+            ("check(n)? > 0", false),
+        ] {
+            let src = format!("impl S {{ fn f(&mut self, n: usize) -> bool {{ {body} }} }}");
+            let all = bodies(&src);
+            assert_eq!(all.len(), 2, "{body}");
+            assert!(all.iter().all(|b| b.1 == only_computes), "{body}: {all:?}");
+        }
+    }
+
+    #[test]
+    fn a_replaced_operator_keeps_its_operands() {
+        // Every replacement is the same tree with another operator, also where the new
+        // operator binds otherwise than the old one.
+        assert_eq!(
+            built("const X: i32 = 8 - 2 * 3;"),
+            [
+                "const X: i32 = 8 + 2 * 3;",
+                "const X: i32 = (8) / (2 * 3);",
+                "const X: i32 = 8 - 2 / 3;",
+                "const X: i32 = 8 - (2 + 3);",
+            ]
+        );
+        assert_eq!(
+            built("const B: bool = P || Q && R;"),
+            [
+                "const B: bool = (P) && (Q && R);",
+                "const B: bool = P || (Q || R);",
+            ]
+        );
+        assert_eq!(
+            built("const M: u8 = A & B | C;"),
+            [
+                "const M: u8 = (A & B) & (C);",
+                "const M: u8 = (A & B) ^ (C);",
+                "const M: u8 = (A | B) | C;",
+                "const M: u8 = (A ^ B) | C;",
+            ]
+        );
+        assert_eq!(
+            built("const S: u8 = 1 << 2 + 1;"),
+            [
+                "const S: u8 = 1 >> 2 + 1;",
+                "const S: u8 = 1 << 2 - 1;",
+                "const S: u8 = 1 << (2) * (1);",
+            ]
+        );
+        // Comparisons bind alike, and an assignment has its operands to itself.
+        assert_eq!(
+            built("const C: bool = A + 1 < B;")[..3],
+            [
+                "const C: bool = A + 1 == B;",
+                "const C: bool = A + 1 > B;",
+                "const C: bool = A + 1 <= B;",
+            ]
+        );
+        let assigned = built("const fn f(mut x: u8) -> u8 { x += 2 * 3; x }");
+        for expected in [
+            "const fn f(mut x: u8) -> u8 { x -= 2 * 3; x }",
+            "const fn f(mut x: u8) -> u8 { x *= 2 * 3; x }",
+            "const fn f(mut x: u8) -> u8 { x += (2 + 3); x }",
+        ] {
+            assert!(assigned.iter().any(|text| text == expected), "{assigned:?}");
+        }
     }
 
     #[test]

@@ -107,6 +107,7 @@ impl Trace {
                 let limit = match kind {
                     "B" => 4,
                     "A" => 32,
+                    "L" => 16,
                     _ => 8,
                 };
                 let bits: u8 = bits.parse().ok().filter(|b| (1..limit).contains(b))?;
@@ -690,7 +691,8 @@ mod tests {
             crate::plan::LogicObs {
                 short: true,
                 rhs_true: false,
-                rhs_false: true
+                rhs_false: true,
+                rhs_started: false,
             }
         );
         assert_eq!(
@@ -698,7 +700,8 @@ mod tests {
             crate::plan::LogicObs {
                 short: false,
                 rhs_true: true,
-                rhs_false: false
+                rhs_false: false,
+                rhs_started: false,
             }
         );
         assert_eq!(
@@ -720,9 +723,14 @@ mod tests {
             }
         );
         assert!(trace.reach[&3].contains("t"));
+        // A right operand that was started, with and without a value.
+        let started = Trace::parse("L\t1\tt\t8\nL\t1\tu\t10\n");
+        assert_eq!(started.malformed_lines, 0);
+        assert!(started.logic[&1]["t"].rhs_started && !started.logic[&1]["t"].rhs_true);
+        assert!(started.logic[&1]["u"].rhs_started && started.logic[&1]["u"].rhs_true);
         for bad in [
             "L\t1\tt\t0\n",
-            "L\t1\tt\t8\n",
+            "L\t1\tt\t16\n",
             "A\t1\t\t1\n",
             "R\t1\tt\n",
             "L\tx\tt\t1\n",

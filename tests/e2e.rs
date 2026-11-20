@@ -1331,3 +1331,36 @@ fn the_last_round_of_a_loop_is_the_nearest_value() {
     assert_eq!(bad.code, 2, "{}", bad.stderr);
     assert!(bad.stderr.contains("--opt-level"), "{}", bad.stderr);
 }
+
+#[test]
+fn a_right_operand_that_leaves_the_function_was_still_executed() {
+    let dir = fixture("diverging", "diverging");
+    let (code, report) = json(&dir);
+    assert_eq!(code, 2, "{report:#}");
+    // `positive(n)?` returns the error: the right operand never gives a value. The
+    // expression is not unreached for that, and `||` in its place is run and found out
+    // (it would not get as far as the error).
+    let unreached: Vec<&str> = report["unreached"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["code"].as_str().unwrap())
+        .collect();
+    assert_eq!(unreached, ["n > 0"], "{report:#}");
+    let survivors: Vec<&str> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["code"] == "flag && positive(n)?")
+        .flat_map(|f| strings(&f["survivors"]))
+        .collect();
+    // What does survive are the two that still call `positive`.
+    assert_eq!(
+        survivors,
+        [
+            "`flag && { positive(n)?; true }`",
+            "`{ flag; positive(n)? }`"
+        ],
+        "{report:#}"
+    );
+}

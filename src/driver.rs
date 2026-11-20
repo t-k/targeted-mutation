@@ -2024,8 +2024,16 @@ pub fn run(options: &Options) -> Result<Report> {
         // is a multiple of this: where it matters, time the tests as the mutants run them.
         if bin.traced > SLOW_TRACE {
             let started = Instant::now();
-            if run_binary(&bin, None, &[], bin.traced, false)? == Outcome::Pass {
-                bin.baseline = started.elapsed();
+            match run_binary(&bin, None, &[], bin.traced, false)? {
+                Outcome::Pass => bin.baseline = started.elapsed(),
+                // Every failure from here on would be counted as a mutant found out.
+                Outcome::Fail => bail!(
+                    "the tests of `{}` pass while their run is recorded and fail without: \
+                     they do not always give the same result, and nothing can be concluded \
+                     from running them",
+                    bin.name
+                ),
+                Outcome::Timeout => {}
             }
         }
         // No file means no probe was reached. Anything else unreadable or malformed means
@@ -2277,26 +2285,34 @@ pub fn run(options: &Options) -> Result<Report> {
                 mutant.replacement,
                 &file.original[mutant.end..]
             );
-            state.write(&file.path, &instrumented(file, &mutated))?;
-            let viable = cargo_build()?.status.success();
-            let mut survived = viable;
-            if viable {
-                report.mutants_run += 1;
+            // `None`: it does not build. Otherwise what stopped it, if anything did.
+            let attempt = || -> Result<Option<Outcome>> {
+                state.write(&file.path, &instrumented(file, &mutated))?;
+                if !cargo_build()?.status.success() {
+                    return Ok(None);
+                }
                 for bin in &by_speed {
                     let outcome = run_binary(bin, None, &[], mutant_timeout(bin.baseline), true)?;
                     if outcome != Outcome::Pass {
-                        survived = false;
-                        report.mutants_killed += 1;
-                        report.mutants_timed_out += (outcome == Outcome::Timeout) as usize;
-                        break;
+                        return Ok(Some(outcome));
                     }
                 }
-            } else {
-                report.unviable_mutants += 1;
-            }
-            // The file as it was, before another one is changed.
+                Ok(Some(Outcome::Pass))
+            };
+            let attempted = attempt();
+            // The file as it was, before another one is changed and whatever went wrong.
             let rendered = file.rendered.as_ref().expect("rendered before building");
             state.write(&file.path, &instrumented(file, &rendered.text))?;
+            let outcome = attempted?;
+            match outcome {
+                None => report.unviable_mutants += 1,
+                Some(outcome) => {
+                    report.mutants_run += 1;
+                    report.mutants_killed += (outcome != Outcome::Pass) as usize;
+                    report.mutants_timed_out += (outcome == Outcome::Timeout) as usize;
+                }
+            }
+            let survived = outcome == Some(Outcome::Pass);
             if survived {
                 let at = report::location(&file.display, site);
                 let text = report::describe(site, mutation_of(site, mutant));

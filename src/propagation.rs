@@ -66,6 +66,8 @@ fn per_test(trace: &Trace) -> BTreeMap<(&str, u32), Seen> {
                 short,
                 rhs_true,
                 rhs_false,
+                // Not an outcome: it comes with every value the right operand gives.
+                rhs_started: _,
             } = *obs;
             let seen = all.entry((test, *site)).or_default();
             seen.reached |= obs.reached();
