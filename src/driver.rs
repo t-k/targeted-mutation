@@ -923,23 +923,8 @@ fn run_binary(
 
     let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
     let threads = test_threads(cores, sharing);
-    // Where the runtime leaves a mark when a run cannot go on as its mutant. The exit
-    // status says so too, but only that of the tests themselves: a program a test
-    // started gives its status to the test, which fails for it.
     static RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let unable_mark = std::env::temp_dir().join(format!(
-        "tmt-unable-{}-{}",
-        std::process::id(),
-        RUNS.fetch_add(1, Ordering::SeqCst)
-    ));
-    // The tests run in a directory of their own, and so does what they start: a place
-    // given from here (`TMPDIR=.`) has to be the same place there.
-    let unable_mark = std::path::absolute(&unable_mark).unwrap_or(unable_mark);
-    // The file is there for the run, and gone when the run was given up: the runtime
-    // only has to take it away, which it can do on a full disk too. If it cannot even
-    // be made here, nothing could be told from the run.
-    fs::write(&unable_mark, b"")
-        .with_context(|| format!("creating {}", unable_mark.display()))?;
+    let unable_mark = reserve_mark(&std::env::temp_dir(), &RUNS)?;
 
     let mut cmd = match &bin.runner {
         Runner::Exe(exe) => {
@@ -1038,10 +1023,59 @@ fn run_binary(
     // Whatever the tests made of it, a run that left the mark was not the mutant's. The
     // mark alone says so: a status is the tests' to choose, and one of them may well end
     // with the runtime's when it finds a mutant out.
-    if fs::remove_file(&unable_mark).is_err() {
+    if release_mark(&unable_mark)? {
         return Ok(Outcome::Unable);
     }
     Ok(outcome)
+}
+
+/// Makes the file by which a run says that it gave up: there for the run, and gone when
+/// the run could not go on as its mutant. The runtime only has to take it away, which
+/// it can do on a full disk too. The exit status would say the same, but only that of
+/// the tests themselves: a program a test started gives its status to the test, which
+/// fails for it.
+///
+/// The file is new: one of the same name that is there already (the directory is shared
+/// with everything else) is left as it is, and another name is tried.
+fn reserve_mark(dir: &Path, runs: &std::sync::atomic::AtomicUsize) -> Result<PathBuf> {
+    // The tests run in a directory of their own, and so does what they start: a place
+    // given from here (`TMPDIR=.`) has to be the same place there.
+    let dir = std::path::absolute(dir).unwrap_or(dir.to_path_buf());
+    loop {
+        let mark = dir.join(format!(
+            "tmt-unable-{}-{}",
+            std::process::id(),
+            runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&mark)
+        {
+            Ok(_) => return Ok(mark),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {}
+            // If it cannot be made, nothing could be told from the run.
+            Err(err) => {
+                return Err(err).with_context(|| format!("creating {}", mark.display()));
+            }
+        }
+    }
+}
+
+/// Takes the mark away after the run and says whether the run had given up (the mark
+/// was gone). Anything else that keeps it from being taken away leaves the question
+/// open, and is an error rather than an answer.
+fn release_mark(mark: &Path) -> Result<bool> {
+    match fs::remove_file(mark) {
+        Ok(()) => Ok(false),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(true),
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "removing {}: cannot tell whether the tests ran the mutant to the end",
+                mark.display()
+            )
+        }),
+    }
 }
 
 /// A line of libtest output that reports a failed test.
@@ -3891,6 +3925,48 @@ serde = { path = "../../serde-fork" }
             .map(|(kind, into, mutation)| (kind.as_str(), into.as_str(), mutation.as_str()))
             .collect();
         assert_eq!(seen, expected);
+    }
+
+    #[test]
+    fn the_mark_of_a_run_is_a_new_file_and_says_one_of_three_things() {
+        let dir = scratch("unable-mark");
+        fs::create_dir_all(&dir).unwrap();
+        let runs = std::sync::atomic::AtomicUsize::new(0);
+        let name = |n: usize| dir.join(format!("tmt-unable-{}-{n}", std::process::id()));
+        // A file of the name that would be next belongs to someone: it is not emptied,
+        // and the mark gets another name.
+        fs::write(name(0), "not ours").unwrap();
+        fs::write(name(1), "nor this").unwrap();
+        let mark = reserve_mark(&dir, &runs).unwrap();
+        assert_eq!(mark, name(2));
+        assert!(mark.is_absolute());
+        assert_eq!(fs::read_to_string(&mark).unwrap(), "");
+        assert_eq!(fs::read_to_string(name(0)).unwrap(), "not ours");
+        assert_eq!(fs::read_to_string(name(1)).unwrap(), "nor this");
+        // Still there after the run: the run went to its end, and the mark is taken away.
+        assert!(!release_mark(&mark).unwrap());
+        assert!(!mark.exists());
+        // Gone: the run gave up.
+        let mark = reserve_mark(&dir, &runs).unwrap();
+        assert_eq!(mark, name(3));
+        fs::remove_file(&mark).unwrap();
+        assert!(release_mark(&mark).unwrap());
+        // There, and not to be taken away: neither of the two, and said as an error.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mark = reserve_mark(&dir, &runs).unwrap();
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
+            let refused = release_mark(&mark);
+            // A directory that cannot be written to cannot have a mark made in it either.
+            let unmade = reserve_mark(&dir, &runs);
+            fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+            let refused = format!("{:#}", refused.unwrap_err());
+            assert!(refused.contains("cannot tell whether"), "{refused}");
+            assert!(refused.contains("tmt-unable-"), "{refused}");
+            assert!(format!("{:#}", unmade.unwrap_err()).contains("creating"));
+        }
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
