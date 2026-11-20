@@ -93,6 +93,7 @@ Running:
 - `--all-files`: copy files that git ignores too. Use it when the build needs generated files that are not tracked.
 - `--no-verify`: trust the trace; do not re-run tests against predicted survivors.
 - `--no-effects`: do not trace surviving mutants to say what they change.
+- `--opt-level N`: build the tests at optimisation level N (0 to 3) instead of the profile's own. Worth it when tests spend their time in loops (see "Speed").
 - `--rebuild`: also run the mutants that need a build of their own (see "How it works", step 5). Without it the summary says how many were left out.
 
 Output: text by default, `--json`, or `--sarif` (SARIF 2.1.0 for code scanning). `--show-unreached` lists the code no test executes, `--quiet` drops the progress lines.
@@ -170,6 +171,7 @@ The probes are written to leave the unmutated program alone: every operand is ev
 - `formal/pict/planner.pict`: 3-way combinations of operator, observation shape, literal position and type range. The generated table (`tests/data/planner.pict.tsv`) is replayed against a brute-force oracle in `plan::tests::pict_table`.
 - `formal/tla/RepairLoop.tla`: the instrument, build, disable-failing-probes loop terminates and never ships a probe that does not compile. Checked with TLC. The model covers compile errors only; that a probe which compiles also behaves like the code it replaces is what `fixtures/semantics` tests.
 - `formal/tla/JobPool.tla`: the parallel runner runs every mutant exactly once and has every result when the workers stop. Checked with TLC.
+- `formal/tla/TraceBacklog.tla`: the observations a thread keeps back while recording. Nothing a thread knows is anywhere but in the trace, in its backlog or on its way, and when every thread has ended the trace has the nearest distance. Three wrong variants (no write at the end of a thread, a backlog that keeps the first value, news that is dropped) are told apart. Checked with TLC.
 - `formal/tla/WorkCopy.tla`: the working copy across runs. Whatever earlier runs left behind, and wherever one was interrupted, the build of a run sees exactly the files that run wants, and instrumented text is never in the copy without the log naming it. Checked with TLC.
 - `formal/pict/workcopy.pict`: what a file was after the last run, what the user did to it since, and whether this run instruments it. The table (`tests/data/workcopy.pict.tsv`) is replayed in `driver::tests::work_copy_table`.
 
@@ -194,6 +196,7 @@ java -jar tla2tools.jar formal/tla/RepairLoop.tla
 - The survivor prediction assumes deterministic tests. A wrong prediction shows up as `UNSTABLE`.
 - Equivalent mutants are not always detected. If `max(a, b)` is written with `a >= b`, then `a > b` is reported although no test could observe it. The same goes for an operand that is constant by construction (`is_large(n) && FEATURE_ENABLED`).
 - Observations made on threads that a test spawns, and all observations of doc tests, cannot be attributed to a single test; the mutant is then run against the whole test binary.
+- A thread without a name, and the main thread, write every observation at once (slow in a loop); a thread with a name keeps distances back as described under "Speed". If such a thread is still running when the process exits, what it observed in its last 20 ms can be missing from the trace, as anything it would have observed a moment later is. A survivor predicted from that is re-run like every other and shows up as `UNSTABLE` if the prediction was wrong.
 - With `--jobs`, a mutant's time limit is still derived from the unloaded test run, so a heavily loaded machine can turn a slow mutant into a timeout (counted as killed).
 
 ## Speed
@@ -201,7 +204,8 @@ java -jar tla2tools.jar formal/tla/RepairLoop.tla
 - The crate is built once; mutants are switched on by an environment variable.
 - A mutant is run only against the tests whose observations it changes, and the run stops at the first test that fails.
 - A mutant that makes a loop endless is stopped after 5 seconds plus five times what its test binary takes without recording. The summary says how many were stopped that way; each of them costs that limit.
-- Probes cost time, most of all while recording: a test that spends its time in arithmetic loops can take ten times as long in the trace run. A probe that sees nothing new does not take the recorder's lock.
+- Probes cost time where tests spend theirs in loops. In an unoptimised build (what `cargo test` makes) a probe that has nothing to do is a load, a compare and the operation itself, but nothing around it is inlined: a loop of plain arithmetic and comparisons took 13 times as long with probes as without, and 170 times as long while recording. `--opt-level 1` removes nearly all of it (the same loop: as fast as without probes, and 13 times as long while recording), at the price of a slower build and of tests that are not built exactly as `cargo test` builds them.
+- While recording, a probe that sees nothing new does not take the recorder's lock, and a distance that only comes closer to zero (a loop counting towards its bound, in every round) is not written each time but kept and written when the thread ends, when any other thread ends, and every 20 ms.
 - The working copy is kept between runs. A file is rewritten only when its instrumented text changed, so cargo rebuilds what changed and nothing else.
 - Mutants that need a build of their own (step 5) cost a build and a full test run each. Their number is printed before they start.
 - `--since` and `--lines` cut the work down to the code under review.

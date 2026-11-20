@@ -1308,3 +1308,26 @@ fn the_mutants_of_cargo_mutants() {
         "{quick:#}"
     );
 }
+
+#[test]
+fn the_last_round_of_a_loop_is_the_nearest_value() {
+    let dir = fixture("countdown", "countdown");
+    let (code, report) = json(&dir);
+    assert_eq!(code, 2, "{report:#}");
+    let gaps = findings(&report, "input_gap");
+    assert_eq!(gaps.len(), 1, "{report:#}");
+    // A distance that only comes closer is not written each time it does, but when the
+    // thread ends: -11 is the last round of the thread the test started, 50 the last of
+    // a test's own.
+    assert_eq!(
+        gaps[0]["observed"],
+        "nearest values the tests passed: `i` - `limit` = -11, 50"
+    );
+    // Optimised code observes the same and gives the same report.
+    let run = tmt(&dir, &["--json", "--quiet", "--opt-level", "2"]);
+    let optimised: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(optimised, report);
+    let bad = tmt(&dir, &["--quiet", "--opt-level", "4"]);
+    assert_eq!(bad.code, 2, "{}", bad.stderr);
+    assert!(bad.stderr.contains("--opt-level"), "{}", bad.stderr);
+}

@@ -13,7 +13,8 @@ use std::cell::{Cell, RefCell};
 use std::cmp::Ordering;
 use std::collections::{HashMap, HashSet};
 use std::io::Write;
-use std::sync::{Mutex, OnceLock};
+use std::sync::atomic::{AtomicU8, AtomicU32, Ordering as Atomic};
+use std::sync::{Arc, Mutex, OnceLock};
 
 /// Numeric value of a comparison operand.
 #[derive(Clone, Copy, PartialEq, Debug)]
@@ -39,11 +40,13 @@ pub trait ValAny {
 macro_rules! tmt_ints {
     ($($t:ty)*) => {$(
         impl<'a> ValNum for W<'a, $t> {
+            #[inline(always)]
             fn tmt_val(&self) -> Val {
                 Val::Int(*self.0 as i128, <$t>::MIN as i128, <$t>::MAX as i128)
             }
         }
         impl<'a, 'b> ValNum for W<'a, &'b $t> {
+            #[inline(always)]
             fn tmt_val(&self) -> Val {
                 Val::Int(**self.0 as i128, <$t>::MIN as i128, <$t>::MAX as i128)
             }
@@ -55,11 +58,13 @@ tmt_ints!(i8 i16 i32 i64 isize u8 u16 u32 u64 usize);
 macro_rules! tmt_floats {
     ($($t:ty)*) => {$(
         impl<'a> ValNum for W<'a, $t> {
+            #[inline(always)]
             fn tmt_val(&self) -> Val {
                 Val::Float(*self.0 as f64)
             }
         }
         impl<'a, 'b> ValNum for W<'a, &'b $t> {
+            #[inline(always)]
             fn tmt_val(&self) -> Val {
                 Val::Float(**self.0 as f64)
             }
@@ -236,9 +241,42 @@ pub struct Summary {
     pub f_min_pos: Option<f64>,
 }
 
+/// What an observation added to a summary.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub enum News {
+    Nothing,
+    /// Only a distance that was known came closer to zero. A loop that counts towards
+    /// its bound does this in every round.
+    Closer,
+    Other,
+}
+
 impl Summary {
     /// Folds one observation in; returns whether the summary changed.
     pub fn observe(&mut self, rel: u8, d: Diff) -> bool {
+        self.news(rel, d) != News::Nothing
+    }
+
+    /// Folds one observation in and says what kind of change that was.
+    pub fn news(&mut self, rel: u8, d: Diff) -> News {
+        let before = *self;
+        if !self.fold(rel, d) {
+            return News::Nothing;
+        }
+        // The same but for distances that were there before: those can only have shrunk.
+        let mut rest = *self;
+        rest.max_neg = before.max_neg.or(rest.max_neg);
+        rest.min_pos = before.min_pos.or(rest.min_pos);
+        rest.f_max_neg = before.f_max_neg.or(rest.f_max_neg);
+        rest.f_min_pos = before.f_min_pos.or(rest.f_min_pos);
+        if rest == before {
+            News::Closer
+        } else {
+            News::Other
+        }
+    }
+
+    fn fold(&mut self, rel: u8, d: Diff) -> bool {
         let before = *self;
         self.rels |= rel;
         match d {
@@ -284,11 +322,56 @@ impl Summary {
     }
 }
 
+/// Summaries of one thread that are closer to zero than the trace says: written when
+/// the thread ends, when any other does, and by the flusher. A thread shares its backlog
+/// with the tracer, so that it is not lost with a thread that never ends.
+#[derive(Default)]
+pub struct Backlog {
+    latest: Vec<Option<Summary>>,
+    stale: Vec<u32>,
+}
+
+impl Backlog {
+    /// Keeps `summary` as the latest of `site`, to be written later.
+    pub fn keep(&mut self, site: u32, summary: Summary) {
+        let slot = site as usize;
+        if self.latest.len() <= slot {
+            self.latest.resize(slot + 1, None);
+        }
+        if self.latest[slot].replace(summary).is_none() {
+            self.stale.push(site);
+        }
+    }
+
+    /// The site is written by other means: nothing of it is left to write.
+    pub fn forget(&mut self, site: u32) {
+        if let Some(slot) = self.latest.get_mut(site as usize) {
+            if slot.take().is_some() {
+                self.stale.retain(|s| *s != site);
+            }
+        }
+    }
+
+    /// Takes out everything that is to be written.
+    pub fn drain(&mut self) -> Vec<(u32, Summary)> {
+        let stale = std::mem::take(&mut self.stale);
+        stale
+            .into_iter()
+            .filter_map(|site| Some((site, self.latest[site as usize].take()?)))
+            .collect()
+    }
+}
+
+struct Shelf {
+    test: u32,
+    backlog: Arc<Mutex<Backlog>>,
+}
+
 struct Tracer {
     out: std::fs::File,
     names: Vec<String>,
     ids: HashMap<String, u32>,
-    cmp: HashMap<(u32, u32), Summary>,
+    shelves: Vec<Shelf>,
     /// Bits already written per (kind, site, test) for statement, logic and arithmetic sites.
     bits: HashMap<(u8, u32, u32), u8>,
     typed: HashSet<u32>,
@@ -297,6 +380,43 @@ struct Tracer {
 struct State {
     mutant: Option<(u32, Mutant)>,
     tracer: Option<Mutex<Tracer>>,
+}
+
+/// What the probes have to do in this process, kept where a probe can read it without a
+/// call: nothing has looked yet, nothing at all, everything (a trace is recorded), or
+/// only the site in `TARGET` (a mutant is on and no trace is recorded).
+static MODE: AtomicU8 = AtomicU8::new(MODE_UNKNOWN);
+static TARGET: AtomicU32 = AtomicU32::new(0);
+const MODE_UNKNOWN: u8 = 0;
+const MODE_IDLE: u8 = 1;
+const MODE_ALL: u8 = 2;
+const MODE_ONE: u8 = 3;
+
+/// Whether the probe at `site` has nothing to do but what the code it stands for does.
+/// Most probes are asked most of the time: a run with a mutant concerns one site.
+#[inline(always)]
+pub fn idle(site: u32) -> bool {
+    match MODE.load(Atomic::Relaxed) {
+        MODE_IDLE => true,
+        MODE_ONE => TARGET.load(Atomic::Relaxed) != site,
+        MODE_ALL => false,
+        _ => first_look(site),
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn first_look(site: u32) -> bool {
+    state(); // sets `MODE`
+    idle(site)
+}
+
+fn mode_of(state: &State) -> u8 {
+    match (&state.mutant, &state.tracer) {
+        (_, Some(_)) => MODE_ALL,
+        (Some(_), None) => MODE_ONE,
+        (None, None) => MODE_IDLE,
+    }
 }
 
 fn state() -> &'static State {
@@ -318,12 +438,29 @@ fn state() -> &'static State {
                 out,
                 names: Vec::new(),
                 ids: HashMap::new(),
-                cmp: HashMap::new(),
+                shelves: Vec::new(),
                 bits: HashMap::new(),
                 typed: HashSet::new(),
             })
         });
-        State { mutant, tracer }
+        let state = State { mutant, tracer };
+        if let Some((site, _)) = state.mutant {
+            TARGET.store(site, Atomic::Relaxed);
+        }
+        MODE.store(mode_of(&state), Atomic::Relaxed);
+        if state.tracer.is_some() {
+            // For the threads that never end (a pool that lives as long as the process).
+            // Without this thread their backlog is still written whenever a thread ends.
+            let _ = std::thread::Builder::new()
+                .name("tmt-flush".to_string())
+                .spawn(|| {
+                    loop {
+                        std::thread::sleep(FLUSH_EVERY);
+                        flush_backlogs(None);
+                    }
+                });
+        }
+        state
     })
 }
 
@@ -405,14 +542,79 @@ pub fn bits_are_news(kind: u8, site: u32, bits: u8) -> bool {
         .unwrap_or(true)
 }
 
+const FLUSH_EVERY: std::time::Duration = std::time::Duration::from_millis(20);
+
+fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    match mutex.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+/// Writes what the threads have kept back; `leaving` is the backlog of a thread that ends.
+/// Locks are taken in one order everywhere: the tracer, then a backlog.
+fn flush_backlogs(leaving: Option<&Arc<Mutex<Backlog>>>) {
+    let Some(tracer) = &state().tracer else {
+        return;
+    };
+    let mut tracer = locked(tracer);
+    let t = &mut *tracer;
+    for shelf in &t.shelves {
+        for (site, summary) in locked(&shelf.backlog).drain() {
+            let line = summary.line(site, &t.names[shelf.test as usize]);
+            write_line(&mut t.out, &line);
+        }
+    }
+    if let Some(leaving) = leaving {
+        t.shelves
+            .retain(|shelf| !Arc::ptr_eq(&shelf.backlog, leaving));
+    }
+}
+
+/// The backlog of this thread. Its end writes every backlog: what a test had other
+/// threads do is in the trace when the test is over.
+struct Keeper(Option<Arc<Mutex<Backlog>>>);
+
+impl Keeper {
+    fn new() -> Keeper {
+        // Only a thread with an end that is waited for keeps anything back. The main
+        // thread has none (and a test may run on it, with `--test-threads=1`); a thread
+        // without a name is not one of the harness and may be left behind at the exit.
+        // Those write at once.
+        if matches!(std::thread::current().name(), None | Some("main")) {
+            return Keeper(None);
+        }
+        let backlog = Arc::new(Mutex::new(Backlog::default()));
+        let shelved = backlog.clone();
+        let mut registered = false;
+        with_tracer(|t, test| {
+            t.shelves.push(Shelf {
+                test,
+                backlog: shelved,
+            });
+            registered = true;
+        });
+        Keeper(registered.then_some(backlog))
+    }
+}
+
+impl Drop for Keeper {
+    fn drop(&mut self) {
+        if let Some(backlog) = &self.0 {
+            flush_backlogs(Some(backlog));
+        }
+    }
+}
+
+thread_local! {
+    static KEEPER: Keeper = Keeper::new();
+}
+
 fn with_tracer(f: impl FnOnce(&mut Tracer, u32)) {
     let Some(tracer) = &state().tracer else {
         return;
     };
-    let mut tracer = match tracer.lock() {
-        Ok(t) => t,
-        Err(poisoned) => poisoned.into_inner(),
-    };
+    let mut tracer = locked(tracer);
     let cached = TEST_ID.try_with(|c| c.get()).ok().flatten();
     let id = match cached {
         Some(id) => id,
@@ -439,6 +641,8 @@ fn record_bits(kind: u8, site: u32, bits: u8) {
     if state().tracer.is_none() || !bits_are_news(kind, site, bits) {
         return;
     }
+    // A thread that records has a keeper, so that its end writes every backlog.
+    let _ = KEEPER.try_with(|_| ());
     with_tracer(|t, test| {
         let seen = t.bits.entry((kind, site, test)).or_insert(0);
         if *seen | bits != *seen {
@@ -454,21 +658,46 @@ fn record_bits(kind: u8, site: u32, bits: u8) {
 
 fn record_cmp(site: u32, rel: u8, d: Diff, av: Val, bv: Val) {
     // The summary this thread has built so far says whether the observation is news.
-    let news = SEEN_CMP
-        .try_with(|seen| {
-            let mut seen = seen.borrow_mut();
-            let slot = site as usize;
-            if seen.len() <= slot {
-                seen.resize(slot + 1, None);
+    let seen = SEEN_CMP.try_with(|seen| {
+        let mut seen = seen.borrow_mut();
+        let slot = site as usize;
+        if seen.len() <= slot {
+            seen.resize(slot + 1, None);
+        }
+        let summary = seen[slot].get_or_insert_with(Summary::default);
+        (summary.news(rel, d), *summary)
+    });
+    let summary = match seen {
+        Ok((News::Nothing, _)) => return,
+        Ok((News::Closer, summary)) => {
+            // Not worth a line each time: kept for later where there is a later.
+            let kept = KEEPER.try_with(|keeper| match &keeper.0 {
+                Some(backlog) => {
+                    locked(backlog).keep(site, summary);
+                    true
+                }
+                None => false,
+            });
+            if kept == Ok(true) {
+                return;
             }
-            seen[slot]
-                .get_or_insert_with(Summary::default)
-                .observe(rel, d)
-        })
-        .unwrap_or(true);
-    if !news {
-        return;
-    }
+            summary
+        }
+        Ok((News::Other, summary)) => {
+            let _ = KEEPER.try_with(|keeper| {
+                if let Some(backlog) = &keeper.0 {
+                    locked(backlog).forget(site);
+                }
+            });
+            summary
+        }
+        // The thread is ending and its memory is gone: this one observation.
+        Err(_) => {
+            let mut summary = Summary::default();
+            summary.observe(rel, d);
+            summary
+        }
+    };
     with_tracer(|t, test| {
         if let (Val::Int(_, amin, amax), Val::Int(_, bmin, bmax)) = (av, bv) {
             if t.typed.insert(site) {
@@ -476,11 +705,8 @@ fn record_cmp(site: u32, rel: u8, d: Diff, av: Val, bv: Val) {
                 write_line(&mut t.out, &line);
             }
         }
-        let summary = t.cmp.entry((site, test)).or_default();
-        if summary.observe(rel, d) {
-            let line = summary.line(site, &t.names[test as usize]);
-            write_line(&mut t.out, &line);
-        }
+        let line = summary.line(site, &t.names[test as usize]);
+        write_line(&mut t.out, &line);
     });
 }
 
@@ -521,6 +747,7 @@ fn finish(site: u32, op: u8, orig: bool, rel: u8, av: Val, bv: Val) -> bool {
 /// `partial_cmp`, and the operator's result is derived from that. This is what the
 /// operator itself does unless a type overrides `lt`/`le`/`gt`/`ge` inconsistently with
 /// `partial_cmp`, which the `PartialOrd` contract forbids.
+#[inline(always)]
 pub fn ord<A: ?Sized + PartialOrd<B>, B: ?Sized>(
     site: u32,
     op: u8,
@@ -529,8 +756,7 @@ pub fn ord<A: ?Sized + PartialOrd<B>, B: ?Sized>(
     av: Val,
     bv: Val,
 ) -> bool {
-    let st = state();
-    if st.mutant.is_none() && st.tracer.is_none() {
+    if idle(site) {
         return match op {
             LT => a < b,
             LE => a <= b,
@@ -538,6 +764,18 @@ pub fn ord<A: ?Sized + PartialOrd<B>, B: ?Sized>(
             _ => a >= b,
         };
     }
+    ord_busy(site, op, a, b, av, bv)
+}
+
+#[inline(never)]
+fn ord_busy<A: ?Sized + PartialOrd<B>, B: ?Sized>(
+    site: u32,
+    op: u8,
+    a: &A,
+    b: &B,
+    av: Val,
+    bv: Val,
+) -> bool {
     let rel = match a.partial_cmp(b) {
         Some(Ordering::Less) => REL_LT,
         Some(Ordering::Equal) => REL_EQ,
@@ -548,6 +786,7 @@ pub fn ord<A: ?Sized + PartialOrd<B>, B: ?Sized>(
 }
 
 /// `a == b`, `a != b`.
+#[inline(always)]
 pub fn eq<A: ?Sized + PartialEq<B>, B: ?Sized>(
     site: u32,
     op: u8,
@@ -557,10 +796,14 @@ pub fn eq<A: ?Sized + PartialEq<B>, B: ?Sized>(
     bv: Val,
 ) -> bool {
     let orig = if op == EQ { a == b } else { a != b };
-    let st = state();
-    if st.mutant.is_none() && st.tracer.is_none() {
+    if idle(site) {
         return orig;
     }
+    eq_busy(site, op, orig, av, bv)
+}
+
+#[inline(never)]
+fn eq_busy(site: u32, op: u8, orig: bool, av: Val, bv: Val) -> bool {
     let equal = orig == (op == EQ);
     let rel = match (equal, diff(av, bv, equal)) {
         (true, _) => REL_EQ,
@@ -571,7 +814,13 @@ pub fn eq<A: ?Sized + PartialEq<B>, B: ?Sized>(
 }
 
 /// Guards a statement: false when the active mutant deletes it.
+#[inline(always)]
 pub fn live(site: u32) -> bool {
+    idle(site) || live_busy(site)
+}
+
+#[inline(never)]
+fn live_busy(site: u32) -> bool {
     if mutant_at(site) == Some(Mutant::Delete) {
         return false;
     }
@@ -605,6 +854,9 @@ pub fn rhs_value(and: bool, b: bool, m: Option<Mutant>) -> bool {
 
 /// Left operand of `a && b` / `a || b`.
 pub fn lhs(site: u32, and: bool, a: bool) -> u8 {
+    if idle(site) {
+        return lhs_code(and, a, None);
+    }
     let m = mutant_at(site);
     let c = lhs_code(and, a, m);
     if m.is_none() && c != 2 {
@@ -614,7 +866,16 @@ pub fn lhs(site: u32, and: bool, a: bool) -> u8 {
 }
 
 /// Right operand of `a && b` / `a || b`, evaluated because `lhs` returned 2.
+#[inline(always)]
 pub fn rhs(site: u32, and: bool, b: bool) -> bool {
+    if idle(site) {
+        return b;
+    }
+    rhs_busy(site, and, b)
+}
+
+#[inline(never)]
+fn rhs_busy(site: u32, and: bool, b: bool) -> bool {
     let m = mutant_at(site);
     if m.is_none() {
         record_bits(b'L', site, if b { LOGIC_RHS_TRUE } else { LOGIC_RHS_FALSE });
@@ -626,10 +887,12 @@ pub fn rhs(site: u32, and: bool, b: bool) -> bool {
 pub struct Ar<L, R>(Cell<Option<(L, R)>>);
 
 impl<L, R> Ar<L, R> {
+    #[inline(always)]
     pub fn new(l: L, r: R) -> Self {
         Ar(Cell::new(Some((l, r))))
     }
 
+    #[inline(always)]
     fn take(&self) -> (L, R) {
         self.0.take().expect("operands are taken once")
     }
@@ -693,11 +956,17 @@ pub trait ArithNum: Copy {
         }
     }
 
+    #[inline(always)]
     fn tmt_run(site: u32, op: u8, a: Self, b: Self) -> Self {
-        let st = state();
-        if st.mutant.is_none() && st.tracer.is_none() {
+        if idle(site) {
             return Self::tmt_real(op, a, b);
         }
+        Self::tmt_busy(site, op, a, b)
+    }
+
+    #[inline(never)]
+    fn tmt_busy(site: u32, op: u8, a: Self, b: Self) -> Self {
+        let st = state();
         let second = arith_swapped2(op);
         match (mutant_at(site), second) {
             (Some(Mutant::ArithSwap), _) => return Self::tmt_real(arith_swapped(op), a, b),
@@ -745,10 +1014,12 @@ pub trait BitPrim {
 pub struct Aa<'p, L, R>(Cell<Option<(&'p mut L, R)>>);
 
 impl<'p, L, R> Aa<'p, L, R> {
+    #[inline(always)]
     pub fn new(l: &'p mut L, r: R) -> Self {
         Aa(Cell::new(Some((l, r))))
     }
 
+    #[inline(always)]
     fn take(&self) -> (&'p mut L, R) {
         self.0.take().expect("operands are taken once")
     }
@@ -773,18 +1044,18 @@ pub trait BitAssignPrim {
 macro_rules! tmt_arith_prim {($($t:ty)*) => {$(
         impl ArithPrim for Ar<$t, $t> {
             type O = $t;
-            fn tmt_add(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, ADD, a, b) }
-            fn tmt_sub(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, SUB, a, b) }
-            fn tmt_mul(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, MUL, a, b) }
-            fn tmt_div(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, DIV, a, b) }
-                        fn tmt_rem(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, REM, a, b) }
+            #[inline(always)] fn tmt_add(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, ADD, a, b) }
+            #[inline(always)] fn tmt_sub(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, SUB, a, b) }
+            #[inline(always)] fn tmt_mul(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, MUL, a, b) }
+            #[inline(always)] fn tmt_div(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, DIV, a, b) }
+                        #[inline(always)] fn tmt_rem(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, REM, a, b) }
         }
         impl<'p> ArithAssignPrim for Aa<'p, $t, $t> {
-            fn tmt_add_assign(&self, site: u32) { let (l, r) = self.take(); *l = <$t>::tmt_run(site, ADD, *l, r) }
-            fn tmt_sub_assign(&self, site: u32) { let (l, r) = self.take(); *l = <$t>::tmt_run(site, SUB, *l, r) }
-            fn tmt_mul_assign(&self, site: u32) { let (l, r) = self.take(); *l = <$t>::tmt_run(site, MUL, *l, r) }
-            fn tmt_div_assign(&self, site: u32) { let (l, r) = self.take(); *l = <$t>::tmt_run(site, DIV, *l, r) }
-            fn tmt_rem_assign(&self, site: u32) { let (l, r) = self.take(); *l = <$t>::tmt_run(site, REM, *l, r) }
+            #[inline(always)] fn tmt_add_assign(&self, site: u32) { let (l, r) = self.take(); *l = <$t>::tmt_run(site, ADD, *l, r) }
+            #[inline(always)] fn tmt_sub_assign(&self, site: u32) { let (l, r) = self.take(); *l = <$t>::tmt_run(site, SUB, *l, r) }
+            #[inline(always)] fn tmt_mul_assign(&self, site: u32) { let (l, r) = self.take(); *l = <$t>::tmt_run(site, MUL, *l, r) }
+            #[inline(always)] fn tmt_div_assign(&self, site: u32) { let (l, r) = self.take(); *l = <$t>::tmt_run(site, DIV, *l, r) }
+            #[inline(always)] fn tmt_rem_assign(&self, site: u32) { let (l, r) = self.take(); *l = <$t>::tmt_run(site, REM, *l, r) }
         }
     )*};
 }
@@ -792,6 +1063,7 @@ macro_rules! tmt_arith_prim {($($t:ty)*) => {$(
 macro_rules! tmt_arith_ints {
     ($($t:ty)*) => {$(
         impl ArithNum for $t {
+            #[inline(always)]
             fn tmt_real(op: u8, a: $t, b: $t) -> $t {
                 match op {
                     ADD => a + b,
@@ -826,18 +1098,18 @@ macro_rules! tmt_arith_ints {
         }
         impl BitPrim for Ar<$t, $t> {
             type O = $t;
-            fn tmt_bitand(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, BITAND, a, b) }
-            fn tmt_bitor(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, BITOR, a, b) }
-            fn tmt_bitxor(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, BITXOR, a, b) }
-            fn tmt_shl(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, SHL, a, b) }
-            fn tmt_shr(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, SHR, a, b) }
+            #[inline(always)] fn tmt_bitand(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, BITAND, a, b) }
+            #[inline(always)] fn tmt_bitor(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, BITOR, a, b) }
+            #[inline(always)] fn tmt_bitxor(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, BITXOR, a, b) }
+            #[inline(always)] fn tmt_shl(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, SHL, a, b) }
+            #[inline(always)] fn tmt_shr(&self, site: u32) -> $t { let (a, b) = self.take(); <$t>::tmt_run(site, SHR, a, b) }
         }
         impl<'p> BitAssignPrim for Aa<'p, $t, $t> {
-            fn tmt_bitand_assign(&self, site: u32) { let (l, r) = self.take(); *l = <$t>::tmt_run(site, BITAND, *l, r) }
-            fn tmt_bitor_assign(&self, site: u32) { let (l, r) = self.take(); *l = <$t>::tmt_run(site, BITOR, *l, r) }
-            fn tmt_bitxor_assign(&self, site: u32) { let (l, r) = self.take(); *l = <$t>::tmt_run(site, BITXOR, *l, r) }
-            fn tmt_shl_assign(&self, site: u32) { let (l, r) = self.take(); *l = <$t>::tmt_run(site, SHL, *l, r) }
-            fn tmt_shr_assign(&self, site: u32) { let (l, r) = self.take(); *l = <$t>::tmt_run(site, SHR, *l, r) }
+            #[inline(always)] fn tmt_bitand_assign(&self, site: u32) { let (l, r) = self.take(); *l = <$t>::tmt_run(site, BITAND, *l, r) }
+            #[inline(always)] fn tmt_bitor_assign(&self, site: u32) { let (l, r) = self.take(); *l = <$t>::tmt_run(site, BITOR, *l, r) }
+            #[inline(always)] fn tmt_bitxor_assign(&self, site: u32) { let (l, r) = self.take(); *l = <$t>::tmt_run(site, BITXOR, *l, r) }
+            #[inline(always)] fn tmt_shl_assign(&self, site: u32) { let (l, r) = self.take(); *l = <$t>::tmt_run(site, SHL, *l, r) }
+            #[inline(always)] fn tmt_shr_assign(&self, site: u32) { let (l, r) = self.take(); *l = <$t>::tmt_run(site, SHR, *l, r) }
         }
     )*};
 }
@@ -845,6 +1117,7 @@ macro_rules! tmt_arith_ints {
 macro_rules! tmt_arith_floats {
     ($($t:ty)*) => {$(
         impl ArithNum for $t {
+            #[inline(always)]
             fn tmt_real(op: u8, a: $t, b: $t) -> $t {
                 match op { ADD => a + b, SUB => a - b, MUL => a * b, DIV => a / b, _ => a % b }
             }
@@ -870,7 +1143,11 @@ macro_rules! tmt_arith_any {
             type O = L::Output;
             fn $method(&self, site: u32) -> L::Output {
                 let (a, b) = self.take();
-                record_bits(b'A', site, ARITH_OPAQUE);
+                if !idle(site) {
+                    if !idle(site) {
+            record_bits(b'A', site, ARITH_OPAQUE);
+        }
+                }
                 std::ops::$bound::$call(a, b)
             }
         }
@@ -899,7 +1176,11 @@ macro_rules! tmt_assign_any {
         impl<'r, 'p, L: std::ops::$bound<R>, R> $name for &'r Aa<'p, L, R> {
             fn $method(&self, site: u32) {
                 let (l, r) = self.take();
-                record_bits(b'A', site, ARITH_OPAQUE);
+                if !idle(site) {
+                    if !idle(site) {
+            record_bits(b'A', site, ARITH_OPAQUE);
+        }
+                }
                 std::ops::$bound::$call(l, r)
             }
         }
@@ -953,13 +1234,18 @@ impl<'r, T: std::ops::Not> AnyNot for &'r Un<T> {
     type O = T::Output;
     fn tmt_not(&self, site: u32) -> T::Output {
         let value = self.0.take().expect("the operand is taken once");
-        record_bits(b'A', site, ARITH_OPAQUE);
+        if !idle(site) {
+            record_bits(b'A', site, ARITH_OPAQUE);
+        }
         !value
     }
 }
 
 /// Normal exit of a `-> bool` function: `Const` replaces the value.
 pub fn ret(site: u32, value: bool) -> bool {
+    if idle(site) {
+        return value;
+    }
     if let Some(Mutant::Const(c)) = mutant_at(site) {
         return c;
     }
@@ -970,6 +1256,9 @@ pub fn ret(site: u32, value: bool) -> bool {
 /// Normal exit of a function returning `Option<T>`: `Const(false)` replaces the value by
 /// `None`. (There is no value to replace `None` with.)
 pub fn ret_opt<T>(site: u32, value: Option<T>) -> Option<T> {
+    if idle(site) {
+        return value;
+    }
     if mutant_at(site) == Some(Mutant::Const(false)) {
         return None;
     }
@@ -982,12 +1271,9 @@ pub fn ret_opt<T>(site: u32, value: Option<T>) -> Option<T> {
 }
 
 /// Guard of a `match` arm: false when the active mutant removes the arm.
+#[inline(always)]
 pub fn arm(site: u32) -> bool {
-    if mutant_at(site) == Some(Mutant::Delete) {
-        return false;
-    }
-    record_bits(b'R', site, 1);
-    true
+    idle(site) || live_busy(site)
 }
 
 /// `a..b` and `a..=b` on integers: the `RangeEnd` mutant includes or excludes the end.
@@ -1038,12 +1324,16 @@ impl<'r, T> AnyRange for &'r Ar<T, T> {
     type T = T;
     fn tmt_range(&self, site: u32) -> std::ops::Range<T> {
         let (a, b) = self.take();
-        record_bits(b'A', site, ARITH_OPAQUE);
+        if !idle(site) {
+            record_bits(b'A', site, ARITH_OPAQUE);
+        }
         a..b
     }
     fn tmt_range_inclusive(&self, site: u32) -> std::ops::RangeInclusive<T> {
         let (a, b) = self.take();
-        record_bits(b'A', site, ARITH_OPAQUE);
+        if !idle(site) {
+            record_bits(b'A', site, ARITH_OPAQUE);
+        }
         a..=b
     }
 }
@@ -1092,12 +1382,16 @@ impl<'r, T: Ord> AnyMinMax for &'r Ar<T, T> {
     type T = T;
     fn tmt_max(&self, site: u32) -> T {
         let (a, b) = self.take();
-        record_bits(b'A', site, ARITH_OPAQUE);
+        if !idle(site) {
+            record_bits(b'A', site, ARITH_OPAQUE);
+        }
         Ord::max(a, b)
     }
     fn tmt_min(&self, site: u32) -> T {
         let (a, b) = self.take();
-        record_bits(b'A', site, ARITH_OPAQUE);
+        if !idle(site) {
+            record_bits(b'A', site, ARITH_OPAQUE);
+        }
         Ord::min(a, b)
     }
 }

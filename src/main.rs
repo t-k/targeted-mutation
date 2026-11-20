@@ -61,6 +61,12 @@ struct Cli {
     /// for each of them.
     #[arg(long)]
     rebuild: bool,
+    /// Build the tests at this optimisation level (0 to 3) instead of the profile's own.
+    /// The probes cost next to nothing in optimised code, which pays off when tests
+    /// spend their time in loops; the build takes longer, and the tests no longer run
+    /// exactly as `cargo test` builds them.
+    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(0..=3))]
+    opt_level: Option<u8>,
     /// Print the report as SARIF 2.1.0.
     #[arg(long, conflicts_with = "json")]
     sarif: bool,
@@ -89,6 +95,7 @@ fn main() -> ExitCode {
         dependents: cli.dependents,
         effects: !cli.no_effects,
         rebuild: cli.rebuild,
+        opt_level: cli.opt_level,
         jobs: cli.jobs,
         all_files: cli.all_files,
         doc: cli.doc,

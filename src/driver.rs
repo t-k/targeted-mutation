@@ -47,6 +47,8 @@ pub struct Options {
     pub effects: bool,
     /// Build and run, one by one, the mutants that cannot be switched at run time.
     pub rebuild: bool,
+    /// Optimisation level to build the tests with, instead of the profile's own.
+    pub opt_level: Option<u8>,
     /// How many mutants to run at the same time.
     pub jobs: usize,
     /// Copy every file of the workspace, including the ones git ignores.
@@ -260,6 +262,7 @@ enum Runner {
         copy: PathBuf,
         target_dir: PathBuf,
         package: String,
+        opt_level: Option<u8>,
     },
 }
 
@@ -821,6 +824,17 @@ fn parse_test_list(stdout: &str) -> BTreeSet<String> {
         .collect()
 }
 
+/// What makes cargo build the tests (and what they depend on) at an optimisation level.
+/// Overflow checks and debug assertions stay as the profile has them.
+fn profile_env(opt_level: Option<u8>) -> Vec<(&'static str, String)> {
+    opt_level.map_or(vec![], |level| {
+        vec![
+            ("CARGO_PROFILE_DEV_OPT_LEVEL", level.to_string()),
+            ("CARGO_PROFILE_TEST_OPT_LEVEL", level.to_string()),
+        ]
+    })
+}
+
 /// A trace run longer than this is followed by a run without recording, for the timing.
 const SLOW_TRACE: Duration = Duration::from_secs(2);
 
@@ -859,11 +873,13 @@ fn run_binary(
             copy,
             target_dir,
             package,
+            opt_level,
         } => {
             let mut cmd = Command::new("cargo");
             cmd.args(["test", "--doc", "-p", package])
                 .current_dir(copy)
-                .env("CARGO_TARGET_DIR", target_dir);
+                .env("CARGO_TARGET_DIR", target_dir)
+                .envs(profile_env(*opt_level));
             cmd
         }
     };
@@ -1868,6 +1884,7 @@ pub fn run(options: &Options) -> Result<Report> {
             .args(test_packages.iter().flat_map(|p| ["-p", p.name.as_str()]))
             .current_dir(&copy)
             .env("CARGO_TARGET_DIR", &build_target)
+            .envs(profile_env(options.opt_level))
             .stderr(Stdio::piped())
             .output()
             .context("running cargo test --no-run")
@@ -1969,6 +1986,7 @@ pub fn run(options: &Options) -> Result<Report> {
             copy: copy.clone(),
             target_dir: build_target.clone(),
             package: package.name.clone(),
+            opt_level: options.opt_level,
         };
         runners.push(("doc tests".to_string(), doc, session.package_dir.clone()));
     }

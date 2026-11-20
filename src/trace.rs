@@ -892,6 +892,61 @@ mod tests {
 
     /// A probe in a loop asks the tracer only when it has something new to say.
     #[test]
+    fn only_a_known_distance_coming_closer_can_wait() {
+        use tmt_rt::{Diff, News, Summary};
+        let mut s = Summary::default();
+        // The first distance on each side is news of the other kind, and so is a new relation.
+        assert_eq!(s.news(1, Diff::Int(-9)), News::Other);
+        assert_eq!(s.news(1, Diff::Int(-9)), News::Nothing);
+        assert_eq!(s.news(1, Diff::Int(-10)), News::Nothing);
+        assert_eq!(s.news(1, Diff::Int(-4)), News::Closer);
+        assert_eq!(s.news(4, Diff::Int(7)), News::Other);
+        assert_eq!(s.news(4, Diff::Int(6)), News::Closer);
+        assert_eq!(s.news(1, Diff::Int(-1)), News::Closer);
+        assert_eq!(s.news(2, Diff::Int(0)), News::Other);
+        assert_eq!((s.max_neg, s.min_pos), (Some(-1), Some(6)));
+        // Floats alike; a closer distance together with something new does not wait.
+        assert_eq!(s.news(1, Diff::Float(-2.0)), News::Other);
+        assert_eq!(s.news(1, Diff::Float(-1.5)), News::Closer);
+        assert_eq!(s.news(4, Diff::Float(0.5)), News::Other);
+        assert_eq!(s.news(4, Diff::Float(0.25)), News::Closer);
+        let mut t = Summary::default();
+        assert_eq!(t.news(1, Diff::Int(-9)), News::Other);
+        assert_eq!(t.news(8, Diff::Int(-3)), News::Other);
+        assert_eq!(t.news(8, Diff::None), News::Other);
+    }
+
+    #[test]
+    fn a_backlog_hands_out_the_latest_of_each_site_once() {
+        use tmt_rt::{Backlog, Diff, Summary};
+        let at = |d: i128| {
+            let mut s = Summary::default();
+            s.observe(1, Diff::Int(d));
+            s
+        };
+        let mut backlog = Backlog::default();
+        assert!(backlog.drain().is_empty());
+        backlog.keep(7, at(-5));
+        backlog.keep(2, at(-8));
+        backlog.keep(7, at(-3));
+        assert_eq!(backlog.drain(), [(7, at(-3)), (2, at(-8))]);
+        assert!(backlog.drain().is_empty(), "written once");
+        // Kept again after it was written: written again.
+        backlog.keep(7, at(-1));
+        assert_eq!(backlog.drain(), [(7, at(-1))]);
+        // A site written by other means is not written from here, the others are.
+        backlog.keep(7, at(-1));
+        backlog.keep(2, at(-2));
+        backlog.keep(9, at(-4));
+        backlog.forget(2);
+        backlog.forget(100);
+        backlog.forget(1);
+        assert_eq!(backlog.drain(), [(7, at(-1)), (9, at(-4))]);
+        backlog.keep(2, at(-1));
+        assert_eq!(backlog.drain(), [(2, at(-1))]);
+    }
+
+    #[test]
     fn a_thread_remembers_what_it_recorded() {
         // Sites of their own, far from the ones other tests of this binary use.
         let site = 900_000;
