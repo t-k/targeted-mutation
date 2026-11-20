@@ -1425,3 +1425,72 @@ fn the_features_asked_for_are_the_ones_analysed() {
     assert_eq!(bad.code, 1, "{}", bad.stderr);
     assert!(bad.stderr.contains("nope"), "{}", bad.stderr);
 }
+
+#[test]
+fn a_finding_is_known_by_where_it_is() {
+    let dir = fixture("twins", "twins");
+    let ids = |report: &Value| -> Vec<String> {
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["id"].as_str().unwrap().to_string())
+            .collect()
+    };
+    let (code, report) = json(&dir);
+    assert_eq!(code, 2, "{report:#}");
+    // The same code four times: told apart by the function, and within one by the order.
+    assert_eq!(
+        ids(&report),
+        [
+            "input_gap|src/lib.rs|first|a > b|0",
+            "input_gap|src/lib.rs|second|a > b|0",
+            "input_gap|src/lib.rs|Pair::both|a > b|0",
+            "input_gap|src/lib.rs|Pair::both|a > b|1",
+        ],
+        "{report:#}"
+    );
+    assert_eq!(report["findings"][2]["item"], "Pair::both");
+
+    // SARIF carries the name, and the path from the top of the repository.
+    let sarif = tmt(&dir, &["--sarif", "--quiet"]);
+    let sarif: Value = serde_json::from_str(&sarif.stdout).unwrap();
+    let result = &sarif["runs"][0]["results"][3];
+    assert_eq!(
+        result["partialFingerprints"]["tmtFindingId/v2"],
+        "input_gap|src/lib.rs|Pair::both|a > b|1"
+    );
+    let uri = result["locations"][0]["physicalLocation"]["artifactLocation"]["uri"]
+        .as_str()
+        .unwrap();
+    assert!(
+        uri.ends_with("twins/src/lib.rs") && uri.len() > "src/lib.rs".len(),
+        "{uri}"
+    );
+
+    // Known findings stay known when the code moves and a new twin appears; only the
+    // new one is reported.
+    let baseline = dir.join("known.json");
+    let baseline_arg = baseline.to_str().unwrap();
+    tmt(&dir, &["--quiet", "--write-baseline", baseline_arg]);
+    let written: Value = serde_json::from_str(&fs::read_to_string(&baseline).unwrap()).unwrap();
+    assert_eq!(written["version"], 2);
+    let source = fs::read_to_string(dir.join("src/lib.rs")).unwrap();
+    let moved = source.replace(
+        "pub fn first(",
+        "pub fn zeroth(a: u32, b: u32) -> bool {\n    a > b\n}\n\n\npub fn first(",
+    );
+    let moved = moved.replace(
+        "assert!(first(9, 1));",
+        "assert!(zeroth(9, 1));\n        assert!(!zeroth(1, 9));\n        assert!(first(9, 1));",
+    );
+    fs::write(dir.join("src/lib.rs"), moved).unwrap();
+    let run = tmt(&dir, &["--json", "--quiet", "--baseline", baseline_arg]);
+    let after: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(
+        ids(&after),
+        ["input_gap|src/lib.rs|zeroth|a > b|0"],
+        "{after:#}"
+    );
+    assert_eq!(after["suppressed"], 4, "{after:#}");
+}

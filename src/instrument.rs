@@ -707,6 +707,121 @@ fn has_ident(tokens: TokenStream, name: &str) -> bool {
 /// The number of a site that has none.
 pub const NO_ID: u32 = u32::MAX;
 
+/// A function or constant of a file with the stretch of source it takes up, named by the
+/// modules, impls and functions around it: `Store::commit`, `<Display for Id>::fmt`.
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct NamedItem {
+    pub start: usize,
+    pub end: usize,
+    pub name: String,
+}
+
+/// The functions and constants of a source file. A finding is told from another one on
+/// the same code by the item it is in, which stays the same when lines move.
+pub fn named_items(source: &str) -> Vec<NamedItem> {
+    struct Namer {
+        path: Vec<String>,
+        items: Vec<NamedItem>,
+    }
+    impl Namer {
+        fn inside(&mut self, name: String, span: Option<Span>, visit: impl FnOnce(&mut Self)) {
+            self.path.push(name);
+            if let Some(span) = span {
+                let range = span.byte_range();
+                self.items.push(NamedItem {
+                    start: range.start,
+                    end: range.end,
+                    name: self.path.join("::"),
+                });
+            }
+            visit(self);
+            self.path.pop();
+        }
+    }
+    impl<'ast> Visit<'ast> for Namer {
+        fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+            self.inside(node.ident.to_string(), None, |namer| {
+                visit::visit_item_mod(namer, node)
+            });
+        }
+        fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
+            self.inside(node.ident.to_string(), None, |namer| {
+                visit::visit_item_trait(namer, node)
+            });
+        }
+        fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+            let of = squeezed(&node.self_ty.to_token_stream().to_string());
+            let name = match &node.trait_ {
+                Some((_, path, _)) => {
+                    format!(
+                        "<{} for {of}>",
+                        squeezed(&path.to_token_stream().to_string())
+                    )
+                }
+                None => of,
+            };
+            self.inside(name, None, |namer| visit::visit_item_impl(namer, node));
+        }
+        fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+            self.inside(node.sig.ident.to_string(), Some(node.span()), |namer| {
+                visit::visit_item_fn(namer, node)
+            });
+        }
+        fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+            self.inside(node.sig.ident.to_string(), Some(node.span()), |namer| {
+                visit::visit_impl_item_fn(namer, node)
+            });
+        }
+        fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
+            self.inside(node.sig.ident.to_string(), Some(node.span()), |namer| {
+                visit::visit_trait_item_fn(namer, node)
+            });
+        }
+        fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
+            self.inside(node.ident.to_string(), Some(node.span()), |_| {});
+        }
+        fn visit_item_static(&mut self, node: &'ast syn::ItemStatic) {
+            self.inside(node.ident.to_string(), Some(node.span()), |_| {});
+        }
+        fn visit_impl_item_const(&mut self, node: &'ast syn::ImplItemConst) {
+            self.inside(node.ident.to_string(), Some(node.span()), |_| {});
+        }
+    }
+    let Ok(file) = syn::parse_file(source) else {
+        return vec![];
+    };
+    let mut namer = Namer {
+        path: vec![],
+        items: vec![],
+    };
+    namer.visit_file(&file);
+    namer.items
+}
+
+/// The name of the innermost item that `offset` lies in; empty outside of all of them.
+pub fn enclosing_item(items: &[NamedItem], offset: usize) -> &str {
+    items
+        .iter()
+        .filter(|item| item.start <= offset && offset < item.end)
+        .min_by_key(|item| item.end - item.start)
+        .map_or("", |item| item.name.as_str())
+}
+
+/// Where the 1-based `line` and `column` (in characters) of a source text are, in bytes.
+pub fn offset_of(source: &str, line: usize, column: usize) -> Option<usize> {
+    let start: usize = source
+        .split_inclusive('\n')
+        .take(line.checked_sub(1)?)
+        .map(str::len)
+        .sum();
+    let rest = source.get(start..)?;
+    let within = rest
+        .char_indices()
+        .nth(column.checked_sub(1)?)
+        .map_or(rest.len(), |(at, _)| at);
+    Some(start + within)
+}
+
 /// A mutant as a change of the source text: `replacement` in place of `start..end`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SourceMutant {
@@ -3675,6 +3790,53 @@ mod tests {
             assert_eq!(all.len(), 2, "{body}");
             assert!(all.iter().all(|b| b.1 == only_computes), "{body}: {all:?}");
         }
+    }
+
+    #[test]
+    fn items_are_named_by_what_is_around_them() {
+        let src = "fn top(a: u8) -> u8 { fn inner(b: u8) -> u8 { b } inner(a) }\n\
+                   mod m { pub fn in_mod() {} const K: u8 = 1; }\n\
+                   impl Store { fn commit(&self) {} const LIMIT: u8 = 2; }\n\
+                   impl<T> fmt::Display for Id<T> { fn fmt(&self) {} }\n\
+                   trait Tr { fn provided(&self) {} fn required(&self); }\n\
+                   static S: u8 = 3;\nlet";
+        // Not a source file: nothing is named.
+        assert!(named_items(src).is_empty());
+        let src = src.strip_suffix("let").unwrap();
+        let items = named_items(src);
+        let names: Vec<&str> = items.iter().map(|item| item.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "top",
+                "top::inner",
+                "m::in_mod",
+                "m::K",
+                "Store::commit",
+                "Store::LIMIT",
+                "<fmt::Display for Id<T>>::fmt",
+                "Tr::provided",
+                "Tr::required",
+                "S",
+            ]
+        );
+        // The innermost item a place is in; none between the items.
+        let at = |text: &str| src.find(text).unwrap();
+        assert_eq!(enclosing_item(&items, at("{ b }") + 2), "top::inner");
+        assert_eq!(enclosing_item(&items, at("inner(a)")), "top");
+        assert_eq!(enclosing_item(&items, at("fn top")), "top");
+        assert_eq!(enclosing_item(&items, at("mod m")), "");
+        assert_eq!(enclosing_item(&items, at("= 2") + 2), "Store::LIMIT");
+        assert_eq!(enclosing_item(&items, src.len()), "");
+        // Lines and columns count from one, columns in characters.
+        let text = "ab\nçd e\n";
+        assert_eq!(offset_of(text, 1, 1), Some(0));
+        assert_eq!(offset_of(text, 1, 2), Some(1));
+        assert_eq!(offset_of(text, 2, 1), Some(3));
+        assert_eq!(offset_of(text, 2, 2), Some(5), "after the two bytes of `ç`");
+        assert_eq!(offset_of(text, 2, 99), Some(text.len()));
+        assert_eq!(offset_of(text, 0, 1), None);
+        assert_eq!(offset_of(text, 1, 0), None);
     }
 
     #[test]

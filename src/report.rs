@@ -6,12 +6,26 @@ use serde::Serialize;
 use crate::instrument::{ArithOp, LiteralSide, Site, SiteKind};
 use crate::plan::{CmpOp, InputGap, LogicGap, Mutation, Obs};
 
-#[derive(Clone, Debug, PartialEq, Serialize)]
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct Location {
     pub file: String,
     pub line: usize,
     pub column: usize,
     pub code: String,
+    /// The function or constant the code is in (`Store::commit`); empty where unknown.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub item: String,
+    /// What the finding at this place is known by across runs: see [`finding_id`].
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub id: String,
+}
+
+/// The name a finding keeps from run to run: its kind, its file, the item it is in, its
+/// code, and which of the places with that code in that item it is (0 for the first).
+/// Lines are not in it, so code that moves keeps its name, and neither are the words
+/// that describe the surviving mutants, so those can be improved.
+pub fn finding_id(kind: &str, at: &Location, nth: usize) -> String {
+    format!("{kind}|{}|{}|{}|{nth}", at.file, at.item, at.code)
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
@@ -59,6 +73,8 @@ pub struct CargoConfig {
 /// What a run looked at and how: a report says nothing about what is outside of it.
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct Analysis {
+    /// The package's directory in its git repository (`crates/core/`; empty at the top).
+    pub package_path: String,
     /// Only the code changed since this revision.
     pub since: Option<String>,
     /// Only these lines.
@@ -125,6 +141,7 @@ pub fn location(file: &str, site: &Site) -> Location {
         line: site.line,
         column: site.column,
         code: one_line(&site.text),
+        ..Location::default()
     }
 }
 
@@ -562,7 +579,9 @@ pub fn arith_gap_finding(
 
 /// The report as SARIF 2.1.0, for code scanning UIs. `prefix` is put in front of the file
 /// names (the package's path inside the repository).
-pub fn render_sarif(report: &Report, prefix: &str) -> String {
+/// SARIF with the files named from the top of the repository.
+pub fn render_sarif(report: &Report) -> String {
+    let prefix = report.analysis.package_path.as_str();
     let results: Vec<serde_json::Value> = report
         .findings
         .iter()
@@ -578,6 +597,8 @@ pub fn render_sarif(report: &Report, prefix: &str) -> String {
                 "ruleId": rule,
                 "level": "warning",
                 "message": { "text": text },
+                // What the service tells a finding of one run from that of another by.
+                "partialFingerprints": { "tmtFindingId/v2": at.id },
                 "locations": [{
                     "physicalLocation": {
                         "artifactLocation": { "uri": format!("{prefix}{}", at.file) },
@@ -598,6 +619,8 @@ pub fn render_sarif(report: &Report, prefix: &str) -> String {
                     { "id": "assertion-gap", "shortDescription": { "text": "Tests run the mutated code and still pass" } }
                 ]
             } },
+            // What was looked at: a run of a part says nothing about the rest.
+            "properties": { "analysis": report.analysis },
             "results": results
         }]
     });
@@ -788,6 +811,10 @@ mod tests {
     use super::*;
     use crate::instrument::discover;
 
+    fn results_of(sarif: &serde_json::Value) -> &Vec<serde_json::Value> {
+        sarif["runs"][0]["results"].as_array().unwrap()
+    }
+
     fn or_site() -> Site {
         site_of("fn f(a: bool, b: bool) -> bool { a || b }")
     }
@@ -899,7 +926,8 @@ mod tests {
                     file: "src/lib.rs".into(),
                     line: 1,
                     column: 26,
-                    code: "age >= 18".into()
+                    code: "age >= 18".into(),
+                    ..Location::default()
                 },
                 survivors: vec!["`age >= 19`".into(), "`age >= 20`".into()],
                 survivor_count: 2,
@@ -1341,12 +1369,14 @@ mod tests {
             line: 3,
             column: 9,
             code: "a >= b".into(),
+            ..Location::default()
         };
         let below = Location {
             file: "src/lib.rs".into(),
             line: 7,
             column: 5,
             code: "s.reset();".into(),
+            ..Location::default()
         };
         let report = Report {
             package: "p".into(),
@@ -1421,8 +1451,18 @@ mod tests {
             "q: 0 sites, 0 input gaps, 0 assertion gaps, 0 mutants run (0 killed), 0 sites unreached\n"
         );
 
-        let sarif: serde_json::Value =
-            serde_json::from_str(&render_sarif(&report, "crates/p/")).unwrap();
+        let mut in_repository = report.clone();
+        in_repository.analysis.package_path = "crates/p/".into();
+        in_repository.analysis.since = Some("abc".into());
+        if let Finding::AssertionGap { at, .. } = &mut in_repository.findings[3] {
+            at.id = "assertion_gap|src/lib.rs|f|s.reset();|0".into();
+        }
+        let sarif: serde_json::Value = serde_json::from_str(&render_sarif(&in_repository)).unwrap();
+        assert_eq!(
+            results_of(&sarif)[3]["partialFingerprints"]["tmtFindingId/v2"],
+            "assertion_gap|src/lib.rs|f|s.reset();|0"
+        );
+        assert_eq!(sarif["runs"][0]["properties"]["analysis"]["since"], "abc");
         assert_eq!(sarif["version"], "2.1.0");
         let results = sarif["runs"][0]["results"].as_array().unwrap();
         assert_eq!(results.len(), 4);
@@ -1470,6 +1510,7 @@ mod tests {
             line: 3,
             column: 9,
             code: "s.check()?;".into(),
+            ..Location::default()
         };
         let report = Report {
             package: "p".into(),
@@ -1538,6 +1579,7 @@ mod tests {
             line: 1,
             column: 1,
             code: "a > b".into(),
+            ..Location::default()
         };
         assert!(!Report::default().has_gaps());
         assert!(
@@ -1649,6 +1691,7 @@ mod tests {
                 line: 1,
                 column: 1,
                 code: "a < b".into(),
+                ..Location::default()
             },
             survivors: survivors.iter().map(|s| s.to_string()).collect(),
             tests: vec!["tests::t".into()],
@@ -1742,6 +1785,7 @@ mod tests {
                 line,
                 column,
                 code: "x".into(),
+                ..Location::default()
             },
             survivors: vec![survivor.into()],
             tests: vec![],

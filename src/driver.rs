@@ -2160,6 +2160,9 @@ pub fn run(options: &Options) -> Result<Report> {
         package: package.name.clone(),
         sites: total_sites,
         analysis: report::Analysis {
+            package_path: repository_prefix(
+                package.manifest_path.parent().unwrap_or(Path::new(".")),
+            ),
             since: options.since.clone(),
             lines: options.lines.clone(),
             tests_of: test_packages.iter().map(|p| p.name.clone()).collect(),
@@ -2453,6 +2456,15 @@ pub fn run(options: &Options) -> Result<Report> {
     }
 
     report.sort_findings();
+    let places: Vec<FilePlaces> = files
+        .iter()
+        .map(|file| FilePlaces {
+            display: &file.display,
+            source: &file.original,
+            sites: file.sites.iter().chain(&file.rebuild_sites).collect(),
+        })
+        .collect();
+    name_findings(&mut report.findings, &places);
 
     // 8. Findings the user has already dealt with.
     let ignored: BTreeMap<&str, BTreeMap<usize, String>> = files
@@ -2465,8 +2477,8 @@ pub fn run(options: &Options) -> Result<Report> {
         })
         .collect();
     let known = match &options.baseline {
-        Some(path) => crate::baseline::load(path)?,
-        None => BTreeSet::new(),
+        Some(path) => Some(crate::baseline::load(path)?),
+        None => None,
     };
     let location = |finding: &Finding| match finding {
         Finding::InputGap { at, .. } | Finding::AssertionGap { at, .. } => {
@@ -2485,9 +2497,75 @@ pub fn run(options: &Options) -> Result<Report> {
     }
     report
         .findings
-        .retain(|finding| !known.contains(&crate::baseline::fingerprint(finding)));
+        .retain(|finding| !known.as_ref().is_some_and(|known| known.knows(finding)));
     report.suppressed = before - report.findings.len();
     Ok(report)
+}
+
+/// Where a directory is in its git repository: `crates/core/`, or nothing at the top
+/// and outside of any. The files of a report are named from the package; this in front
+/// of them names them from the repository, as a code-scanning service wants them.
+fn repository_prefix(dir: &Path) -> String {
+    let shown = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["rev-parse", "--show-prefix"])
+        .stderr(Stdio::null())
+        .output();
+    match shown {
+        Ok(output) if output.status.success() => {
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        }
+        _ => String::new(),
+    }
+}
+
+/// What naming the findings of a file needs to know of it.
+struct FilePlaces<'a> {
+    display: &'a str,
+    source: &'a str,
+    sites: Vec<&'a Site>,
+}
+
+/// Gives every finding the item it is in and its name (`report::finding_id`). Which of
+/// several places with the same code in one item a finding is at is counted over the
+/// sites of the file, not over the findings: a finding keeps its number when the one
+/// before it is closed.
+fn name_findings(findings: &mut [Finding], files: &[FilePlaces]) {
+    for file in files {
+        let items = instrument::named_items(file.source);
+        let item_at = |line: usize, column: usize| -> String {
+            instrument::offset_of(file.source, line, column)
+                .map_or("", |offset| instrument::enclosing_item(&items, offset))
+                .to_string()
+        };
+        // Every place of the file a finding can be at: where, in which item, on which code.
+        let places: BTreeSet<(String, String, usize, usize)> = file
+            .sites
+            .iter()
+            .map(|site| {
+                let at = report::location(file.display, site);
+                (item_at(at.line, at.column), at.code, at.line, at.column)
+            })
+            .collect();
+        for finding in findings.iter_mut() {
+            let (kind, at) = match finding {
+                Finding::InputGap { at, .. } => ("input_gap", at),
+                Finding::AssertionGap { at, .. } => ("assertion_gap", at),
+            };
+            if at.file != file.display {
+                continue;
+            }
+            at.item = item_at(at.line, at.column);
+            let nth = places
+                .iter()
+                .filter(|(item, code, line, column)| {
+                    *item == at.item && *code == at.code && (*line, *column) < (at.line, at.column)
+                })
+                .count();
+            at.id = report::finding_id(kind, at, nth);
+        }
+    }
 }
 
 /// The mutation that a change of the source text is, to describe it in the same words.
@@ -3394,6 +3472,58 @@ serde = { path = "../../serde-fork" }
         assert_eq!(read("keep/deep/y"), "y");
         fs::remove_dir_all(&dir).unwrap();
     }
+    #[test]
+    fn a_finding_keeps_its_number_when_the_one_before_it_is_closed() {
+        let source = "impl S {\n    fn f(a: u8, b: u8) -> u8 {\n        let x = if a > b { 1 } else { 0 };\n        let y = if a > b { 2 } else { 0 };\n        x + y\n    }\n}\nfn g(a: u8, b: u8) -> bool {\n    a > b\n}\n";
+        let found = instrument::discover(source, 0).unwrap();
+        let places = [FilePlaces {
+            display: "src/lib.rs",
+            source,
+            sites: found.sites.iter().collect(),
+        }];
+        let gap = |line: usize, column: usize, file: &str| Finding::InputGap {
+            at: report::Location {
+                file: file.to_string(),
+                line,
+                column,
+                code: "a > b".to_string(),
+                ..report::Location::default()
+            },
+            survivors: vec![],
+            survivor_count: 0,
+            add_tests: vec![],
+            observed: None,
+            verified: true,
+        };
+        let name = |finding: &Finding| {
+            let (Finding::InputGap { at, .. } | Finding::AssertionGap { at, .. }) = finding;
+            (at.item.clone(), at.id.clone())
+        };
+        // Only the second of the two in `f` is a finding: it is still the second.
+        let mut findings = [
+            gap(4, 20, "src/lib.rs"),
+            gap(9, 5, "src/lib.rs"),
+            gap(9, 5, "src/other.rs"),
+        ];
+        name_findings(&mut findings, &places);
+        assert_eq!(
+            name(&findings[0]),
+            (
+                "S::f".to_string(),
+                "input_gap|src/lib.rs|S::f|a > b|1".to_string()
+            )
+        );
+        assert_eq!(
+            name(&findings[1]),
+            (
+                "g".to_string(),
+                "input_gap|src/lib.rs|g|a > b|0".to_string()
+            )
+        );
+        // A finding of a file that is not among the given ones is left without a name.
+        assert_eq!(name(&findings[2]), (String::new(), String::new()));
+    }
+
     #[test]
     fn concurrent_runs_share_the_cores() {
         // Alone a binary has them all; four at a time have a quarter each.

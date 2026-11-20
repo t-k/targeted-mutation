@@ -121,7 +121,7 @@ fn main() -> ExitCode {
     match driver::run(&options) {
         Ok(result) => {
             if cli.sarif {
-                println!("{}", report::render_sarif(&result, ""));
+                println!("{}", report::render_sarif(&result));
             } else if cli.json {
                 println!(
                     "{}",

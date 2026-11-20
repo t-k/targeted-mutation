@@ -22,17 +22,66 @@ pub fn fingerprint(finding: &Finding) -> String {
     )
 }
 
-/// Reads a baseline written by [`write`]: one fingerprint per JSON array element.
-pub fn load(path: &Path) -> Result<BTreeSet<String>> {
+/// The findings a baseline file lists.
+#[derive(Debug, PartialEq)]
+pub enum Baseline {
+    /// As written before findings had names of their own: by [`fingerprint`].
+    Fingerprints(BTreeSet<String>),
+    /// By the name of the finding (`report::finding_id`).
+    Ids(BTreeSet<String>),
+}
+
+impl Baseline {
+    pub fn knows(&self, finding: &Finding) -> bool {
+        let (Finding::InputGap { at, .. } | Finding::AssertionGap { at, .. }) = finding;
+        match self {
+            Baseline::Fingerprints(prints) => prints.contains(&fingerprint(finding)),
+            Baseline::Ids(ids) => !at.id.is_empty() && ids.contains(&at.id),
+        }
+    }
+}
+
+/// The version of the file [`write`] writes.
+const VERSION: u64 = 2;
+
+/// Reads a baseline: the object [`write`] writes, or the list of fingerprints earlier
+/// versions wrote.
+pub fn load(path: &Path) -> Result<Baseline> {
     let text =
         std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
-    serde_json::from_str(&text).with_context(|| format!("{} is not a tmt baseline", path.display()))
+    parse(&text).with_context(|| format!("{} is not a tmt baseline", path.display()))
+}
+
+fn parse(text: &str) -> Result<Baseline> {
+    let strings = |value: &serde_json::Value| -> Result<BTreeSet<String>> {
+        Ok(serde_json::from_value(value.clone())?)
+    };
+    let value: serde_json::Value = serde_json::from_str(text)?;
+    if value.is_array() {
+        return Ok(Baseline::Fingerprints(strings(&value)?));
+    }
+    match value["version"].as_u64() {
+        Some(VERSION) => Ok(Baseline::Ids(strings(&value["findings"])?)),
+        Some(other) => anyhow::bail!("version {other} of the format is not known to this tmt"),
+        None => anyhow::bail!("neither a list nor an object with a version"),
+    }
 }
 
 pub fn write(path: &Path, findings: &[Finding]) -> Result<()> {
-    let prints: BTreeSet<String> = findings.iter().map(fingerprint).collect();
-    let text = serde_json::to_string_pretty(&prints).expect("strings serialise");
+    let text = render(findings);
     std::fs::write(path, format!("{text}\n")).with_context(|| format!("writing {}", path.display()))
+}
+
+fn render(findings: &[Finding]) -> String {
+    let ids: BTreeSet<&str> = findings
+        .iter()
+        .map(|finding| {
+            let (Finding::InputGap { at, .. } | Finding::AssertionGap { at, .. }) = finding;
+            at.id.as_str()
+        })
+        .collect();
+    let file = serde_json::json!({ "version": VERSION, "findings": ids });
+    serde_json::to_string_pretty(&file).expect("strings serialise")
 }
 
 /// Lines covered by a `// tmt:ignore` comment, with the reason given after it. The
@@ -70,11 +119,59 @@ mod tests {
                 line,
                 column: 5,
                 code: code.into(),
+                ..Location::default()
             },
             survivors: survivors.iter().map(|s| s.to_string()).collect(),
             tests: vec!["tests::t".into()],
             effects: vec![],
             effects_of: None,
+        }
+    }
+
+    #[test]
+    fn a_baseline_knows_findings_by_name_and_old_ones_by_fingerprint() {
+        let named = |id: &str, survivors: &[&str]| {
+            let mut finding = gap(10, "a > b", survivors);
+            let Finding::AssertionGap { at, .. } = &mut finding else {
+                unreachable!()
+            };
+            at.id = id.to_string();
+            finding
+        };
+        let one = named("assertion_gap|src/lib.rs|f|a > b|0", &["`a >= b`"]);
+        let other = named("assertion_gap|src/lib.rs|g|a > b|0", &["`a >= b`"]);
+        let written = render(&[one.clone()]);
+        let baseline = parse(&written).unwrap();
+        assert!(baseline.knows(&one));
+        // The same code in another function is another finding.
+        assert!(!baseline.knows(&other));
+        // Other words for the mutants, or one more of them, and it is still the one.
+        assert!(baseline.knows(&named(
+            "assertion_gap|src/lib.rs|f|a > b|0",
+            &["`a >= b`", "the negation"]
+        )));
+        // A finding without a name is not known by having none.
+        assert!(
+            !parse(&render(&[gap(1, "x", &[])]))
+                .unwrap()
+                .knows(&gap(2, "y", &[]))
+        );
+        // A file of an earlier version lists fingerprints, and still works as it did.
+        let old = serde_json::to_string(&[fingerprint(&one)]).unwrap();
+        let baseline = parse(&old).unwrap();
+        assert!(matches!(baseline, Baseline::Fingerprints(_)));
+        assert!(baseline.knows(&one) && baseline.knows(&other));
+        assert!(!baseline.knows(&named("x", &["`a >= b`", "the negation"])));
+        // Anything else is refused, with a later version said to be one.
+        let later = parse(r#"{"version": 3, "findings": []}"#).unwrap_err();
+        assert!(later.to_string().contains("version 3"), "{later}");
+        for bad in [
+            "{}",
+            "3",
+            r#"{"version": 2, "findings": [1]}"#,
+            r#"["a", 1]"#,
+        ] {
+            assert!(parse(bad).is_err(), "{bad}");
         }
     }
 
@@ -98,6 +195,7 @@ mod tests {
                 line: 10,
                 column: 5,
                 code: "a > b".into(),
+                ..Location::default()
             },
             survivors: vec!["`a >= b`".into()],
             survivor_count: 1,
@@ -112,14 +210,21 @@ mod tests {
     fn baseline_round_trip() {
         let path =
             std::env::temp_dir().join(format!("tmt-baseline-test-{}.json", std::process::id()));
-        let findings = [
+        let mut findings = [
             gap(1, "a > b", &["`a >= b`"]),
             gap(2, "x();", &["delete `x();`"]),
         ];
+        for (index, finding) in findings.iter_mut().enumerate() {
+            let Finding::AssertionGap { at, .. } = finding else {
+                unreachable!()
+            };
+            at.id = format!("id-{index}");
+        }
         write(&path, &findings).unwrap();
         let loaded = load(&path).unwrap();
-        assert_eq!(loaded.len(), 2);
-        assert!(findings.iter().all(|f| loaded.contains(&fingerprint(f))));
+        let ids: BTreeSet<String> = ["id-0", "id-1"].iter().map(|id| id.to_string()).collect();
+        assert_eq!(loaded, Baseline::Ids(ids));
+        assert!(findings.iter().all(|f| loaded.knows(f)));
         std::fs::write(&path, "not json").unwrap();
         assert!(load(&path).is_err());
         std::fs::remove_file(&path).unwrap();
