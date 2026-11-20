@@ -1045,6 +1045,21 @@ mod tests {
     use super::*;
     use crate::instrument::discover;
 
+    #[test]
+    fn evaluation_distinguishes_no_sites_no_mutants_and_completed_work() {
+        let mut report = Report::default();
+        report.record_evaluation();
+        assert_eq!(report.evaluation, Some(Evaluation::NoSites));
+        report.sites = 1;
+        report.record_evaluation();
+        assert_eq!(report.evaluation, Some(Evaluation::NoMutantsExecuted));
+        assert!(render_text(&report, false).contains("No mutants executed."));
+        report.mutants_run = 1;
+        report.record_evaluation();
+        assert_eq!(report.evaluation, None);
+        assert!(!render_text(&report, false).contains("No mutants executed."));
+    }
+
     fn results_of(sarif: &serde_json::Value) -> &Vec<serde_json::Value> {
         sarif["runs"][0]["results"].as_array().unwrap()
     }
