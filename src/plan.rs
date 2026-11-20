@@ -90,6 +90,26 @@ impl CmpOp {
         })
     }
 
+    /// `<` and `>` as each other and as `==`.
+    pub fn mistaken_for(self) -> &'static [CmpOp] {
+        match self {
+            CmpOp::Lt => &[CmpOp::Eq, CmpOp::Gt],
+            CmpOp::Gt => &[CmpOp::Eq, CmpOp::Lt],
+            _ => &[],
+        }
+    }
+
+    pub fn negated(self) -> CmpOp {
+        match self {
+            CmpOp::Lt => CmpOp::Ge,
+            CmpOp::Le => CmpOp::Gt,
+            CmpOp::Gt => CmpOp::Le,
+            CmpOp::Ge => CmpOp::Lt,
+            CmpOp::Eq => CmpOp::Ne,
+            CmpOp::Ne => CmpOp::Eq,
+        }
+    }
+
     /// `<` <-> `<=`, `>` <-> `>=`: the classic off-by-one.
     pub fn flip_eq(self) -> Option<CmpOp> {
         match self {
@@ -311,6 +331,20 @@ pub enum Mutation {
 }
 
 impl Mutation {
+    /// The operator this mutation of a comparison with `op` amounts to, where it is one:
+    /// over integers `a > b - 1` is `a >= b`.
+    pub fn as_operator(&self, op: CmpOp) -> Option<CmpOp> {
+        match (self, op) {
+            (Mutation::Negate, _) => Some(op.negated()),
+            (Mutation::Op(other), _) => Some(*other),
+            (Mutation::Shift(-1), CmpOp::Gt) => Some(CmpOp::Ge),
+            (Mutation::Shift(1), CmpOp::Ge) => Some(CmpOp::Gt),
+            (Mutation::Shift(1), CmpOp::Lt) => Some(CmpOp::Le),
+            (Mutation::Shift(-1), CmpOp::Le) => Some(CmpOp::Lt),
+            _ => None,
+        }
+    }
+
     /// Wire format shared with the injected runtime (`TMT_MUTANT=<site>:<encoded>`).
     pub fn encode(&self) -> String {
         match self {
@@ -467,6 +501,27 @@ impl InputGap {
 /// known. It only matters for a condition with a single observed outcome: if the types
 /// rule the other outcome out (`x >= 0` for unsigned `x`), there is nothing to report.
 pub fn plan_cmp(op: CmpOp, obs: &Obs, domain: Option<(i128, i128)>) -> CmpPlan {
+    let mut plan = plan_boundary(op, obs, domain);
+    // The other operators a `<` or `>` is commonly mistaken for (the replacements
+    // cargo-mutants makes). One that answers like the original for every relation the
+    // tests saw passes them all, which the gap already says; one that answers like a
+    // mutant that is run anyway fails or passes with it. The rest are run.
+    let answers = |answer: &dyn Fn(Rel) -> bool| -> Vec<bool> { obs.rels().map(answer).collect() };
+    let original = answers(&|rel| op.eval_rel(rel));
+    for other in op.mistaken_for() {
+        let mine = answers(&|rel| other.eval_rel(rel));
+        let run_already = plan.run.iter().any(|m| {
+            m.as_operator(op)
+                .is_some_and(|same| answers(&|rel| same.eval_rel(rel)) == mine)
+        });
+        if mine != original && !run_already {
+            plan.run.push(Mutation::Op(*other));
+        }
+    }
+    plan
+}
+
+fn plan_boundary(op: CmpOp, obs: &Obs, domain: Option<(i128, i128)>) -> CmpPlan {
     if !obs.reached() {
         return CmpPlan {
             cannot_differ: false,
@@ -857,16 +912,75 @@ mod tests {
         assert_eq!(plan.gap.unwrap().representative(), Some(Mutation::Shift(1)));
     }
 
+    /// Every operator `<` and `>` are mistaken for is accounted for, whatever the tests
+    /// saw: it passes them all (and a gap says so), or it is run, or a mutant that is
+    /// run answers like it in every relation the tests saw.
+    #[test]
+    fn the_operators_a_comparison_is_mistaken_for() {
+        let rels = [Rel::Less, Rel::Equal, Rel::Greater, Rel::Unordered];
+        for op in [CmpOp::Lt, CmpOp::Gt] {
+            for seen in 1u8..16 {
+                let mut obs = Obs::default();
+                let seen: Vec<Rel> = (0..4)
+                    .filter(|i| seen & (1 << i) != 0)
+                    .map(|i| rels[i])
+                    .collect();
+                for rel in &seen {
+                    obs.merge(&Obs::of_rel(*rel));
+                }
+                let plan = plan_cmp(op, &obs, None);
+                for other in op.mistaken_for() {
+                    let alike = |a: CmpOp, b: CmpOp| {
+                        seen.iter().all(|rel| a.eval_rel(*rel) == b.eval_rel(*rel))
+                    };
+                    let what = format!("{op:?} as {other:?} with {seen:?}: {plan:?}");
+                    if alike(*other, op) {
+                        assert!(plan.gap.is_some(), "{what}");
+                        assert!(!plan.run.contains(&Mutation::Op(*other)), "{what}");
+                    } else {
+                        let run = plan
+                            .run
+                            .iter()
+                            .filter_map(|m| m.as_operator(op))
+                            .filter(|same| alike(*same, *other))
+                            .count();
+                        assert_eq!(run, 1, "run once, as itself or as its like: {what}");
+                    }
+                }
+            }
+            // The other operators get nothing added.
+            for op in [CmpOp::Le, CmpOp::Ge, CmpOp::Eq, CmpOp::Ne] {
+                assert!(op.mistaken_for().is_empty());
+            }
+        }
+        // What a mutation amounts to as an operator, checked against its own answers.
+        for op in [
+            CmpOp::Lt,
+            CmpOp::Le,
+            CmpOp::Gt,
+            CmpOp::Ge,
+            CmpOp::Eq,
+            CmpOp::Ne,
+        ] {
+            for m in [Mutation::Negate, Mutation::Shift(-1), Mutation::Shift(1)] {
+                for d in -3..=3 {
+                    if let Some(same) = m.as_operator(op) {
+                        assert_eq!(eval_mutated_d(op, m, d), same.eval_d(d), "{op:?} {m:?} {d}");
+                    }
+                }
+            }
+        }
+    }
+
     #[test]
     fn pinned_boundary_has_no_input_gap() {
         for op in [CmpOp::Lt, CmpOp::Le, CmpOp::Gt, CmpOp::Ge] {
             let plan = plan_cmp(op, &obs_of(&[-1, 0, 1]), None);
             assert_eq!(plan.gap, None, "{op:?}");
-            assert_eq!(
-                plan.run,
-                vec![Mutation::Shift(-1), Mutation::Shift(1), Mutation::Negate],
-                "{op:?}"
-            );
+            // With all three relations seen, no two operators answer alike.
+            let mut run = vec![Mutation::Shift(-1), Mutation::Shift(1), Mutation::Negate];
+            run.extend(op.mistaken_for().iter().map(|other| Mutation::Op(*other)));
+            assert_eq!(plan.run, run, "{op:?}");
         }
     }
 
@@ -905,9 +1019,15 @@ mod tests {
         // are real mutants (`x > -1` is `x >= 0`, which differs at 0).
         let plan = plan_cmp(CmpOp::Gt, &obs_of(&[0, 1]), Some((0, 255)));
         assert_eq!(plan.gap, None);
+        // `x == 0` answers like the negation at 0 and 1; `x < 0` is false at both.
         assert_eq!(
             plan.run,
-            vec![Mutation::Shift(-1), Mutation::Shift(1), Mutation::Negate]
+            vec![
+                Mutation::Shift(-1),
+                Mutation::Shift(1),
+                Mutation::Negate,
+                Mutation::Op(CmpOp::Lt)
+            ]
         );
         // `x <= 0` for unsigned x, observed at 0 and 1: `x <= -1` is a real mutant too,
         // but `x < 0`-style thresholds below the domain are not counted twice.
@@ -1345,12 +1465,21 @@ mod tests {
                 float_gap: None
             })
         );
-        assert_eq!(plan.run, vec![Mutation::Negate]);
+        // Without equal operands `>` answers like the negation, and `==` is never true.
+        assert_eq!(plan.run, vec![Mutation::Negate, Mutation::Op(CmpOp::Eq)]);
 
         obs.merge(&Obs::of_rel(Rel::Equal));
         let plan = plan_cmp(CmpOp::Lt, &obs, None);
         assert_eq!(plan.gap, None);
-        assert_eq!(plan.run, vec![Mutation::Op(CmpOp::Le), Mutation::Negate]);
+        assert_eq!(
+            plan.run,
+            vec![
+                Mutation::Op(CmpOp::Le),
+                Mutation::Negate,
+                Mutation::Op(CmpOp::Eq),
+                Mutation::Op(CmpOp::Gt)
+            ]
+        );
     }
 
     #[test]
