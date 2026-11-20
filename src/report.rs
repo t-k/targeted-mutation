@@ -39,9 +39,11 @@ pub enum Finding {
         survivors: Vec<String>,
         /// Tests whose execution changed under the mutants but did not fail.
         tests: Vec<String>,
-        /// What the first surviving mutant changes later in those tests: the places an
+        /// What one surviving mutant changes later in those tests: the places an
         /// assertion could catch it. Empty when that was not looked into.
         effects: Vec<String>,
+        /// The mutant whose effects those are, as it is written in `survivors`.
+        effects_of: Option<String>,
     },
 }
 
@@ -650,6 +652,7 @@ fn finding_body(finding: &Finding) -> Vec<String> {
             survivors,
             tests,
             effects,
+            effects_of,
             ..
         } => {
             lines.push(format!("passes every test as: {}", survivors.join(", ")));
@@ -665,6 +668,13 @@ fn finding_body(finding: &Finding) -> Vec<String> {
             if effects.is_empty() {
                 lines.push("add an assertion on what this code is responsible for".to_string());
             } else {
+                // Which of several mutants was followed, so that what is said of "the
+                // mutant" below can be tried.
+                if let (Some(followed), true) = (effects_of, survivors.len() > 1) {
+                    lines.push(format!(
+                        "followed one of them through the tests: {followed}"
+                    ));
+                }
                 lines.extend(effects.iter().cloned());
             }
         }
@@ -1365,6 +1375,7 @@ mod tests {
                     survivors: vec!["`!(a >= b)`".into()],
                     tests: vec!["t".into()],
                     effects: vec![],
+                    effects_of: None,
                 },
                 Finding::AssertionGap {
                     at: below,
@@ -1373,6 +1384,7 @@ mod tests {
                     effects: vec![
                         "with the mutant, `t` no longer runs `s.count = 0;` (src/lib.rs:12)".into(),
                     ],
+                    effects_of: None,
                 },
             ],
             ..Report::default()
@@ -1475,6 +1487,7 @@ mod tests {
                 survivors: vec!["delete `s.check()?;`".into()],
                 tests: (0..7).map(|i| format!("tests::t{i}")).collect(),
                 effects: vec![],
+                effects_of: None,
             }],
             unreached: vec![at.clone()],
             unstable: vec![at],
@@ -1629,6 +1642,40 @@ mod tests {
     }
 
     #[test]
+    fn the_effects_are_said_of_the_mutant_they_were_seen_with() {
+        let gap = |survivors: &[&str], effects_of: Option<&str>| Finding::AssertionGap {
+            at: Location {
+                file: "src/lib.rs".into(),
+                line: 1,
+                column: 1,
+                code: "a < b".into(),
+            },
+            survivors: survivors.iter().map(|s| s.to_string()).collect(),
+            tests: vec!["tests::t".into()],
+            effects: vec!["with the mutant, `tests::t` now runs `x;` (src/lib.rs:2)".into()],
+            effects_of: effects_of.map(str::to_string),
+        };
+        // Of several mutants one was followed: the report says which.
+        let body = finding_body(&gap(&["`a <= b`", "`a == b`"], Some("`a <= b`")));
+        assert_eq!(
+            body[2..],
+            [
+                "followed one of them through the tests: `a <= b`",
+                "with the mutant, `tests::t` now runs `x;` (src/lib.rs:2)"
+            ]
+        );
+        // A single mutant needs no saying, and nothing is said where nothing is known.
+        for single in [
+            gap(&["`a <= b`"], Some("`a <= b`")),
+            gap(&["`a <= b`", "`a == b`"], None),
+        ] {
+            let body = finding_body(&single);
+            assert_eq!(body.len(), 3, "{body:?}");
+            assert!(body[2].starts_with("with the mutant"), "{body:?}");
+        }
+    }
+
+    #[test]
     fn lists_and_counts_at_their_limits() {
         let items: Vec<String> = ["a", "b", "c"].iter().map(|s| s.to_string()).collect();
         assert_eq!(list(&items, 3), "a, b, c");
@@ -1699,6 +1746,7 @@ mod tests {
             survivors: vec![survivor.into()],
             tests: vec![],
             effects: vec![],
+            effects_of: None,
         };
         let mut report = Report {
             findings: vec![

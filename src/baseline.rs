@@ -74,6 +74,7 @@ mod tests {
             survivors: survivors.iter().map(|s| s.to_string()).collect(),
             tests: vec!["tests::t".into()],
             effects: vec![],
+            effects_of: None,
         }
     }
 

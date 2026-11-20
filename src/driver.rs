@@ -2309,6 +2309,7 @@ pub fn run(options: &Options) -> Result<Report> {
                 survivors,
                 tests: passing_tests.into_iter().collect(),
                 effects: vec![],
+                effects_of: None,
             });
         }
     }
@@ -2342,8 +2343,16 @@ pub fn run(options: &Options) -> Result<Report> {
                 }
                 changes.retain(|_, found| !found.is_empty());
             }
-            if let Finding::AssertionGap { effects, .. } = &mut report.findings[*finding] {
+            if let Finding::AssertionGap {
+                effects,
+                effects_of,
+                ..
+            } = &mut report.findings[*finding]
+            {
                 *effects = describe_effects(&changes, &sites);
+                *effects_of = sites
+                    .get(&jobs[*job].site)
+                    .map(|(_, site)| report::describe(site, jobs[*job].mutation));
             }
         }
     }
@@ -2438,6 +2447,7 @@ pub fn run(options: &Options) -> Result<Report> {
                         survivors,
                         tests: vec![],
                         effects: vec![],
+                        effects_of: None,
                     }),
             );
     }
