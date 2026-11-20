@@ -59,6 +59,46 @@ pub enum Finding {
         /// The mutant whose effects those are, as it is written in `survivors`.
         effects_of: Option<String>,
     },
+    /// A mutant that was built on its own passes every test, and nothing was recorded
+    /// that says why: whether no test runs the code (nothing can be recorded in a
+    /// `const fn`), or one does and does not look at the result.
+    Survivor {
+        #[serde(flatten)]
+        at: Location,
+        survivors: Vec<String>,
+    },
+}
+
+impl Finding {
+    pub fn at(&self) -> &Location {
+        let (Finding::InputGap { at, .. }
+        | Finding::AssertionGap { at, .. }
+        | Finding::Survivor { at, .. }) = self;
+        at
+    }
+
+    pub fn at_mut(&mut self) -> &mut Location {
+        let (Finding::InputGap { at, .. }
+        | Finding::AssertionGap { at, .. }
+        | Finding::Survivor { at, .. }) = self;
+        at
+    }
+
+    pub fn survivors(&self) -> &[String] {
+        let (Finding::InputGap { survivors, .. }
+        | Finding::AssertionGap { survivors, .. }
+        | Finding::Survivor { survivors, .. }) = self;
+        survivors
+    }
+
+    /// The kind as the JSON report and the names of findings spell it.
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Finding::InputGap { .. } => "input_gap",
+            Finding::AssertionGap { .. } => "assertion_gap",
+            Finding::Survivor { .. } => "survivor",
+        }
+    }
 }
 
 /// What decides which code cargo compiles, as given on the command line.
@@ -148,7 +188,7 @@ impl Report {
     pub fn sort_findings(&mut self) {
         self.findings.sort_by(|a, b| {
             let key = |finding: &Finding| {
-                let (Finding::InputGap { at, .. } | Finding::AssertionGap { at, .. }) = finding;
+                let at = finding.at();
                 (at.file.clone(), at.line, at.column)
             };
             key(a).cmp(&key(b))
@@ -614,10 +654,10 @@ pub fn render_sarif(report: &Report) -> String {
         .iter()
         .map(|finding| {
             let (kind, at) = finding_parts(finding);
-            let rule = if kind == "INPUT GAP" {
-                "input-gap"
-            } else {
-                "assertion-gap"
+            let rule = match kind {
+                "INPUT GAP" => "input-gap",
+                "ASSERTION GAP" => "assertion-gap",
+                _ => "survivor",
             };
             let text = format!("`{}`: {}", at.code, finding_body(finding).join("; "));
             serde_json::json!({
@@ -643,7 +683,8 @@ pub fn render_sarif(report: &Report) -> String {
                 "name": "tmt",
                 "rules": [
                     { "id": "input-gap", "shortDescription": { "text": "No test input tells this mutant from the original" } },
-                    { "id": "assertion-gap", "shortDescription": { "text": "Tests run the mutated code and still pass" } }
+                    { "id": "assertion-gap", "shortDescription": { "text": "Tests run the mutated code and still pass" } },
+                    { "id": "survivor", "shortDescription": { "text": "A mutant built on its own passes every test; why is not known" } }
                 ]
             } },
             // What was looked at: a run of a part says nothing about the rest.
@@ -706,15 +747,10 @@ fn finding_body(finding: &Finding) -> Vec<String> {
             ..
         } => {
             lines.push(format!("passes every test as: {}", survivors.join(", ")));
-            lines.push(if tests.is_empty() {
-                // Built on its own: nothing recorded which tests run this code.
-                "no test fails with it".to_string()
-            } else {
-                format!(
-                    "these tests run the changed code and still pass: {}",
-                    list(tests, 5)
-                )
-            });
+            lines.push(format!(
+                "these tests run the changed code and still pass: {}",
+                list(tests, 5)
+            ));
             if effects.is_empty() {
                 lines.push("add an assertion on what this code is responsible for".to_string());
             } else {
@@ -728,6 +764,13 @@ fn finding_body(finding: &Finding) -> Vec<String> {
                 lines.extend(effects.iter().cloned());
             }
         }
+        Finding::Survivor { survivors, .. } => {
+            lines.push(format!("passes every test as: {}", survivors.join(", ")));
+            lines.push(
+                "built on its own, where nothing can be recorded: either no test runs this code, or one does and does not check what it gives"
+                    .to_string(),
+            );
+        }
     }
     lines
 }
@@ -736,6 +779,7 @@ fn finding_parts(finding: &Finding) -> (&'static str, &Location) {
     match finding {
         Finding::InputGap { at, .. } => ("INPUT GAP", at),
         Finding::AssertionGap { at, .. } => ("ASSERTION GAP", at),
+        Finding::Survivor { at, .. } => ("SURVIVOR", at),
     }
 }
 
@@ -788,7 +832,12 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
         .iter()
         .filter(|f| matches!(f, Finding::InputGap { .. }))
         .count();
-    let assertion = report.findings.len() - input;
+    let assertion = report
+        .findings
+        .iter()
+        .filter(|f| matches!(f, Finding::AssertionGap { .. }))
+        .count();
+    let unexplained = report.findings.len() - input - assertion;
     // A mutant stopped by the time limit costs the limit: worth knowing when a run is slow.
     let by_time_limit = if report.mutants_timed_out > 0 {
         format!(", {} of them by the time limit", report.mutants_timed_out)
@@ -805,6 +854,11 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
         report.mutants_killed,
         report.unreached.len()
     ));
+    if unexplained > 0 {
+        out.push_str(&format!(
+            ", {unexplained} survivors of mutants built on their own"
+        ));
+    }
     if report.suppressed > 0 {
         out.push_str(&format!(", {} findings suppressed", report.suppressed));
     }
@@ -1542,7 +1596,43 @@ mod tests {
         let rules = sarif["runs"][0]["tool"]["driver"]["rules"]
             .as_array()
             .unwrap();
-        assert_eq!(rules.len(), 2);
+        assert_eq!(rules.len(), 3);
+    }
+
+    #[test]
+    fn a_mutant_built_on_its_own_is_a_survivor_without_a_cause() {
+        let survivor = Finding::Survivor {
+            at: Location {
+                file: "src/lib.rs".into(),
+                line: 2,
+                column: 1,
+                code: "const fn limit() -> u8".into(),
+                ..Location::default()
+            },
+            survivors: vec!["the body of `limit` replaced by `0`".into()],
+        };
+        assert_eq!(survivor.kind(), "survivor");
+        assert_eq!(survivor.at().line, 2);
+        assert_eq!(survivor.survivors().len(), 1);
+        let report = Report {
+            package: "p".into(),
+            findings: vec![survivor],
+            ..Report::default()
+        };
+        // Neither of the two gaps: it is counted and named as what it is.
+        assert_eq!(
+            render_text(&report, false),
+            "SURVIVOR  src/lib.rs:2:1\n    const fn limit() -> u8\n\
+             \x20 passes every test as: the body of `limit` replaced by `0`\n\
+             \x20 built on its own, where nothing can be recorded: either no test runs this code, or one does and does not check what it gives\n\
+             \n\
+             p: 0 sites, 0 input gaps, 0 assertion gaps, 0 mutants run (0 killed), 0 sites unreached, 1 survivors of mutants built on their own\n"
+        );
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["findings"][0]["kind"], "survivor");
+        let sarif: serde_json::Value = serde_json::from_str(&render_sarif(&report)).unwrap();
+        assert_eq!(results_of(&sarif)[0]["ruleId"], "survivor");
+        assert!(report.has_gaps());
     }
 
     #[test]

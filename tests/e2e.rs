@@ -298,6 +298,12 @@ fn awkward_constructs() {
             .collect()
     };
     assert_eq!(in_const("a < 10"), ["`a <= 10`"], "{report:#}");
+    let kinds: Vec<&str> = all
+        .iter()
+        .filter(|f| f["code"] == "a < 10")
+        .map(|f| f["kind"].as_str().unwrap())
+        .collect();
+    assert_eq!(kinds, ["survivor"], "built on its own: {report:#}");
     assert_eq!(
         in_const("const fn const_limit(a: u32) -> bool"),
         ["the body of `const_limit` replaced by `true`"],
@@ -1297,9 +1303,11 @@ fn the_mutants_of_cargo_mutants() {
 
     // A minus that changes the type: its probe does not compile, so the mutant is built
     // on its own instead of the site being skipped.
-    assert_eq!(survivors("-above", "assertion_gap"), ["`above`"]);
+    // Nothing was recorded for it: it is a survivor, with no claim about the cause.
+    assert_eq!(survivors("-above", "survivor"), ["`above`"]);
+    assert!(survivors("-above", "assertion_gap").is_empty());
     let built = all.iter().find(|f| f["code"] == "-above").unwrap();
-    assert_eq!(built["tests"].as_array().unwrap().len(), 0, "{built:#}");
+    assert!(built.get("tests").is_none(), "{built:#}");
 
     // An iterator of another type cannot be returned beside the body's own, so the
     // three replacements of `evens` are built one by one. Unless asked for they are

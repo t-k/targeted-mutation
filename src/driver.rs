@@ -2537,19 +2537,11 @@ pub fn run(options: &Options) -> Result<Report> {
                 }
             }
         }
-        report
-            .findings
-            .extend(
-                survivors
-                    .into_iter()
-                    .map(|(at, survivors)| Finding::AssertionGap {
-                        at,
-                        survivors,
-                        tests: vec![],
-                        effects: vec![],
-                        effects_of: None,
-                    }),
-            );
+        report.findings.extend(
+            survivors
+                .into_iter()
+                .map(|(at, survivors)| Finding::Survivor { at, survivors }),
+        );
     }
 
     report.sort_findings();
@@ -2577,11 +2569,7 @@ pub fn run(options: &Options) -> Result<Report> {
         Some(path) => Some(crate::baseline::load(path)?),
         None => None,
     };
-    let location = |finding: &Finding| match finding {
-        Finding::InputGap { at, .. } | Finding::AssertionGap { at, .. } => {
-            (at.file.clone(), at.line)
-        }
-    };
+    let location = |finding: &Finding| (finding.at().file.clone(), finding.at().line);
     let before = report.findings.len();
     report.findings.retain(|finding| {
         let (file, line) = location(finding);
@@ -2651,10 +2639,8 @@ fn name_findings(findings: &mut [Finding], files: &[FilePlaces]) {
             .map(|(line, column, code)| (item_at(*line, *column), code.as_str(), *line, *column))
             .collect();
         for finding in findings.iter_mut() {
-            let (kind, at) = match finding {
-                Finding::InputGap { at, .. } => ("input_gap", at),
-                Finding::AssertionGap { at, .. } => ("assertion_gap", at),
-            };
+            let kind = finding.kind();
+            let at = finding.at_mut();
             if at.file != file.display {
                 continue;
             }
@@ -3606,7 +3592,7 @@ serde = { path = "../../serde-fork" }
             verified: true,
         };
         let name = |finding: &Finding| {
-            let (Finding::InputGap { at, .. } | Finding::AssertionGap { at, .. }) = finding;
+            let at = finding.at();
             (at.item.clone(), at.id.clone())
         };
         // Only the second of the two in `f` is a finding: it is still the second.

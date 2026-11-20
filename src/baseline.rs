@@ -10,10 +10,12 @@ use crate::report::Finding;
 /// What identifies a finding across runs: its kind, file, code and surviving mutants.
 /// Line numbers are left out, so code that merely moves keeps its fingerprint.
 pub fn fingerprint(finding: &Finding) -> String {
-    let (kind, at, survivors) = match finding {
-        Finding::InputGap { at, survivors, .. } => ("input_gap", at, survivors),
-        Finding::AssertionGap { at, survivors, .. } => ("assertion_gap", at, survivors),
+    // A mutant built on its own was an assertion gap when fingerprints were written.
+    let kind = match finding {
+        Finding::InputGap { .. } => "input_gap",
+        Finding::AssertionGap { .. } | Finding::Survivor { .. } => "assertion_gap",
     };
+    let (at, survivors) = (finding.at(), finding.survivors());
     format!(
         "{kind}\t{}\t{}\t{}",
         at.file,
@@ -33,7 +35,7 @@ pub enum Baseline {
 
 impl Baseline {
     pub fn knows(&self, finding: &Finding) -> bool {
-        let (Finding::InputGap { at, .. } | Finding::AssertionGap { at, .. }) = finding;
+        let at = finding.at();
         match self {
             Baseline::Fingerprints(prints) => prints.contains(&fingerprint(finding)),
             Baseline::Ids(ids) => !at.id.is_empty() && ids.contains(&at.id),
@@ -76,7 +78,7 @@ fn render(findings: &[Finding]) -> String {
     let ids: BTreeSet<&str> = findings
         .iter()
         .map(|finding| {
-            let (Finding::InputGap { at, .. } | Finding::AssertionGap { at, .. }) = finding;
+            let at = finding.at();
             at.id.as_str()
         })
         .collect();
