@@ -61,6 +61,12 @@ fn json(dir: &Path) -> (i32, Value) {
     (run.code, value)
 }
 
+/// A report without what it says about how it was asked for.
+fn but_how(mut report: Value) -> Value {
+    report.as_object_mut().unwrap().remove("analysis");
+    report
+}
+
 fn findings<'a>(report: &'a Value, kind: &str) -> Vec<&'a Value> {
     report["findings"]
         .as_array()
@@ -929,7 +935,12 @@ fn only_changed_code_is_analysed_on_request() {
         ],
     );
     let by_lines: Value = serde_json::from_str(&run.stdout).unwrap();
-    assert_eq!(by_lines, report);
+    assert_eq!(by_lines["analysis"]["lines"][1], "src/extra.rs");
+    assert_eq!(
+        report["analysis"]["since"].as_str().map(str::len),
+        Some(base.len())
+    );
+    assert_eq!(but_how(by_lines), but_how(report));
     let bad = tmt(&dir, &["--quiet", "--lines", "src/lib.rs:9-2"]);
     assert_eq!(bad.code, 1);
     assert!(bad.stderr.contains("not a line range"), "{}", bad.stderr);
@@ -1326,7 +1337,8 @@ fn the_last_round_of_a_loop_is_the_nearest_value() {
     // Optimised code observes the same and gives the same report.
     let run = tmt(&dir, &["--json", "--quiet", "--opt-level", "2"]);
     let optimised: Value = serde_json::from_str(&run.stdout).unwrap();
-    assert_eq!(optimised, report);
+    assert_eq!(optimised["analysis"]["opt_level"], 2);
+    assert_eq!(but_how(optimised), but_how(report));
     let bad = tmt(&dir, &["--quiet", "--opt-level", "4"]);
     assert_eq!(bad.code, 2, "{}", bad.stderr);
     assert!(bad.stderr.contains("--opt-level"), "{}", bad.stderr);
@@ -1363,4 +1375,48 @@ fn a_right_operand_that_leaves_the_function_was_still_executed() {
         ],
         "{report:#}"
     );
+}
+
+#[test]
+fn the_features_asked_for_are_the_ones_analysed() {
+    let dir = fixture("featured", "featured");
+    let run = |args: &[&str]| -> (Vec<String>, Vec<String>, Value) {
+        let mut all = vec!["--json", "--quiet"];
+        all.extend(args);
+        let run = tmt(&dir, &all);
+        let report: Value = serde_json::from_str(&run.stdout)
+            .unwrap_or_else(|e| panic!("{e}: {}{}", run.stdout, run.stderr));
+        let codes = |list: &Value| -> Vec<String> {
+            list.as_array()
+                .unwrap()
+                .iter()
+                .map(|item| item["code"].as_str().unwrap().to_string())
+                .collect()
+        };
+        (
+            codes(&report["findings"]),
+            codes(&report["unreached"]),
+            report,
+        )
+    };
+    // By default `extra` is not compiled: nothing runs it.
+    let (findings, unreached, _) = run(&[]);
+    assert!(findings.is_empty(), "{findings:?}");
+    assert!(unreached.contains(&"n > 10".to_string()), "{unreached:?}");
+    // With the feature its test runs, and is found to be far from the limit.
+    let (findings, unreached, report) = run(&["--features", "extra"]);
+    assert!(findings.contains(&"n > 10".to_string()), "{findings:?}");
+    assert!(!unreached.contains(&"n > 10".to_string()), "{unreached:?}");
+    assert_eq!(report["analysis"]["cargo"]["features"][0], "extra");
+    // Without the default features `basic` is gone.
+    let (_, unreached, report) = run(&["--no-default-features", "--features", "extra"]);
+    assert!(unreached.contains(&"n > 5".to_string()), "{unreached:?}");
+    assert_eq!(report["analysis"]["cargo"]["no_default_features"], true);
+    let (findings, unreached, _) = run(&["--all-features"]);
+    assert!(findings.contains(&"n > 10".to_string()), "{findings:?}");
+    assert!(!unreached.contains(&"n > 5".to_string()), "{unreached:?}");
+    // A feature the package does not have is cargo's error, passed on.
+    let bad = tmt(&dir, &["--quiet", "--features", "nope"]);
+    assert_eq!(bad.code, 1, "{}", bad.stderr);
+    assert!(bad.stderr.contains("nope"), "{}", bad.stderr);
 }

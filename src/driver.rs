@@ -49,12 +49,36 @@ pub struct Options {
     pub rebuild: bool,
     /// Optimisation level to build the tests with, instead of the profile's own.
     pub opt_level: Option<u8>,
+    /// Cargo's choice of features and of the lock file, the same for every cargo command.
+    pub cargo: CargoConfig,
     /// How many mutants to run at the same time.
     pub jobs: usize,
     /// Copy every file of the workspace, including the ones git ignores.
     pub all_files: bool,
     /// Also run the doc tests (slow: rustdoc recompiles them for every mutant they reach).
     pub doc: bool,
+}
+
+pub use crate::report::CargoConfig;
+
+impl CargoConfig {
+    /// The arguments that say the same to `cargo metadata`, `cargo test` and rustdoc.
+    pub fn flags(&self) -> Vec<String> {
+        let mut flags = vec![];
+        if !self.features.is_empty() {
+            flags.extend(["--features".to_string(), self.features.join(",")]);
+        }
+        for (on, flag) in [
+            (self.all_features, "--all-features"),
+            (self.no_default_features, "--no-default-features"),
+            (self.locked, "--locked"),
+        ] {
+            if on {
+                flags.push(flag.to_string());
+            }
+        }
+        flags
+    }
 }
 
 /// How far from an error to look for the probe that caused it (a probe can break type
@@ -263,6 +287,7 @@ enum Runner {
         target_dir: PathBuf,
         package: String,
         opt_level: Option<u8>,
+        flags: Vec<String>,
     },
 }
 
@@ -902,9 +927,11 @@ fn run_binary(
             target_dir,
             package,
             opt_level,
+            flags,
         } => {
             let mut cmd = Command::new("cargo");
             cmd.args(["test", "--doc", "-p", package])
+                .args(flags)
                 .current_dir(copy)
                 .env("CARGO_TARGET_DIR", target_dir)
                 .envs(profile_env(*opt_level));
@@ -1648,6 +1675,7 @@ pub fn run(options: &Options) -> Result<Report> {
     // 1. Locate the package.
     let output = Command::new("cargo")
         .args(["metadata", "--no-deps", "--format-version", "1"])
+        .args(options.cargo.flags())
         .current_dir(&dir)
         .output()
         .context("running cargo metadata")?;
@@ -1910,6 +1938,7 @@ pub fn run(options: &Options) -> Result<Report> {
         Command::new("cargo")
             .args(["test", "--no-run", "--message-format=json"])
             .args(test_packages.iter().flat_map(|p| ["-p", p.name.as_str()]))
+            .args(options.cargo.flags())
             .current_dir(&copy)
             .env("CARGO_TARGET_DIR", &build_target)
             .envs(profile_env(options.opt_level))
@@ -2015,6 +2044,7 @@ pub fn run(options: &Options) -> Result<Report> {
             target_dir: build_target.clone(),
             package: package.name.clone(),
             opt_level: options.opt_level,
+            flags: options.cargo.flags(),
         };
         runners.push(("doc tests".to_string(), doc, session.package_dir.clone()));
     }
@@ -2096,6 +2126,16 @@ pub fn run(options: &Options) -> Result<Report> {
     let mut report = Report {
         package: package.name.clone(),
         sites: total_sites,
+        analysis: report::Analysis {
+            since: options.since.clone(),
+            lines: options.lines.clone(),
+            tests_of: test_packages.iter().map(|p| p.name.clone()).collect(),
+            cargo: options.cargo.clone(),
+            opt_level: options.opt_level,
+            rebuild: options.rebuild,
+            verified: options.verify,
+            doc_tests: options.doc,
+        },
         ..Report::default()
     };
     for site in files.iter().flat_map(|f| &f.sites) {
@@ -3306,6 +3346,26 @@ serde = { path = "../../serde-fork" }
         assert_eq!(read("keep/deep/y"), "y");
         fs::remove_dir_all(&dir).unwrap();
     }
+    #[test]
+    fn cargo_is_told_the_same_everywhere() {
+        assert!(CargoConfig::default().flags().is_empty());
+        let some = CargoConfig {
+            features: vec!["a".to_string(), "dep/b".to_string()],
+            no_default_features: true,
+            ..CargoConfig::default()
+        };
+        assert_eq!(
+            some.flags(),
+            ["--features", "a,dep/b", "--no-default-features"]
+        );
+        let all = CargoConfig {
+            all_features: true,
+            locked: true,
+            ..CargoConfig::default()
+        };
+        assert_eq!(all.flags(), ["--all-features", "--locked"]);
+    }
+
     #[test]
     fn source_mutants_are_described_like_the_others() {
         let source = "fn f(a: i32, b: i32, k: Option<i32>) -> bool { \

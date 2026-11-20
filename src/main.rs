@@ -67,6 +67,18 @@ struct Cli {
     /// exactly as `cargo test` builds them.
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(0..=3))]
     opt_level: Option<u8>,
+    /// Features of the package to build with (as for `cargo test`; repeatable).
+    #[arg(long, short = 'F', value_name = "FEATURES", value_delimiter = ',')]
+    features: Vec<String>,
+    /// Build with all features.
+    #[arg(long, conflicts_with_all = ["features", "no_default_features"])]
+    all_features: bool,
+    /// Build without the default features.
+    #[arg(long)]
+    no_default_features: bool,
+    /// Do not let cargo change the lock file.
+    #[arg(long)]
+    locked: bool,
     /// Print the report as SARIF 2.1.0.
     #[arg(long, conflicts_with = "json")]
     sarif: bool,
@@ -96,6 +108,12 @@ fn main() -> ExitCode {
         effects: !cli.no_effects,
         rebuild: cli.rebuild,
         opt_level: cli.opt_level,
+        cargo: driver::CargoConfig {
+            features: cli.features,
+            all_features: cli.all_features,
+            no_default_features: cli.no_default_features,
+            locked: cli.locked,
+        },
         jobs: cli.jobs,
         all_files: cli.all_files,
         doc: cli.doc,

@@ -45,9 +45,37 @@ pub enum Finding {
     },
 }
 
+/// What decides which code cargo compiles, as given on the command line.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct CargoConfig {
+    pub features: Vec<String>,
+    pub all_features: bool,
+    pub no_default_features: bool,
+    pub locked: bool,
+}
+
+/// What a run looked at and how: a report says nothing about what is outside of it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct Analysis {
+    /// Only the code changed since this revision.
+    pub since: Option<String>,
+    /// Only these lines.
+    pub lines: Vec<String>,
+    /// The packages whose tests were run.
+    pub tests_of: Vec<String>,
+    pub cargo: CargoConfig,
+    pub opt_level: Option<u8>,
+    /// Mutants that need a build of their own were run.
+    pub rebuild: bool,
+    /// Predicted survivors were re-run.
+    pub verified: bool,
+    pub doc_tests: bool,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct Report {
     pub package: String,
+    pub analysis: Analysis,
     pub sites: usize,
     /// Sites that could not be instrumented (the probe did not compile there).
     pub skipped_sites: usize,
@@ -1433,6 +1461,7 @@ mod tests {
         };
         let report = Report {
             package: "p".into(),
+            analysis: Analysis::default(),
             sites: 4,
             skipped_sites: 1,
             unviable_mutants: 2,
