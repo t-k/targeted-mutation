@@ -1619,12 +1619,12 @@ mod tests {
         assert!(!render_text(&Report::default(), false).contains("left out"));
         assert!(!render_text(&one, false).contains("--rebuild"));
         let quick = Report {
-            mutants_not_built: 3,
+            mutants_not_built: 1,
             ..Report::default()
         };
         assert!(
             render_text(&quick, false)
-                .ends_with("\n(3 more mutants need a build of their own: --rebuild runs them)\n"),
+                .ends_with("\n(1 more mutants need a build of their own: --rebuild runs them)\n"),
             "{}",
             render_text(&quick, false)
         );

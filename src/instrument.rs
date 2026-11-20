@@ -735,25 +735,26 @@ pub fn source_mutants(site: &Site) -> Vec<SourceMutant> {
     // A replacement that binds otherwise than the original keeps the operands it had:
     // `2 * 3` in `8 - 2 * 3` becomes `(2 + 3)`, and `8 - 2 * 3` becomes `(8) / (2 * 3)`.
     let operator = |gap: &(usize, usize), from: String, to: String, binds: std::cmp::Ordering| {
-        let inside =
-            site.start <= gap.0 && gap.1 <= site.end && site.text.len() == site.end - site.start;
-        let (left, right) = if inside {
-            (
-                site.text[..gap.0 - site.start].trim_end(),
-                site.text[gap.1 - site.start..].trim_start(),
-            )
-        } else {
-            ("", "")
-        };
-        match binds {
-            std::cmp::Ordering::Less if inside => change(
+        // The operands as they are written, on either side of the operator.
+        let operands = gap
+            .0
+            .checked_sub(site.start)
+            .zip(gap.1.checked_sub(site.start))
+            .and_then(|(left, right)| {
+                Some((
+                    site.text.get(..left)?.trim_end(),
+                    site.text.get(right..)?.trim_start(),
+                ))
+            });
+        match (binds, operands) {
+            (std::cmp::Ordering::Less, Some((left, right))) => change(
                 site.start,
                 site.end,
                 format!("({left} {to} {right})"),
                 &from,
                 &to,
             ),
-            std::cmp::Ordering::Greater if inside => change(
+            (std::cmp::Ordering::Greater, Some((left, right))) => change(
                 site.start,
                 site.end,
                 format!("({left}) {to} ({right})"),
@@ -3666,6 +3667,8 @@ mod tests {
             ("(if n > 1 { n } else { 0 }) > 0", false),
             ("list[n] > 0", false),
             ("check(n)? > 0", false),
+            ("(self.count += n) == ()", false),
+            ("(self.count = n) == ()", false),
         ] {
             let src = format!("impl S {{ fn f(&mut self, n: usize) -> bool {{ {body} }} }}");
             let all = bodies(&src);
@@ -3682,10 +3685,12 @@ mod tests {
                    #[cfg_attr(test, mutants::skip)] fn conditional(a: u8) -> u8 { a + 4 }\n\
                    #[mutants::skip] mod generated;\n\
                    #[mutants::skip] #[path = \"gen/other.rs\"] mod other;\n\
-                   mod plain;\n";
+                   mod plain;\n\
+                   mod inline { fn inner(a: u8) -> u8 { a + 5 } }\n\
+                   #[mutants::skip] mod marked { fn inner(a: u8) -> u8 { a + 6 } }\n";
         let all = discover(src, 0).unwrap();
         let texts: Vec<&str> = found_arith(&all.sites);
-        assert_eq!(texts, ["a + 1", "a + 2"]);
+        assert_eq!(texts, ["a + 1", "a + 2", "a + 5"]);
         // The file of a marked module is not looked into either.
         assert_eq!(
             all.test_modules,

@@ -488,10 +488,8 @@ fn sync_file(src: &Path, dst: &Path, state: &WorkCopy) -> Result<()> {
     }
     // Times say nothing certain: a file put back from an archive is older than the copy
     // of what it replaces. A copy is what holds the same bytes.
-    let up_to_date = match (fs::metadata(src), fs::symlink_metadata(dst)) {
-        (Ok(from), Ok(to)) => to.is_file() && from.len() == to.len() && same_bytes(src, dst),
-        _ => false,
-    };
+    // A link is not a copy, whatever it points to.
+    let up_to_date = fs::symlink_metadata(dst).is_ok_and(|to| to.is_file()) && same_bytes(src, dst);
     if up_to_date {
         return Ok(());
     }
@@ -507,23 +505,10 @@ fn sync_file(src: &Path, dst: &Path, state: &WorkCopy) -> Result<()> {
 
 /// Whether two files hold the same bytes. One that cannot be read is not the same.
 fn same_bytes(a: &Path, b: &Path) -> bool {
-    use std::io::Read;
-    let (Ok(mut a), Ok(mut b)) = (fs::File::open(a), fs::File::open(b)) else {
-        return false;
-    };
-    let (mut left, mut right) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
-    loop {
-        let Ok(n) = a.read(&mut left) else {
-            return false;
-        };
-        if n == 0 {
-            // The other one has nothing left either.
-            return matches!(b.read(&mut right), Ok(0));
-        }
-        if b.read_exact(&mut right[..n]).is_err() || left[..n] != right[..n] {
-            return false;
-        }
-    }
+    fs::read(a)
+        .ok()
+        .zip(fs::read(b).ok())
+        .is_some_and(|(a, b)| a == b)
 }
 
 /// Makes `dir` a directory of the working copy. Whatever else is in the way below the
@@ -3230,6 +3215,8 @@ serde = { path = "../../serde-fork" }
             "was_dir",
             "was_link",
             "short_link",
+            "twin_link",
+            "shorter",
         ] {
             fs::write(workspace.join("src").join(name), "source").unwrap();
             set_modified(&workspace.join("src").join(name), hour_ago);
@@ -3261,6 +3248,12 @@ serde = { path = "../../serde-fork" }
         let outside = dir.join("outside");
         fs::write(&outside, "keep").unwrap();
         std::os::unix::fs::symlink(&outside, copy.join("src/was_link")).unwrap();
+        // Not even one to a file that holds what the source holds.
+        let twin = dir.join("twin");
+        fs::write(&twin, "source").unwrap();
+        std::os::unix::fs::symlink(&twin, copy.join("src/twin_link")).unwrap();
+        // The beginning of the source is not the source.
+        fs::write(copy.join("src/shorter"), "sour").unwrap();
         // Not even one whose own size and time would pass for the file's.
         std::os::unix::fs::symlink("abcdef", copy.join("src/short_link")).unwrap();
         // What the run does not want goes, with the directories it leaves empty.
@@ -3294,8 +3287,14 @@ serde = { path = "../../serde-fork" }
             "src/was_dir",
             "src/was_link",
             "src/short_link",
+            "src/twin_link",
+            "src/shorter",
         ] {
             assert_eq!(read(name), "source", "{name}");
+            assert!(
+                fs::symlink_metadata(copy.join(name)).unwrap().is_file(),
+                "{name}"
+            );
         }
         assert!(
             fs::symlink_metadata(copy.join("src/was_link"))

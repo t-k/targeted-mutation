@@ -331,16 +331,13 @@ pub enum Mutation {
 }
 
 impl Mutation {
-    /// The operator this mutation of a comparison with `op` amounts to, where it is one:
-    /// over integers `a > b - 1` is `a >= b`.
+    /// The operator this mutation of a comparison with `op` amounts to, where it is one.
+    /// (A shifted boundary is `<=` or `>=`, which no test that saw both outcomes takes
+    /// for `==` or for the reverse: it is not asked for here.)
     pub fn as_operator(&self, op: CmpOp) -> Option<CmpOp> {
-        match (self, op) {
-            (Mutation::Negate, _) => Some(op.negated()),
-            (Mutation::Op(other), _) => Some(*other),
-            (Mutation::Shift(-1), CmpOp::Gt) => Some(CmpOp::Ge),
-            (Mutation::Shift(1), CmpOp::Ge) => Some(CmpOp::Gt),
-            (Mutation::Shift(1), CmpOp::Lt) => Some(CmpOp::Le),
-            (Mutation::Shift(-1), CmpOp::Le) => Some(CmpOp::Lt),
+        match self {
+            Mutation::Negate => Some(op.negated()),
+            Mutation::Op(other) => Some(*other),
             _ => None,
         }
     }
@@ -967,7 +964,7 @@ mod tests {
             CmpOp::Eq,
             CmpOp::Ne,
         ] {
-            for m in [Mutation::Negate, Mutation::Shift(-1), Mutation::Shift(1)] {
+            for m in [Mutation::Negate, Mutation::Op(CmpOp::Le)] {
                 for d in -3..=3 {
                     if let Some(same) = m.as_operator(op) {
                         assert_eq!(eval_mutated_d(op, m, d), same.eval_d(d), "{op:?} {m:?} {d}");
