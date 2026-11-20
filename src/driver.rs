@@ -993,7 +993,7 @@ fn run_binary(
     let kill = |child: &mut std::process::Child| {
         #[cfg(unix)]
         let _ = Command::new("kill")
-            .args(["-KILL", &format!("-{}", child.id())])
+            .args(["-KILL", "--", &format!("-{}", child.id())])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status();
