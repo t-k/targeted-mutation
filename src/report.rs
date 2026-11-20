@@ -126,6 +126,9 @@ pub struct Report {
     pub unviable_mutants: usize,
     /// Mutants that need a build of their own and were not asked for (`--rebuild`).
     pub mutants_not_built: usize,
+    /// Mutants that could not be run as what they are (a range that ends at the largest
+    /// value of its type cannot be made to include it): neither killed nor survivors.
+    pub mutants_not_evaluated: usize,
     pub mutants_run: usize,
     pub mutants_killed: usize,
     /// Killed mutants that were stopped by the timeout (typically an endless loop).
@@ -840,6 +843,12 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
                 binary.binary, binary.records
             ));
         }
+    }
+    if report.mutants_not_evaluated > 0 {
+        out.push_str(&format!(
+            "({} mutants not evaluated: a range that ends at the largest value of its type cannot be made to include it)\n",
+            report.mutants_not_evaluated
+        ));
     }
     if report.mutants_not_built > 0 {
         out.push_str(&format!(
@@ -1567,6 +1576,7 @@ mod tests {
             skipped_sites: 1,
             unviable_mutants: 2,
             mutants_not_built: 0,
+            mutants_not_evaluated: 0,
             mutants_run: 3,
             mutants_killed: 2,
             mutants_timed_out: 0,
@@ -1828,6 +1838,18 @@ mod tests {
         );
         assert!(!render_text(&Report::default(), false).contains("left out"));
         assert!(!render_text(&one, false).contains("--rebuild"));
+        assert!(!render_text(&one, false).contains("not evaluated"));
+        let at_top = Report {
+            mutants_not_evaluated: 1,
+            ..Report::default()
+        };
+        assert!(
+            render_text(&at_top, false).ends_with(
+                "\n(1 mutants not evaluated: a range that ends at the largest value of its type cannot be made to include it)\n"
+            ),
+            "{}",
+            render_text(&at_top, false)
+        );
         let quick = Report {
             mutants_not_built: 1,
             ..Report::default()

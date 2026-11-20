@@ -106,6 +106,10 @@ pub const SHR: u8 = 9;
 pub const RET_TRUE: u8 = 1;
 pub const RET_FALSE: u8 = 2;
 
+/// With the reach bit of a range `a..b`: `b` was the largest value of its type, where
+/// `a..=b` cannot be written as a range of the same kind.
+pub const RANGE_AT_TOP: u8 = 2;
+
 /// Logic observations: the left operand decided alone, the right operand was true / false.
 pub const LOGIC_SHORT: u8 = 1;
 pub const LOGIC_RHS_TRUE: u8 = 2;
@@ -1301,10 +1305,12 @@ macro_rules! tmt_ranges {
             fn tmt_range(&self, site: u32) -> std::ops::Range<$t> {
                 let (a, b) = self.take();
                 if mutant_at(site) == Some(Mutant::RangeEnd) {
-                    // At the top of the type there is no "one more": leave the range alone.
+                    // At the top of the type there is no "one more". The range is left
+                    // alone, and the driver does not run this mutant where that happens
+                    // (see `RANGE_AT_TOP`): it would pass for having done nothing.
                     return a..b.checked_add(1).unwrap_or(b);
                 }
-                record_bits(b'R', site, 1);
+                record_bits(b'R', site, if b == <$t>::MAX { 1 | RANGE_AT_TOP } else { 1 });
                 a..b
             }
             fn tmt_range_inclusive(&self, site: u32) -> std::ops::RangeInclusive<$t> {
@@ -1349,60 +1355,42 @@ impl<'r, T> AnyRange for &'r Ar<T, T> {
     }
 }
 
-/// `a.max(b)` / `a.min(b)` on numbers: the `MinMax` mutant takes the other one. The two
-/// only differ when the operands do.
+/// The two operands of `a.max(b)` / `a.min(b)`, looked at before the call. The call
+/// itself stays in the code as it was written, so that a type with a `max` of its own
+/// gets that one; the probe only says whether to call the other of the two.
+pub struct Mm<'a, A, B>(pub &'a A, pub &'a B);
+
+/// On numbers: the `MinMax` mutant takes the other one. The two only differ when the
+/// operands do.
 pub trait MinMaxPrim {
-    type T;
-    fn tmt_max(&self, site: u32) -> Self::T;
-    fn tmt_min(&self, site: u32) -> Self::T;
+    fn tmt_other(&self, site: u32) -> bool;
 }
 
 macro_rules! tmt_min_max {
     ($($t:ty)*) => {$(
-        impl MinMaxPrim for Ar<$t, $t> {
-            type T = $t;
-            fn tmt_max(&self, site: u32) -> $t {
-                let (a, b) = self.take();
+        impl<'a> MinMaxPrim for Mm<'a, $t, $t> {
+            fn tmt_other(&self, site: u32) -> bool {
                 if mutant_at(site) == Some(Mutant::MinMax) {
-                    return a.min(b);
+                    return true;
                 }
-                record_bits(b'A', site, if a == b { ARITH_SAME } else { ARITH_DIFFERS });
-                a.max(b)
-            }
-            fn tmt_min(&self, site: u32) -> $t {
-                let (a, b) = self.take();
-                if mutant_at(site) == Some(Mutant::MinMax) {
-                    return a.max(b);
-                }
-                record_bits(b'A', site, if a == b { ARITH_SAME } else { ARITH_DIFFERS });
-                a.min(b)
+                record_bits(b'A', site, if self.0 == self.1 { ARITH_SAME } else { ARITH_DIFFERS });
+                false
             }
         }
     )*};
 }
 tmt_min_max!(i8 i16 i32 i64 isize u8 u16 u32 u64 usize f32 f64);
 
-/// `max` / `min` of any other ordered type: untouched.
+/// `max` / `min` of anything else: never the other one.
 pub trait AnyMinMax {
-    type T;
-    fn tmt_max(&self, site: u32) -> Self::T;
-    fn tmt_min(&self, site: u32) -> Self::T;
+    fn tmt_other(&self, site: u32) -> bool;
 }
 
-impl<'r, T: Ord> AnyMinMax for &'r Ar<T, T> {
-    type T = T;
-    fn tmt_max(&self, site: u32) -> T {
-        let (a, b) = self.take();
+impl<'r, 'a, A, B> AnyMinMax for &'r Mm<'a, A, B> {
+    fn tmt_other(&self, site: u32) -> bool {
         if !idle(site) {
             record_bits(b'A', site, ARITH_OPAQUE);
         }
-        Ord::max(a, b)
-    }
-    fn tmt_min(&self, site: u32) -> T {
-        let (a, b) = self.take();
-        if !idle(site) {
-            record_bits(b'A', site, ARITH_OPAQUE);
-        }
-        Ord::min(a, b)
+        false
     }
 }

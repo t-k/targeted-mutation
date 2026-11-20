@@ -331,17 +331,6 @@ pub enum Mutation {
 }
 
 impl Mutation {
-    /// The operator this mutation of a comparison with `op` amounts to, where it is one.
-    /// (A shifted boundary is `<=` or `>=`, which no test that saw both outcomes takes
-    /// for `==` or for the reverse: it is not asked for here.)
-    pub fn as_operator(&self, op: CmpOp) -> Option<CmpOp> {
-        match self {
-            Mutation::Negate => Some(op.negated()),
-            Mutation::Op(other) => Some(*other),
-            _ => None,
-        }
-    }
-
     /// Wire format shared with the injected runtime (`TMT_MUTANT=<site>:<encoded>`).
     pub fn encode(&self) -> String {
         match self {
@@ -501,17 +490,15 @@ pub fn plan_cmp(op: CmpOp, obs: &Obs, domain: Option<(i128, i128)>) -> CmpPlan {
     let mut plan = plan_boundary(op, obs, domain);
     // The other operators a `<` or `>` is commonly mistaken for (the replacements
     // cargo-mutants makes). One that answers like the original for every relation the
-    // tests saw passes them all, which the gap already says; one that answers like a
-    // mutant that is run anyway fails or passes with it. The rest are run.
-    let answers = |answer: &dyn Fn(Rel) -> bool| -> Vec<bool> { obs.rels().map(answer).collect() };
-    let original = answers(&|rel| op.eval_rel(rel));
+    // tests saw runs like the original from the first step to the last and passes them
+    // all, which the gap already says. Every other one is run, also where it answers
+    // like another mutant for everything that was seen: once a mutant has changed the
+    // way the code goes, the comparison meets values the tests never gave it, and there
+    // the two may part.
+    let answers =
+        |other: CmpOp| -> Vec<bool> { obs.rels().map(|rel| other.eval_rel(rel)).collect() };
     for other in op.mistaken_for() {
-        let mine = answers(&|rel| other.eval_rel(rel));
-        let run_already = plan.run.iter().any(|m| {
-            m.as_operator(op)
-                .is_some_and(|same| answers(&|rel| same.eval_rel(rel)) == mine)
-        });
-        if mine != original && !run_already {
+        if answers(*other) != answers(op) {
             plan.run.push(Mutation::Op(*other));
         }
     }
@@ -915,8 +902,9 @@ mod tests {
     }
 
     /// Every operator `<` and `>` are mistaken for is accounted for, whatever the tests
-    /// saw: it passes them all (and a gap says so), or it is run, or a mutant that is
-    /// run answers like it in every relation the tests saw.
+    /// saw: it answers like the original for all of it and passes (a gap says so), or
+    /// it is run. It is never left to another mutant that answers alike: two mutants
+    /// that both change the way the code goes meet different values afterwards.
     #[test]
     fn the_operators_a_comparison_is_mistaken_for() {
         let rels = [Rel::Less, Rel::Equal, Rel::Greater, Rel::Unordered];
@@ -932,46 +920,32 @@ mod tests {
                 }
                 let plan = plan_cmp(op, &obs, None);
                 for other in op.mistaken_for() {
-                    let alike = |a: CmpOp, b: CmpOp| {
-                        seen.iter().all(|rel| a.eval_rel(*rel) == b.eval_rel(*rel))
-                    };
+                    let like_the_original = seen
+                        .iter()
+                        .all(|rel| other.eval_rel(*rel) == op.eval_rel(*rel));
                     let what = format!("{op:?} as {other:?} with {seen:?}: {plan:?}");
-                    if alike(*other, op) {
+                    let run = plan
+                        .run
+                        .iter()
+                        .filter(|m| **m == Mutation::Op(*other))
+                        .count();
+                    if like_the_original {
                         assert!(plan.gap.is_some(), "{what}");
-                        assert!(!plan.run.contains(&Mutation::Op(*other)), "{what}");
+                        assert_eq!(run, 0, "{what}");
                     } else {
-                        let run = plan
-                            .run
-                            .iter()
-                            .filter_map(|m| m.as_operator(op))
-                            .filter(|same| alike(*same, *other))
-                            .count();
-                        assert_eq!(run, 1, "run once, as itself or as its like: {what}");
-                    }
-                }
-            }
-            // The other operators get nothing added.
-            for op in [CmpOp::Le, CmpOp::Ge, CmpOp::Eq, CmpOp::Ne] {
-                assert!(op.mistaken_for().is_empty());
-            }
-        }
-        // What a mutation amounts to as an operator, checked against its own answers.
-        for op in [
-            CmpOp::Lt,
-            CmpOp::Le,
-            CmpOp::Gt,
-            CmpOp::Ge,
-            CmpOp::Eq,
-            CmpOp::Ne,
-        ] {
-            for m in [Mutation::Negate, Mutation::Op(CmpOp::Le)] {
-                for d in -3..=3 {
-                    if let Some(same) = m.as_operator(op) {
-                        assert_eq!(eval_mutated_d(op, m, d), same.eval_d(d), "{op:?} {m:?} {d}");
+                        assert_eq!(run, 1, "{what}");
                     }
                 }
             }
         }
+        // The other operators get nothing added.
+        for op in [CmpOp::Le, CmpOp::Ge, CmpOp::Eq, CmpOp::Ne] {
+            assert!(op.mistaken_for().is_empty());
+        }
+        // Seen above the bound only, `>=` and `>` in place of `<` answer alike, and
+        // both are run: the first step they change, they go different ways.
+        let plan = plan_cmp(CmpOp::Lt, &Obs::of_rel(Rel::Greater), None);
+        assert_eq!(plan.run, vec![Mutation::Negate, Mutation::Op(CmpOp::Gt)]);
     }
 
     #[test]
@@ -1003,7 +977,15 @@ mod tests {
     fn one_sided_condition() {
         let plan = plan_cmp(CmpOp::Gt, &obs_of(&[3, 5]), None);
         assert_eq!(plan.gap, Some(InputGap::OneSided { always: true }));
-        assert_eq!(plan.run, vec![Mutation::Negate]);
+        // Always true: the negation, `==` and `<` are all false here, and each is run.
+        assert_eq!(
+            plan.run,
+            vec![
+                Mutation::Negate,
+                Mutation::Op(CmpOp::Eq),
+                Mutation::Op(CmpOp::Lt)
+            ]
+        );
     }
 
     #[test]
@@ -1021,13 +1003,14 @@ mod tests {
         // are real mutants (`x > -1` is `x >= 0`, which differs at 0).
         let plan = plan_cmp(CmpOp::Gt, &obs_of(&[0, 1]), Some((0, 255)));
         assert_eq!(plan.gap, None);
-        // `x == 0` answers like the negation at 0 and 1; `x < 0` is false at both.
+        // `x == 0` answers like the negation at 0 and 1, and is run all the same.
         assert_eq!(
             plan.run,
             vec![
                 Mutation::Shift(-1),
                 Mutation::Shift(1),
                 Mutation::Negate,
+                Mutation::Op(CmpOp::Eq),
                 Mutation::Op(CmpOp::Lt)
             ]
         );
@@ -1488,8 +1471,15 @@ mod tests {
                 float_gap: None
             })
         );
-        // Without equal operands `>` answers like the negation, and `==` is never true.
-        assert_eq!(plan.run, vec![Mutation::Negate, Mutation::Op(CmpOp::Eq)]);
+        // Without equal operands `>` answers like the negation; it is run as well.
+        assert_eq!(
+            plan.run,
+            vec![
+                Mutation::Negate,
+                Mutation::Op(CmpOp::Eq),
+                Mutation::Op(CmpOp::Gt)
+            ]
+        );
 
         obs.merge(&Obs::of_rel(Rel::Equal));
         let plan = plan_cmp(CmpOp::Lt, &obs, None);

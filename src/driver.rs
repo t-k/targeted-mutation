@@ -275,6 +275,9 @@ struct SourceFile {
     sites: Vec<Site>,
     /// Sites whose mutants are built one by one.
     rebuild_sites: Vec<Site>,
+    /// Where every site of the file is (line, column, code), also those a run of a part
+    /// leaves out: findings are numbered by these.
+    places: Vec<(usize, usize, String)>,
     rendered: Option<Rendered>,
 }
 
@@ -1241,6 +1244,8 @@ struct SitePlan<'a> {
 
 enum Planned<'a> {
     Unreached,
+    /// Reached, and its mutant cannot be run as a probe here: said, not passed over.
+    NotEvaluated,
     /// Reached, but nothing to mutate (operands that are not numbers).
     Nothing,
     Plan(SitePlan<'a>),
@@ -1351,6 +1356,17 @@ impl Session {
             SiteKind::Arm { .. } if reached => reach_plan(Mutation::Delete),
             SiteKind::Arm { .. } => return Planned::Unreached,
             SiteKind::Not { .. } if reached => reach_plan(Mutation::DropNot),
+            // `a..=b` with `b` the largest value of its type is no range the probe could
+            // return in place of `a..b`: the mutant would run as the original and pass.
+            SiteKind::Range { .. }
+                if reached
+                    && self
+                        .binaries
+                        .iter()
+                        .any(|b| b.trace.ranges_at_top.contains(&id)) =>
+            {
+                return Planned::NotEvaluated;
+            }
             SiteKind::Range { .. } if reached => reach_plan(Mutation::RangeEnd),
             // `!` on an integer or a user type is not negation of a condition, and a range
             // of something other than integers has no "one more".
@@ -1910,10 +1926,20 @@ pub fn run(options: &Options) -> Result<Report> {
                 for module in &found.test_modules {
                     test_only.extend(module_paths(&path, module));
                 }
+                let places = found
+                    .sites
+                    .iter()
+                    .chain(&found.rebuild_sites)
+                    .map(|site| {
+                        let at = report::location("", site);
+                        (at.line, at.column, at.code)
+                    })
+                    .collect();
                 files.push(SourceFile {
                     display,
                     path,
                     original,
+                    places,
                     sites: found.sites,
                     rebuild_sites: found.rebuild_sites,
                     rendered: None,
@@ -2203,6 +2229,10 @@ pub fn run(options: &Options) -> Result<Report> {
                     continue;
                 }
                 Planned::Nothing => continue,
+                Planned::NotEvaluated => {
+                    report.mutants_not_evaluated += 1;
+                    continue;
+                }
                 Planned::Plan(plan) => plan,
             };
             let mut add =
@@ -2528,7 +2558,7 @@ pub fn run(options: &Options) -> Result<Report> {
         .map(|file| FilePlaces {
             display: &file.display,
             source: &file.original,
-            sites: file.sites.iter().chain(&file.rebuild_sites).collect(),
+            places: &file.places,
         })
         .collect();
     name_findings(&mut report.findings, &places);
@@ -2598,7 +2628,8 @@ fn spread(count: usize, wanted: usize) -> Vec<usize> {
 struct FilePlaces<'a> {
     display: &'a str,
     source: &'a str,
-    sites: Vec<&'a Site>,
+    /// Every site of the file as (line, column, code), whatever part of it was analysed.
+    places: &'a [(usize, usize, String)],
 }
 
 /// Gives every finding the item it is in and its name (`report::finding_id`). Which of
@@ -2614,13 +2645,10 @@ fn name_findings(findings: &mut [Finding], files: &[FilePlaces]) {
                 .to_string()
         };
         // Every place of the file a finding can be at: where, in which item, on which code.
-        let places: BTreeSet<(String, String, usize, usize)> = file
-            .sites
+        let places: BTreeSet<(String, &str, usize, usize)> = file
+            .places
             .iter()
-            .map(|site| {
-                let at = report::location(file.display, site);
-                (item_at(at.line, at.column), at.code, at.line, at.column)
-            })
+            .map(|(line, column, code)| (item_at(*line, *column), code.as_str(), *line, *column))
             .collect();
         for finding in findings.iter_mut() {
             let (kind, at) = match finding {
@@ -3550,10 +3578,18 @@ serde = { path = "../../serde-fork" }
     fn a_finding_keeps_its_number_when_the_one_before_it_is_closed() {
         let source = "impl S {\n    fn f(a: u8, b: u8) -> u8 {\n        let x = if a > b { 1 } else { 0 };\n        let y = if a > b { 2 } else { 0 };\n        x + y\n    }\n}\nfn g(a: u8, b: u8) -> bool {\n    a > b\n}\n";
         let found = instrument::discover(source, 0).unwrap();
+        let all: Vec<(usize, usize, String)> = found
+            .sites
+            .iter()
+            .map(|site| {
+                let at = report::location("", site);
+                (at.line, at.column, at.code)
+            })
+            .collect();
         let places = [FilePlaces {
             display: "src/lib.rs",
             source,
-            sites: found.sites.iter().collect(),
+            places: &all,
         }];
         let gap = |line: usize, column: usize, file: &str| Finding::InputGap {
             at: report::Location {

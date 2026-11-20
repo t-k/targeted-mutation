@@ -1538,3 +1538,50 @@ fn an_audit_runs_survivors_against_all_tests() {
     let bad = tmt(&dir, &["--quiet", "--audit", "1", "--no-verify"]);
     assert!(bad.stderr.contains("--no-verify"), "{}", bad.stderr);
 }
+
+#[test]
+fn mutants_are_run_as_what_they_are() {
+    let dir = fixture("revisit", "revisit");
+    let (code, report) = json(&dir);
+    // The tests pass under the probes at all: `Level` has a `max` of its own (never above
+    // nine), and that one is still the one called.
+    assert_eq!(code, 2, "{report:#}");
+    let survivors = |code: &str| -> Vec<&str> {
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["code"] == code && f["kind"] == "assertion_gap")
+            .flat_map(|f| strings(&f["survivors"]))
+            .collect()
+    };
+    // `>=` and `>` in place of `<` answer alike for the one value the test starts with.
+    // Both are run: the second time round they see different values, and `>` passes.
+    assert_eq!(survivors("x < 1"), ["`x > 1`"], "{report:#}");
+    // `from..=to` cannot be made of `from..to` where `to` is the largest value there is:
+    // the mutant is not run and not reported as passing.
+    assert_eq!(report["mutants_not_evaluated"], 1, "{report:#}");
+    assert!(survivors("from..to").is_empty(), "{report:#}");
+    let text = tmt(&dir, &["--quiet"]).stdout;
+    assert!(text.contains("(1 mutants not evaluated: a range"), "{text}");
+}
+
+#[test]
+fn a_part_of_a_file_numbers_its_findings_as_the_whole_does() {
+    let dir = fixture("twins", "twins-part");
+    // Only the line of the second of the two comparisons in `Pair::both`.
+    let run = tmt(&dir, &["--json", "--quiet", "--lines", "src/lib.rs:16"]);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    let ids: Vec<&str> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f["id"].as_str().unwrap())
+        .collect();
+    // It is still the second: a baseline of the whole file knows it as that.
+    assert_eq!(
+        ids,
+        ["input_gap|src/lib.rs|Pair::both|a > b|1"],
+        "{report:#}"
+    );
+}

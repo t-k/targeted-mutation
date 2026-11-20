@@ -34,6 +34,8 @@ pub struct Trace {
     pub returns: BTreeMap<u32, BTreeMap<String, ReturnObs>>,
     /// site -> tests that executed the statement
     pub reach: BTreeMap<u32, BTreeSet<String>>,
+    /// Ranges `a..b` that some test ran with `b` at the largest value of its type.
+    pub ranges_at_top: BTreeSet<u32>,
     pub bounds: BTreeMap<u32, TypeBounds>,
     pub malformed_lines: usize,
 }
@@ -158,6 +160,9 @@ impl Trace {
                 let test = test.to_string();
                 match kind {
                     "R" => {
+                        if bits & 2 != 0 {
+                            self.ranges_at_top.insert(site);
+                        }
                         self.reach.entry(site).or_default().insert(test);
                     }
                     "B" => self
@@ -766,6 +771,11 @@ mod tests {
             }
         );
         assert!(trace.reach[&3].contains("t"));
+        // A range that ended at the largest value of its type is remembered as one.
+        let ranges = Trace::parse("R\t7\tt\t3\nR\t8\tt\t1\n");
+        assert_eq!(ranges.malformed_lines, 0);
+        assert!(ranges.reach[&7].contains("t") && ranges.reach[&8].contains("t"));
+        assert_eq!(ranges.ranges_at_top.iter().collect::<Vec<_>>(), [&7]);
         // A right operand that was started, with and without a value.
         let started = Trace::parse("L\t1\tt\t8\nL\t1\tu\t10\n");
         assert_eq!(started.malformed_lines, 0);

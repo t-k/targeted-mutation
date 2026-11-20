@@ -1894,7 +1894,9 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     site: site.id,
                 });
                 // The call's own `)` (and a trailing comma) is replaced by the probe.
-                let method = if *max { "tmt_max" } else { "tmt_min" };
+                // The call is made as it was written, on the same operands; the probe only
+                // decides which of the two it is.
+                let (same, other) = if *max { ("max", "min") } else { ("min", "max") };
                 edits.push(Edit {
                     pos: close.0,
                     end: close.1,
@@ -1902,7 +1904,7 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     order: 0,
                     text: format!(
                         ") {{ (__tmt_a, __tmt_b) => {{ #[allow(unused_imports)] use {rt}::{{AnyMinMax as _, MinMaxPrim as _}}; \
-                         (&{rt}::Ar::new(__tmt_a, __tmt_b)).{method}({}u32) }} }})",
+                         if (&{rt}::Mm(&__tmt_a, &__tmt_b)).tmt_other({}u32) {{ __tmt_a.{other}(__tmt_b) }} else {{ __tmt_a.{same}(__tmt_b) }} }} }})",
                         site.id
                     ),
                     site: site.id,
@@ -2835,8 +2837,13 @@ mod tests {
             out.contains(".tmt_range(") && out.contains(".tmt_range_inclusive("),
             "{out}"
         );
+        // The call that was written, and the other one for the mutant, on the operands
+        // as they were evaluated once.
         assert!(
-            out.contains(".tmt_min(") && out.contains(".tmt_max("),
+            out.contains(".tmt_other(6u32) { __tmt_a.max(__tmt_b) } else { __tmt_a.min(__tmt_b) }")
+                && out.contains(
+                    ".tmt_other(5u32) { __tmt_a.min(__tmt_b) } else { __tmt_a.max(__tmt_b) }"
+                ),
             "{out}"
         );
         assert!(
