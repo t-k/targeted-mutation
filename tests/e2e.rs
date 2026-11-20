@@ -410,6 +410,11 @@ fn endless_loop_mutant_is_killed_by_the_timeout() {
         started.elapsed() < std::time::Duration::from_secs(120),
         "and the mutant was stopped"
     );
+    // Run three at a time, a mutant that ran out of time is run once more on its own:
+    // the two that never end run out of time again, and the report is the same.
+    let run = tmt(&dir, &["--json", "--quiet", "--jobs", "3"]);
+    let together: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(together, report);
 }
 
 #[test]

@@ -895,20 +895,27 @@ fn mutant_timeout(baseline: Duration) -> Duration {
     Duration::from_secs(5) + baseline * 5
 }
 
+/// The test threads of one test binary when `sharing` of them run at the same time: its
+/// share of the cores. Never fewer than two, because the harness runs the tests of a
+/// single thread on the main thread, where they have no name to be told apart by.
+fn test_threads(cores: usize, sharing: usize) -> usize {
+    (cores / sharing.max(1)).max(2)
+}
+
 fn run_binary(
     bin: &TestBinary,
     tests: Option<&[String]>,
     env: &[(&str, &str)],
     timeout: Duration,
     stop_at_first_failure: bool,
+    sharing: usize,
 ) -> Result<Outcome> {
     use std::io::BufRead;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
-    let threads = std::thread::available_parallelism()
-        .map_or(2, |n| n.get())
-        .max(2);
+    let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+    let threads = test_threads(cores, sharing);
     let mut cmd = match &bin.runner {
         Runner::Exe(exe) => {
             let mut cmd = Command::new(exe);
@@ -1553,10 +1560,14 @@ impl Session {
     }
 
     /// Runs one mutant against its tests, stopping at the first test that fails.
-    fn run_job(&self, job: &Job) -> Result<JobResult> {
+    /// Runs one mutant while `sharing` jobs run at the same time.
+    fn run_job(&self, job: &Job, sharing: usize) -> Result<JobResult> {
         let spec = format!("{}:{}", job.site, job.mutation.encode());
         let mut passed = vec![];
-        for (index, filter) in &job.tests {
+        // One failure is enough: the quick binaries first.
+        let mut tests: Vec<&(usize, Option<Vec<String>>)> = job.tests.iter().collect();
+        tests.sort_by_key(|(index, _)| self.binaries[*index].baseline);
+        for (index, filter) in tests {
             let bin = &self.binaries[*index];
             let outcome = run_binary(
                 bin,
@@ -1564,6 +1575,7 @@ impl Session {
                 &[("TMT_MUTANT", &spec)],
                 mutant_timeout(bin.baseline),
                 true,
+                sharing,
             )?;
             if outcome != Outcome::Pass {
                 return Ok(JobResult {
@@ -1584,7 +1596,12 @@ impl Session {
 
     /// Runs a surviving mutant once more with tracing on, and returns what it changed in
     /// each test compared with the original run.
-    fn trace_job(&self, job: &Job, scratch: &Path) -> Result<BTreeMap<String, BTreeSet<Change>>> {
+    fn trace_job(
+        &self,
+        job: &Job,
+        scratch: &Path,
+        sharing: usize,
+    ) -> Result<BTreeMap<String, BTreeSet<Change>>> {
         let spec = format!("{}:{}", job.site, job.mutation.encode());
         let mut all: BTreeMap<String, BTreeSet<Change>> = BTreeMap::new();
         for (index, filter) in &job.tests {
@@ -1598,6 +1615,7 @@ impl Session {
                 &[("TMT_MUTANT", &spec), ("TMT_TRACE", &trace_env)],
                 mutant_timeout(bin.traced),
                 false,
+                sharing,
             )?;
             let text = fs::read_to_string(&path).unwrap_or_default();
             let _ = fs::remove_file(&path);
@@ -1617,8 +1635,22 @@ impl Session {
 
     /// Runs every job exactly once on `workers` threads (formal/tla/JobPool.tla) and
     /// returns the results in job order.
+    /// Runs the mutants, `workers` at a time. A mutant that ran out of time while others
+    /// were running may only have been slowed down by them: it gets a second run on its
+    /// own, and that one counts.
     fn run_jobs(&self, jobs: &[Job], workers: usize) -> Result<Vec<JobResult>> {
-        run_pool(jobs.len(), workers, |index| self.run_job(&jobs[index]))
+        let sharing = workers.clamp(1, jobs.len().max(1));
+        let mut results = run_pool(jobs.len(), workers, |index| {
+            self.run_job(&jobs[index], sharing)
+        })?;
+        if sharing > 1 {
+            for (job, result) in jobs.iter().zip(&mut results) {
+                if result.timed_out {
+                    *result = self.run_job(job, 1)?;
+                }
+            }
+        }
+        Ok(results)
     }
 }
 
@@ -2069,6 +2101,7 @@ pub fn run(options: &Options) -> Result<Report> {
             &[("TMT_TRACE", &trace_env)],
             Duration::from_secs(3600),
             false,
+            1,
         )?;
         if outcome != Outcome::Pass {
             bail!(
@@ -2082,7 +2115,7 @@ pub fn run(options: &Options) -> Result<Report> {
         // is a multiple of this: where it matters, time the tests as the mutants run them.
         if bin.traced > SLOW_TRACE {
             let started = Instant::now();
-            match run_binary(&bin, None, &[], bin.traced, false)? {
+            match run_binary(&bin, None, &[], bin.traced, false, 1)? {
                 Outcome::Pass => bin.baseline = started.elapsed(),
                 // Every failure from here on would be counted as a mutant found out.
                 Outcome::Fail => bail!(
@@ -2288,7 +2321,11 @@ pub fn run(options: &Options) -> Result<Report> {
             .flat_map(|f| f.sites.iter().map(move |s| (s.id, (f.display.as_str(), s))))
             .collect();
         let traced = run_pool(effect_jobs.len(), options.jobs, |index| {
-            session.trace_job(&jobs[effect_jobs[index].1], &scratch)
+            session.trace_job(
+                &jobs[effect_jobs[index].1],
+                &scratch,
+                options.jobs.clamp(1, effect_jobs.len()),
+            )
         })?;
         for ((finding, job), mut changes) in effect_jobs.iter().zip(traced) {
             // What happens inside the mutated code itself is not an effect of it: deleting
@@ -2360,7 +2397,8 @@ pub fn run(options: &Options) -> Result<Report> {
                     return Ok(None);
                 }
                 for bin in &by_speed {
-                    let outcome = run_binary(bin, None, &[], mutant_timeout(bin.baseline), true)?;
+                    let outcome =
+                        run_binary(bin, None, &[], mutant_timeout(bin.baseline), true, 1)?;
                     if outcome != Outcome::Pass {
                         return Ok(Some(outcome));
                     }
@@ -3346,6 +3384,20 @@ serde = { path = "../../serde-fork" }
         assert_eq!(read("keep/deep/y"), "y");
         fs::remove_dir_all(&dir).unwrap();
     }
+    #[test]
+    fn concurrent_runs_share_the_cores() {
+        // Alone a binary has them all; four at a time have a quarter each.
+        assert_eq!(test_threads(16, 1), 16);
+        assert_eq!(test_threads(16, 4), 4);
+        assert_eq!(test_threads(18, 4), 4);
+        // Never fewer than two: a single thread is the main thread, without a name.
+        assert_eq!(test_threads(16, 8), 2);
+        assert_eq!(test_threads(16, 9), 2);
+        assert_eq!(test_threads(4, 16), 2);
+        assert_eq!(test_threads(1, 1), 2);
+        assert_eq!(test_threads(8, 0), 8);
+    }
+
     #[test]
     fn cargo_is_told_the_same_everywhere() {
         assert!(CargoConfig::default().flags().is_empty());
