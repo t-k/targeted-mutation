@@ -141,8 +141,17 @@ pub struct Analysis {
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct TestSelection {
+    pub build_scope: TestBuildScope,
     pub wrapper: Option<String>,
     pub tests: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TestBuildScope {
+    #[default]
+    PackageWide,
+    SelectedTargets,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]

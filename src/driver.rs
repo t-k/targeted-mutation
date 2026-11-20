@@ -133,8 +133,44 @@ struct Package {
     name: String,
     #[serde(default)]
     dependencies: Vec<Dependency>,
+    features: BTreeMap<String, Vec<String>>,
     manifest_path: PathBuf,
     targets: Vec<Target>,
+}
+
+impl Package {
+    /// Only count features we can establish without resolving the dependency graph.
+    fn enabled_local_features(&self, workspace: &Path, cargo: &CargoConfig) -> BTreeSet<&str> {
+        if cargo.all_features {
+            return self.features.keys().map(String::as_str).collect();
+        }
+        let mut pending = Vec::new();
+        if !cargo.no_default_features {
+            pending.push("default");
+        }
+        // With resolver 1, unqualified CLI features only apply to the current package.
+        let at_workspace_root = self.manifest_path.parent() == Some(workspace);
+        for feature in cargo
+            .features
+            .iter()
+            .flat_map(|features| features.split(|c: char| c == ',' || c.is_whitespace()))
+        {
+            match feature.split_once('/') {
+                Some((package, name)) if package == self.name => pending.push(name),
+                None if at_workspace_root => pending.push(feature),
+                _ => {}
+            }
+        }
+        let mut enabled = BTreeSet::new();
+        while let Some(feature) = pending.pop() {
+            if let Some((name, activates)) = self.features.get_key_value(feature)
+                && enabled.insert(name.as_str())
+            {
+                pending.extend(activates.iter().map(String::as_str));
+            }
+        }
+        enabled
+    }
 }
 
 #[derive(Deserialize)]
@@ -144,8 +180,80 @@ struct Dependency {
 
 #[derive(Deserialize)]
 struct Target {
+    name: String,
     kind: Vec<String>,
     src_path: PathBuf,
+    test: bool,
+    #[serde(default, rename = "required-features")]
+    required_features: Vec<String>,
+}
+
+impl Target {
+    /// The Cargo selector and its optional name. `--lib` selects every package's library.
+    fn test_build_arg(&self) -> Option<(&'static str, Option<&str>)> {
+        match self.kind.first()?.as_str() {
+            "lib" | "rlib" | "cdylib" | "dylib" | "staticlib" | "proc-macro" => {
+                Some(("--lib", None))
+            }
+            "bin" => Some(("--bin", Some(&self.name))),
+            "example" => Some(("--example", Some(&self.name))),
+            "test" => Some(("--test", Some(&self.name))),
+            "bench" => Some(("--bench", Some(&self.name))),
+            _ => None,
+        }
+    }
+}
+
+/// Select only test targets that Cargo's flags can express without broadening the selection.
+fn test_build_flags(
+    packages: &[&Package],
+    names: &[String],
+    workspace: &Path,
+    cargo: &CargoConfig,
+) -> Option<Vec<String>> {
+    if names.is_empty() {
+        return None;
+    }
+    let selected = |target: &Target| target.test && names.contains(&target.name);
+    let mut selectors = BTreeSet::new();
+    for package in packages {
+        let enabled_features = package.enabled_local_features(workspace, cargo);
+        for target in package.targets.iter().filter(|t| selected(t)) {
+            let selector = target.test_build_arg()?;
+            // Cargo skips gated targets in a default build but errors if named explicitly.
+            if target
+                .required_features
+                .iter()
+                .any(|feature| !enabled_features.contains(feature.as_str()))
+                || selector
+                    .1
+                    .is_some_and(|name| name.contains(['*', '?', '[']))
+            {
+                return None;
+            }
+            selectors.insert(selector);
+        }
+    }
+    // A selector applies to all the chosen packages and can override `test = false`.
+    if selectors.is_empty()
+        || packages.iter().flat_map(|p| &p.targets).any(|target| {
+            !selected(target)
+                && target
+                    .test_build_arg()
+                    .is_some_and(|selector| selectors.contains(&selector))
+        })
+    {
+        return None;
+    }
+    Some(
+        selectors
+            .into_iter()
+            .map(|(flag, name)| match name {
+                Some(name) => format!("{flag}={name}"),
+                None => flag.to_owned(),
+            })
+            .collect(),
+    )
 }
 
 /// One line of `cargo --message-format=json`.
@@ -2506,12 +2614,32 @@ pub fn run(options: &Options) -> Result<Report> {
     let mut disabled: HashSet<u32> = HashSet::new();
     let mut repairs = BTreeMap::new();
     let build_target = work_directory(&work, "target")?;
+    let target_flags = test_build_flags(
+        &test_packages,
+        &selection.targets,
+        &workspace,
+        &options.cargo,
+    );
+    let build_scope = if target_flags.is_some() {
+        report::TestBuildScope::SelectedTargets
+    } else {
+        report::TestBuildScope::PackageWide
+    };
+    let build_note = if !selection.targets.is_empty() && target_flags.is_none() {
+        "Cargo is using a package-wide build because the selected test targets cannot be expressed exactly.\n"
+    } else {
+        ""
+    };
+    if !build_note.is_empty() {
+        note(build_note.trim_end());
+    }
     let cargo_build = || {
         let mut command = Command::new("cargo");
         isolate_copy_command(&mut command, &work);
         command
             .args(["test", "--no-run", "--message-format=json"])
             .args(test_packages.iter().flat_map(|p| ["-p", p.name.as_str()]))
+            .args(target_flags.as_deref().unwrap_or_default())
             .args(options.cargo.flags())
             .current_dir(&copy)
             .env("CARGO_TARGET_DIR", &build_target)
@@ -2552,7 +2680,7 @@ pub fn run(options: &Options) -> Result<Report> {
         }
         if build.errors.is_empty() {
             bail!(
-                "the build failed:\n{}",
+                "the build failed:\n{build_note}{}",
                 String::from_utf8_lossy(&output.stderr)
             );
         }
@@ -2584,12 +2712,12 @@ pub fn run(options: &Options) -> Result<Report> {
                 .map_or("", |e| e.rendered.as_str());
             bail!(
                 "the crate does not build after instrumentation, and the error is not at a probe.\n\
-                 Does `cargo test --no-run` pass on the original?\n{shown}"
+                 {build_note}Does `cargo test --no-run` pass on the original for the same targets?\n{shown}"
             );
         }
     };
     if build.test_binaries.is_empty() {
-        bail!("`{}` has no test binaries", package.name);
+        bail!("{build_note}`{}` has no test binaries", package.name);
     }
 
     // 5. Trace run: what does each test observe?
@@ -2670,9 +2798,10 @@ pub fn run(options: &Options) -> Result<Report> {
         runners.push((name, Runner::Exe(exe), cwd));
     }
     if selection.enabled() && runners.is_empty() {
-        bail!("no tests matched the requested selection");
+        bail!("{build_note}no tests matched the requested selection");
     }
     let selected_tests = selection.enabled().then(|| report::TestSelection {
+        build_scope,
         wrapper: selection
             .wrapper
             .as_ref()
@@ -3464,6 +3593,138 @@ mod tests {
     use crate::trace::UNKNOWN_TEST;
 
     #[test]
+    fn test_build_scope_uses_only_known_local_features() {
+        let package = Package {
+            name: "pkg".to_owned(),
+            dependencies: vec![],
+            features: BTreeMap::from([
+                ("default".to_owned(), vec!["alias".to_owned()]),
+                (
+                    "alias".to_owned(),
+                    vec!["extra".to_owned(), "dep/extra".to_owned()],
+                ),
+                ("extra".to_owned(), vec![]),
+                ("separate".to_owned(), vec![]),
+            ]),
+            manifest_path: PathBuf::from("workspace/pkg/Cargo.toml"),
+            targets: vec![],
+        };
+        let enabled = |workspace: &str, features: &str, no_default_features, all_features| {
+            package.enabled_local_features(
+                Path::new(workspace),
+                &CargoConfig {
+                    features: vec![features.to_owned()],
+                    no_default_features,
+                    all_features,
+                    locked: false,
+                },
+            )
+        };
+        let root = "workspace/pkg";
+        assert_eq!(
+            enabled(root, "", false, false),
+            BTreeSet::from(["default", "alias", "extra"])
+        );
+        assert_eq!(
+            enabled(root, "", true, true),
+            BTreeSet::from(["default", "alias", "extra", "separate"])
+        );
+        assert_eq!(
+            enabled(root, "alias, separate", true, false),
+            BTreeSet::from(["alias", "extra", "separate"])
+        );
+        assert_eq!(
+            enabled("workspace", "extra other/separate", true, false),
+            BTreeSet::new()
+        );
+        assert_eq!(
+            enabled("workspace", "pkg/extra other/separate", true, false),
+            BTreeSet::from(["extra"])
+        );
+    }
+
+    #[test]
+    fn test_build_scope_preserves_cargo_target_eligibility() {
+        let target = |name, kind, test, required_features: &[&str]| {
+            serde_json::from_value(serde_json::json!({
+                "name": name, "kind": [kind], "test": test, "src_path": "ignored.rs",
+                "required-features": required_features,
+            }))
+            .unwrap()
+        };
+        let package = |name: &str, targets| Package {
+            name: name.to_owned(),
+            dependencies: vec![],
+            targets,
+            manifest_path: PathBuf::new(),
+            features: BTreeMap::from([("extra".to_owned(), vec![])]),
+        };
+        let first = package(
+            "first",
+            vec![
+                target("first", "proc-macro", true, &[]),
+                target("name", "bin", true, &[]),
+                target("name", "example", true, &[]),
+                target("name", "bench", true, &[]),
+                target("name", "test", true, &[]),
+                target("conditional", "test", true, &["extra"]),
+                target("dependency_feature", "test", true, &["dep/extra"]),
+                target("disabled", "test", false, &[]),
+                target("glob[a]", "test", true, &[]),
+                target("--leading-dash", "test", true, &[]),
+                target("build-script-build", "custom-build", false, &[]),
+            ],
+        );
+        let second = package(
+            "second",
+            vec![
+                target("second", "staticlib", true, &[]),
+                target("name", "test", false, &[]),
+            ],
+        );
+        let flags = |packages: &[&Package], names: &[&str], all| {
+            test_build_flags(
+                packages,
+                &names.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+                Path::new("workspace"),
+                &CargoConfig {
+                    all_features: all,
+                    ..CargoConfig::default()
+                },
+            )
+        };
+        assert_eq!(
+            flags(&[&first], &["name", "first", "unknown"], false).unwrap(),
+            [
+                "--bench=name",
+                "--bin=name",
+                "--example=name",
+                "--lib",
+                "--test=name"
+            ]
+        );
+        assert_eq!(flags(&[&first], &[], false), None);
+        assert_eq!(flags(&[&first], &["unknown", "disabled"], false), None);
+        assert_eq!(flags(&[&first], &["glob[a]"], false), None);
+        assert_eq!(
+            flags(&[&first], &["--leading-dash"], false).unwrap(),
+            ["--test=--leading-dash"]
+        );
+        assert_eq!(flags(&[&first], &["name", "conditional"], false), None);
+        assert_eq!(flags(&[&first], &["dependency_feature"], true), None);
+        assert_eq!(
+            flags(&[&first], &["conditional"], true).unwrap(),
+            ["--test=conditional"]
+        );
+        assert_eq!(flags(&[&first, &second], &["name"], false), None);
+        assert_eq!(flags(&[&first, &second], &["first"], false), None);
+        assert_eq!(
+            flags(&[&first, &second], &["first", "second"], false).unwrap(),
+            ["--lib"]
+        );
+    }
+
+    #[test]
     fn parses_cargo_json_messages() {
         let stdout = concat!(
             r#"{"reason":"compiler-artifact","package_id":"p 0.1.0","target":{"name":"p","kind":["lib"]},"profile":{"test":false},"executable":null}"#,
@@ -3793,6 +4054,7 @@ serde = { path = "../../serde-fork" }
     fn workspace_dependents() {
         let package = |name: &str, deps: &[&str]| Package {
             name: name.to_string(),
+            features: BTreeMap::new(),
             dependencies: deps
                 .iter()
                 .map(|d| Dependency {

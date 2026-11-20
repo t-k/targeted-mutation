@@ -1947,6 +1947,211 @@ fn cli_boundary() {
     assert!(rebuilt.stdout.contains("n < 4"), "{}", rebuilt.stdout);
 }
 
+#[test]
+fn test_target_build_scope_applies_to_probes_and_source_rebuilds() {
+    for integration in [true, false] {
+        for multiple in [false, true] {
+            let dir = fixture("spawned", &format!("target-scope-{integration}-{multiple}"));
+            fs::remove_file(dir.join("tests/exit.rs")).unwrap();
+            fs::remove_file(dir.join("tests/cli.rs")).unwrap();
+            let (target, lines, test) = if integration {
+                fs::remove_file(dir.join("src/lib.rs")).unwrap();
+                fs::write(
+                    dir.join("src/main.rs"),
+                    r#"fn main() {
+    let n: u32 = std::env::args().nth(1).unwrap().parse().unwrap();
+    println!("{}", n <= 4);
+}
+"#,
+                )
+                .unwrap();
+                fs::write(
+                    dir.join("tests/arguments.rs"),
+                    r#"#[test]
+fn arguments() {
+    for (arg, want) in [("4", "true\n"), ("5", "false\n")] {
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_spawned"))
+            .arg(arg).output().unwrap();
+        assert!(result.status.success());
+        assert_eq!(result.stdout, want.as_bytes());
+    }
+}
+"#,
+                )
+                .unwrap();
+                (
+                    "arguments",
+                    "src/main.rs:3",
+                    "spawned::test::arguments::arguments",
+                )
+            } else {
+                fs::remove_file(dir.join("src/main.rs")).unwrap();
+                fs::write(
+                    dir.join("src/lib.rs"),
+                    r#"pub fn allowed(n: u32) -> bool {
+    n <= 4
+}
+
+fn late_init(flag: bool) -> u32 {
+    let value;
+    value = if flag { 1 } else { 2 };
+    value
+}
+
+#[test]
+fn boundary() {
+    assert!(allowed(4));
+    assert!(!allowed(5));
+    assert_eq!(late_init(true), 1);
+}
+"#,
+                )
+                .unwrap();
+                ("spawned", "src/lib.rs:2", "spawned::lib::spawned::boundary")
+            };
+            let package_wide = !integration && multiple;
+            if !package_wide {
+                fs::write(
+                    dir.join("tests/unselected.rs"),
+                    "compile_error!(\"unselected artifact build sentinel\");\n",
+                )
+                .unwrap();
+            }
+            let mut args = vec![
+                "--json",
+                "--quiet",
+                "--lines",
+                lines,
+                "--test-target",
+                target,
+            ];
+            if multiple {
+                append(&dir.join("Cargo.toml"), "members = [\"other\"]\n");
+                fs::create_dir_all(dir.join("other/src")).unwrap();
+                fs::write(
+                    dir.join("other/Cargo.toml"),
+                    "[package]\nname = \"other\"\nversion = \"0.0.0\"\nedition = \"2021\"\n",
+                )
+                .unwrap();
+                fs::write(
+                    dir.join("other/src/lib.rs"),
+                    if integration {
+                        "compile_error!(\"unselected package sentinel\");\n"
+                    } else {
+                        "#[test]\nfn unselected() { panic!(\"unselected test ran\"); }\n"
+                    },
+                )
+                .unwrap();
+                args.extend(["--also-test", "other"]);
+            }
+            for source_only in [false, true] {
+                let mut args = args.clone();
+                if source_only {
+                    args.push("--source-only");
+                }
+                let repairs_probes = !integration && !multiple && !source_only;
+                if repairs_probes {
+                    args.extend(["--lines", "src/lib.rs:7"]);
+                }
+                let run = tmt(&dir, &args);
+                assert_ne!(run.code, 1, "{args:?}: {}", run.stderr);
+                let report: Value = serde_json::from_str(&run.stdout).unwrap();
+                let selection = &report["analysis"]["test_selection"];
+                assert_eq!(
+                    selection["build_scope"],
+                    if package_wide {
+                        "package_wide"
+                    } else {
+                        "selected_targets"
+                    },
+                    "{args:?}: {report:#}"
+                );
+                assert_eq!(strings(&selection["tests"]), [test]);
+                assert!(
+                    report["mutants_killed"].as_u64().unwrap() >= 2,
+                    "{report:#}"
+                );
+                if repairs_probes {
+                    assert!(
+                        report["skipped"].as_array().unwrap().iter().any(|site| {
+                            site["reason"] == "probe_compile_error" && site["line"] == 7
+                        }),
+                        "{report:#}"
+                    );
+                }
+            }
+            if package_wide {
+                fs::write(
+                    dir.join("tests/unselected.rs"),
+                    "compile_error!(\"fallback sentinel\");\n",
+                )
+                .unwrap();
+                let run = tmt(&dir, &args);
+                assert_eq!(run.code, 1, "{}", run.stderr);
+                assert!(run.stderr.contains("package-wide"), "{}", run.stderr);
+                assert!(run.stderr.contains("fallback sentinel"), "{}", run.stderr);
+            }
+        }
+    }
+}
+
+#[test]
+fn test_target_with_required_features_is_built_when_they_are_enabled() {
+    let dir = fixture("eligibility", "target-required-features");
+    fs::create_dir_all(dir.join("tests")).unwrap();
+    append(
+        &dir.join("Cargo.toml"),
+        r#"
+[features]
+default = ["extra"]
+extra = []
+
+[[test]]
+name = "-chosen"
+path = "tests/chosen.rs"
+required-features = ["extra"]
+"#,
+    );
+    fs::write(
+        dir.join("tests/chosen.rs"),
+        "#[test]\nfn boundary() { assert!(eligibility::is_eligible(18)); }\n",
+    )
+    .unwrap();
+    let args = ["--json", "--quiet", "--test-target=-chosen"];
+    let disabled = tmt(
+        &dir,
+        &[args.as_slice(), &["--no-default-features"]].concat(),
+    );
+    assert_eq!(disabled.code, 1, "{}", disabled.stderr);
+    assert!(
+        disabled.stderr.contains("no tests matched"),
+        "{}",
+        disabled.stderr
+    );
+
+    fs::write(
+        dir.join("tests/unselected.rs"),
+        "compile_error!(\"unselected\");\n",
+    )
+    .unwrap();
+    for features in [
+        &[][..],
+        &["--no-default-features", "--features", "extra"],
+        &["--no-default-features", "--features", "eligibility/extra"],
+        &["--all-features"],
+    ] {
+        let run = tmt(&dir, &[args.as_slice(), features].concat());
+        assert_ne!(run.code, 1, "{features:?}: {}", run.stderr);
+        let report: Value = serde_json::from_str(&run.stdout).unwrap();
+        let selection = &report["analysis"]["test_selection"];
+        assert_eq!(selection["build_scope"], "selected_targets", "{report:#}");
+        assert_eq!(
+            strings(&selection["tests"]),
+            ["eligibility::test::-chosen::boundary"]
+        );
+    }
+}
+
 #[cfg(unix)]
 #[test]
 fn selected_tests_run_in_their_own_process_and_use_a_wrapper() {

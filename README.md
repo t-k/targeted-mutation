@@ -85,6 +85,7 @@ Which tests to use:
 - `--dependents`: also run the tests of every workspace package that depends on the analysed one. A gap that an integration test elsewhere closes is then not reported.
 - `--doc`: also run the doc tests. rustdoc recompiles them for every mutant they reach, so this is slow.
 - `--isolate-tests`: run each selected libtest test in its own process. `--test-target NAME` selects Cargo test executable names, and `--include-test NAME` and `--exclude-test NAME` select exact libtest names. These flags are repeatable and enable isolation. `--include-ignored` also allows ignored tests. Keep the default `--jobs 1` when tests share ports or files.
+- `--test-target NAME` also narrows the Cargo build when Cargo can express the selection exactly. Cargo still builds required dependencies, including binaries used by integration tests. Selections such as a subset of workspace libraries or targets whose required features cannot be confirmed use the usual package-wide Cargo build. JSON reports show `analysis.test_selection.build_scope` as `selected_targets` or `package_wide`.
 - `--test-wrapper PATH`: in isolated mode, run a workspace-relative executable from the working copy with the test executable and its arguments. A wrapper can set up a private temporary directory and then run the supplied command, preserving its status and the `TMT_*` environment. The report records the selected tests and wrapper. Isolated selection works with standard libtest executables and does not run doc tests.
 
 Findings you have already dealt with:

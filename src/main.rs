@@ -73,7 +73,7 @@ struct Cli {
     /// Run one selected libtest test per process, including its child threads.
     #[arg(long)]
     isolate_tests: bool,
-    /// Run only these Cargo test artifact names (repeatable).
+    /// Select these Cargo test artifact names for running and, where possible, for building (repeatable).
     #[arg(long)]
     test_target: Vec<String>,
     /// Include these exact libtest names (repeatable).
