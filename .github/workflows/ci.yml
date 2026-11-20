@@ -37,6 +37,19 @@ jobs:
       - name: Test
         run: cargo test
 
+  msrv:
+    name: Builds with the oldest supported Rust (1.88)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v6.1.0
+        with:
+          persist-credentials: false
+      - name: Check with Rust 1.88
+        run: |
+          rustup toolchain install 1.88.0 --profile minimal
+          cargo +1.88.0 check --all-targets
+
   lockfile:
     name: The lockfile of the actions is current
     runs-on: ubuntu-24.04

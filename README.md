@@ -69,6 +69,8 @@ cargo install --git https://github.com/t-k/targeted-mutation   # installs `cargo
 cargo tmt [DIR] [OPTIONS]
 ```
 
+Building it takes Rust 1.88 or newer. The crates it analyses are built with whatever toolchain is active for them.
+
 What to analyse:
 
 - `--package NAME`: the workspace member to analyse. Not needed when `DIR` is the member's own directory.

@@ -2,6 +2,7 @@
 name = "targeted-mutation"
 version = "0.1.0"
 edition = "2024"
+rust-version = "1.88"
 license = "Apache-2.0"
 description = "Targeted mutation testing for Rust: find the wrong implementations your tests let through"
 repository = "https://github.com/t-k/targeted-mutation"
