@@ -343,6 +343,12 @@ struct WorkCopy {
 impl WorkCopy {
     fn open(work: &Path, root: &Path) -> WorkCopy {
         let log = work.join(WRITTEN_LOG);
+        // The log is appended to and replaced: never through a link to somewhere else.
+        for file in [log.clone(), log.with_extension("new")] {
+            if fs::symlink_metadata(&file).is_ok_and(|found| found.is_symlink()) {
+                let _ = fs::remove_file(&file);
+            }
+        }
         let earlier: HashSet<PathBuf> = fs::read_to_string(&log)
             .unwrap_or_default()
             .lines()
@@ -480,12 +486,10 @@ fn sync_file(src: &Path, dst: &Path, state: &WorkCopy) -> Result<()> {
             return Ok(());
         }
     }
+    // Times say nothing certain: a file put back from an archive is older than the copy
+    // of what it replaces. A copy is what holds the same bytes.
     let up_to_date = match (fs::metadata(src), fs::symlink_metadata(dst)) {
-        (Ok(from), Ok(to)) => {
-            to.is_file()
-                && from.len() == to.len()
-                && matches!((from.modified(), to.modified()), (Ok(a), Ok(b)) if b >= a)
-        }
+        (Ok(from), Ok(to)) => to.is_file() && from.len() == to.len() && same_bytes(src, dst),
         _ => false,
     };
     if up_to_date {
@@ -499,6 +503,45 @@ fn sync_file(src: &Path, dst: &Path, state: &WorkCopy) -> Result<()> {
         }
     }
     copy_as_new(src, dst)
+}
+
+/// Whether two files hold the same bytes. One that cannot be read is not the same.
+fn same_bytes(a: &Path, b: &Path) -> bool {
+    use std::io::Read;
+    let (Ok(mut a), Ok(mut b)) = (fs::File::open(a), fs::File::open(b)) else {
+        return false;
+    };
+    let (mut left, mut right) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
+    loop {
+        let Ok(n) = a.read(&mut left) else {
+            return false;
+        };
+        if n == 0 {
+            // The other one has nothing left either.
+            return matches!(b.read(&mut right), Ok(0));
+        }
+        if b.read_exact(&mut right[..n]).is_err() || left[..n] != right[..n] {
+            return false;
+        }
+    }
+}
+
+/// Makes `dir` a directory of the working copy. Whatever else is in the way below the
+/// copy's root goes first, a link above all: a link is followed, and what is written
+/// "into the copy" would land where it points.
+fn real_dir(dir: &Path, state: &WorkCopy) -> Result<()> {
+    if let Ok(below) = dir.strip_prefix(&state.root) {
+        let mut path = state.root.clone();
+        for part in below.components() {
+            path.push(part);
+            match fs::symlink_metadata(&path) {
+                Ok(found) if !found.is_dir() => fs::remove_file(&path)
+                    .with_context(|| format!("removing {}", path.display()))?,
+                _ => {}
+            }
+        }
+    }
+    fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))
 }
 
 /// Copies a file and gives the copy the current time. Some systems copy the modification
@@ -579,7 +622,7 @@ fn copy_tree(
     skip: &dyn Fn(&Path) -> bool,
     state: &WorkCopy,
 ) -> Result<()> {
-    fs::create_dir_all(to)?;
+    real_dir(to, state)?;
     for entry in fs::read_dir(from).with_context(|| format!("reading {}", from.display()))? {
         let src = entry?.path();
         if skip(&src) {
@@ -687,7 +730,7 @@ fn copy_git_visible(
             continue; // deleted in the working tree
         };
         if let Some(parent) = dst.parent() {
-            fs::create_dir_all(parent)?;
+            real_dir(parent, state)?;
         }
         if kind.is_dir() {
             match git_visible_files(&src)? {
@@ -3081,11 +3124,25 @@ serde = { path = "../../serde-fork" }
             fs::read_to_string(dir.join("work").join(WRITTEN_LOG)).unwrap(),
             "src/__tmt_rt.rs\nsrc/edited.rs\nsrc/lib.rs\n"
         );
-        // A plain copy whose source got newer, or another size, is copied again.
+        // A source that was only touched is still what the copy holds: nothing to do.
         let later = hour_ago + Duration::from_secs(60);
         set_modified(&dir.join("ws/src/plain.rs"), later);
         run();
-        assert!(modified(&copy.join("src/plain.rs")) >= later);
+        assert_eq!(modified(&copy.join("src/plain.rs")), hour_ago);
+        // Other bytes are copied, also where the size and the time of the source say
+        // nothing (a file put back as it was long ago).
+        let plain = fs::read_to_string(dir.join("ws/src/plain.rs")).unwrap();
+        fs::write(dir.join("ws/src/plain.rs"), plain.to_uppercase()).unwrap();
+        set_modified(
+            &dir.join("ws/src/plain.rs"),
+            hour_ago - Duration::from_secs(60),
+        );
+        run();
+        assert_eq!(
+            fs::read_to_string(copy.join("src/plain.rs")).unwrap(),
+            plain.to_uppercase()
+        );
+        assert!(modified(&copy.join("src/plain.rs")) > later);
         fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -3184,9 +3241,19 @@ serde = { path = "../../serde-fork" }
         permissions.set_readonly(true);
         fs::set_permissions(&locked, permissions).unwrap();
         fs::create_dir_all(copy.join("src/was_dir/inner")).unwrap();
-        // Same size and not older: taken for a copy, whatever it holds.
+        // The same size and newer, and not the same: no copy of the source.
         fs::write(copy.join("src/same"), "SOURCE").unwrap();
-        set_modified(&copy.join("src/same"), hour_ago);
+        // A copy is one whatever its time says, and keeps that time (nothing to rebuild).
+        fs::write(workspace.join("src/copied"), "as it is").unwrap();
+        fs::write(copy.join("src/copied"), "as it is").unwrap();
+        let long_ago = hour_ago - Duration::from_secs(7200);
+        set_modified(&copy.join("src/copied"), long_ago);
+        // A directory of the copy that has become a link is not walked into.
+        let elsewhere = dir.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        std::os::unix::fs::symlink(&elsewhere, copy.join("linked")).unwrap();
+        fs::create_dir_all(workspace.join("linked/deep")).unwrap();
+        fs::write(workspace.join("linked/deep/z"), "z").unwrap();
         fs::write(copy.join("src/longer"), "SOURCE+").unwrap();
         fs::write(copy.join("src/newer"), "SOURCE").unwrap();
         set_modified(&copy.join("src/newer"), hour_ago - Duration::from_secs(60));
@@ -3204,9 +3271,24 @@ serde = { path = "../../serde-fork" }
 
         copy_run(&dir, &[], true);
         let read = |name: &str| fs::read_to_string(copy.join(name)).unwrap();
-        assert_eq!(read("src/same"), "SOURCE");
         assert_eq!(read("src/locked"), "read only");
+        assert_eq!(read("src/copied"), "as it is");
+        assert_eq!(
+            fs::metadata(copy.join("src/copied"))
+                .unwrap()
+                .modified()
+                .unwrap(),
+            long_ago
+        );
+        assert_eq!(read("linked/deep/z"), "z");
+        assert!(fs::symlink_metadata(copy.join("linked")).unwrap().is_dir());
+        assert_eq!(
+            fs::read_dir(&elsewhere).unwrap().count(),
+            0,
+            "nothing written through"
+        );
         for name in [
+            "src/same",
             "src/longer",
             "src/newer",
             "src/was_dir",

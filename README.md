@@ -148,6 +148,8 @@ Functions, `impl` blocks and modules marked `#[mutants::skip]` (also inside `cfg
 
 ### Compared with cargo-mutants
 
+For `<` and `>`, `==` and the reverse operator are run as well, unless another mutant that is run gives the same answer for every relation the tests saw (without equal operands, `<` in place of `>` is the negation).
+
 Every mutant that cargo-mutants 27.1.0 lists for the crates in `fixtures/` has a counterpart here: `tests/parity.rs` checks the stored lists (`tests/data/cargo-mutants`) against the sites this tool finds, and names the exceptions with their reason (a `||` inside a let chain, which does not compile). An empty body is not made for a function that consists of one statement, because deleting that statement is the same mutant. The same test checks any other crate on request (see its last function); that is how the table above was completed against real code. On top of those come the mutants that need the trace: shifted boundaries, an ignored operand of `&&` / `||`, a result replaced after the body ran, deleted statements, `min` / `max`, range ends.
 
 The difference is in how they are run. cargo-mutants builds every mutant and runs all tests against it. Here one build carries all mutants that a probe can carry, each is run only against the tests that execute it, and those that provably pass every test are not run at all but reported with the input that is missing. Only the rest (step 5) costs a build each, and is run when `--rebuild` asks for it: with that option every mutant of cargo-mutants is run, without it the summary says how many were not.
@@ -197,6 +199,10 @@ java -jar tla2tools.jar formal/tla/RepairLoop.tla
 - Equivalent mutants are not always detected. If `max(a, b)` is written with `a >= b`, then `a > b` is reported although no test could observe it. The same goes for an operand that is constant by construction (`is_large(n) && FEATURE_ENABLED`).
 - Observations made on threads that a test spawns, and all observations of doc tests, cannot be attributed to a single test; the mutant is then run against the whole test binary.
 - A thread without a name, and the main thread, write every observation at once (slow in a loop); a thread with a name keeps distances back as described under "Speed". If such a thread is still running when the process exits, what it observed in its last 20 ms can be missing from the trace, as anything it would have observed a moment later is. A survivor predicted from that is re-run like every other and shows up as `UNSTABLE` if the prediction was wrong.
+- A comparison, a guard or an operand that a mutant replaces by a constant is still evaluated, and so is a field's value when the mutant takes the field from the base (which is then evaluated twice). A test that only notices that a call inside them no longer happens does not count against these mutants; built with `--rebuild`, a guard or a field is replaced outright.
+- A probe keeps the order of evaluation and the life of temporaries of the code it stands for, with two exceptions that need unusual code to be seen: a temporary with a destructor inside the value of a field of a struct literal with a base (`S { x: guard().value(), ..base }`) is dropped before the next field is evaluated, and `*p += f()` on a number takes the place before it calls `f`, which a `DerefMut` with side effects can observe.
+- A thread that a test names exactly like another test of the same binary is taken for that test.
+- A replaced operator in a mutant that is built keeps its operands by parentheses where the new operator binds otherwise (`8 - (2 + 3)`). A crate that denies `unused_parens` rejects those where they turn out not to be needed; they are then counted as not compiling.
 - With `--jobs`, a mutant's time limit is still derived from the unloaded test run, so a heavily loaded machine can turn a slow mutant into a timeout (counted as killed).
 
 ## Speed

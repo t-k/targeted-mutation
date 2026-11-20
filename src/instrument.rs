@@ -1133,10 +1133,9 @@ fn values_of(ty: &syn::Type) -> Vec<String> {
 /// `#[mutants::skip]`, also inside `cfg_attr`: the mark cargo-mutants uses for code that
 /// is not to be mutated.
 fn is_skipped(attrs: &[syn::Attribute]) -> bool {
-    attrs.iter().any(|attr| {
-        let tokens = attr.meta.to_token_stream();
-        has_ident(tokens.clone(), "mutants") && has_ident(tokens, "skip")
-    })
+    attrs
+        .iter()
+        .any(|attr| squeezed(&attr.meta.to_token_stream().to_string()).contains("mutants::skip"))
 }
 
 /// `#[test]`, `#[tokio::test]`, `#[cfg(test)]`, `#[cfg(all(test, ...))]`; not `#[cfg(not(test))]`.
@@ -1216,7 +1215,8 @@ impl<'ast> Visit<'ast> for Finder<'_> {
     }
 
     fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
-        if is_test_only(&node.attrs) {
+        // The file of a module that is not analysed is left alone as a whole.
+        if is_test_only(&node.attrs) || is_skipped(&node.attrs) {
             if node.content.is_none() {
                 let path = node.attrs.iter().find_map(|attr| match &attr.meta {
                     syn::Meta::NameValue(nv) if nv.path.is_ident("path") => match &nv.value {
@@ -1235,9 +1235,7 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             }
             return;
         }
-        if !is_skipped(&node.attrs) {
-            visit::visit_item_mod(self, node);
-        }
+        visit::visit_item_mod(self, node);
     }
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
@@ -1515,10 +1513,7 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                     lit: syn::Lit::Int(lit),
                     ..
                 }) => lit.base10_parse::<u128>().is_ok_and(|v| v == 0),
-                syn::Expr::Lit(syn::ExprLit {
-                    lit: syn::Lit::Float(lit),
-                    ..
-                }) => lit.base10_parse::<f64>().is_ok_and(|v| v == 0.0),
+                // Not a float: `-0.0` is not `0.0` (`1.0 / -0.0` is minus infinity).
                 _ => false,
             };
             if !zero {
@@ -3354,7 +3349,8 @@ mod tests {
             [
                 "neg -x | x | literal=false",
                 "neg -5 | 5 | literal=true",
-                // `-0` and `-0.0` are 0 either way.
+                // `-0` is 0 either way; `-0.0` is not `0.0`.
+                "neg -0.0 | 0.0 | literal=true",
                 "neg -y | y | literal=false",
                 // No catch-all arm: the arm cannot be removed, so `false` is a mutant.
                 "guard n > 1 | can_be_false=true",
@@ -3408,7 +3404,7 @@ mod tests {
             assert!(out.contains(expected), "{expected}\n{out}");
         }
         assert!(
-            !out.contains("{ -0 }") && !out.contains("{ -0.0 }"),
+            !out.contains("{ -0 }") && out.contains("{ -0.0 } else { 0.0 }"),
             "{out}"
         );
     }
@@ -3676,6 +3672,42 @@ mod tests {
             assert_eq!(all.len(), 2, "{body}");
             assert!(all.iter().all(|b| b.1 == only_computes), "{body}: {all:?}");
         }
+    }
+
+    #[test]
+    fn what_marks_code_as_not_to_be_mutated() {
+        let src = "#[allow(mutants, skip)] fn loosely(a: u8) -> u8 { a + 1 }\n\
+                   #[doc = \"mutants skip\"] fn spoken_of(a: u8) -> u8 { a + 2 }\n\
+                   #[mutants :: skip] fn spaced(a: u8) -> u8 { a + 3 }\n\
+                   #[cfg_attr(test, mutants::skip)] fn conditional(a: u8) -> u8 { a + 4 }\n\
+                   #[mutants::skip] mod generated;\n\
+                   #[mutants::skip] #[path = \"gen/other.rs\"] mod other;\n\
+                   mod plain;\n";
+        let all = discover(src, 0).unwrap();
+        let texts: Vec<&str> = found_arith(&all.sites);
+        assert_eq!(texts, ["a + 1", "a + 2"]);
+        // The file of a marked module is not looked into either.
+        assert_eq!(
+            all.test_modules,
+            [
+                TestModule {
+                    name: "generated".to_string(),
+                    path: None
+                },
+                TestModule {
+                    name: "other".to_string(),
+                    path: Some("gen/other.rs".to_string())
+                },
+            ]
+        );
+    }
+
+    fn found_arith(sites: &[Site]) -> Vec<&str> {
+        sites
+            .iter()
+            .filter(|site| matches!(site.kind, SiteKind::Arith { .. }))
+            .map(|site| site.text.as_str())
+            .collect()
     }
 
     #[test]
