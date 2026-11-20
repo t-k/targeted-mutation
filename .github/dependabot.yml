@@ -1,0 +1,7 @@
+version: 2
+updates:
+  # Keeps the actions and their entries in .github/workflows/actions.lock current.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly

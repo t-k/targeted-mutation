@@ -4,7 +4,13 @@ version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
 description = "Targeted mutation testing for Rust: find the wrong implementations your tests let through"
-exclude = ["fixtures/*/target", "formal", "docs.local"]
+repository = "https://github.com/t-k/targeted-mutation"
+readme = "README.md"
+keywords = ["mutation-testing", "testing", "cargo", "subcommand", "mutants"]
+categories = ["development-tools::testing", "development-tools::cargo-plugins", "command-line-utilities"]
+# The tests need the crates under fixtures/, which cargo leaves out of a package (each is
+# a package of its own): they are run from the repository, not from the published crate.
+exclude = ["fixtures", "formal", "docs.local", "tests", "eval", ".github"]
 
 [[bin]]
 name = "cargo-tmt"
