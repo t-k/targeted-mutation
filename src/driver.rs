@@ -911,12 +911,18 @@ fn test_threads(cores: usize, sharing: usize) -> usize {
     (cores / sharing.max(1)).max(2)
 }
 
+enum RunOutput<'a> {
+    Quiet,
+    FirstFailure,
+    Capture(&'a fs::File),
+}
+
 fn run_binary(
     bin: &TestBinary,
     tests: Option<&[String]>,
     env: &[(&str, &str)],
     timeout: Duration,
-    stop_at_first_failure: bool,
+    output: RunOutput<'_>,
     sharing: usize,
 ) -> Result<Outcome> {
     use std::io::BufRead;
@@ -953,6 +959,7 @@ fn run_binary(
                 .args(flags)
                 .current_dir(copy)
                 .env("CARGO_TARGET_DIR", target_dir)
+                .env("CARGO_BUILD_BUILD_DIR", target_dir)
                 .envs(profile_env(*opt_level));
             cmd
         }
@@ -961,13 +968,18 @@ fn run_binary(
         .env_remove("TMT_MUTANT")
         .env("TMT_UNABLE", &unable_mark)
         .envs(env.iter().copied())
-        .stdin(Stdio::null())
-        .stdout(if stop_at_first_failure {
-            Stdio::piped()
-        } else {
-            Stdio::null()
-        })
-        .stderr(Stdio::null());
+        .stdin(Stdio::null());
+    match output {
+        RunOutput::Capture(file) => {
+            cmd.stdout(file.try_clone()?).stderr(file.try_clone()?);
+        }
+        RunOutput::FirstFailure => {
+            cmd.stdout(Stdio::piped()).stderr(Stdio::null());
+        }
+        RunOutput::Quiet => {
+            cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+    }
     // Its own process group, so that a timeout can stop whatever the tests started too.
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
@@ -1031,23 +1043,78 @@ fn run_binary(
     Ok(outcome)
 }
 
+/// Keeps diagnostics on disk so a descendant holding stdout open cannot hold up the driver.
+fn run_baseline(
+    bin: &TestBinary,
+    env: &[(&str, &str)],
+    timeout: Duration,
+    path: &Path,
+) -> Result<()> {
+    use std::io::{Read, Seek, SeekFrom};
+
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err).with_context(|| format!("removing {}", path.display())),
+    }
+    let mut log = fs::OpenOptions::new()
+        .create_new(true)
+        .read(true)
+        .write(true)
+        .open(path)
+        .with_context(|| format!("creating baseline log {}", path.display()))?;
+    let result =
+        run_binary(bin, None, env, timeout, RunOutput::Capture(&log), 1).with_context(|| {
+            format!(
+                "running baseline for `{}`; output: {}",
+                bin.name,
+                path.display()
+            )
+        })?;
+    let reason = match result {
+        Outcome::Pass => {
+            drop(log);
+            fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
+            return Ok(());
+        }
+        Outcome::Fail => "do not pass on the unmutated code",
+        Outcome::Timeout => "timed out on the unmutated code",
+        Outcome::Unable => "could not be evaluated on the unmutated code",
+    };
+    const LIMIT: u64 = 16 * 1024;
+    log.seek(SeekFrom::Start(log.metadata()?.len().saturating_sub(LIMIT)))?;
+    let mut tail = Vec::new();
+    log.take(LIMIT).read_to_end(&mut tail)?;
+    bail!(
+        "the tests in `{}` {reason}; full output: {}\n{}",
+        bin.name,
+        path.display(),
+        String::from_utf8_lossy(&tail).trim_end()
+    );
+}
+
 /// The directory of the marks in a working directory: made if it is not there, used if
 /// it is one. Anything else of that name (a file, a link) is somebody's, in a directory
 /// that was given to work in before it was this tool's: it is left alone and said.
 fn marks_dir(work: &Path) -> Result<PathBuf> {
-    let marks = work.join("marks");
-    match fs::symlink_metadata(&marks) {
+    work_directory(work, "marks")
+}
+
+fn work_directory(work: &Path, name: &str) -> Result<PathBuf> {
+    let path = work.join(name);
+    match fs::symlink_metadata(&path) {
         Ok(found) if found.is_dir() => {}
         Ok(_) => bail!(
             "{} is in the way: the working directory needs a directory of that name, and \
              this is not one. Move it, or choose another --work-dir",
-            marks.display()
+            path.display()
         ),
-        Err(_) => {
-            fs::create_dir(&marks).with_context(|| format!("creating {}", marks.display()))?
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            fs::create_dir(&path).with_context(|| format!("creating {}", path.display()))?
         }
+        Err(err) => return Err(err).with_context(|| format!("inspecting {}", path.display())),
     }
-    Ok(marks)
+    Ok(path)
 }
 
 /// Makes the file by which a run says that it gave up: there for the run, and gone when
@@ -1147,6 +1214,8 @@ fn requested_scope(
             "--no-color",
             "--no-ext-diff",
             "--relative",
+            "--src-prefix=a/",
+            "--dst-prefix=b/",
             revision,
             "--",
         ])?));
@@ -1676,7 +1745,7 @@ impl Session {
                 filter.as_deref(),
                 &[("TMT_MUTANT", &spec)],
                 mutant_timeout(bin.baseline),
-                true,
+                RunOutput::FirstFailure,
                 sharing,
             )?;
             if outcome != Outcome::Pass {
@@ -1718,7 +1787,7 @@ impl Session {
                 filter.as_deref(),
                 &[("TMT_MUTANT", &spec), ("TMT_TRACE", &trace_env)],
                 mutant_timeout(bin.traced),
-                false,
+                RunOutput::Quiet,
                 sharing,
             )?;
             let text = fs::read_to_string(&path).unwrap_or_default();
@@ -2079,7 +2148,7 @@ pub fn run(options: &Options) -> Result<Report> {
 
     // 4. Build, disabling the sites whose probe does not compile (formal/tla/RepairLoop.tla).
     let mut disabled: HashSet<u32> = HashSet::new();
-    let build_target = work.join("target");
+    let build_target = work_directory(&work, "target")?;
     let cargo_build = || {
         Command::new("cargo")
             .args(["test", "--no-run", "--message-format=json"])
@@ -2087,6 +2156,7 @@ pub fn run(options: &Options) -> Result<Report> {
             .args(options.cargo.flags())
             .current_dir(&copy)
             .env("CARGO_TARGET_DIR", &build_target)
+            .env("CARGO_BUILD_BUILD_DIR", &build_target)
             .envs(profile_env(options.opt_level))
             .stderr(Stdio::piped())
             .output()
@@ -2215,37 +2285,26 @@ pub fn run(options: &Options) -> Result<Report> {
         session.note(&format!("tracing `{}`", bin.name));
         let started = Instant::now();
         let trace_env = trace_path.to_string_lossy().into_owned();
-        let outcome = run_binary(
+        run_baseline(
             &bin,
-            None,
             &[("TMT_TRACE", &trace_env)],
             Duration::from_secs(3600),
-            false,
-            1,
+            &work.join(format!("baseline-{index}.log")),
         )?;
-        if outcome != Outcome::Pass {
-            bail!(
-                "the tests in `{}` do not pass on the unmutated code; fix them first",
-                bin.name
-            );
-        }
         bin.traced = started.elapsed();
         bin.baseline = bin.traced;
         // Recording slows code in loops down a lot, and the time limit of every mutant
         // is a multiple of this: where it matters, time the tests as the mutants run them.
         if bin.traced > SLOW_TRACE {
             let started = Instant::now();
-            match run_binary(&bin, None, &[], bin.traced, false, 1)? {
-                Outcome::Pass => bin.baseline = started.elapsed(),
-                // Every failure from here on would be counted as a mutant found out.
-                Outcome::Fail => bail!(
-                    "the tests of `{}` pass while their run is recorded and fail without: \
-                     they do not always give the same result, and nothing can be concluded \
-                     from running them",
-                    bin.name
-                ),
-                Outcome::Timeout | Outcome::Unable => {}
-            }
+            run_baseline(
+                &bin,
+                &[],
+                // A noisy timing pass must not be mistaken for a passing baseline.
+                Duration::from_secs(3600),
+                &work.join(format!("baseline-{index}-untraced.log")),
+            )?;
+            bin.baseline = started.elapsed();
         }
         // No file means no probe was reached. Anything else unreadable or malformed means
         // the evidence is incomplete, and conclusions drawn from it would be wrong.
@@ -2432,7 +2491,14 @@ pub fn run(options: &Options) -> Result<Report> {
             let _ = fs::remove_file(&path);
             let trace_env = path.to_string_lossy().into_owned();
             let limit = Duration::from_secs(3600);
-            let outcome = run_binary(bin, None, &[("TMT_TRACE", &trace_env)], limit, false, 1)?;
+            let outcome = run_binary(
+                bin,
+                None,
+                &[("TMT_TRACE", &trace_env)],
+                limit,
+                RunOutput::Quiet,
+                1,
+            )?;
             let again = Trace::parse(&fs::read_to_string(&path).unwrap_or_default());
             let _ = fs::remove_file(&path);
             let records = bin.trace.differences(&again);
@@ -2664,8 +2730,14 @@ pub fn run(options: &Options) -> Result<Report> {
                     return Ok(None);
                 }
                 for bin in &by_speed {
-                    let outcome =
-                        run_binary(bin, None, &[], mutant_timeout(bin.baseline), true, 1)?;
+                    let outcome = run_binary(
+                        bin,
+                        None,
+                        &[],
+                        mutant_timeout(bin.baseline),
+                        RunOutput::FirstFailure,
+                        1,
+                    )?;
                     if outcome != Outcome::Pass {
                         return Ok(Some(outcome));
                     }

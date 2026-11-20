@@ -365,12 +365,18 @@ fn failing_tests_stop_the_analysis() {
     let dir = fixture("eligibility", "failing-baseline");
     append(
         &dir.join("src/lib.rs"),
-        "\n#[test]\nfn broken() {\n    assert!(is_eligible(1));\n}\n",
+        "\n#[test]\nfn broken() {\n    assert!(is_eligible(1), \"baseline diagnostic sentinel\");\n}\n",
     );
-    let run = tmt(&dir, &["--quiet"]);
+    let run = tmt(&dir, &["--json", "--quiet"]);
     assert_eq!(run.code, 1, "{}", run.stdout);
     assert!(
         run.stderr.contains("do not pass on the unmutated code"),
+        "{}",
+        run.stderr
+    );
+    assert!(run.stderr.contains("test broken"), "{}", run.stderr);
+    assert!(
+        run.stderr.contains("baseline diagnostic sentinel"),
         "{}",
         run.stderr
     );
@@ -702,6 +708,31 @@ fn files_ignored_by_git_stay_out_of_the_working_copy() {
 }
 
 #[test]
+fn cargo_intermediates_stay_inside_the_work_directory() {
+    let dir = fixture("doc-tested", "cargo-build-dir");
+    let work = dir.join("mutation");
+    let ordinary = dir.join("ordinary-build");
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-tmt"))
+        .arg(&dir)
+        .args(["--json", "--quiet", "--doc", "--rebuild", "--work-dir"])
+        .arg(&work)
+        .env("CARGO_BUILD_BUILD_DIR", &ordinary)
+        .output()
+        .unwrap();
+    assert!(
+        matches!(output.status.code(), Some(0 | 2)),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(work.join("target/debug").is_dir());
+    assert!(
+        !ordinary.exists(),
+        "mutation build wrote {}",
+        ordinary.display()
+    );
+}
+
+#[test]
 fn observations_on_a_named_thread_are_not_mistaken_for_a_test() {
     let dir = fixture("eligibility", "named-thread");
     // The boundary value is only passed on a thread the test names itself. `--exact worker`
@@ -932,6 +963,14 @@ fn only_changed_code_is_analysed_on_request() {
         .map(|u| u["file"].as_str().unwrap())
         .collect();
     assert_eq!(unreached, ["src/extra.rs", "src/extra.rs"]);
+
+    for setting in [["diff.noprefix", "true"], ["diff.dstPrefix", "custom/"]] {
+        git_output(&dir, &["config", setting[0], setting[1]]);
+        let actual = tmt(&dir, &["--json", "--quiet", "--since", &base]);
+        let actual: Value = serde_json::from_str(&actual.stdout).unwrap();
+        assert_eq!(actual, report, "{setting:?}");
+        git_output(&dir, &["config", "--unset", setting[0]]);
+    }
 
     // The same selection by hand.
     let run = tmt(
