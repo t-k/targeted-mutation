@@ -1031,6 +1031,25 @@ fn run_binary(
     Ok(outcome)
 }
 
+/// The directory of the marks in a working directory: made if it is not there, used if
+/// it is one. Anything else of that name (a file, a link) is somebody's, in a directory
+/// that was given to work in before it was this tool's: it is left alone and said.
+fn marks_dir(work: &Path) -> Result<PathBuf> {
+    let marks = work.join("marks");
+    match fs::symlink_metadata(&marks) {
+        Ok(found) if found.is_dir() => {}
+        Ok(_) => bail!(
+            "{} is in the way: the working directory needs a directory of that name, and \
+             this is not one. Move it, or choose another --work-dir",
+            marks.display()
+        ),
+        Err(_) => {
+            fs::create_dir(&marks).with_context(|| format!("creating {}", marks.display()))?
+        }
+    }
+    Ok(marks)
+}
+
 /// Makes the file by which a run says that it gave up: there for the run, and gone when
 /// the run could not go on as its mutant. The runtime only has to take it away, which
 /// it can do on a full disk too. The exit status would say the same, but only that of
@@ -2179,11 +2198,7 @@ pub fn run(options: &Options) -> Result<Report> {
     // files: the working directory is this analysis's alone while it is locked. A
     // directory shared with others (the temporary one, between containers that count
     // their processes alike) could hand one run's mark to another.
-    let marks = work.join("marks");
-    if fs::symlink_metadata(&marks).is_ok_and(|found| !found.is_dir()) {
-        fs::remove_file(&marks).with_context(|| format!("removing {}", marks.display()))?;
-    }
-    fs::create_dir_all(&marks).with_context(|| format!("creating {}", marks.display()))?;
+    let marks = marks_dir(&work)?;
     for (index, (name, runner, cwd)) in runners.into_iter().enumerate() {
         let trace_path = work.join(format!("trace-{index}.tsv"));
         let _ = fs::remove_file(&trace_path);
@@ -3975,6 +3990,51 @@ serde = { path = "../../serde-fork" }
         let unmade = format!("{:#}", reserve_mark(&name(0), &runs).unwrap_err());
         assert!(unmade.contains("creating"), "{unmade}");
         assert_eq!(fs::read_to_string(name(0)).unwrap(), "not ours");
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn the_directory_of_the_marks_is_made_or_used_and_nothing_is_removed_for_it() {
+        let dir = scratch("marks-dir");
+        let work = dir.join("work");
+        // Not there: made. There as a directory, with whatever is in it: used.
+        assert_eq!(marks_dir(&work).unwrap(), work.join("marks"));
+        assert!(work.join("marks").is_dir());
+        fs::write(work.join("marks/left-over"), "x").unwrap();
+        assert_eq!(marks_dir(&work).unwrap(), work.join("marks"));
+        assert_eq!(
+            fs::read_to_string(work.join("marks/left-over")).unwrap(),
+            "x"
+        );
+        // A file of that name is somebody's: it stays, and the run does not start.
+        let taken = dir.join("taken");
+        fs::create_dir_all(&taken).unwrap();
+        fs::write(taken.join("marks"), "grades of the class").unwrap();
+        let said = format!("{:#}", marks_dir(&taken).unwrap_err());
+        assert!(
+            said.contains("is in the way") && said.contains("marks"),
+            "{said}"
+        );
+        assert_eq!(
+            fs::read_to_string(taken.join("marks")).unwrap(),
+            "grades of the class"
+        );
+        // So is a link, whatever it points to: neither followed nor removed.
+        #[cfg(unix)]
+        {
+            let linked = dir.join("linked");
+            let elsewhere = dir.join("elsewhere");
+            fs::create_dir_all(&linked).unwrap();
+            fs::create_dir_all(&elsewhere).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, linked.join("marks")).unwrap();
+            assert!(marks_dir(&linked).is_err());
+            assert!(
+                fs::symlink_metadata(linked.join("marks"))
+                    .unwrap()
+                    .is_symlink()
+            );
+            assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
+        }
         fs::remove_dir_all(&dir).unwrap();
     }
 
