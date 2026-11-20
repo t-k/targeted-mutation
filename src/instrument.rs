@@ -841,6 +841,25 @@ pub struct SourceMutant {
 /// building them. The replacements of an operator are those of cargo-mutants. Sites that
 /// only exist as probes (a result replaced after the body ran, a deleted statement, the
 /// other of `min` / `max`, the end of a range) have none.
+/// A strict/non-strict boundary replacement for runs without operand observations.
+pub(crate) fn source_boundary_mutant(site: &Site) -> Option<SourceMutant> {
+    let SiteKind::Cmp { op, gap, .. } = &site.kind else {
+        return None;
+    };
+    let replacement = match op {
+        CmpOp::Le => "<",
+        CmpOp::Ge => ">",
+        _ => return None,
+    };
+    Some(SourceMutant {
+        start: gap.0,
+        end: gap.1,
+        replacement: format!(" {replacement} "),
+        what: op.symbol().to_string(),
+        into: replacement.to_string(),
+    })
+}
+
 pub fn source_mutants(site: &Site) -> Vec<SourceMutant> {
     let change =
         |start: usize, end: usize, replacement: String, what: &str, into: &str| SourceMutant {

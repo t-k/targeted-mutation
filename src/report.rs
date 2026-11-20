@@ -152,6 +152,47 @@ pub enum Evaluation {
     NoMutantsExecuted,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SkipReason {
+    ProbeCompileError,
+    ProbeReplacedBySourceRebuild,
+    RequiresSourceRebuild,
+    UnparseableSource,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct SkippedSite {
+    #[serde(flatten)]
+    pub at: Location,
+    pub end_line: usize,
+    pub end_column: usize,
+    pub reason: SkipReason,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub diagnostic: Option<String>,
+}
+
+impl SkippedSite {
+    pub(crate) fn new(
+        at: Location,
+        source: &str,
+        end: usize,
+        reason: SkipReason,
+        diagnostic: Option<String>,
+    ) -> Self {
+        let before = source.get(..end).unwrap_or(source);
+        let end_line = crate::scope::line_of(before, before.len());
+        let end_column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+        Self {
+            at,
+            end_line,
+            end_column,
+            reason,
+            diagnostic,
+        }
+    }
+}
+
 /// What a run that was asked to check itself found (`--audit`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct Audit {
@@ -205,6 +246,8 @@ pub struct Report {
     pub sites: usize,
     /// Sites that could not be instrumented (the probe did not compile there).
     pub skipped_sites: usize,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub skipped: Vec<SkippedSite>,
     /// Values a function's body was to be replaced by that do not have its type
     /// (`Default::default()` for a type without a default): those mutants do not exist.
     pub unviable_mutants: usize,
@@ -732,7 +775,7 @@ pub fn render_sarif(report: &Report) -> String {
                 ]
             } },
             // What was looked at: a run of a part says nothing about the rest.
-            "properties": { "analysis": report.analysis, "evaluation": report.evaluation },
+            "properties": { "analysis": report.analysis, "evaluation": report.evaluation, "skipped": report.skipped },
             "results": results
         }]
     });
@@ -972,6 +1015,12 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
         out.push_str(&format!(
             "({} more mutants need a build of their own: --rebuild runs them)\n",
             report.mutants_not_built
+        ));
+    }
+    if !report.skipped.is_empty() {
+        out.push_str(&format!(
+            "({} skipped entries with locations and reasons in --json)\n",
+            report.skipped.len()
         ));
     }
     if report.evaluation == Some(Evaluation::NoMutantsExecuted) {
@@ -1732,6 +1781,7 @@ mod tests {
             evaluation: None,
             sites: 4,
             skipped_sites: 1,
+            skipped: vec![],
             unviable_mutants: 2,
             mutants_not_built: 0,
             mutants_not_evaluated: 0,

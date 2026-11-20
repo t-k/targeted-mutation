@@ -162,6 +162,7 @@ struct CargoMessage {
 #[derive(Deserialize)]
 struct ArtifactTarget {
     name: String,
+    kind: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -202,8 +203,8 @@ struct CompileError {
 
 #[derive(Debug, Default, PartialEq)]
 struct BuildOutput {
-    /// `(target name, executable, package)` of the test binaries.
-    test_binaries: Vec<(String, PathBuf, String)>,
+    /// `(target name, executable, package, target kind)` of the test binaries.
+    test_binaries: Vec<(String, PathBuf, String, Vec<String>)>,
     errors: Vec<CompileError>,
 }
 
@@ -252,7 +253,7 @@ fn parse_build_output(stdout: &str, packages: &[&str]) -> BuildOutput {
                     && let Some(package) = packages.iter().find(|name| is_package(id, name))
                 {
                     out.test_binaries
-                        .push((target.name, exe, package.to_string()));
+                        .push((target.name, exe, package.to_string(), target.kind));
                 }
             }
             "compiler-message" => {
@@ -630,7 +631,7 @@ fn prune(dir: &Path, state: &WorkCopy) -> Result<bool> {
         let path = entry?.path();
         let is_dir = fs::symlink_metadata(&path)?.is_dir();
         if is_dir {
-            if prune(&path, state)? {
+            if prune(&path, state)? && !state.is_kept(&path) {
                 fs::remove_dir(&path)?;
             } else {
                 empty = false;
@@ -744,6 +745,7 @@ fn copy_fixture_entry(
         );
     }
     real_dir(to, state)?;
+    state.kept.borrow_mut().insert(to.to_path_buf());
     for entry in fs::read_dir(&resolved)? {
         let entry = entry?;
         let path = entry.path();
@@ -994,7 +996,13 @@ fn parse_test_list(stdout: &str) -> BTreeSet<String> {
 }
 
 /// What makes cargo build the tests (and what they depend on) at an optimisation level.
-fn list_tests(exe: &Path, cwd: &Path, work: &Path, ignored: bool) -> Result<BTreeSet<String>> {
+fn list_tests(
+    exe: &Path,
+    cwd: &Path,
+    work: &Path,
+    ignored: bool,
+    strict: bool,
+) -> Result<BTreeSet<String>> {
     let mut command = Command::new(exe);
     isolate_copy_command(&mut command, work);
     command.args(["--list", "--format", "terse"]);
@@ -1007,6 +1015,9 @@ fn list_tests(exe: &Path, cwd: &Path, work: &Path, ignored: bool) -> Result<BTre
         .output()
         .with_context(|| format!("listing tests of {}", exe.display()))?;
     if !listing.status.success() {
+        if !strict {
+            return Ok(BTreeSet::new());
+        }
         bail!(
             "listing tests of {} failed: {}",
             exe.display(),
@@ -1157,19 +1168,20 @@ fn run_binary(
             }
         })
     });
+    let group = child.id();
     let kill = |child: &mut std::process::Child| {
-        #[cfg(unix)]
-        let _ = Command::new("kill")
-            .args(["-KILL", "--", &format!("-{}", child.id())])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
+        kill_test_group(group);
         let _ = child.kill();
         let _ = child.wait();
     };
     let started = Instant::now();
     let outcome = loop {
         if let Some(status) = child.try_wait()? {
+            if matches!(bin.runner, Runner::Isolated { .. })
+                || watcher.as_ref().is_some_and(|thread| !thread.is_finished())
+            {
+                kill_test_group(group);
+            }
             break if status.success() {
                 Outcome::Pass
             } else {
@@ -1198,26 +1210,48 @@ fn run_binary(
     Ok(outcome)
 }
 
+fn kill_test_group(id: u32) {
+    #[cfg(unix)]
+    let _ = Command::new("kill")
+        .args(["-KILL", "--", &format!("-{id}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+    #[cfg(not(unix))]
+    let _ = id;
+}
+
 /// Keeps diagnostics on disk so a descendant holding stdout open cannot hold up the driver.
 fn run_baseline(
     bin: &TestBinary,
     env: &[(&str, &str)],
     timeout: Duration,
     path: &Path,
-) -> Result<()> {
+    timing_only: bool,
+) -> Result<bool> {
     use std::io::{Read, Seek, SeekFrom};
 
-    match fs::remove_file(path) {
-        Ok(()) => {}
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
-        Err(err) => return Err(err).with_context(|| format!("removing {}", path.display())),
-    }
-    let mut log = fs::OpenOptions::new()
-        .create_new(true)
-        .read(true)
-        .write(true)
-        .open(path)
-        .with_context(|| format!("creating baseline log {}", path.display()))?;
+    let mut suffix = 0;
+    let (path, mut log) = loop {
+        let candidate = if suffix == 0 {
+            path.to_path_buf()
+        } else {
+            path.with_extension(format!("{suffix}.log"))
+        };
+        match fs::OpenOptions::new()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&candidate)
+        {
+            Ok(log) => break (candidate, log),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => suffix += 1,
+            Err(err) => {
+                return Err(err)
+                    .with_context(|| format!("creating baseline log {}", candidate.display()));
+            }
+        }
+    };
     let result =
         run_binary(bin, None, env, timeout, RunOutput::Capture(&log), 1).with_context(|| {
             format!(
@@ -1226,12 +1260,13 @@ fn run_baseline(
                 path.display()
             )
         })?;
+    if result == Outcome::Pass || (timing_only && result == Outcome::Timeout) {
+        drop(log);
+        fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+        return Ok(result == Outcome::Pass);
+    }
     let reason = match result {
-        Outcome::Pass => {
-            drop(log);
-            fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
-            return Ok(());
-        }
+        Outcome::Pass => unreachable!("pass handled above"),
         Outcome::Fail => "do not pass on the unmutated code",
         Outcome::Timeout => "timed out on the unmutated code",
         Outcome::Unable => "could not be evaluated on the unmutated code",
@@ -2274,6 +2309,8 @@ pub fn run(options: &Options) -> Result<Report> {
         },
         &mut paths,
     )?;
+    let scope = requested_scope(options, &workspace, &package_dir, &copy)?;
+    let mut skipped = vec![];
     let mut files = vec![];
     let mut test_only = HashSet::new();
     let mut next_id = 0u32;
@@ -2311,13 +2348,33 @@ pub fn run(options: &Options) -> Result<Report> {
                     rendered: None,
                 });
             }
-            Err(err) => note(&format!("skipping {display}: {err:#}")),
+            Err(err) => {
+                let relative = path.strip_prefix(&copy).unwrap_or(&path).to_string_lossy();
+                if scope
+                    .as_ref()
+                    .is_none_or(|scope| scope.touches(&relative, 1, usize::MAX))
+                {
+                    let diagnostic = format!("{err:#}");
+                    note(&format!("skipping {display}: {diagnostic}"));
+                    skipped.push(report::SkippedSite::new(
+                        report::Location {
+                            file: display,
+                            line: 1,
+                            column: 1,
+                            ..Default::default()
+                        },
+                        &original,
+                        original.len(),
+                        report::SkipReason::UnparseableSource,
+                        Some(diagnostic),
+                    ));
+                }
+            }
         }
     }
     files.retain(|f| !f.path.ancestors().any(|a| test_only.contains(a)));
 
     // Only the requested lines, if any were requested.
-    let scope = requested_scope(options, &workspace, &package_dir, &copy)?;
     if let Some(scope) = &scope {
         for file in &mut files {
             let relative = file
@@ -2348,6 +2405,42 @@ pub fn run(options: &Options) -> Result<Report> {
         }
     }
 
+    let mut report = Report {
+        package: package.name.clone(),
+        sites: total_sites,
+        analysis: report::Analysis {
+            package_path: repository_prefix(
+                package.manifest_path.parent().unwrap_or(Path::new(".")),
+            ),
+            since: options.since.clone(),
+            lines: options.lines.clone(),
+            tests_of: test_packages.iter().map(|p| p.name.clone()).collect(),
+            cargo: options.cargo.clone(),
+            opt_level: options.opt_level,
+            rebuild: options.rebuild || options.source_only,
+            verified: options.verify && !options.source_only,
+            doc_tests: options.doc,
+            source_only: options.source_only,
+            test_selection: None,
+            git_index: options.git_index,
+            copy_fixtures: options.copy_fixtures.clone(),
+        },
+        skipped,
+        ..Report::default()
+    };
+    if scope.is_some() && total_sites == 0 {
+        // Restore files changed by a previous run before reporting a selection with no work.
+        state.settle(&workspace)?;
+        if let Some(path) = &options.baseline {
+            crate::baseline::load(path)?;
+        }
+        if let Some(path) = &options.write_baseline {
+            crate::baseline::write(path, &[])?;
+        }
+        report.evaluation = Some(report::Evaluation::NoSites);
+        return Ok(report);
+    }
+
     let root_source = state
         .original(&root_file, &workspace)?
         .with_context(|| format!("{} is missing", root_target.src_path.display()))?;
@@ -2368,6 +2461,7 @@ pub fn run(options: &Options) -> Result<Report> {
 
     // 4. Build, disabling the sites whose probe does not compile (formal/tla/RepairLoop.tla).
     let mut disabled: HashSet<u32> = HashSet::new();
+    let mut repairs = BTreeMap::new();
     let build_target = work_directory(&work, "target")?;
     let cargo_build = || {
         let mut command = Command::new("cargo");
@@ -2431,7 +2525,12 @@ pub fn run(options: &Options) -> Result<Report> {
             if blamed.is_empty() {
                 unexplained.push(error);
             }
-            blamed_now.extend(blamed);
+            for id in blamed {
+                repairs
+                    .entry(id)
+                    .or_insert_with(|| error.rendered.lines().next().unwrap_or("").to_string());
+                blamed_now.insert(id);
+            }
         }
         disabled.extend(blamed_now);
         if disabled.len() == before || rounds > MAX_REPAIR_ROUNDS {
@@ -2481,7 +2580,7 @@ pub fn run(options: &Options) -> Result<Report> {
         })
         .transpose()?;
     let mut runners: Vec<(String, Runner, PathBuf)> = vec![];
-    for (name, exe, owner) in build.test_binaries {
+    for (name, exe, owner, kind) in build.test_binaries {
         if !selection.targets.is_empty() && !selection.targets.contains(&name) {
             continue;
         }
@@ -2496,8 +2595,8 @@ pub fn run(options: &Options) -> Result<Report> {
                 .expect("manifest has a parent"),
         )?;
         if selection.enabled() {
-            let all = list_tests(&exe, &cwd, &work, false)?;
-            let ignored = list_tests(&exe, &cwd, &work, true)?;
+            let all = list_tests(&exe, &cwd, &work, false, true)?;
+            let ignored = list_tests(&exe, &cwd, &work, true, true)?;
             for test in all {
                 let was_ignored = ignored.contains(&test);
                 if (was_ignored && !selection.include_ignored)
@@ -2507,7 +2606,7 @@ pub fn run(options: &Options) -> Result<Report> {
                     continue;
                 }
                 runners.push((
-                    format!("{owner}::{name}::{test}"),
+                    format!("{owner}::{}::{name}::{test}", kind.join("+")),
                     Runner::Isolated {
                         exe: exe.clone(),
                         test,
@@ -2575,6 +2674,7 @@ pub fn run(options: &Options) -> Result<Report> {
             if options.source_only { &[] } else { &trace },
             Duration::from_secs(3600),
             &work.join(format!("baseline-{index}.log")),
+            false,
         )?;
         bin.traced = started.elapsed();
         bin.baseline = bin.traced;
@@ -2582,14 +2682,15 @@ pub fn run(options: &Options) -> Result<Report> {
         // is a multiple of this: where it matters, time the tests as the mutants run them.
         if !options.source_only && bin.traced > SLOW_TRACE {
             let started = Instant::now();
-            run_baseline(
+            if run_baseline(
                 &bin,
                 &[],
-                // A noisy timing pass must not be mistaken for a passing baseline.
-                Duration::from_secs(3600),
+                bin.traced,
                 &work.join(format!("baseline-{index}-untraced.log")),
-            )?;
-            bin.baseline = started.elapsed();
+                true,
+            )? {
+                bin.baseline = started.elapsed();
+            }
         }
         // No file means no probe was reached. Anything else unreadable or malformed means
         // the evidence is incomplete, and conclusions drawn from it would be wrong.
@@ -2607,42 +2708,47 @@ pub fn run(options: &Options) -> Result<Report> {
             );
         }
         if let Runner::Exe(exe) = &bin.runner {
-            bin.tests = list_tests(exe, &bin.cwd, &work, false)?;
+            bin.tests = list_tests(exe, &bin.cwd, &work, false, false)?;
         }
         session.binaries.push(bin);
     }
 
     // 6. Plan every site, run the mutants, and put the findings together.
-    let mut report = Report {
-        package: package.name.clone(),
-        sites: total_sites,
-        analysis: report::Analysis {
-            package_path: repository_prefix(
-                package.manifest_path.parent().unwrap_or(Path::new(".")),
-            ),
-            since: options.since.clone(),
-            lines: options.lines.clone(),
-            tests_of: test_packages.iter().map(|p| p.name.clone()).collect(),
-            cargo: options.cargo.clone(),
-            opt_level: options.opt_level,
-            rebuild: options.rebuild || options.source_only,
-            verified: options.verify && !options.source_only,
-            doc_tests: options.doc,
-            source_only: options.source_only,
-            test_selection: selected_tests,
-            git_index: options.git_index,
-            copy_fixtures: options.copy_fixtures.clone(),
-        },
-        ..Report::default()
-    };
-    for site in files.iter().flat_map(|f| &f.sites) {
-        if disabled.contains(&site.id) {
-            match site.kind {
-                SiteKind::Body { .. } => report.unviable_mutants += 1,
-                // Mutated below by building it, where that is possible.
-                _ if options.rebuild && !instrument::source_mutants(site).is_empty() => {}
-                _ => report.skipped_sites += 1,
+    report.analysis.test_selection = selected_tests;
+    for file in &files {
+        for site in &file.sites {
+            if disabled.contains(&site.id) {
+                let fallback = options.rebuild
+                    && !matches!(site.kind, SiteKind::Body { .. })
+                    && !instrument::source_mutants(site).is_empty();
+                match site.kind {
+                    SiteKind::Body { .. } => report.unviable_mutants += 1,
+                    _ if fallback => {}
+                    _ => report.skipped_sites += 1,
+                }
+                report.skipped.push(report::SkippedSite::new(
+                    report::location(&file.display, site),
+                    &file.original,
+                    site.end,
+                    if fallback {
+                        report::SkipReason::ProbeReplacedBySourceRebuild
+                    } else {
+                        report::SkipReason::ProbeCompileError
+                    },
+                    repairs.get(&site.id).cloned(),
+                ));
             }
+        }
+        if !options.rebuild && !options.source_only {
+            report.skipped.extend(file.rebuild_sites.iter().map(|site| {
+                report::SkippedSite::new(
+                    report::location(&file.display, site),
+                    &file.original,
+                    site.end,
+                    report::SkipReason::RequiresSourceRebuild,
+                    None,
+                )
+            }));
         }
     }
     let scratch = work.clone();
@@ -2926,6 +3032,12 @@ pub fn run(options: &Options) -> Result<Report> {
             built.extend(
                 instrument::source_mutants(site)
                     .into_iter()
+                    .chain(
+                        options
+                            .source_only
+                            .then(|| instrument::source_boundary_mutant(site))
+                            .flatten(),
+                    )
                     .map(|mutant| (file, site, mutant, None)),
             );
         }
@@ -3336,7 +3448,12 @@ mod tests {
         let out = parse_build_output(stdout, &["p", "other"]);
         assert_eq!(
             out.test_binaries,
-            [("p".to_string(), PathBuf::from("/t/p-abc"), "p".to_string())]
+            [(
+                "p".to_string(),
+                PathBuf::from("/t/p-abc"),
+                "p".to_string(),
+                vec!["lib".to_string()]
+            )]
         );
         // With several packages each binary is attributed to its own.
         let both = parse_build_output(stdout, &["dep", "p"]);
@@ -3780,6 +3897,47 @@ serde = { path = "../../serde-fork" }
         fs::create_dir_all(dir.join("ws/src")).unwrap();
         fs::create_dir_all(dir.join("work/src")).unwrap();
         dir.canonicalize().unwrap()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_descendant_cannot_keep_the_completed_runner_output_open() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let dir = scratch("descendant-output");
+        let work = dir.join("work");
+        let exe = work.join("runner");
+        fs::write(&exe, "#!/bin/sh\nsleep 8 &\nexit 0\n").unwrap();
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+        let bin = TestBinary {
+            name: "runner".into(),
+            cwd: work.join("src"),
+            marks: marks_dir(&work).unwrap(),
+            git_ceiling: work,
+            tests: BTreeSet::new(),
+            runner: Runner::Exe(exe),
+            baseline: Duration::ZERO,
+            traced: Duration::ZERO,
+            trace: Trace::default(),
+        };
+        let started = Instant::now();
+        assert_eq!(
+            run_binary(
+                &bin,
+                None,
+                &[],
+                Duration::from_secs(2),
+                RunOutput::FirstFailure,
+                1
+            )
+            .unwrap(),
+            Outcome::Pass
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(6),
+            "a descendant held the output pipe open"
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     fn set_modified(path: &Path, time: std::time::SystemTime) {

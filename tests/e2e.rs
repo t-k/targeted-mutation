@@ -219,6 +219,17 @@ fn awkward_constructs() {
 
     // `let value; value = ...;` and a diverging call cannot be guarded: skipped, not fatal.
     assert_eq!(report["skipped_sites"], 2, "{report:#}");
+    let skipped = report["skipped"].as_array().unwrap();
+    assert!(
+        skipped
+            .iter()
+            .any(|site| site["reason"] == "probe_compile_error"
+                && site["file"] == "src/lib.rs"
+                && site["line"].as_u64().unwrap() > 0
+                && site["end_line"].as_u64().unwrap() >= site["line"].as_u64().unwrap()
+                && !site["diagnostic"].as_str().unwrap().is_empty()),
+        "{report:#}"
+    );
     assert!(
         !all.iter()
             .any(|f| f["code"].as_str().unwrap().contains("fail_hard")),
@@ -367,6 +378,10 @@ fn failing_tests_stop_the_analysis() {
         &dir.join("src/lib.rs"),
         "\n#[test]\nfn broken() {\n    assert!(is_eligible(1), \"baseline diagnostic sentinel\");\n}\n",
     );
+    let work = dir.join("target/tmt");
+    fs::create_dir_all(&work).unwrap();
+    let sentinel = work.join("baseline-0.log");
+    fs::write(&sentinel, "operator's file").unwrap();
     let run = tmt(&dir, &["--json", "--quiet"]);
     assert_eq!(run.code, 1, "{}", run.stdout);
     assert!(
@@ -380,7 +395,12 @@ fn failing_tests_stop_the_analysis() {
         "{}",
         run.stderr
     );
+    assert_eq!(fs::read_to_string(sentinel).unwrap(), "operator's file");
     assert_eq!(run.stdout, "");
+    let no_sites = tmt(&dir, &["--json", "--quiet", "--lines", "README.md"]);
+    assert_eq!(no_sites.code, 0, "{}", no_sites.stderr);
+    let report: Value = serde_json::from_str(&no_sites.stdout).unwrap();
+    assert_eq!(report["evaluation"], "no_sites");
 }
 
 #[test]
@@ -1369,6 +1389,14 @@ fn the_mutants_of_cargo_mutants() {
     );
     // Left out, the site with the probe that did not compile is a skipped one.
     assert_eq!(quick["skipped_sites"], 1, "{quick:#}");
+    assert!(
+        quick["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|site| site["reason"] == "requires_source_rebuild"),
+        "{quick:#}"
+    );
     assert_eq!(
         quick["findings"].as_array().unwrap().len() + 2,
         all.len(),
@@ -1889,7 +1917,7 @@ fn cli_boundary() {
     fs::remove_file(dir.join("tests/exit.rs")).unwrap();
     let args = ["--json", "--quiet", "--lines", "src/main.rs:3"];
     let probe = tmt(&dir, &args);
-    assert_eq!(probe.code, 0, "{}", probe.stderr);
+    assert_eq!(probe.code, 3, "{}", probe.stderr);
     let report: Value = serde_json::from_str(&probe.stdout).unwrap();
     assert_eq!(report["evaluation"], "no_mutants_executed", "{report:#}");
     let rebuilt = tmt(&dir, &[args.as_slice(), &["--source-only"]].concat());
@@ -1901,6 +1929,12 @@ fn cli_boundary() {
     );
     assert_eq!(report["analysis"]["source_only"], true);
     assert_eq!(report["unreached"].as_array().unwrap().len(), 0);
+    let test = dir.join("tests/cli.rs");
+    let text = fs::read_to_string(&test).unwrap();
+    fs::write(test, text.replace(r#"("4", "true"#, r#"("3", "true"#)).unwrap();
+    let rebuilt = tmt(&dir, &[args.as_slice(), &["--source-only"]].concat());
+    assert_eq!(rebuilt.code, 2, "{}", rebuilt.stderr);
+    assert!(rebuilt.stdout.contains("n < 4"), "{}", rebuilt.stdout);
 }
 
 #[cfg(unix)]
@@ -1955,8 +1989,8 @@ fn extra() {
     assert_eq!(
         selection["tests"],
         serde_json::json!([
-            "eligibility::selected::extra",
-            "eligibility::selected::selected"
+            "eligibility::test::selected::extra",
+            "eligibility::test::selected::selected"
         ])
     );
     assert!(report["mutants_run"].as_u64().unwrap() > 0, "{report:#}");
@@ -1992,7 +2026,7 @@ fn git_index_is_available() {
     git_output(&dir, &["init", "-q"]);
     git_output(&dir, &["add", "-A"]);
     fs::remove_file(dir.join("tracked-but-deleted")).unwrap();
-    fs::create_dir_all(dir.join("node_modules/sdk")).unwrap();
+    fs::create_dir_all(dir.join("node_modules/sdk/empty")).unwrap();
     fs::write(dir.join("node_modules/sdk/data.txt"), "fixture").unwrap();
     fs::write(dir.join("node_modules/unrequested"), "exclude me").unwrap();
     let work = dir.with_file_name("requested-work");
@@ -2009,6 +2043,7 @@ fn git_index_is_available() {
     let _: Value = serde_json::from_str(&good.stdout)
         .unwrap_or_else(|error| panic!("{error}: {}", good.stderr));
     assert!(work.join("src/.git/index").is_file());
+    assert!(work.join("src/node_modules/sdk/empty").is_dir());
     assert!(!work.join("src/node_modules/unrequested").exists());
     let bad = tmt(&dir, &args);
     assert_eq!(bad.code, 1, "{}", bad.stderr);
@@ -2032,4 +2067,27 @@ fn progress_stays_on_stderr_and_respects_quiet() {
     let quiet = tmt(&dir, &["--json", "--rebuild", "--quiet"]);
     assert_eq!(quiet.stderr, "");
     assert_eq!(quiet.stdout, run.stdout);
+}
+
+#[test]
+fn a_custom_harness_can_reject_listing_in_default_mode() {
+    let dir = fixture("eligibility", "custom-harness");
+    append(
+        &dir.join("Cargo.toml"),
+        "\n[[test]]\nname = \"custom\"\nharness = false\n",
+    );
+    fs::create_dir_all(dir.join("tests")).unwrap();
+    fs::write(
+        dir.join("tests/custom.rs"),
+        r#"
+fn main() {
+    if std::env::args().any(|arg| arg == "--list") { std::process::exit(2); }
+    assert!(eligibility::is_eligible(20));
+}
+"#,
+    )
+    .unwrap();
+    let run = tmt(&dir, &["--json", "--quiet"]);
+    assert_ne!(run.code, 1, "{}", run.stderr);
+    let _: Value = serde_json::from_str(&run.stdout).unwrap();
 }

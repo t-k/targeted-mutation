@@ -122,7 +122,7 @@ struct Cli {
     quiet: bool,
 }
 
-/// Exit codes: 0 no gaps, 2 gaps found, 1 the analysis could not run.
+/// Exit codes: 0 no gaps, 1 analysis failed, 2 gaps found, 3 no mutations executed.
 fn main() -> ExitCode {
     let cli = Cli::parse_from(arguments(std::env::args_os()));
     let options = driver::Options {
@@ -176,6 +176,8 @@ fn main() -> ExitCode {
             }
             if result.has_gaps() {
                 ExitCode::from(2)
+            } else if result.evaluation == Some(report::Evaluation::NoMutantsExecuted) {
+                ExitCode::from(3)
             } else {
                 ExitCode::SUCCESS
             }
