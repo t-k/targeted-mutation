@@ -935,7 +935,12 @@ fn run_binary(
     // The tests run in a directory of their own, and so does what they start: a place
     // given from here (`TMPDIR=.`) has to be the same place there.
     let unable_mark = std::path::absolute(&unable_mark).unwrap_or(unable_mark);
-    let _ = fs::remove_file(&unable_mark);
+    // The file is there for the run, and gone when the run was given up: the runtime
+    // only has to take it away, which it can do on a full disk too. If it cannot even
+    // be made here, nothing could be told from the run.
+    fs::write(&unable_mark, b"")
+        .with_context(|| format!("creating {}", unable_mark.display()))?;
+
     let mut cmd = match &bin.runner {
         Runner::Exe(exe) => {
             let mut cmd = Command::new(exe);
@@ -1033,7 +1038,7 @@ fn run_binary(
     // Whatever the tests made of it, a run that left the mark was not the mutant's. The
     // mark alone says so: a status is the tests' to choose, and one of them may well end
     // with the runtime's when it finds a mutant out.
-    if fs::remove_file(&unable_mark).is_ok() {
+    if fs::remove_file(&unable_mark).is_err() {
         return Ok(Outcome::Unable);
     }
     Ok(outcome)

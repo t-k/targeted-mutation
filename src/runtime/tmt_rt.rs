@@ -111,13 +111,12 @@ pub const RET_FALSE: u8 = 2;
 pub const CANNOT_EVALUATE: i32 = 86;
 
 /// The run may be that of a program a test started, whose exit status the test takes for
-/// a failure of its own: the driver also names a file (`TMT_UNABLE`) to leave a mark in.
+/// a failure of its own: the sign is a file the driver made and named (`TMT_UNABLE`),
+/// which is taken away here. Taking a file away needs no room on the disk, so a full
+/// one cannot turn a run that was given up into a mutant found out.
 fn cannot_evaluate() -> ! {
     if let Some(path) = std::env::var_os("TMT_UNABLE") {
-        let _ = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path);
+        let _ = std::fs::remove_file(path);
     }
     std::process::exit(CANNOT_EVALUATE)
 }
