@@ -300,6 +300,8 @@ struct TestBinary {
     name: String,
     /// Directory the tests run in: their package's, as under `cargo test`.
     cwd: PathBuf,
+    /// Where the marks of its runs are made: a directory of this analysis alone.
+    marks: PathBuf,
     /// The tests the binary contains, by the name libtest selects them with.
     tests: BTreeSet<String>,
     runner: Runner,
@@ -924,7 +926,7 @@ fn run_binary(
     let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
     let threads = test_threads(cores, sharing);
     static RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let unable_mark = reserve_mark(&std::env::temp_dir(), &RUNS)?;
+    let unable_mark = reserve_mark(&bin.marks, &RUNS)?;
 
     let mut cmd = match &bin.runner {
         Runner::Exe(exe) => {
@@ -1035,8 +1037,8 @@ fn run_binary(
 /// the tests themselves: a program a test started gives its status to the test, which
 /// fails for it.
 ///
-/// The file is new: one of the same name that is there already (the directory is shared
-/// with everything else) is left as it is, and another name is tried.
+/// The file is new: one of the same name that is there already is left as it is, and
+/// another name is tried.
 fn reserve_mark(dir: &Path, runs: &std::sync::atomic::AtomicUsize) -> Result<PathBuf> {
     // The tests run in a directory of their own, and so does what they start: a place
     // given from here (`TMPDIR=.`) has to be the same place there.
@@ -2173,12 +2175,22 @@ pub fn run(options: &Options) -> Result<Report> {
         };
         runners.push(("doc tests".to_string(), doc, session.package_dir.clone()));
     }
+    // The marks by which a run says that it gave up are made where nothing else makes
+    // files: the working directory is this analysis's alone while it is locked. A
+    // directory shared with others (the temporary one, between containers that count
+    // their processes alike) could hand one run's mark to another.
+    let marks = work.join("marks");
+    if fs::symlink_metadata(&marks).is_ok_and(|found| !found.is_dir()) {
+        fs::remove_file(&marks).with_context(|| format!("removing {}", marks.display()))?;
+    }
+    fs::create_dir_all(&marks).with_context(|| format!("creating {}", marks.display()))?;
     for (index, (name, runner, cwd)) in runners.into_iter().enumerate() {
         let trace_path = work.join(format!("trace-{index}.tsv"));
         let _ = fs::remove_file(&trace_path);
         let mut bin = TestBinary {
             name,
             cwd,
+            marks: marks.clone(),
             tests: BTreeSet::new(),
             runner,
             baseline: Duration::ZERO,
@@ -3951,21 +3963,18 @@ serde = { path = "../../serde-fork" }
         assert_eq!(mark, name(3));
         fs::remove_file(&mark).unwrap();
         assert!(release_mark(&mark).unwrap());
-        // There, and not to be taken away: neither of the two, and said as an error.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mark = reserve_mark(&dir, &runs).unwrap();
-            fs::set_permissions(&dir, fs::Permissions::from_mode(0o555)).unwrap();
-            let refused = release_mark(&mark);
-            // A directory that cannot be written to cannot have a mark made in it either.
-            let unmade = reserve_mark(&dir, &runs);
-            fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
-            let refused = format!("{:#}", refused.unwrap_err());
-            assert!(refused.contains("cannot tell whether"), "{refused}");
-            assert!(refused.contains("tmt-unable-"), "{refused}");
-            assert!(format!("{:#}", unmade.unwrap_err()).contains("creating"));
-        }
+        // There, and not to be taken away (a directory is not a file to remove): neither
+        // of the two, and said as an error. Whoever runs the tests, with whatever rights.
+        let in_the_way = dir.join("a-directory");
+        fs::create_dir_all(&in_the_way).unwrap();
+        let refused = format!("{:#}", release_mark(&in_the_way).unwrap_err());
+        assert!(refused.contains("cannot tell whether"), "{refused}");
+        assert!(refused.contains("a-directory"), "{refused}");
+        assert!(in_the_way.is_dir());
+        // A mark cannot be made in what is no directory, and that is not tried for ever.
+        let unmade = format!("{:#}", reserve_mark(&name(0), &runs).unwrap_err());
+        assert!(unmade.contains("creating"), "{unmade}");
+        assert_eq!(fs::read_to_string(name(0)).unwrap(), "not ours");
         fs::remove_dir_all(&dir).unwrap();
     }
 
