@@ -84,6 +84,8 @@ Which tests to use:
 - `--also-test PACKAGE`: also run the tests of another workspace package (repeatable).
 - `--dependents`: also run the tests of every workspace package that depends on the analysed one. A gap that an integration test elsewhere closes is then not reported.
 - `--doc`: also run the doc tests. rustdoc recompiles them for every mutant they reach, so this is slow.
+- `--isolate-tests`: run each selected libtest test in its own process. `--test-target NAME` selects Cargo test executable names, and `--include-test NAME` and `--exclude-test NAME` select exact libtest names. These flags are repeatable and enable isolation. `--include-ignored` also allows ignored tests. Keep the default `--jobs 1` when tests share ports or files.
+- `--test-wrapper PATH`: in isolated mode, run a workspace-relative executable from the working copy with the test executable and its arguments. A wrapper can set up a private temporary directory and then run the supplied command, preserving its status and the `TMT_*` environment. The report records the selected tests and wrapper. Isolated selection works with standard libtest executables and does not run doc tests.
 
 Findings you have already dealt with:
 
@@ -94,19 +96,22 @@ Running:
 
 - `--jobs N`: run N mutants at the same time (default 1). Raise it only if the tests can run concurrently with themselves: no fixed ports, no shared files.
 - `--work-dir DIR`: where the working copy and its build go. It must be a directory of its own: the tool deletes files from the copy inside it, and refuses a directory that contains the workspace or a `src` it did not create.
-- `--all-files`: copy files that git ignores too. Use it when the build needs generated files that are not tracked.
+- `--all-files`: copy files that git ignores too, subject to the default exclusions for Git metadata, `node_modules` and build caches.
+- `--copy-fixture PATH`: copy a particular workspace-relative file or directory even if ignored, for example `--copy-fixture sdk/node_modules`. Prepare it before running tmt. Links are resolved only within the workspace and excluded paths are protected.
+- `--git-index`: give tests an isolated Git index for commands such as `git ls-files`. The copy has its own metadata. History, remotes and staged blob contents are unavailable.
 - `--no-verify`: trust the trace; do not re-run tests against predicted survivors.
 - `--no-effects`: do not trace surviving mutants to say what they change. (Where several mutants survive at one place, one of them is followed through the tests; the report says which, in the text and as `effects_of`.)
 - `--features A,B`, `--all-features`, `--no-default-features`, `--locked`: as for `cargo test`, and told to every cargo command of the run.
 - `--audit N`: check the run itself, three ways. Up to N of the surviving mutants (spread evenly, the same ones every time) are run once more against every test of every binary, not only the tests chosen for them; one that fails is counted as found out and listed. Up to N of the mutants that were run as probes are also built from the source, as a person would write them, and run against all tests; where the result is not the one of the probe, both are listed (a build and a full test run each: slow). The summary says how many were chosen, how many could be compared, and how many could not (they did not build, or their probe run was given up). A negated comparison that no mutant of the source stands for is compared with the negation written out, `!(a >= b)`. And the tests are recorded a second time; binaries whose two recordings differ are listed, since their tests do not always do the same.
 - `--opt-level N`: build the tests at optimisation level N (0 to 3) instead of the profile's own. Worth it when tests spend their time in loops (see "Speed").
 - `--rebuild`: also run the mutants that need a build of their own (see "How it works", step 5). Without it the summary says how many were left out.
+- `--source-only`: build supported mutants directly from source and run them against the selected tests. Scope it with `--lines` or `--since` when tests launch children with `Command::env_clear()` or otherwise omit the probe environment. This mode is slower and reports surviving source mutants without trace-based input or assertion suggestions.
 
-Output: text by default, `--json`, or `--sarif` (SARIF 2.1.0 for code scanning: paths from the top of the git repository, the finding's id as `partialFingerprints`, and what the run looked at under the run's `properties`). The JSON report has the same under `analysis`: package, `--since` and `--lines`, features, and whether mutants were built and predictions re-run. `--show-unreached` lists the code no test executes, `--quiet` drops the progress lines.
+Output: text by default, `--json`, or `--sarif` (SARIF 2.1.0 for code scanning: paths from the top of the git repository, the finding's id as `partialFingerprints`, and what the run looked at under the run's `properties`). The JSON report has the same under `analysis`: package, `--since` and `--lines`, features, and whether mutants were built and predictions re-run. `--show-unreached` lists sites with no recorded execution. Long campaigns print completed, failed, timed-out, survived and unevaluated counts on stderr. `--quiet` suppresses progress. If a baseline test fails, stderr includes the available diagnostics and the full log path.
 
-Exit status: `0` no gaps, `2` gaps found or a prediction failed its re-run (`UNSTABLE`), `1` the analysis could not run (tests fail on the unmutated code, the crate does not build, ...).
+Exit status: `0` no gaps, `2` gaps found or a prediction failed its re-run (`UNSTABLE`), `1` the analysis could not run (tests fail on the unmutated code, the crate does not build, ...). When there are no sites or no executed mutants, JSON and SARIF expose `evaluation` as `no_sites` or `no_mutants_executed`.
 
-Your source tree is never modified. In a git repository only the files git does not ignore are copied (submodules by their own rules), so build output, caches and local files kept out of the repository stay where they are. The copy contains no symbolic links: a linked file is copied as a file, and a linked directory is followed only if it lies inside the workspace. The workspace is copied to `<target dir>/tmt/src` (or `--work-dir`) and built in a `target` directory next to that copy. Path dependencies that point outside the workspace are rewritten to absolute paths in the copy.
+Your source tree is never modified. In a git repository only the files git does not ignore are copied (submodules by their own rules), so build output, caches and local files kept out of the repository stay where they are. The copy contains no symbolic links: a linked file is copied as a file, and a linked directory is followed only if it lies inside the workspace. The workspace is copied to `<target dir>/tmt/src` (or `--work-dir`) and built in a `target` directory next to that copy. Cargo intermediates also stay in that directory, even if `build.build-dir` is configured for ordinary builds. Path dependencies that point outside the workspace are rewritten to absolute paths in the copy.
 
 ## How it works
 
@@ -191,7 +196,8 @@ java -jar tla2tools.jar formal/tla/RepairLoop.tla
 
 ## Limits
 
-- Rust only, one package per run. Test binaries are started directly, not through `cargo test`: a configured target runner is not used, and the number of test threads is set by the tool (`RUST_TEST_THREADS` is ignored).
+- Rust only, one package per run. The direct runner sets the libtest thread count, and the isolated runner uses one test per process. tmt does not load nextest configuration or Cargo target runners. Use the explicit selection and wrapper flags for suites with extra requirements.
+- Probe recording and probe mutants need the environment variables passed to the process under test. A subprocess that clears them can execute code without recording it. Use `--source-only` for those sites.
 - A module that two targets of the package both declare (`mod common;` in `lib.rs` and in `main.rs`) cannot be probed; its sites are counted as skipped.
 - Source files that start with a byte order mark or a `#!` line are not instrumented.
 - A macro that shadows a standard one is only recognised when it is defined at the top level of the same file.

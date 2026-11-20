@@ -509,6 +509,11 @@ fn mutant_at(site: u32) -> Option<Mutant> {
 /// libtest names each test thread after the test. Anything else is reported as `?`,
 /// which the driver treats as "any test of this binary".
 fn test_name() -> String {
+    if let Ok(name) = std::env::var("TMT_TEST") {
+        if !name.is_empty() && !name.contains(['\t', '\n', '\r']) {
+            return name;
+        }
+    }
     match std::thread::current().name() {
         Some(name) if name != "main" && !name.contains('\t') && !name.contains('\n') => {
             name.to_string()

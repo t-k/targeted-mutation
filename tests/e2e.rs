@@ -1853,3 +1853,183 @@ fn started_by_cargo_as_one_of_its_subcommands() {
         String::from_utf8_lossy(&help.stdout)
     );
 }
+
+#[test]
+fn a_child_without_probe_environment_can_be_tested_from_source() {
+    let dir = fixture("spawned", "env-clear");
+    let child_test = dir.join("tests/cli.rs");
+    fs::write(
+        dir.join("src/main.rs"),
+        r#"fn main() {
+    let n: u32 = std::env::args().nth(1).unwrap().parse().unwrap();
+    println!("{}", n <= 4);
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        child_test,
+        r#"#[test]
+fn cli_boundary() {
+    for (arg, want) in [("4", "true\n"), ("5", "false\n")] {
+        let result = std::process::Command::new(env!("CARGO_BIN_EXE_spawned"))
+            .env_clear()
+            .arg(arg)
+            .output()
+            .unwrap();
+        assert!(result.status.success());
+        assert_eq!(result.stdout, want.as_bytes());
+    }
+}
+"#,
+    )
+    .unwrap();
+    // A binary-only crate makes src/main.rs the mutation target.
+    fs::remove_file(dir.join("src/lib.rs")).unwrap();
+    fs::remove_file(dir.join("tests/exit.rs")).unwrap();
+    let args = ["--json", "--quiet", "--lines", "src/main.rs:3"];
+    let probe = tmt(&dir, &args);
+    assert_eq!(probe.code, 0, "{}", probe.stderr);
+    let report: Value = serde_json::from_str(&probe.stdout).unwrap();
+    assert_eq!(report["evaluation"], "no_mutants_executed", "{report:#}");
+    let rebuilt = tmt(&dir, &[args.as_slice(), &["--source-only"]].concat());
+    assert_ne!(rebuilt.code, 1, "{}", rebuilt.stderr);
+    let report: Value = serde_json::from_str(&rebuilt.stdout).unwrap();
+    assert!(
+        report["mutants_killed"].as_u64().unwrap() >= 1,
+        "{report:#}"
+    );
+    assert_eq!(report["analysis"]["source_only"], true);
+    assert_eq!(report["unreached"].as_array().unwrap().len(), 0);
+}
+
+#[cfg(unix)]
+#[test]
+fn selected_tests_run_in_their_own_process_and_use_a_wrapper() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = fixture("eligibility", "isolated");
+    fs::create_dir_all(dir.join("tests")).unwrap();
+    fs::write(
+        dir.join("tests/selected.rs"),
+        r#"#[test]
+fn selected() {
+    assert_eq!(std::env::var("WRAPPED").as_deref(), Ok("yes"));
+    let handle = std::thread::Builder::new().name("excluded".into())
+        .spawn(|| assert!(eligibility::is_eligible(20))).unwrap();
+    handle.join().unwrap();
+}
+#[test]
+fn excluded() {
+    panic!("this test must not run");
+}
+#[test]
+#[ignore]
+fn extra() {
+    assert!(!eligibility::is_eligible(17));
+}
+"#,
+    )
+    .unwrap();
+    let wrapper = dir.join("wrapper.sh");
+    fs::write(&wrapper, "#!/bin/sh\nexport WRAPPED=yes\nexec \"$@\"\n").unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let run = tmt(
+        &dir,
+        &[
+            "--json",
+            "--quiet",
+            "--test-target",
+            "selected",
+            "--exclude-test",
+            "excluded",
+            "--include-ignored",
+            "--test-wrapper",
+            "wrapper.sh",
+        ],
+    );
+    assert_ne!(run.code, 1, "{}", run.stderr);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    let selection = &report["analysis"]["test_selection"];
+    assert_eq!(selection["wrapper"], "wrapper.sh");
+    assert_eq!(
+        selection["tests"],
+        serde_json::json!([
+            "eligibility::selected::extra",
+            "eligibility::selected::selected"
+        ])
+    );
+    assert!(report["mutants_run"].as_u64().unwrap() > 0, "{report:#}");
+
+    let missing = tmt(&dir, &["--quiet", "--include-test", "missing"]);
+    assert_eq!(missing.code, 1);
+    assert!(
+        missing.stderr.contains("no tests matched"),
+        "{}",
+        missing.stderr
+    );
+}
+
+#[test]
+fn requested_git_index_and_ignored_fixtures_stay_in_the_copy() {
+    let dir = fixture("eligibility", "requested-copy");
+    fs::write(dir.join(".gitignore"), "target/\nnode_modules/\n").unwrap();
+    fs::write(dir.join("tracked-but-deleted"), "tracked").unwrap();
+    append(
+        &dir.join("src/lib.rs"),
+        r#"
+#[test]
+fn git_index_is_available() {
+    let output = std::process::Command::new("git")
+        .args(["ls-files", "--error-unmatch", "Cargo.toml", "tracked-but-deleted"])
+        .output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert_eq!(std::fs::read_to_string("node_modules/sdk/data.txt").unwrap(), "fixture");
+    assert!(!std::path::Path::new("node_modules/unrequested").exists());
+}
+"#,
+    );
+    git_output(&dir, &["init", "-q"]);
+    git_output(&dir, &["add", "-A"]);
+    fs::remove_file(dir.join("tracked-but-deleted")).unwrap();
+    fs::create_dir_all(dir.join("node_modules/sdk")).unwrap();
+    fs::write(dir.join("node_modules/sdk/data.txt"), "fixture").unwrap();
+    fs::write(dir.join("node_modules/unrequested"), "exclude me").unwrap();
+    let work = dir.with_file_name("requested-work");
+    let work_arg = work.to_str().unwrap();
+    let args = ["--json", "--quiet", "--work-dir", work_arg];
+    let good = tmt(
+        &dir,
+        &[
+            args.as_slice(),
+            &["--git-index", "--copy-fixture", "node_modules/sdk"],
+        ]
+        .concat(),
+    );
+    let _: Value = serde_json::from_str(&good.stdout)
+        .unwrap_or_else(|error| panic!("{error}: {}", good.stderr));
+    assert!(work.join("src/.git/index").is_file());
+    assert!(!work.join("src/node_modules/unrequested").exists());
+    let bad = tmt(&dir, &args);
+    assert_eq!(bad.code, 1, "{}", bad.stderr);
+    assert!(!work.join("src/.git").exists());
+    assert!(!work.join("src/node_modules").exists());
+    assert!(dir.join(".git/index").is_file());
+}
+
+#[test]
+fn progress_stays_on_stderr_and_respects_quiet() {
+    let dir = fixture("eligibility", "mutant-progress");
+    let run = tmt(&dir, &["--json", "--rebuild"]);
+    assert_ne!(run.code, 1, "{}", run.stderr);
+    let _: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert!(run.stderr.contains("mutants: ") && run.stderr.contains("completed ("));
+    assert!(
+        run.stderr.contains("failed")
+            && run.stderr.contains("timed out")
+            && run.stderr.contains("survived")
+    );
+    let quiet = tmt(&dir, &["--json", "--rebuild", "--quiet"]);
+    assert_eq!(quiet.stderr, "");
+    assert_eq!(quiet.stdout, run.stdout);
+}

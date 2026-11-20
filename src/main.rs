@@ -31,6 +31,12 @@ struct Cli {
     /// untracked files). By default they are left out of the working copy.
     #[arg(long)]
     all_files: bool,
+    /// Reproduce the source Git index in an independent repository in the work copy.
+    #[arg(long)]
+    git_index: bool,
+    /// Copy a workspace-relative file or directory even when Git ignores it (repeatable).
+    #[arg(long, value_name = "PATH")]
+    copy_fixture: Vec<PathBuf>,
     /// Mutants to run at the same time. Only raise it if the tests can run concurrently
     /// with themselves (no fixed ports, no shared files).
     #[arg(short, long, default_value_t = 1, value_name = "N")]
@@ -61,6 +67,27 @@ struct Cli {
     /// for each of them.
     #[arg(long)]
     rebuild: bool,
+    /// Build every supported mutant in the selected source instead of using probes.
+    #[arg(long, conflicts_with_all = ["rebuild", "audit", "no_verify"])]
+    source_only: bool,
+    /// Run one selected libtest test per process, including its child threads.
+    #[arg(long)]
+    isolate_tests: bool,
+    /// Run only these Cargo test artifact names (repeatable).
+    #[arg(long)]
+    test_target: Vec<String>,
+    /// Include these exact libtest names (repeatable).
+    #[arg(long)]
+    include_test: Vec<String>,
+    /// Exclude these exact libtest names (repeatable).
+    #[arg(long)]
+    exclude_test: Vec<String>,
+    /// Also allow tests marked #[ignore].
+    #[arg(long)]
+    include_ignored: bool,
+    /// Executable in the workspace copy to invoke with the test binary and its arguments.
+    #[arg(long, value_name = "PATH")]
+    test_wrapper: Option<PathBuf>,
     /// Build the tests at this optimisation level (0 to 3) instead of the profile's own.
     /// The probes cost next to nothing in optimised code, which pays off when tests
     /// spend their time in loops; the build takes longer, and the tests no longer run
@@ -112,6 +139,15 @@ fn main() -> ExitCode {
         dependents: cli.dependents,
         effects: !cli.no_effects,
         rebuild: cli.rebuild,
+        source_only: cli.source_only,
+        test_selection: driver::TestSelection {
+            isolate: cli.isolate_tests,
+            targets: cli.test_target,
+            include: cli.include_test,
+            exclude: cli.exclude_test,
+            include_ignored: cli.include_ignored,
+            wrapper: cli.test_wrapper,
+        },
         opt_level: cli.opt_level,
         audit: cli.audit,
         cargo: driver::CargoConfig {
@@ -122,6 +158,8 @@ fn main() -> ExitCode {
         },
         jobs: cli.jobs,
         all_files: cli.all_files,
+        git_index: cli.git_index,
+        copy_fixtures: cli.copy_fixture,
         doc: cli.doc,
     };
     match driver::run(&options) {

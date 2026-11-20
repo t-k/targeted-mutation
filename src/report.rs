@@ -2,6 +2,7 @@
 //! survives, and which input or assertion would catch it.
 
 use serde::Serialize;
+use std::path::PathBuf;
 
 use crate::instrument::{ArithOp, LiteralSide, Site, SiteKind};
 use crate::plan::{CmpOp, InputGap, LogicGap, Mutation, Obs};
@@ -128,6 +129,27 @@ pub struct Analysis {
     /// Predicted survivors were re-run.
     pub verified: bool,
     pub doc_tests: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub source_only: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test_selection: Option<TestSelection>,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub git_index: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub copy_fixtures: Vec<PathBuf>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct TestSelection {
+    pub wrapper: Option<String>,
+    pub tests: Vec<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Evaluation {
+    NoSites,
+    NoMutantsExecuted,
 }
 
 /// What a run that was asked to check itself found (`--audit`).
@@ -178,6 +200,8 @@ pub struct Report {
     /// Present when the run was asked to check itself.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audit: Option<Audit>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub evaluation: Option<Evaluation>,
     pub sites: usize,
     /// Sites that could not be instrumented (the probe did not compile there).
     pub skipped_sites: usize,
@@ -708,7 +732,7 @@ pub fn render_sarif(report: &Report) -> String {
                 ]
             } },
             // What was looked at: a run of a part says nothing about the rest.
-            "properties": { "analysis": report.analysis },
+            "properties": { "analysis": report.analysis, "evaluation": report.evaluation },
             "results": results
         }]
     });
@@ -949,6 +973,9 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
             "({} more mutants need a build of their own: --rebuild runs them)\n",
             report.mutants_not_built
         ));
+    }
+    if report.evaluation == Some(Evaluation::NoMutantsExecuted) {
+        out.push_str("No mutants executed. A subprocess that clears the environment cannot report probes; use --source-only on the affected lines if needed.\n");
     }
     if !show_unreached && !report.unreached.is_empty() {
         out.push_str("(--show-unreached lists the code no test executes)\n");
@@ -1702,6 +1729,7 @@ mod tests {
             package: "p".into(),
             analysis: Analysis::default(),
             audit: None,
+            evaluation: None,
             sites: 4,
             skipped_sites: 1,
             unviable_mutants: 2,

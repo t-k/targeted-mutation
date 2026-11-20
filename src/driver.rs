@@ -20,6 +20,7 @@ use crate::propagation::{self, Change};
 use crate::report::{self, Finding, Report};
 use crate::scope::{self, Scope};
 use crate::trace::Trace;
+use crate::{git_index, progress};
 
 pub struct Options {
     /// Directory of the package (or workspace) to analyse.
@@ -47,6 +48,8 @@ pub struct Options {
     pub effects: bool,
     /// Build and run, one by one, the mutants that cannot be switched at run time.
     pub rebuild: bool,
+    pub source_only: bool,
+    pub test_selection: TestSelection,
     /// Optimisation level to build the tests with, instead of the profile's own.
     pub opt_level: Option<u8>,
     /// Run this many surviving mutants against all tests and record the tests twice.
@@ -57,8 +60,31 @@ pub struct Options {
     pub jobs: usize,
     /// Copy every file of the workspace, including the ones git ignores.
     pub all_files: bool,
+    pub git_index: bool,
+    pub copy_fixtures: Vec<PathBuf>,
     /// Also run the doc tests (slow: rustdoc recompiles them for every mutant they reach).
     pub doc: bool,
+}
+
+#[derive(Default)]
+pub struct TestSelection {
+    pub isolate: bool,
+    pub targets: Vec<String>,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub include_ignored: bool,
+    pub wrapper: Option<PathBuf>,
+}
+
+impl TestSelection {
+    fn enabled(&self) -> bool {
+        self.isolate
+            || !self.targets.is_empty()
+            || !self.include.is_empty()
+            || !self.exclude.is_empty()
+            || self.include_ignored
+            || self.wrapper.is_some()
+    }
 }
 
 pub use crate::report::CargoConfig;
@@ -285,6 +311,12 @@ struct SourceFile {
 enum Runner {
     /// A libtest executable.
     Exe(PathBuf),
+    Isolated {
+        exe: PathBuf,
+        test: String,
+        ignored: bool,
+        wrapper: Option<PathBuf>,
+    },
     /// The package's doc tests, through `cargo test --doc` in the working copy. rustdoc
     /// compiles them on every run, and they cannot be selected by name.
     Doc {
@@ -302,6 +334,7 @@ struct TestBinary {
     cwd: PathBuf,
     /// Where the marks of its runs are made: a directory of this analysis alone.
     marks: PathBuf,
+    git_ceiling: PathBuf,
     /// The tests the binary contains, by the name libtest selects them with.
     tests: BTreeSet<String>,
     runner: Runner,
@@ -319,6 +352,22 @@ enum Outcome {
     Timeout,
     /// The run gave up: it could not go on as the mutant it was started with.
     Unable,
+}
+
+impl From<Outcome> for progress::Outcome {
+    fn from(outcome: Outcome) -> Self {
+        match outcome {
+            Outcome::Pass => Self::Survived,
+            Outcome::Fail => Self::Failed,
+            Outcome::Timeout => Self::TimedOut,
+            Outcome::Unable => Self::Unable,
+        }
+    }
+}
+
+fn isolate_copy_command(command: &mut Command, work: &Path) {
+    git_index::remove_git_overrides(command);
+    command.env("GIT_CEILING_DIRECTORIES", work);
 }
 
 /// Keeps two runs from rebuilding the same working copy under each other.
@@ -655,6 +704,64 @@ fn copy_tree(
     Ok(())
 }
 
+/// An explicitly selected fixture may include ignored directories. Resolve links to
+/// their contents inside the workspace, without following them into a parent cycle.
+fn copy_fixture_entry(
+    from: &Path,
+    to: &Path,
+    workspace: &Path,
+    forbidden: &dyn Fn(&Path) -> bool,
+    state: &WorkCopy,
+    visiting: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    let resolved = from
+        .canonicalize()
+        .with_context(|| format!("resolving fixture {}", from.display()))?;
+    let allowed = |path: &Path| {
+        path.starts_with(workspace)
+            && path != workspace
+            && !path
+                .ancestors()
+                .take_while(|part| *part != workspace)
+                .any(forbidden)
+    };
+    if !allowed(from) || !allowed(&resolved) {
+        bail!(
+            "fixture {} resolves to an excluded path: {}",
+            from.display(),
+            resolved.display()
+        );
+    }
+    let kind = fs::metadata(&resolved)?.file_type();
+    real_dir(to.parent().expect("fixture has a parent"), state)?;
+    if kind.is_file() {
+        return sync_file(&resolved, to, state);
+    }
+    if !kind.is_dir() || !visiting.insert(resolved.clone()) {
+        bail!(
+            "fixture {} is a cycle or is not a regular file or directory",
+            from.display()
+        );
+    }
+    real_dir(to, state)?;
+    for entry in fs::read_dir(&resolved)? {
+        let entry = entry?;
+        let path = entry.path();
+        if !forbidden(&path) {
+            copy_fixture_entry(
+                &path,
+                &to.join(entry.file_name()),
+                workspace,
+                forbidden,
+                state,
+                visiting,
+            )?;
+        }
+    }
+    visiting.remove(&resolved);
+    Ok(())
+}
+
 fn rust_files(dir: &Path, skip: &dyn Fn(&Path) -> bool, out: &mut Vec<PathBuf>) -> Result<()> {
     let mut entries: Vec<PathBuf> = fs::read_dir(dir)?
         .map(|e| e.map(|e| e.path()))
@@ -887,6 +994,28 @@ fn parse_test_list(stdout: &str) -> BTreeSet<String> {
 }
 
 /// What makes cargo build the tests (and what they depend on) at an optimisation level.
+fn list_tests(exe: &Path, cwd: &Path, work: &Path, ignored: bool) -> Result<BTreeSet<String>> {
+    let mut command = Command::new(exe);
+    isolate_copy_command(&mut command, work);
+    command.args(["--list", "--format", "terse"]);
+    if ignored {
+        command.arg("--ignored");
+    }
+    let listing = command
+        .current_dir(cwd)
+        .stdin(Stdio::null())
+        .output()
+        .with_context(|| format!("listing tests of {}", exe.display()))?;
+    if !listing.status.success() {
+        bail!(
+            "listing tests of {} failed: {}",
+            exe.display(),
+            String::from_utf8_lossy(&listing.stderr)
+        );
+    }
+    Ok(parse_test_list(&String::from_utf8_lossy(&listing.stdout)))
+}
+
 /// Overflow checks and debug assertions stay as the profile has them.
 fn profile_env(opt_level: Option<u8>) -> Vec<(&'static str, String)> {
     opt_level.map_or(vec![], |level| {
@@ -947,6 +1076,27 @@ fn run_binary(
                 .env("CARGO_MANIFEST_DIR", &bin.cwd);
             cmd
         }
+        Runner::Isolated {
+            exe,
+            test,
+            ignored,
+            wrapper,
+        } => {
+            let mut cmd = if let Some(wrapper) = wrapper {
+                let mut cmd = Command::new(wrapper);
+                cmd.arg(exe);
+                cmd
+            } else {
+                Command::new(exe)
+            };
+            cmd.args(["--exact", "--test-threads=1", test]);
+            if *ignored {
+                cmd.arg("--ignored");
+            }
+            cmd.current_dir(&bin.cwd)
+                .env("CARGO_MANIFEST_DIR", &bin.cwd);
+            cmd
+        }
         Runner::Doc {
             copy,
             target_dir,
@@ -964,19 +1114,24 @@ fn run_binary(
             cmd
         }
     };
+    isolate_copy_command(&mut cmd, &bin.git_ceiling);
     cmd.env_remove("TMT_TRACE")
         .env_remove("TMT_MUTANT")
+        .env_remove("TMT_TEST")
         .env("TMT_UNABLE", &unable_mark)
         .envs(env.iter().copied())
         .stdin(Stdio::null());
+    if let Runner::Isolated { test, .. } = &bin.runner {
+        cmd.env("TMT_TEST", test);
+    }
     match output {
         RunOutput::Capture(file) => {
             cmd.stdout(file.try_clone()?).stderr(file.try_clone()?);
         }
-        RunOutput::FirstFailure => {
+        RunOutput::FirstFailure if !matches!(bin.runner, Runner::Isolated { .. }) => {
             cmd.stdout(Stdio::piped()).stderr(Stdio::null());
         }
-        RunOutput::Quiet => {
+        RunOutput::Quiet | RunOutput::FirstFailure => {
             cmd.stdout(Stdio::null()).stderr(Stdio::null());
         }
     }
@@ -1321,6 +1476,20 @@ struct JobResult {
     timed_out: bool,
     /// The mutant could not be run as what it is: neither found out nor passed.
     unable: bool,
+}
+
+impl JobResult {
+    fn progress_outcome(&self) -> progress::Outcome {
+        if self.unable {
+            progress::Outcome::Unable
+        } else if self.timed_out {
+            progress::Outcome::TimedOut
+        } else if self.survived.is_some() {
+            progress::Outcome::Survived
+        } else {
+            progress::Outcome::Failed
+        }
+    }
 }
 
 /// The tests of one binary whose observations satisfy `pick`.
@@ -1718,7 +1887,7 @@ impl Session {
                 }
                 let filter = match bin.runner {
                     Runner::Exe(_) => test_filter(&tests, &bin.tests),
-                    Runner::Doc { .. } => None,
+                    Runner::Doc { .. } | Runner::Isolated { .. } => None,
                 };
                 Some((index, filter))
             })
@@ -1757,6 +1926,9 @@ impl Session {
             }
             match filter {
                 Some(names) => passed.extend(names.iter().cloned()),
+                None if matches!(bin.runner, Runner::Isolated { .. }) => {
+                    passed.push(bin.name.clone())
+                }
                 None => passed.push(format!("all tests of `{}`", bin.name)),
             }
         }
@@ -1811,19 +1983,26 @@ impl Session {
     /// Runs the mutants, `workers` at a time. A mutant that ran out of time while others
     /// were running may only have been slowed down by them: it gets a second run on its
     /// own, and that one counts.
-    fn run_jobs(&self, jobs: &[Job], workers: usize) -> Result<Vec<JobResult>> {
+    fn run_jobs(&self, jobs: &[Job], workers: usize, label: &str) -> Result<Vec<JobResult>> {
         let sharing = workers.clamp(1, jobs.len().max(1));
-        let mut results = run_pool(jobs.len(), workers, |index| {
-            self.run_job(&jobs[index], sharing)
-        })?;
-        if sharing > 1 {
-            for (job, result) in jobs.iter().zip(&mut results) {
-                if result.timed_out {
-                    *result = self.run_job(job, 1)?;
+        progress::track(self.progress, label, jobs.len(), |progress| {
+            let mut results = run_pool(jobs.len(), workers, |index| {
+                let result = self.run_job(&jobs[index], sharing)?;
+                if !(sharing > 1 && result.timed_out) {
+                    progress.complete(result.progress_outcome());
+                }
+                Ok(result)
+            })?;
+            if sharing > 1 {
+                for (job, result) in jobs.iter().zip(&mut results) {
+                    if result.timed_out {
+                        *result = self.run_job(job, 1)?;
+                        progress.complete(result.progress_outcome());
+                    }
                 }
             }
-        }
-        Ok(results)
+            Ok(results)
+        })
     }
 }
 
@@ -1867,6 +2046,10 @@ fn run_pool<T: Send>(
 }
 
 pub fn run(options: &Options) -> Result<Report> {
+    let selection = &options.test_selection;
+    if options.doc && selection.enabled() {
+        bail!("--doc cannot be combined with isolated test selection");
+    }
     let note = |text: &str| {
         if options.progress {
             eprintln!("tmt: {text}");
@@ -1968,17 +2151,17 @@ pub fn run(options: &Options) -> Result<Report> {
     )?;
     let _lock = WorkLock::take(&work)?;
     let target_dir = metadata.target_directory.clone();
-    let skip = |path: &Path| {
+    let forbidden = |path: &Path| {
         path == target_dir
             || path == work
-            || path
-                .file_name()
-                .is_some_and(|n| n == ".git" || n == "node_modules")
+            || path.file_name().is_some_and(|n| n == ".git")
             || (path.parent() == Some(workspace.as_path())
                 && path.file_name().is_some_and(|n| n == "target"))
     };
+    let skip =
+        |path: &Path| forbidden(path) || path.file_name().is_some_and(|n| n == "node_modules");
     let state = WorkCopy::open(&work, &copy);
-    fs::create_dir_all(&copy)?;
+    work_directory(&work, "src")?;
     let visible = if options.all_files {
         None
     } else {
@@ -1995,7 +2178,35 @@ pub fn run(options: &Options) -> Result<Report> {
         }
         None => copy_tree(&workspace, &copy, &workspace, &skip, &state)?,
     }
+    for relative in &options.copy_fixtures {
+        use std::path::Component;
+        let relative = relative
+            .components()
+            .filter(|c| *c != Component::CurDir)
+            .collect::<PathBuf>();
+        if relative.as_os_str().is_empty()
+            || relative
+                .components()
+                .any(|c| !matches!(c, Component::Normal(_)))
+        {
+            bail!(
+                "--copy-fixture must name a file or directory inside the workspace: {}",
+                relative.display()
+            );
+        }
+        copy_fixture_entry(
+            &workspace.join(&relative),
+            &copy.join(&relative),
+            &workspace,
+            &forbidden,
+            &state,
+            &mut BTreeSet::new(),
+        )?;
+    }
     prune(&copy, &state)?;
+    if options.git_index {
+        git_index::snapshot(&workspace, &copy)?;
+    }
     // Relative path dependencies that leave the workspace would point nowhere from the copy.
     let mut manifests: Vec<&Path> = metadata
         .packages
@@ -2131,26 +2342,37 @@ pub fn run(options: &Options) -> Result<Report> {
         .map(|f| f.sites.len() + f.rebuild_sites.len())
         .sum();
     note(&format!("{} sites in {} files", total_sites, files.len()));
+    if options.source_only {
+        for file in &mut files {
+            file.rebuild_sites.append(&mut file.sites);
+        }
+    }
 
     let root_source = state
         .original(&root_file, &workspace)?
         .with_context(|| format!("{} is missing", root_target.src_path.display()))?;
-    state.write(
-        &source_dir.join(format!("{RUNTIME_MOD}.rs")),
-        crate::RUNTIME_SOURCE,
-    )?;
-    let std_alias = format!("extern crate std as {STD_ALIAS};");
-    let root_suffix = if root_source.contains(&std_alias) {
-        format!("\n#[doc(hidden)]\nmod {RUNTIME_MOD};\n")
+    let root_suffix = if options.source_only {
+        String::new()
     } else {
-        format!("\n#[doc(hidden)]\n{std_alias}\n#[doc(hidden)]\nmod {RUNTIME_MOD};\n")
+        state.write(
+            &source_dir.join(format!("{RUNTIME_MOD}.rs")),
+            crate::RUNTIME_SOURCE,
+        )?;
+        let std_alias = format!("extern crate std as {STD_ALIAS};");
+        if root_source.contains(&std_alias) {
+            format!("\n#[doc(hidden)]\nmod {RUNTIME_MOD};\n")
+        } else {
+            format!("\n#[doc(hidden)]\n{std_alias}\n#[doc(hidden)]\nmod {RUNTIME_MOD};\n")
+        }
     };
 
     // 4. Build, disabling the sites whose probe does not compile (formal/tla/RepairLoop.tla).
     let mut disabled: HashSet<u32> = HashSet::new();
     let build_target = work_directory(&work, "target")?;
     let cargo_build = || {
-        Command::new("cargo")
+        let mut command = Command::new("cargo");
+        isolate_copy_command(&mut command, &work);
+        command
             .args(["test", "--no-run", "--message-format=json"])
             .args(test_packages.iter().flat_map(|p| ["-p", p.name.as_str()]))
             .args(options.cargo.flags())
@@ -2234,8 +2456,35 @@ pub fn run(options: &Options) -> Result<Report> {
         package_dir,
         binaries: vec![],
     };
+    let wrapper = selection
+        .wrapper
+        .as_ref()
+        .map(|path| {
+            if path.is_absolute()
+                || path
+                    .components()
+                    .any(|c| matches!(c, std::path::Component::ParentDir))
+            {
+                bail!(
+                    "--test-wrapper must be a path inside the workspace: {}",
+                    path.display()
+                );
+            }
+            let copied = copy.join(path);
+            if !copied.is_file() {
+                bail!(
+                    "test wrapper is missing from the work copy: {}",
+                    copied.display()
+                );
+            }
+            Ok(copied)
+        })
+        .transpose()?;
     let mut runners: Vec<(String, Runner, PathBuf)> = vec![];
     for (name, exe, owner) in build.test_binaries {
+        if !selection.targets.is_empty() && !selection.targets.contains(&name) {
+            continue;
+        }
         let owner_package = test_packages
             .iter()
             .find(|p| p.name == owner)
@@ -2246,6 +2495,30 @@ pub fn run(options: &Options) -> Result<Report> {
                 .parent()
                 .expect("manifest has a parent"),
         )?;
+        if selection.enabled() {
+            let all = list_tests(&exe, &cwd, &work, false)?;
+            let ignored = list_tests(&exe, &cwd, &work, true)?;
+            for test in all {
+                let was_ignored = ignored.contains(&test);
+                if (was_ignored && !selection.include_ignored)
+                    || (!selection.include.is_empty() && !selection.include.contains(&test))
+                    || selection.exclude.contains(&test)
+                {
+                    continue;
+                }
+                runners.push((
+                    format!("{owner}::{name}::{test}"),
+                    Runner::Isolated {
+                        exe: exe.clone(),
+                        test,
+                        ignored: was_ignored,
+                        wrapper: wrapper.clone(),
+                    },
+                    cwd.clone(),
+                ));
+            }
+            continue;
+        }
         // Tests of other packages are named after their package.
         let name = if owner == package.name {
             name
@@ -2254,6 +2527,16 @@ pub fn run(options: &Options) -> Result<Report> {
         };
         runners.push((name, Runner::Exe(exe), cwd));
     }
+    if selection.enabled() && runners.is_empty() {
+        bail!("no tests matched the requested selection");
+    }
+    let selected_tests = selection.enabled().then(|| report::TestSelection {
+        wrapper: selection
+            .wrapper
+            .as_ref()
+            .map(|path| path.display().to_string()),
+        tests: runners.iter().map(|(name, _, _)| name.clone()).collect(),
+    });
     if options.doc && is_kind(root_target, &["lib", "rlib", "proc-macro"]) {
         let doc = Runner::Doc {
             copy: copy.clone(),
@@ -2276,6 +2559,7 @@ pub fn run(options: &Options) -> Result<Report> {
             name,
             cwd,
             marks: marks.clone(),
+            git_ceiling: work.clone(),
             tests: BTreeSet::new(),
             runner,
             baseline: Duration::ZERO,
@@ -2285,9 +2569,10 @@ pub fn run(options: &Options) -> Result<Report> {
         session.note(&format!("tracing `{}`", bin.name));
         let started = Instant::now();
         let trace_env = trace_path.to_string_lossy().into_owned();
+        let trace = [("TMT_TRACE", trace_env.as_str())];
         run_baseline(
             &bin,
-            &[("TMT_TRACE", &trace_env)],
+            if options.source_only { &[] } else { &trace },
             Duration::from_secs(3600),
             &work.join(format!("baseline-{index}.log")),
         )?;
@@ -2295,7 +2580,7 @@ pub fn run(options: &Options) -> Result<Report> {
         bin.baseline = bin.traced;
         // Recording slows code in loops down a lot, and the time limit of every mutant
         // is a multiple of this: where it matters, time the tests as the mutants run them.
-        if bin.traced > SLOW_TRACE {
+        if !options.source_only && bin.traced > SLOW_TRACE {
             let started = Instant::now();
             run_baseline(
                 &bin,
@@ -2322,14 +2607,7 @@ pub fn run(options: &Options) -> Result<Report> {
             );
         }
         if let Runner::Exe(exe) = &bin.runner {
-            let listing = Command::new(exe)
-                .args(["--list", "--format", "terse"])
-                .current_dir(&bin.cwd)
-                .stdin(Stdio::null())
-                .stderr(Stdio::null())
-                .output()
-                .with_context(|| format!("listing the tests of `{}`", bin.name))?;
-            bin.tests = parse_test_list(&String::from_utf8_lossy(&listing.stdout));
+            bin.tests = list_tests(exe, &bin.cwd, &work, false)?;
         }
         session.binaries.push(bin);
     }
@@ -2347,9 +2625,13 @@ pub fn run(options: &Options) -> Result<Report> {
             tests_of: test_packages.iter().map(|p| p.name.clone()).collect(),
             cargo: options.cargo.clone(),
             opt_level: options.opt_level,
-            rebuild: options.rebuild,
-            verified: options.verify,
+            rebuild: options.rebuild || options.source_only,
+            verified: options.verify && !options.source_only,
             doc_tests: options.doc,
+            source_only: options.source_only,
+            test_selection: selected_tests,
+            git_index: options.git_index,
+            copy_fixtures: options.copy_fixtures.clone(),
         },
         ..Report::default()
     };
@@ -2438,7 +2720,7 @@ pub fn run(options: &Options) -> Result<Report> {
         jobs.len(),
         options.jobs.max(1)
     ));
-    let mut results = session.run_jobs(&jobs, options.jobs)?;
+    let mut results = session.run_jobs(&jobs, options.jobs, "mutants")?;
 
     // 6b. On request, check what the run rests on: that the tests chosen for a mutant
     // are the ones that could fail with it, and that the tests do the same twice.
@@ -2468,9 +2750,10 @@ pub fn run(options: &Options) -> Result<Report> {
             survivors: survivors.len(),
             ..report::Audit::default()
         };
-        for (job, again) in chosen
-            .iter()
-            .zip(session.run_jobs(&against_all, options.jobs)?)
+        for (job, again) in
+            chosen
+                .iter()
+                .zip(session.run_jobs(&against_all, options.jobs, "audit mutants")?)
         {
             if again.survived.is_none() {
                 // The verdict of all tests is the one that counts.
@@ -2647,7 +2930,7 @@ pub fn run(options: &Options) -> Result<Report> {
             );
         }
     }
-    if !options.rebuild {
+    if !options.rebuild && !options.source_only {
         report.mutants_not_built = built.len();
         built.clear();
     }
@@ -2716,80 +2999,89 @@ pub fn run(options: &Options) -> Result<Report> {
         let mut by_speed: Vec<&TestBinary> = session.binaries.iter().collect();
         by_speed.sort_by_key(|bin| bin.baseline);
         let mut survivors: Vec<(report::Location, Vec<String>)> = vec![];
-        for (file, site, mutant, twin) in &built {
-            let mutated = format!(
-                "{}{}{}",
-                &file.original[..mutant.start],
-                mutant.replacement,
-                &file.original[mutant.end..]
-            );
-            // `None`: it does not build. Otherwise what stopped it, if anything did.
-            let attempt = || -> Result<Option<Outcome>> {
-                state.write(&file.path, &instrumented(file, &mutated))?;
-                if !cargo_build()?.status.success() {
-                    return Ok(None);
-                }
-                for bin in &by_speed {
-                    let outcome = run_binary(
-                        bin,
-                        None,
-                        &[],
-                        mutant_timeout(bin.baseline),
-                        RunOutput::FirstFailure,
-                        1,
-                    )?;
-                    if outcome != Outcome::Pass {
-                        return Ok(Some(outcome));
+        progress::track(
+            options.progress,
+            "source mutants",
+            built.len(),
+            |progress| -> Result<()> {
+                for (file, site, mutant, twin) in &built {
+                    let mutated = format!(
+                        "{}{}{}",
+                        &file.original[..mutant.start],
+                        mutant.replacement,
+                        &file.original[mutant.end..]
+                    );
+                    // `None`: it does not build. Otherwise what stopped it, if anything did.
+                    let attempt = || -> Result<Option<Outcome>> {
+                        state.write(&file.path, &instrumented(file, &mutated))?;
+                        if !cargo_build()?.status.success() {
+                            return Ok(None);
+                        }
+                        for bin in &by_speed {
+                            let outcome = run_binary(
+                                bin,
+                                None,
+                                &[],
+                                mutant_timeout(bin.baseline),
+                                RunOutput::FirstFailure,
+                                1,
+                            )?;
+                            if outcome != Outcome::Pass {
+                                return Ok(Some(outcome));
+                            }
+                        }
+                        Ok(Some(Outcome::Pass))
+                    };
+                    let attempted = attempt();
+                    // The file as it was, before another one is changed and whatever went wrong.
+                    let rendered = file.rendered.as_ref().expect("rendered before building");
+                    state.write(&file.path, &instrumented(file, &rendered.text))?;
+                    let outcome = attempted?;
+                    progress.complete(outcome.map_or(progress::Outcome::Unable, Into::into));
+                    if let Some(job) = twin {
+                        // Only compared: the probe's run is the one that is counted and reported.
+                        let as_probe = results[*job].survived.is_some();
+                        let Some(audit) = report.audit.as_mut() else {
+                            continue;
+                        };
+                        // What does not build, and what the probe could not be, says nothing.
+                        let comparable = outcome.filter(|_| !results[*job].unable);
+                        match comparable {
+                            Some(_) => audit.compared += 1,
+                            None => audit.not_compared += 1,
+                        }
+                        if comparable.is_some_and(|built| (built == Outcome::Pass) != as_probe) {
+                            let verdict = |passes: bool| if passes { "passes" } else { "fails" };
+                            audit.source_disagreements.push(report::SourceDisagreement {
+                                at: report::location(&file.display, site),
+                                mutant: report::describe(site, mutation_of(site, mutant)),
+                                as_probe: verdict(as_probe).to_string(),
+                                built: verdict(!as_probe).to_string(),
+                            });
+                        }
+                        continue;
+                    }
+                    match outcome {
+                        None => report.unviable_mutants += 1,
+                        Some(outcome) => {
+                            report.mutants_run += 1;
+                            report.mutants_killed += (outcome != Outcome::Pass) as usize;
+                            report.mutants_timed_out += (outcome == Outcome::Timeout) as usize;
+                        }
+                    }
+                    let survived = outcome == Some(Outcome::Pass);
+                    if survived {
+                        let at = report::location(&file.display, site);
+                        let text = report::describe(site, mutation_of(site, mutant));
+                        match survivors.last_mut() {
+                            Some((last, texts)) if *last == at => texts.push(text),
+                            _ => survivors.push((at, vec![text])),
+                        }
                     }
                 }
-                Ok(Some(Outcome::Pass))
-            };
-            let attempted = attempt();
-            // The file as it was, before another one is changed and whatever went wrong.
-            let rendered = file.rendered.as_ref().expect("rendered before building");
-            state.write(&file.path, &instrumented(file, &rendered.text))?;
-            let outcome = attempted?;
-            if let Some(job) = twin {
-                // Only compared: the probe's run is the one that is counted and reported.
-                let as_probe = results[*job].survived.is_some();
-                let Some(audit) = report.audit.as_mut() else {
-                    continue;
-                };
-                // What does not build, and what the probe could not be, says nothing.
-                let comparable = outcome.filter(|_| !results[*job].unable);
-                match comparable {
-                    Some(_) => audit.compared += 1,
-                    None => audit.not_compared += 1,
-                }
-                if comparable.is_some_and(|built| (built == Outcome::Pass) != as_probe) {
-                    let verdict = |passes: bool| if passes { "passes" } else { "fails" };
-                    audit.source_disagreements.push(report::SourceDisagreement {
-                        at: report::location(&file.display, site),
-                        mutant: report::describe(site, mutation_of(site, mutant)),
-                        as_probe: verdict(as_probe).to_string(),
-                        built: verdict(!as_probe).to_string(),
-                    });
-                }
-                continue;
-            }
-            match outcome {
-                None => report.unviable_mutants += 1,
-                Some(outcome) => {
-                    report.mutants_run += 1;
-                    report.mutants_killed += (outcome != Outcome::Pass) as usize;
-                    report.mutants_timed_out += (outcome == Outcome::Timeout) as usize;
-                }
-            }
-            let survived = outcome == Some(Outcome::Pass);
-            if survived {
-                let at = report::location(&file.display, site);
-                let text = report::describe(site, mutation_of(site, mutant));
-                match survivors.last_mut() {
-                    Some((last, texts)) if *last == at => texts.push(text),
-                    _ => survivors.push((at, vec![text])),
-                }
-            }
-        }
+                Ok(())
+            },
+        )?;
         report.findings.extend(
             survivors
                 .into_iter()
@@ -2797,6 +3089,11 @@ pub fn run(options: &Options) -> Result<Report> {
         );
     }
 
+    report.evaluation = match (report.sites, report.mutants_run) {
+        (0, _) => Some(report::Evaluation::NoSites),
+        (_, 0) => Some(report::Evaluation::NoMutantsExecuted),
+        _ => None,
+    };
     report.sort_findings();
     let places: Vec<FilePlaces> = files
         .iter()

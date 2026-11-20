@@ -2,8 +2,10 @@
 
 pub mod baseline;
 pub mod driver;
+mod git_index;
 pub mod instrument;
 pub mod plan;
+mod progress;
 pub mod propagation;
 pub mod report;
 pub mod scope;
