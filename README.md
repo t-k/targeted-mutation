@@ -1,5 +1,7 @@
 # targeted-mutation
 
+[![Crates.io version](https://img.shields.io/crates/v/targeted-mutation.svg)](https://crates.io/crates/targeted-mutation)
+
 **Targeted mutation testing** generates the realistic wrong implementations that your existing tests would let through, and tells you which input or assertion would catch them.
 
 Classic mutation testing changes `<` to `<=` and then asks whether a test fails. This tool works the other way round: it first watches what the tests actually feed the code, and from that computes the mutants that are guaranteed to pass, without running them. It needs no AI and no solver.
