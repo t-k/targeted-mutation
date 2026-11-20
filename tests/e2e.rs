@@ -1312,11 +1312,15 @@ fn the_mutants_of_cargo_mutants() {
     // An iterator of another type cannot be returned beside the body's own, so the
     // three replacements of `evens` are built one by one. Unless asked for they are
     // left out, and the report says how many there are.
+    // The range `evens` filters is not run through by a `for`: with its end taken in
+    // it is another type, and that mutant is built as well. It passes: no test asks
+    // for the limit itself.
+    assert_eq!(survivors("0..limit", "survivor").len(), 1, "{report:#}");
     let (_, quick) = json(&dir);
-    assert_eq!(quick["mutants_not_built"], 4, "{quick:#}");
+    assert_eq!(quick["mutants_not_built"], 5, "{quick:#}");
     assert_eq!(
         report["mutants_run"].as_u64().unwrap(),
-        quick["mutants_run"].as_u64().unwrap() + 4,
+        quick["mutants_run"].as_u64().unwrap() + 5,
         "{quick:#}"
     );
     assert_eq!(
@@ -1327,7 +1331,7 @@ fn the_mutants_of_cargo_mutants() {
     // Left out, the site with the probe that did not compile is a skipped one.
     assert_eq!(quick["skipped_sites"], 1, "{quick:#}");
     assert_eq!(
-        quick["findings"].as_array().unwrap().len() + 1,
+        quick["findings"].as_array().unwrap().len() + 2,
         all.len(),
         "{quick:#}"
     );
@@ -1579,6 +1583,25 @@ fn mutants_are_run_as_what_they_are() {
     assert_eq!(report["skipped_sites"], 0, "{report:#}");
     let text = tmt(&dir, &["--quiet"]).stdout;
     assert!(text.contains("(2 mutants not evaluated: a range"), "{text}");
+
+    // A range that is looked at instead of run through (`takes_its_end_in` asks for its
+    // `end_bound`) is no probe at all: `0..end + 1` would hold the numbers of `0..=end`
+    // and still not be it. It waits for a build with the two that were not evaluated.
+    assert_eq!(report["mutants_not_built"], 3, "{report:#}");
+    assert!(survivors("0u8..end").is_empty(), "{report:#}");
+    // Built from the source, all three are what they say, and each fails its test.
+    let run = tmt(&dir, &["--json", "--quiet", "--rebuild"]);
+    let built: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(built["mutants_not_evaluated"], 0, "{built:#}");
+    assert_eq!(built["mutants_not_built"], 0, "{built:#}");
+    for count in ["mutants_run", "mutants_killed"] {
+        assert_eq!(
+            built[count].as_u64().unwrap(),
+            report[count].as_u64().unwrap() + 3,
+            "{count}: {built:#}"
+        );
+    }
+    assert_eq!(built["findings"], report["findings"], "{built:#}");
 }
 
 #[test]

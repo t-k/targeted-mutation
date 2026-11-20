@@ -342,6 +342,7 @@ pub fn discover(source: &str, first_id: u32) -> Result<Discovery> {
         found: Discovery::default(),
         local_macros,
         const_depth: 0,
+        for_ranges: std::collections::HashSet::new(),
     };
     finder.visit_file(&file);
     Ok(finder.found)
@@ -355,6 +356,8 @@ struct Finder<'s> {
     found: Discovery,
     /// How many `const fn` the visitor is inside of.
     const_depth: usize,
+    /// Where the ranges start that a `for` runs through directly.
+    for_ranges: std::collections::HashSet<usize>,
 }
 
 impl Finder<'_> {
@@ -1450,6 +1453,23 @@ impl<'ast> Visit<'ast> for Finder<'_> {
         visit::visit_expr_method_call(self, node);
     }
 
+    fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
+        let mut over = &*node.expr;
+        while let syn::Expr::Paren(syn::ExprParen { expr, .. })
+        | syn::Expr::Group(syn::ExprGroup { expr, .. }) = over
+        {
+            over = expr;
+        }
+        if let syn::Expr::Range(syn::ExprRange {
+            start: Some(from), ..
+        }) = over
+            && let Some((start, _)) = self.range(from.span())
+        {
+            self.for_ranges.insert(start);
+        }
+        visit::visit_expr_for_loop(self, node);
+    }
+
     fn visit_expr_range(&mut self, node: &'ast syn::ExprRange) {
         // With two literals nothing fixes the integer type before the probe is resolved,
         // and it would be taken for `i32` (`for i in 0..16 { words[i] }`).
@@ -1466,7 +1486,14 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                 rhs: self.source[rhs_start..end].to_string(),
                 gap: (lhs_end, rhs_start),
             };
+            // `a..b + 1` in place of `a..=b` gives a `for` the same numbers, and that is
+            // all a `for` takes from its range. Anywhere else the two are told apart (by
+            // their type, by `end_bound`, by a field): there the mutant is the range as it
+            // is written in the source, and it is built like the code of a `const fn`.
+            let built = !self.for_ranges.contains(&start);
+            self.const_depth += built as usize;
             self.push(kind, start, end, from.span());
+            self.const_depth -= built as usize;
         }
         visit::visit_expr_range(self, node);
     }
@@ -2781,7 +2808,7 @@ mod tests {
                     }
                 }
                 let _ = &v[1..=2];
-                let _ = &v[1..=limit as usize];
+                for _ in 1..=limit as usize {}
                 let _ = 'a'..'z';
                 let _ = v.iter().max();
                 None
@@ -3045,8 +3072,8 @@ mod tests {
             ["minmax a.max(b)"]
         );
         // One literal end is enough to fix the type; the ends are searched for sites.
-        let src = "fn f(a: usize, b: usize, v: &[u8]) { let _ = &v[a..10]; let _ = &v[1..b]; \
-                   let _ = (a + 1)..(b * 2); let _ = 3..4; let _ = (5)..(-6); }";
+        let src = "fn f(a: usize, b: usize, v: &[u8]) { for _ in a..10 {} for _ in 1..b {} \
+                   for _ in (a + 1)..(b * 2) {} for _ in 3..4 {} for _ in (5)..(-6) {} }";
         assert_eq!(
             labelled(src),
             [
@@ -3061,7 +3088,7 @@ mod tests {
         );
         let out = render(src, &discover(src, 0).unwrap().sites, &all).text;
         // The `..` itself is gone: the ends are the two arguments of the probe.
-        assert!(out.contains("&v[(match (a, 10) {"), "{out}");
+        assert!(out.contains("for _ in (match (a, 10) {"), "{out}");
         assert!(!out.contains("a..10") && !out.contains("1..b"), "{out}");
         assert!(out.contains("3..4") && out.contains("(5)..((if "), "{out}");
     }
@@ -3115,7 +3142,7 @@ mod tests {
 
         // The probe of `b + 1` opens right after the replaced `..`: an error there is
         // inside `b + 1`, not in front of the `..`.
-        let src = "fn f(a: usize, b: usize) { let _ = a..b + 1; }";
+        let src = "fn f(a: usize, b: usize) { for _ in a..b + 1 {} }";
         let sites = discover(src, 0).unwrap().sites;
         let out = render(src, &sites, &all);
         let inner_probe = out.text.find("(match (a, ").unwrap() + "(match (a, ".len();
@@ -3584,6 +3611,8 @@ mod tests {
                 (3, 1, "fn evens(n: u8) -> impl Iterator<Item = u8> + '_"),
                 (3, 1, "fn evens(n: u8) -> impl Iterator<Item = u8> + '_"),
                 (3, 1, "fn evens(n: u8) -> impl Iterator<Item = u8> + '_"),
+                // A range that is not run through by a `for`.
+                (3, 53, "0..n"),
                 (4, 10, "const fn k(&self) -> u8"),
                 (4, 10, "const fn k(&self) -> u8"),
                 (4, 36, "-self.0"),
@@ -3603,7 +3632,6 @@ mod tests {
                 "*m.entry(k).or_insert(0) += 1;",
                 "m.total -= 1;",
                 "m.total -= 1",
-                "0..n"
             ]
         );
         assert_eq!(
@@ -3638,6 +3666,7 @@ mod tests {
                 "fn evens(n: u8) -> impl Iterator<Item = u8> + '_: body -> ::core::iter::empty()",
                 "fn evens(n: u8) -> impl Iterator<Item = u8> + '_: body -> ::core::iter::once(0)",
                 "fn evens(n: u8) -> impl Iterator<Item = u8> + '_: body -> ::core::iter::once(1)",
+                "0..n: .. -> ..=",
                 "const fn k(&self) -> u8: body -> 0",
                 "const fn k(&self) -> u8: body -> 1",
                 "-self.0: - -> ",
@@ -3878,6 +3907,30 @@ mod tests {
         assert_eq!(offset_of(text, 2, 99), Some(text.len()));
         assert_eq!(offset_of(text, 0, 1), None);
         assert_eq!(offset_of(text, 1, 0), None);
+    }
+
+    #[test]
+    fn only_the_range_of_a_for_is_probed() {
+        let src = "fn f(a: u8, b: u8, v: &[u8]) -> usize {\n\
+                   for _ in a..b {}\n\
+                   for _ in (a..=b) {}\n\
+                   for _ in (a..b).rev() {}\n\
+                   let kept = a..b;\n\
+                   let _ = &v[a as usize..b as usize];\n\
+                   for _ in kept.clone() {}\n\
+                   (a..=b).count() }";
+        let all = discover(src, 0).unwrap();
+        let ranges = |sites: &[Site]| -> Vec<usize> {
+            sites
+                .iter()
+                .filter(|site| matches!(site.kind, SiteKind::Range { .. }))
+                .map(|site| site.line)
+                .collect()
+        };
+        // Run through directly by a `for`, with or without parentheses.
+        assert_eq!(ranges(&all.sites), [2, 3]);
+        // Kept, indexed with, or given to a method: built, as the source says them.
+        assert_eq!(ranges(&all.rebuild_sites), [4, 5, 6, 8]);
     }
 
     #[test]

@@ -50,12 +50,23 @@ pub fn last_count() -> usize {
     let mut end = 0u8;
     let mut n = 0;
     for _ in 0..2 {
-        n = (end..end).count();
+        n = 0;
+        for _ in end..end {
+            n += 1;
+        }
         if n > 0 {
             end = u8::MAX;
         }
     }
     n
+}
+
+/// A range that is looked at, not run through: `0..end` and `0..=end` are not the same
+/// thing here, whatever numbers they hold.
+pub fn takes_its_end_in(end: u8) -> bool {
+    use std::ops::{Bound, RangeBounds};
+    let range = 0u8..end;
+    matches!(range.end_bound(), Bound::Included(_))
 }
 
 /// A type that cannot be copied, says when it is dropped, and has a `max` that only
@@ -127,6 +138,11 @@ mod tests {
         assert_eq!(Gauge { level: 1, dropped: &dropped }.min(4), 1);
         assert_eq!(Gauge { level: 4, dropped: &dropped }.min(4), 4);
         assert_eq!(Gauge { level: 5, dropped: &dropped }.min(4), 4);
+    }
+
+    #[test]
+    fn a_range_written_with_two_dots_leaves_its_end_out() {
+        assert!(!takes_its_end_in(3));
     }
 
     #[test]

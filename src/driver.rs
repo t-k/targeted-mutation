@@ -2225,6 +2225,9 @@ pub fn run(options: &Options) -> Result<Report> {
     }
     let scratch = work.clone();
     let mut jobs: Vec<Job> = vec![];
+    // Sites whose mutant could not be run as a probe for what it is. With `--rebuild`
+    // they are built from the source instead; without, they are counted.
+    let mut not_evaluated: HashSet<u32> = HashSet::new();
     let mut work: Vec<SiteWork> = vec![];
     // `(index of the finding, job of its first surviving mutant)`.
     let mut effect_jobs: Vec<(usize, usize)> = vec![];
@@ -2241,7 +2244,7 @@ pub fn run(options: &Options) -> Result<Report> {
                 }
                 Planned::Nothing => continue,
                 Planned::NotEvaluated => {
-                    report.mutants_not_evaluated += 1;
+                    not_evaluated.insert(site.id);
                     continue;
                 }
                 Planned::Plan(plan) => plan,
@@ -2362,7 +2365,15 @@ pub fn run(options: &Options) -> Result<Report> {
         report.audit = Some(audit);
     }
     let unable = results.iter().filter(|r| r.unable).count();
-    report.mutants_not_evaluated += unable;
+    not_evaluated.extend(
+        jobs.iter()
+            .zip(&results)
+            .filter(|(_, result)| result.unable)
+            .map(|(job, _)| job.site),
+    );
+    if !options.rebuild {
+        report.mutants_not_evaluated = not_evaluated.len();
+    }
     report.mutants_run = results.len() - unable;
     report.mutants_killed = results.iter().filter(|r| r.survived.is_none()).count() - unable;
     report.mutants_timed_out = results.iter().filter(|r| r.timed_out).count();
@@ -2475,8 +2486,11 @@ pub fn run(options: &Options) -> Result<Report> {
     // The last of the four: for an audit, the job that ran the same mutant as a probe.
     let mut built: Vec<(&SourceFile, &Site, instrument::SourceMutant, Option<usize>)> = vec![];
     for file in &files {
+        // Tried again as the source says them: what did not compile as a probe, and
+        // what a probe could not be (a range that ends at the top of its type).
         let retried = file.sites.iter().filter(|site| {
-            disabled.contains(&site.id) && !matches!(site.kind, SiteKind::Body { .. })
+            (disabled.contains(&site.id) && !matches!(site.kind, SiteKind::Body { .. }))
+                || not_evaluated.contains(&site.id)
         });
         for site in file.rebuild_sites.iter().chain(retried) {
             built.extend(
@@ -2497,10 +2511,13 @@ pub fn run(options: &Options) -> Result<Report> {
         for file in &files {
             for site in file.sites.iter().filter(|s| !disabled.contains(&s.id)) {
                 for mutant in instrument::source_mutants(site) {
-                    let mutation = mutation_of(site, &mutant);
-                    let job = jobs
-                        .iter()
-                        .position(|job| job.site == site.id && job.mutation == mutation);
+                    // The first of the mutations that are this change and that was run.
+                    let job = mutations_like(site, &mutant)
+                        .into_iter()
+                        .find_map(|mutation| {
+                            jobs.iter()
+                                .position(|job| job.site == site.id && job.mutation == mutation)
+                        });
                     if let Some(job) = job {
                         twins.push((file, site, mutant, Some(job)));
                     }
@@ -2738,6 +2755,29 @@ fn mutation_of(site: &Site, mutant: &instrument::SourceMutant) -> Mutation {
         // a minus that is not there, a body that is another.
         _ => Mutation::Delete,
     }
+}
+
+/// The mutations a probe may have run that are the same change as a mutant of the source,
+/// its own name first. A comparison is planned in other words than it is written in:
+/// `a != b` for `a == b` is run as the negation, and on integers `a <= b` for `a < b` as
+/// the bound moved by one.
+fn mutations_like(site: &Site, mutant: &instrument::SourceMutant) -> Vec<Mutation> {
+    let mut all = vec![mutation_of(site, mutant)];
+    if let (SiteKind::Cmp { op, .. }, Mutation::Op(into)) = (&site.kind, all[0]) {
+        if into == op.negated() {
+            all.push(Mutation::Negate);
+        }
+        match (op, into) {
+            (plan::CmpOp::Lt, plan::CmpOp::Le) | (plan::CmpOp::Ge, plan::CmpOp::Gt) => {
+                all.push(Mutation::Shift(1))
+            }
+            (plan::CmpOp::Gt, plan::CmpOp::Ge) | (plan::CmpOp::Le, plan::CmpOp::Lt) => {
+                all.push(Mutation::Shift(-1))
+            }
+            _ => {}
+        }
+    }
+    all
 }
 
 /// The changes a surviving mutant causes, as up to three sentences. Changes that many
@@ -3738,6 +3778,47 @@ serde = { path = "../../serde-fork" }
             ("Range", "..", "RangeEnd"),
             ("Range", "..=", "RangeEnd"),
         ];
+        // A comparison is planned in other words than it is written in: the mutations
+        // that are the same change, as an audit looks for them.
+        let like = |source: &str, into: &str| -> Vec<Mutation> {
+            let sites = instrument::discover(source, 0).unwrap().sites;
+            let site = sites
+                .iter()
+                .find(|site| matches!(site.kind, SiteKind::Cmp { .. }))
+                .unwrap();
+            let mutant = instrument::source_mutants(site)
+                .into_iter()
+                .find(|mutant| mutant.into == into)
+                .unwrap();
+            mutations_like(site, &mutant)
+        };
+        use plan::CmpOp::*;
+        for (op, into, expected) in [
+            ("==", "!=", vec![Mutation::Op(Ne), Mutation::Negate]),
+            ("!=", "==", vec![Mutation::Op(Eq), Mutation::Negate]),
+            ("<=", ">", vec![Mutation::Op(Gt), Mutation::Negate]),
+            (">=", "<", vec![Mutation::Op(Lt), Mutation::Negate]),
+            ("<", "<=", vec![Mutation::Op(Le), Mutation::Shift(1)]),
+            (">", ">=", vec![Mutation::Op(Ge), Mutation::Shift(-1)]),
+            ("<", "==", vec![Mutation::Op(Eq)]),
+            ("<", ">", vec![Mutation::Op(Gt)]),
+            (">", "==", vec![Mutation::Op(Eq)]),
+            (">", "<", vec![Mutation::Op(Lt)]),
+        ] {
+            let source = format!("fn f(a: i32, b: i32) -> bool {{ a {op} b }}");
+            assert_eq!(like(&source, into), expected, "{op} as {into}");
+        }
+        // The moved bound is the operator it is taken for, at every distance.
+        for d in -3..=3 {
+            assert_eq!(
+                plan::eval_mutated_d(Lt, Mutation::Shift(1), d),
+                Le.eval_d(d)
+            );
+            assert_eq!(
+                plan::eval_mutated_d(Gt, Mutation::Shift(-1), d),
+                Ge.eval_d(d)
+            );
+        }
         let seen: Vec<(&str, &str, &str)> = seen
             .iter()
             .map(|(kind, into, mutation)| (kind.as_str(), into.as_str(), mutation.as_str()))
