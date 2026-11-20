@@ -7,7 +7,7 @@ use targeted_mutation::{driver, report};
 /// Targeted mutation testing: finds the wrong implementations your tests would let
 /// through, and says which input or assertion would catch them.
 #[derive(Parser)]
-#[command(name = "tmt", version)]
+#[command(name = "cargo-tmt", bin_name = "cargo tmt", version)]
 struct Cli {
     /// Directory of the cargo package to analyse.
     #[arg(default_value = ".")]
@@ -97,7 +97,7 @@ struct Cli {
 
 /// Exit codes: 0 no gaps, 2 gaps found, 1 the analysis could not run.
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(arguments(std::env::args_os()));
     let options = driver::Options {
         dir: cli.dir,
         package: cli.package,
@@ -146,5 +146,55 @@ fn main() -> ExitCode {
             eprintln!("tmt: error: {err:#}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// The arguments as they were meant. Cargo starts `cargo tmt --json` as
+/// `cargo-tmt tmt --json`: the name of the subcommand comes first and is not one of
+/// the arguments. (A directory called `tmt` is given as `./tmt`.)
+fn arguments(given: impl IntoIterator<Item = std::ffi::OsString>) -> Vec<std::ffi::OsString> {
+    let mut all: Vec<std::ffi::OsString> = given.into_iter().collect();
+    if all.get(1).is_some_and(|first| first == "tmt") {
+        all.remove(1);
+    }
+    all
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn given(args: &[&str]) -> Vec<String> {
+        arguments(args.iter().map(std::ffi::OsString::from))
+            .into_iter()
+            .map(|arg| arg.into_string().unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn the_name_of_the_subcommand_is_not_an_argument() {
+        // As cargo starts it, and as it is started by its own name.
+        assert_eq!(
+            given(&["cargo-tmt", "tmt", ".", "--json"]),
+            ["cargo-tmt", ".", "--json"]
+        );
+        assert_eq!(
+            given(&["cargo-tmt", ".", "--json"]),
+            ["cargo-tmt", ".", "--json"]
+        );
+        assert_eq!(given(&["cargo-tmt", "tmt"]), ["cargo-tmt"]);
+        assert_eq!(given(&["cargo-tmt"]), ["cargo-tmt"]);
+        // Only the first, and only in the first place.
+        assert_eq!(given(&["cargo-tmt", "tmt", "tmt"]), ["cargo-tmt", "tmt"]);
+        assert_eq!(given(&["cargo-tmt", "./tmt"]), ["cargo-tmt", "./tmt"]);
+        assert_eq!(
+            given(&["cargo-tmt", "-p", "tmt"]),
+            ["cargo-tmt", "-p", "tmt"]
+        );
+        // And what is left is what the options are read from.
+        let cli = Cli::parse_from(given(&["cargo-tmt", "tmt", "crate", "--jobs", "3"]));
+        assert_eq!((cli.dir, cli.jobs), (PathBuf::from("crate"), 3));
+        let cli = Cli::parse_from(given(&["cargo-tmt", "tmt"]));
+        assert_eq!(cli.dir, PathBuf::from("."));
     }
 }

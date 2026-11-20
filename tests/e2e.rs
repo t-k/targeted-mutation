@@ -40,7 +40,7 @@ struct Run {
 }
 
 fn tmt(dir: &Path, args: &[&str]) -> Run {
-    let output = Command::new(env!("CARGO_BIN_EXE_tmt"))
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-tmt"))
         .arg(dir)
         .args(args)
         .env_remove("TMT_TRACE")
@@ -1762,7 +1762,7 @@ fn a_run_given_up_inside_a_program_a_test_started_is_not_a_failed_test() {
 
     // The mark is found wherever the temporary directory is said to be, also where that
     // is said from the directory the run was started in.
-    let output = Command::new(env!("CARGO_BIN_EXE_tmt"))
+    let output = Command::new(env!("CARGO_BIN_EXE_cargo-tmt"))
         .arg(".")
         .args(["--json", "--quiet"])
         .current_dir(&dir)
@@ -1777,5 +1777,40 @@ fn a_run_given_up_inside_a_program_a_test_started_is_not_a_failed_test() {
     assert_eq!(
         relative["mutants_killed"], report["mutants_killed"],
         "{relative:#}"
+    );
+}
+
+#[test]
+fn started_by_cargo_as_one_of_its_subcommands() {
+    let dir = fixture("eligibility", "as-subcommand");
+    // `cargo tmt` finds `cargo-tmt` on the path and gives it its own name first.
+    let exe = Path::new(env!("CARGO_BIN_EXE_cargo-tmt"));
+    let mut path = vec![exe.parent().unwrap().to_path_buf()];
+    path.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
+    let output = Command::new("cargo")
+        .args(["tmt", "--json", "--quiet"])
+        .current_dir(&dir)
+        .env("PATH", std::env::join_paths(path).unwrap())
+        .env_remove("TMT_TRACE")
+        .env_remove("TMT_MUTANT")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(2),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["package"], "eligibility");
+    assert_eq!(findings(&report, "input_gap").len(), 1, "{report:#}");
+    // Started by its own name it is the same, and it says how it is called.
+    let (_, direct) = json(&dir);
+    assert_eq!(direct["findings"], report["findings"]);
+    let help = Command::new(exe).arg("--help").output().unwrap();
+    assert!(
+        String::from_utf8_lossy(&help.stdout).contains("Usage: cargo tmt"),
+        "{}",
+        String::from_utf8_lossy(&help.stdout)
     );
 }

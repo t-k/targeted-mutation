@@ -4,7 +4,7 @@
 
 Classic mutation testing changes `<` to `<=` and then asks whether a test fails. This tool works the other way round: it first watches what the tests actually feed the code, and from that computes the mutants that are guaranteed to pass, without running them. It needs no AI and no solver.
 
-The command is `tmt`. It works on Rust crates.
+The command is `cargo tmt`. It works on Rust crates.
 
 ## What it reports
 
@@ -18,7 +18,7 @@ pub fn is_eligible(age: u32) -> bool {
 ```
 
 ```text
-$ tmt fixtures/eligibility
+$ cargo tmt fixtures/eligibility
 INPUT GAP  src/lib.rs:4:5
     age >= 18
   passes every test as: `age >= 19`, `age >= 20`  [re-run: tests pass]
@@ -31,7 +31,7 @@ The tests saw 17 and 20, so any threshold in 18..=20 behaves the same on every t
 The second kind of finding is about assertions rather than inputs. `fixtures/batch-store` has an atomic batch commit and a test that checks a failing batch returns an error, but never looks at the store afterwards:
 
 ```text
-$ tmt fixtures/batch-store
+$ cargo tmt fixtures/batch-store
 ASSERTION GAP  src/lib.rs:33:9
     self.check_preconditions(batch)?;
   passes every test as: delete `self.check_preconditions(batch)?;`
@@ -65,14 +65,14 @@ Findings on the same source line are printed as one block.
 ## Usage
 
 ```text
-cargo install --path .
-tmt [DIR] [OPTIONS]
+cargo install --git https://github.com/t-k/targeted-mutation   # installs `cargo-tmt`
+cargo tmt [DIR] [OPTIONS]
 ```
 
 What to analyse:
 
 - `--package NAME`: the workspace member to analyse. Not needed when `DIR` is the member's own directory.
-- `--since REV`: only the code changed since a git revision, plus untracked files. This is the mode for a pull request: `tmt --since "$(git merge-base origin/main HEAD)"` (the merge base, so that what others added to the main branch meanwhile is not taken for yours). A run of a part can tell that a finding is new; it cannot tell that one outside of it is gone, which takes a run of the whole.
+- `--since REV`: only the code changed since a git revision, plus untracked files. This is the mode for a pull request: `cargo tmt --since "$(git merge-base origin/main HEAD)"` (the merge base, so that what others added to the main branch meanwhile is not taken for yours). A run of a part can tell that a finding is new; it cannot tell that one outside of it is gone, which takes a run of the whole.
 - `--lines FILE:FROM-TO`: only these lines (repeatable; `FILE` is relative to the package).
 
 Which tests to use:

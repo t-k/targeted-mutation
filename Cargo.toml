@@ -7,7 +7,7 @@ description = "Targeted mutation testing for Rust: find the wrong implementation
 exclude = ["fixtures/*/target", "formal", "docs.local"]
 
 [[bin]]
-name = "tmt"
+name = "cargo-tmt"
 path = "src/main.rs"
 
 [dependencies]
