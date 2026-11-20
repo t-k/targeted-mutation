@@ -16,10 +16,10 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  test:
-    name: Format, lint and test (Linux)
+  check:
+    name: Format, lint, unit tests
     runs-on: ubuntu-24.04
-    timeout-minutes: 60
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@v6.1.0
         with:
@@ -34,8 +34,40 @@ jobs:
         run: cargo fmt --check
       - name: Lint
         run: cargo clippy --all-targets -- -D warnings
-      - name: Test
-        run: cargo test
+      - name: Unit tests and the parity check
+        run: cargo test --lib --bins --test parity
+
+  # The end-to-end tests build and analyse the crates under fixtures/, each with many
+  # test runs of its own. They are spread over several runners, and on each of them only
+  # two run at a time: a runner that is starved loses its connection, and with it the log.
+  e2e:
+    name: End-to-end tests (${{ matrix.part }} of 6)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        part: [1, 2, 3, 4, 5, 6]
+    steps:
+      - uses: actions/checkout@v6.1.0
+        with:
+          persist-credentials: false
+      - name: Install the stable toolchain
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Build the tests
+        run: cargo test --test e2e --no-run
+      - name: Choose the tests of this part
+        run: |
+          cargo test --test e2e -- --list --format terse \
+            | sed -n 's/: test$//p' \
+            | awk -v part=${{ matrix.part }} 'NR % 6 == part % 6' > tests-of-this-part.txt
+          cat tests-of-this-part.txt
+          test -s tests-of-this-part.txt
+      - name: Run them
+        run: |
+          xargs cargo test --test e2e -- --exact --test-threads=2 < tests-of-this-part.txt
 
   msrv:
     name: Builds with the oldest supported Rust (1.88)
