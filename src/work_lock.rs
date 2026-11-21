@@ -1,6 +1,6 @@
 use std::fs::{self, File, OpenOptions};
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
@@ -32,7 +32,7 @@ impl WorkLock {
     }
 
     pub(crate) fn take(work: &Path) -> Result<Self> {
-        let path = work.join(".tmt-lock");
+        let path = lock_directory(work)?.join("owner");
         match acquire(&path) {
             Ok(file) => Ok(Self {
                 _file: Arc::new(file),
@@ -43,6 +43,32 @@ impl WorkLock {
             Err(err) => Err(err).with_context(|| format!("locking {}", path.display())),
         }
     }
+}
+
+/// A directory at the old sentinel's path makes the two protocols exclude
+/// one another. Creating the directory is atomic. If stopped before opening
+/// its owner file, the next run can still initialize it.
+fn lock_directory(work: &Path) -> Result<PathBuf> {
+    let path = work.join(".tmt-lock");
+    match fs::create_dir(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            let existing = fs::symlink_metadata(&path)
+                .with_context(|| format!("inspecting {}", path.display()))?;
+            if !is_link(&existing) && existing.is_file() {
+                bail!(
+                    "{} is a legacy TMT lock file. Choose a fresh --work-dir, or remove \
+                     the legacy file after all older TMT runs using this directory have ended",
+                    path.display()
+                );
+            }
+            if is_link(&existing) || !existing.is_dir() {
+                bail!("{} must be a real lock directory", path.display());
+            }
+        }
+        Err(error) => return Err(error).with_context(|| format!("creating {}", path.display())),
+    }
+    Ok(path)
 }
 
 #[cfg(unix)]
@@ -111,19 +137,23 @@ fn acquire(path: &Path) -> io::Result<File> {
 }
 
 fn require_regular(metadata: &fs::Metadata) -> io::Result<()> {
+    if metadata.is_file() && !is_link(metadata) {
+        Ok(())
+    } else {
+        Err(io::Error::other("lock path must be a regular file"))
+    }
+}
+
+fn is_link(metadata: &fs::Metadata) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
         if metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(io::Error::other("lock path must be a regular file"));
+            return true;
         }
     }
-    if metadata.is_file() {
-        Ok(())
-    } else {
-        Err(io::Error::other("lock path must be a regular file"))
-    }
+    metadata.file_type().is_symlink()
 }
 
 fn contended(error: &io::Error) -> bool {
@@ -212,6 +242,12 @@ mod tests {
         }
     }
 
+    fn seed_owner(work: &Path, contents: &[u8]) {
+        let reserved = work.join(".tmt-lock");
+        fs::create_dir(&reserved).unwrap();
+        fs::write(reserved.join("owner"), contents).unwrap();
+    }
+
     const TEST_DIR: &str = "TMT_WORK_LOCK_UNIT_TEST_DIR";
 
     #[test]
@@ -267,7 +303,7 @@ mod tests {
     #[test]
     fn live_owner_is_exclusive_and_operations_reuse_the_same_file() {
         // All six valid rows of the three-way lock PICT table.
-        for (legacy, child, killed) in [
+        for (existing_owner, child, killed) in [
             (false, false, false),
             (true, true, true),
             (true, true, false),
@@ -276,9 +312,9 @@ mod tests {
             (false, true, false),
         ] {
             let work = Scratch::new();
-            let marker = work.0.join(".tmt-lock");
-            if legacy {
-                fs::write(&marker, []).unwrap();
+            let marker = work.0.join(".tmt-lock/owner");
+            if existing_owner {
+                seed_owner(&work.0, &[]);
             }
             if child {
                 let mut holder = lock_child(&work.0);
@@ -303,7 +339,7 @@ mod tests {
     #[test]
     fn registered_child_keeps_the_lock_until_it_exits() {
         // All eight rows of the child handoff PICT table.
-        for (legacy, parent_first, killed) in [
+        for (existing_owner, parent_first, killed) in [
             (false, true, true),
             (true, false, false),
             (true, true, true),
@@ -314,8 +350,8 @@ mod tests {
             (false, false, false),
         ] {
             let work = Scratch::new();
-            if legacy {
-                fs::write(work.0.join(".tmt-lock"), []).unwrap();
+            if existing_owner {
+                seed_owner(&work.0, &[]);
             }
             let lock = WorkLock::take(&work.0).unwrap();
             let mut cmd = Command::new("sh");
@@ -355,8 +391,8 @@ mod tests {
     #[test]
     fn leaves_an_existing_regular_file_intact_and_rejects_a_directory() {
         let work = Scratch::new();
-        let marker = work.0.join(".tmt-lock");
-        fs::create_dir(&marker).unwrap();
+        let marker = work.0.join(".tmt-lock/owner");
+        fs::create_dir_all(&marker).unwrap();
         assert!(WorkLock::take(&work.0).is_err());
         assert!(marker.is_dir());
         fs::remove_dir(&marker).unwrap();
@@ -364,6 +400,49 @@ mod tests {
         fs::write(&marker, "keep this content").unwrap();
         drop(WorkLock::take(&work.0).unwrap());
         assert_eq!(fs::read_to_string(&marker).unwrap(), "keep this content");
+    }
+
+    #[test]
+    fn legacy_sentinel_requires_migration_and_cannot_race_current_lock() {
+        let work = Scratch::new();
+        let marker = work.0.join(".tmt-lock");
+        let legacy_open = || {
+            OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&marker)
+        };
+        let legacy = legacy_open().unwrap();
+
+        let check_migration = || {
+            let error = WorkLock::take(&work.0)
+                .err()
+                .expect("new process acquired a legacy lock");
+            assert!(error.to_string().contains("legacy TMT lock"), "{error:#}");
+            assert!(error.to_string().contains("--work-dir"), "{error:#}");
+        };
+        check_migration();
+        drop(legacy);
+        check_migration();
+        fs::remove_file(&marker).unwrap();
+
+        let current = WorkLock::take(&work.0).unwrap();
+        assert!(legacy_open().is_err());
+        drop(current);
+        assert!(legacy_open().is_err());
+    }
+
+    #[test]
+    fn recovers_after_interruption_before_owner_file_creation() {
+        let work = Scratch::new();
+        let reserved = work.0.join(".tmt-lock");
+        fs::create_dir(&reserved).unwrap();
+
+        let current = WorkLock::take(&work.0).unwrap();
+        assert!(reserved.join("owner").is_file());
+        assert_contended(&work.0);
+        drop(current);
+        assert!(WorkLock::take(&work.0).is_ok());
     }
 
     #[cfg(unix)]
@@ -375,6 +454,14 @@ mod tests {
         std::os::unix::fs::symlink(&target, &marker).unwrap();
         assert!(WorkLock::take(&work.0).is_err());
         assert!(!target.exists());
+        fs::create_dir(&target).unwrap();
+        assert!(WorkLock::take(&work.0).is_err());
+        assert!(!target.join("owner").exists());
+        fs::remove_dir(&target).unwrap();
+        fs::remove_file(&marker).unwrap();
+
+        fs::create_dir(&marker).unwrap();
+        std::os::unix::fs::symlink(&target, marker.join("owner")).unwrap();
         fs::write(&target, "outside the reserved path").unwrap();
         assert!(WorkLock::take(&work.0).is_err());
         assert_eq!(
