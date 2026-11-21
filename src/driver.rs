@@ -3704,6 +3704,8 @@ fn run_package(
                 {
                     let diagnostic = format!("{err:#}");
                     note(&format!("skipping {display}: {diagnostic}"));
+                    let end_line = scope::line_of(&original, original.len());
+                    let end_column = original.rsplit('\n').next().unwrap_or("").chars().count() + 1;
                     skipped.push(report::SkippedSite::new(
                         report::Location {
                             file: display,
@@ -3711,7 +3713,7 @@ fn run_package(
                             column: 1,
                             ..Default::default()
                         },
-                        scope::LineIndex::new(&original).position(&original, original.len()),
+                        (end_line, end_column),
                         report::SkipReason::UnparseableSource,
                         Some(diagnostic),
                     ));
@@ -6036,6 +6038,7 @@ mod tests {
         let after = copy.join("after.rs");
         let shared = copy.join("shared.rs");
         let leaf = copy.join("leaf.rs");
+        let test_helper = copy.join("test_helper.rs");
         let nested_leaf = copy.join("shared/leaf.rs");
         let sources = BTreeMap::from([
             (before.clone(), r#"#[path = "shared.rs"] mod dep;"#),
@@ -6044,8 +6047,9 @@ mod tests {
                 r#"mod shared; #[path = "shared.rs"] mod dep;"#,
             ),
             (after.clone(), r#"include!("shared.rs");"#),
-            (shared.clone(), "mod leaf;"),
+            (shared.clone(), "mod leaf; #[cfg(test)] mod test_helper;"),
             (leaf.clone(), "fn top() {}"),
+            (test_helper.clone(), "fn testing() {}"),
             (nested_leaf.clone(), "fn nested() {}"),
         ]);
         for path in sources.keys() {
@@ -6073,6 +6077,8 @@ mod tests {
             "one load in each of two resolution contexts"
         );
         assert_eq!(reads[&leaf], 1);
+        assert_eq!(reads[&test_helper], 1);
+        assert!(!graph.contains_key(&test_helper));
         assert_eq!(reads[&nested_leaf], 1);
         for path in [&leaf, &shared] {
             assert_eq!(
