@@ -1,4 +1,4 @@
-//! Finds a source mutation and a candidate test for first-versus-last slice searches.
+//! Finds source mutations and candidate tests whose results can be compared by execution.
 
 use std::collections::BTreeMap;
 use std::ops::{Range, RangeInclusive};
@@ -10,53 +10,235 @@ use syn::{Expr, FnArg, Item, ItemFn, Pat, Type};
 
 use crate::report::VerifiedWitness;
 
-pub(crate) const TEST_NAME: &str = "__tmt_position_witness";
+mod relations;
+mod sequences;
+mod simple;
+
+pub(crate) const TEST_NAME: &str = "__tmt_witness";
 pub(crate) const OUTPUT_ENV: &str = "TMT_WITNESS_OUTPUT";
-pub(crate) const MUTATION: &str = "replace `position` with `rposition`";
 
 #[derive(Debug)]
-pub(crate) struct PositionSearch {
-    pub method: Range<usize>,
-    pub lines: RangeInclusive<usize>,
-    pub signature_line: usize,
-    pub method_line: usize,
-    pub column: usize,
-    pub call: String,
+pub(crate) struct Edit {
+    pub span: Range<usize>,
+    pub replacement: String,
 }
 
-impl PositionSearch {
-    pub fn verified(&self, original: String, mutant: String) -> Option<VerifiedWitness> {
-        (original != mutant).then(|| VerifiedWitness {
-            call: self.call.clone(),
-            assertion: format!("assert_eq!({}, {original});", self.call),
-            original,
-            mutant,
-        })
+#[derive(Debug)]
+pub(crate) struct Candidate {
+    pub edits: Vec<Edit>,
+    pub scope: RangeInclusive<usize>,
+    pub signature_lines: Vec<usize>,
+    pub description: String,
+    pub existing: bool,
+    pub scenarios: Vec<Scenario>,
+}
+
+#[derive(Debug, Default)]
+pub(crate) struct Scenario {
+    pub setup: String,
+    pub expression: String,
+    pub assertion_prefix: String,
+    pub guidance: Option<String>,
+    pub placement: Option<Placement>,
+    pub source_test: Option<String>,
+    position: bool,
+}
+
+#[derive(Debug)]
+pub(crate) struct Placement {
+    pub offset: usize,
+    pub module: String,
+}
+
+#[derive(Debug)]
+pub(crate) struct Observation {
+    pub value: String,
+    pub equals_expected: Option<bool>,
+}
+
+impl Scenario {
+    pub fn test_name(&self) -> String {
+        self.placement.as_ref().map_or_else(
+            || TEST_NAME.to_owned(),
+            |placement| format!("{}::{TEST_NAME}", placement.module),
+        )
     }
 
-    pub fn test_source(&self) -> String {
+    pub fn render(&self, source: &str, edits: &[Edit], expected: Option<&str>) -> Option<String> {
+        let offset = self.placement.as_ref().map_or(source.len(), |p| p.offset);
+        render_edits(source, edits, Some((offset, &self.test_source(expected))))
+    }
+
+    fn test_source(&self, expected: Option<&str>) -> String {
+        let result_type = if self.position {
+            ": __tmt_witness_std::option::Option<__tmt_witness_std::primitive::usize>"
+        } else {
+            ""
+        };
+        let observation = match expected {
+            Some(expected) => format!(
+                r#"__tmt_witness_std::format!("{{result:?}}\t{{}}\n", &result == &({expected}))"#
+            ),
+            None => r#"__tmt_witness_std::format!("{result:?}\n")"#.to_owned(),
+        };
         format!(
             r#"
 #[test]
 fn {TEST_NAME}() {{
     extern crate std as __tmt_witness_std;
-    let result: __tmt_witness_std::option::Option<__tmt_witness_std::primitive::usize> = self::{};
+    {setup}
+    let result{result_type} = {expression};
     let path = __tmt_witness_std::env::var_os("{OUTPUT_ENV}").unwrap();
     let mut output = __tmt_witness_std::fs::OpenOptions::new().append(true).open(path).unwrap();
-    __tmt_witness_std::io::Write::write_all(&mut output, __tmt_witness_std::format!("{{result:?}}\n").as_bytes()).unwrap();
+    __tmt_witness_std::io::Write::write_all(&mut output, ({observation}).as_bytes()).unwrap();
 }}
 "#,
-            self.call,
+            setup = self.setup,
+            expression = self.expression,
         )
+    }
+
+    pub fn observation(&self, output: &str, compares: bool) -> Option<Observation> {
+        let line = output.strip_suffix('\n')?;
+        let (value, equals_expected) = if compares {
+            let (value, compared) = line.rsplit_once('\t')?;
+            (value, Some(compared.parse::<bool>().ok()?))
+        } else {
+            (line, None)
+        };
+        if value.is_empty() || value.chars().any(char::is_control) {
+            return None;
+        }
+        if self.position {
+            parse_observation(&format!("{value}\n"))?;
+        }
+        Some(Observation {
+            value: value.to_owned(),
+            equals_expected,
+        })
+    }
+
+    pub fn verified(&self, original: String, mutant: String) -> Option<VerifiedWitness> {
+        (original != mutant).then(|| {
+            let call = self
+                .expression
+                .strip_prefix("self::")
+                .unwrap_or(&self.expression);
+            VerifiedWitness {
+                call: call.to_owned(),
+                assertion: if self.assertion_prefix.is_empty() {
+                    format!("assert_eq!({call}, {original});")
+                } else {
+                    format!(
+                        "{} assert_eq!({call}, {original});",
+                        self.assertion_prefix.trim_end()
+                    )
+                },
+                original,
+                mutant,
+                guidance: self.guidance.clone(),
+                individually_killed: None,
+            }
+        })
     }
 }
 
-pub(crate) fn position_searches(source: &str) -> Vec<PositionSearch> {
+/// Debug output may resemble code that has side effects. Only try literal expectations.
+pub(crate) fn is_expected_literal(text: &str) -> bool {
+    fn literal(expr: &Expr) -> bool {
+        match expr {
+            Expr::Lit(value) => !matches!(value.lit, syn::Lit::Verbatim(_)),
+            Expr::Unary(value) if matches!(value.op, syn::UnOp::Neg(_)) => {
+                matches!(value.expr.as_ref(), Expr::Lit(number) if matches!(number.lit, syn::Lit::Int(_) | syn::Lit::Float(_)))
+            }
+            Expr::Path(_) => path_ident(expr).is_some_and(|name| name == "None"),
+            Expr::Array(array) => array.elems.iter().all(literal),
+            Expr::Tuple(tuple) => tuple.elems.iter().all(literal),
+            Expr::Call(call) => {
+                path_ident(&call.func)
+                    .is_some_and(|name| matches!(name.to_string().as_str(), "Some" | "Ok" | "Err"))
+                    && call.args.len() == 1
+                    && call.args.first().is_some_and(literal)
+            }
+            _ => false,
+        }
+    }
+    syn::parse_str::<Expr>(text).is_ok_and(|expr| literal(&expr))
+}
+
+pub(crate) fn render_edits(
+    source: &str,
+    edits: &[Edit],
+    insertion: Option<(usize, &str)>,
+) -> Option<String> {
+    let mut replacements: Vec<_> = edits
+        .iter()
+        .map(|edit| (edit.span.clone(), edit.replacement.as_str()))
+        .collect();
+    if let Some((offset, text)) = insertion {
+        replacements.push((offset..offset, text));
+    }
+    replacements.sort_by_key(|(range, _)| (range.start, range.end));
+    let mut result = String::new();
+    let mut end = 0;
+    for (range, replacement) in replacements {
+        result.push_str(source.get(end..range.start)?);
+        source.get(range.clone())?;
+        result.push_str(replacement);
+        end = range.end;
+    }
+    result.push_str(source.get(end..)?);
+    Some(result)
+}
+
+#[derive(Debug)]
+struct PositionSearch {
+    pub method: Range<usize>,
+    pub lines: RangeInclusive<usize>,
+    pub signature_line: usize,
+    pub call: String,
+}
+
+impl PositionSearch {
+    fn scenario(&self) -> Scenario {
+        Scenario {
+            expression: format!("self::{}", self.call),
+            position: true,
+            ..Default::default()
+        }
+    }
+}
+
+pub(crate) fn discover(source: &str) -> Vec<Candidate> {
     let Ok(file) = syn::parse_file(source) else {
         return vec![];
     };
+    let mut candidates = position_searches(source, &file)
+        .into_iter()
+        .map(|search| {
+            let scenario = search.scenario();
+            Candidate {
+                edits: vec![Edit {
+                    span: search.method,
+                    replacement: "rposition".to_owned(),
+                }],
+                scope: search.lines,
+                signature_lines: vec![search.signature_line],
+                description: "replace `position` with `rposition`".to_owned(),
+                existing: false,
+                scenarios: vec![scenario],
+            }
+        })
+        .collect();
+    simple::discover(source, &file, &mut candidates);
+    relations::discover(source, &file, &mut candidates);
+    sequences::discover(source, &file, &mut candidates);
+    candidates
+}
+
+fn position_searches(source: &str, file: &syn::File) -> Vec<PositionSearch> {
     let mut seeds = SearchValues::default();
-    seeds.visit_file(&file);
+    seeds.visit_file(file);
     file.items
         .iter()
         .filter_map(|item| {
@@ -80,8 +262,6 @@ pub(crate) fn position_searches(source: &str) -> Vec<PositionSearch> {
                 method: range,
                 lines: expression.start().line..=expression.end().line,
                 signature_line: function.sig.span().start().line,
-                method_line: span.start().line,
-                column: span.start().column + 1,
                 call: format!("{function_name}(&[{needle}, {needle}], {needle})"),
             })
         })
@@ -248,6 +428,76 @@ mod tests {
     use super::*;
 
     #[test]
+    fn witness_edits_compose_and_keep_insertion_offsets_in_the_original_source() {
+        let source = "éxy";
+        let first = Edit {
+            span: 2..3,
+            replacement: "first".into(),
+        };
+        let second = Edit {
+            span: 3..4,
+            replacement: "last".into(),
+        };
+        assert_eq!(
+            render_edits(source, &[second, first], Some((4, "!"))).as_deref(),
+            Some("éfirstlast!")
+        );
+        let bad = Edit {
+            span: 1..3,
+            replacement: "wrong".into(),
+        };
+        assert_eq!(render_edits(source, &[bad], None), None);
+        let overlapping = [
+            Edit {
+                span: 0..3,
+                replacement: "one".into(),
+            },
+            Edit {
+                span: 2..4,
+                replacement: "two".into(),
+            },
+        ];
+        assert_eq!(render_edits(source, &overlapping, None), None);
+    }
+
+    #[test]
+    fn witness_expected_values_are_literals_and_equality_output_is_explicit() {
+        for valid in [
+            "None",
+            "Some(\"old\")",
+            "[2, 1]",
+            "false",
+            "-3",
+            "(2, true)",
+        ] {
+            assert!(is_expected_literal(valid), "{valid}");
+        }
+        for invalid in [
+            "Missing",
+            "Some(fetch())",
+            "[file.remove()]",
+            "counter.next()",
+            "{ 1 }",
+            "!true",
+        ] {
+            assert!(!is_expected_literal(invalid), "{invalid}");
+        }
+        let scenario = Scenario::default();
+        let observation = scenario.observation("Some(2)\tfalse\n", true).unwrap();
+        assert_eq!(observation.value, "Some(2)");
+        assert_eq!(observation.equals_expected, Some(false));
+        let observed_only = scenario.observation("2\n", false).unwrap();
+        assert_eq!(observed_only.value, "2");
+        assert_eq!(observed_only.equals_expected, None);
+        for corrupted in ["2\n", "2\tunknown\n", "2\n2\ttrue\n", "2\ttrue"] {
+            assert!(
+                scenario.observation(corrupted, true).is_none(),
+                "{corrupted:?}"
+            );
+        }
+    }
+
+    #[test]
     fn position_searches_require_an_integer_slice_and_direct_equality() {
         let source = r#"
             /// Índice
@@ -271,7 +521,7 @@ mod tests {
                 assert_ne!(Some(nested(&[11], 11)), None);
             }
         "#;
-        let searches = position_searches(source);
+        let searches = position_searches(source, &syn::parse_file(source).unwrap());
         assert_eq!(searches.len(), 3, "{searches:?}");
         assert_eq!(searches[0].call, "search(&[9, 9], 9)");
         assert_eq!(searches[1].call, "reverse(&[0, 0], 0)");
@@ -279,9 +529,6 @@ mod tests {
         assert_eq!(&source[searches[0].method.clone()], "position");
         assert_eq!(searches[0].lines, 3..=3);
         assert_eq!(searches[0].signature_line, 3);
-        assert_eq!(searches[0].method_line, 3);
-        let prefix = source[..searches[0].method.start].lines().last().unwrap();
-        assert_eq!(searches[0].column, prefix.chars().count() + 1);
     }
 
     #[test]
@@ -303,12 +550,13 @@ mod tests {
             method: 0..0,
             lines: 1..=1,
             signature_line: 1,
-            method_line: 1,
-            column: 1,
             call: "f(&[0, 0], 0)".into(),
         };
-        assert_eq!(search.verified(first.clone(), first.clone()), None);
-        let witness = search.verified(first, last).unwrap();
+        assert_eq!(
+            search.scenario().verified(first.clone(), first.clone()),
+            None
+        );
+        let witness = search.scenario().verified(first, last).unwrap();
         assert_eq!(witness.original, "Some(0)");
         assert_eq!(witness.mutant, "Some(1)");
         assert_eq!(witness.assertion, "assert_eq!(f(&[0, 0], 0), Some(0));");
@@ -420,8 +668,8 @@ mod tests {
             ),
         ] {
             let source = format!("{prefix}({params}) -> Option<usize> {{ {body} }}");
-            assert!(syn::parse_file(&source).is_ok(), "{source}");
-            assert!(position_searches(&source).is_empty(), "{source}");
+            let parsed = syn::parse_file(&source).unwrap_or_else(|err| panic!("{source}: {err}"));
+            assert!(position_searches(&source, &parsed).is_empty(), "{source}");
         }
     }
 }

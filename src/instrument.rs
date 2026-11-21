@@ -1276,14 +1276,14 @@ fn values_of(ty: &syn::Type) -> Vec<String> {
 
 /// `#[mutants::skip]`, also inside `cfg_attr`: the mark cargo-mutants uses for code that
 /// is not to be mutated.
-fn is_skipped(attrs: &[syn::Attribute]) -> bool {
+pub(crate) fn is_skipped(attrs: &[syn::Attribute]) -> bool {
     attrs
         .iter()
         .any(|attr| squeezed(&attr.meta.to_token_stream().to_string()).contains("mutants::skip"))
 }
 
 /// `#[test]`, `#[tokio::test]`, `#[cfg(test)]`, `#[cfg(all(test, ...))]`; not `#[cfg(not(test))]`.
-fn is_test_only(attrs: &[syn::Attribute]) -> bool {
+pub(crate) fn is_test_only(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attr| {
         let path = attr.path();
         if path.segments.last().is_some_and(|s| s.ident == "test") {

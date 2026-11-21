@@ -1518,21 +1518,24 @@ fn run_source_tests(binaries: &[&TestBinary]) -> Result<Outcome> {
     Ok(Outcome::Pass)
 }
 
-fn observe_position(
+fn observe_witness(
     baseline: &TestBinary,
     exe: PathBuf,
     wrapper: Option<&Path>,
-) -> Result<Option<String>> {
+    scenario: &witness::Scenario,
+    compares: bool,
+) -> Result<Option<witness::Observation>> {
     use std::io::Read as _;
+    let test_name = scenario.test_name();
     let test = TestBinary {
-        name: witness::TEST_NAME.to_owned(),
+        name: test_name.clone(),
         cwd: baseline.cwd.clone(),
         marks: baseline.marks.clone(),
         git_ceiling: baseline.git_ceiling.clone(),
         tests: BTreeSet::new(),
         runner: Runner::Isolated {
             exe,
-            test: witness::TEST_NAME.to_owned(),
+            test: test_name,
             ignored: false,
             wrapper: wrapper.map(Path::to_path_buf),
         },
@@ -1558,11 +1561,35 @@ fn observe_position(
             return Ok(None);
         }
         let mut text = String::new();
-        fs::File::open(&path)?.take(128).read_to_string(&mut text)?;
-        Ok(witness::parse_observation(&text))
+        const MAX_OBSERVATION: u64 = 2048;
+        fs::File::open(&path)?
+            .take(MAX_OBSERVATION + 1)
+            .read_to_string(&mut text)?;
+        Ok((text.len() <= MAX_OBSERVATION as usize)
+            .then(|| scenario.observation(&text, compares))
+            .flatten())
     })();
     release_mark(&path)?;
     result
+}
+
+fn witness_location(source: &SourceFile, candidate: &witness::Candidate) -> report::Location {
+    let span = &candidate.edits[0].span;
+    let prefix = &source.original[..span.start];
+    let column = prefix.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+    report::Location {
+        file: source.display.clone(),
+        line: scope::line_of(&source.original, span.start),
+        column,
+        code: report::one_line(&source.original[span.clone()]),
+        ..Default::default()
+    }
+}
+
+enum WitnessTrial {
+    NotApplicable,
+    BuildFailed,
+    Evaluated(Outcome, Option<report::VerifiedWitness>),
 }
 
 /// Takes the mark away after the run and says whether the run had given up (the mark
@@ -2619,7 +2646,7 @@ pub fn run(options: &Options) -> Result<Report> {
         }
         files.retain(|f| !f.sites.is_empty() || !f.rebuild_sites.is_empty() || f.path == root_file);
     }
-    let mut position_searches = vec![];
+    let mut witness_candidates = vec![];
     if (options.rebuild || options.source_only)
         && root_target.test_build_arg() == Some(("--lib", None))
         && let Some(file) = files.iter_mut().find(|file| file.path == root_file)
@@ -2629,16 +2656,34 @@ pub fn run(options: &Options) -> Result<Report> {
             .strip_prefix(&copy)
             .unwrap_or(&file.path)
             .to_string_lossy();
-        position_searches = witness::position_searches(&file.original);
-        file.places.extend(
-            position_searches
-                .iter()
-                .map(|search| (search.method_line, search.column, "position".to_owned())),
-        );
-        position_searches.retain(|search| {
+        witness_candidates = witness::discover(&file.original);
+        let locations: Vec<_> = witness_candidates
+            .iter()
+            .filter(|candidate| !candidate.existing)
+            .map(|candidate| {
+                let at = witness_location(file, candidate);
+                (at.line, at.column, at.code)
+            })
+            .collect();
+        file.places.extend(locations);
+        witness_candidates.retain(|candidate| {
             scope.as_ref().is_none_or(|scope| {
-                scope.touches(&relative, *search.lines.start(), *search.lines.end())
-                    || scope.touches(&relative, search.signature_line, search.signature_line)
+                let site_in_scope = if candidate.edits.len() == 1 {
+                    scope.touches(&relative, *candidate.scope.start(), *candidate.scope.end())
+                } else {
+                    candidate.edits.iter().any(|edit| {
+                        scope.touches(
+                            &relative,
+                            scope::line_of(&file.original, edit.span.start),
+                            scope::line_of(&file.original, edit.span.end),
+                        )
+                    })
+                };
+                site_in_scope
+                    || candidate
+                        .signature_lines
+                        .iter()
+                        .any(|&line| scope.touches(&relative, line, line))
             })
         });
     }
@@ -2646,7 +2691,10 @@ pub fn run(options: &Options) -> Result<Report> {
         .iter()
         .map(|f| f.sites.len() + f.rebuild_sites.len())
         .sum::<usize>()
-        + position_searches.len();
+        + witness_candidates
+            .iter()
+            .filter(|candidate| !candidate.existing)
+            .count();
     note(&format!("{} sites in {} files", total_sites, files.len()));
     if options.source_only {
         for file in &mut files {
@@ -2858,7 +2906,7 @@ pub fn run(options: &Options) -> Result<Report> {
             })
             .map(|(_, exe, _, _)| exe.clone())
     };
-    let root_exe = (!position_searches.is_empty())
+    let root_exe = (!witness_candidates.is_empty())
         .then(|| root_test_exe(&build))
         .flatten();
     for (name, exe, owner, kind) in build.test_binaries {
@@ -3252,6 +3300,7 @@ pub fn run(options: &Options) -> Result<Report> {
                 tests: passing_tests.into_iter().collect(),
                 effects: vec![],
                 effects_of: None,
+                witness: None,
             });
         }
     }
@@ -3474,101 +3523,207 @@ pub fn run(options: &Options) -> Result<Report> {
         );
     }
 
-    if !position_searches.is_empty() {
+    if !witness_candidates.is_empty() {
         let file = files
             .iter()
             .find(|file| file.path == root_file)
-            .expect("searches in the root file");
-        let baseline_text = &file
-            .rendered
-            .as_ref()
-            .expect("rendered before building")
-            .text;
-        let restore = format!("{baseline_text}{root_suffix}");
-        let selected_root = root_exe.as_deref().and_then(|exe| {
-            session
-                .binaries
-                .iter()
-                .find(|bin| bin.runner.executable() == Some(exe))
-        });
+            .expect("witness candidates in the root file");
+        let rendered = file.rendered.as_ref().expect("rendered before building");
+        let restore = format!("{}{root_suffix}", rendered.text);
+        let library_runners: Vec<_> = session
+            .binaries
+            .iter()
+            .filter(|bin| {
+                root_exe
+                    .as_deref()
+                    .is_some_and(|exe| bin.runner.executable() == Some(exe))
+            })
+            .collect();
+        let ignored = library_runners
+            .iter()
+            .find_map(|bin| match &bin.runner {
+                Runner::Exe(exe) => Some(list_tests(exe, &bin.cwd, &bin.git_ceiling, true, false)),
+                _ => None,
+            })
+            .transpose()?
+            .unwrap_or_default();
+        let runner_for = |scenario: &witness::Scenario| {
+            library_runners.iter().copied().find(|bin| {
+                scenario
+                    .source_test
+                    .as_ref()
+                    .is_none_or(|required| match &bin.runner {
+                        Runner::Exe(_) => {
+                            bin.tests.contains(required) && !ignored.contains(required)
+                        }
+                        Runner::Isolated { test, .. } => test == required,
+                        Runner::Doc { .. } => false,
+                    })
+            })
+        };
+        let suite = |edits: &[witness::Edit]| -> Result<Option<Outcome>> {
+            let Some(source) = witness::render_edits(&file.original, edits, None) else {
+                return Ok(None);
+            };
+            state.write(&root_file, &format!("{source}{root_suffix}"))?;
+            if !cargo_build()?.status.success() {
+                return Ok(None);
+            }
+            run_source_tests(&by_speed).map(Some)
+        };
+        let observe = |scenario: &witness::Scenario,
+                       baseline: &TestBinary,
+                       edits: &[witness::Edit],
+                       expected: Option<&str>|
+         -> Result<Option<witness::Observation>> {
+            let Some(source) = scenario.render(&file.original, edits, expected) else {
+                return Ok(None);
+            };
+            state.write(&root_file, &format!("{source}{root_suffix}"))?;
+            let build = cargo_build()?;
+            if !build.status.success() {
+                return Ok(None);
+            }
+            let artifacts = parse_build_output(
+                &String::from_utf8_lossy(&build.stdout),
+                &[package.name.as_str()],
+            );
+            let Some(exe) = root_test_exe(&artifacts) else {
+                return Ok(None);
+            };
+            observe_witness(
+                baseline,
+                exe,
+                wrapper.as_deref(),
+                scenario,
+                expected.is_some(),
+            )
+        };
         progress::track(
             options.progress,
-            "position mutants",
-            position_searches.len(),
+            "distinguishing tests",
+            witness_candidates.len(),
             |progress| -> Result<()> {
-                for search in &position_searches {
-                    let mut mutated = file.original.clone();
-                    mutated.replace_range(search.method.clone(), "rposition");
+                for candidate in &witness_candidates {
+                    let at = witness_location(file, candidate);
+                    let existing = candidate
+                        .existing
+                        .then(|| {
+                            report.findings.iter().position(|finding| {
+                                let location = finding.at();
+                                location.file == at.file
+                                    && location.line == at.line
+                                    && location.column == at.column
+                                    && finding.survivors().contains(&candidate.description)
+                            })
+                        })
+                        .flatten();
+                    let scenarios: Vec<_> = candidate
+                        .scenarios
+                        .iter()
+                        .filter_map(|scenario| {
+                            runner_for(scenario).map(|runner| (scenario, runner))
+                        })
+                        .take(4)
+                        .collect();
+                    let paired = candidate.edits.len() > 1;
+                    if (candidate.existing && (existing.is_none() || scenarios.is_empty()))
+                        || (paired && scenarios.is_empty())
+                    {
+                        progress.complete(progress::Outcome::Unable);
+                        continue;
+                    }
+                    // A compound survivor is interesting only if both component mutations fail
+                    // the same selected suite by themselves.
                     let attempted = (|| -> Result<_> {
-                        state.write(&root_file, &format!("{mutated}{root_suffix}"))?;
-                        if !cargo_build()?.status.success() {
-                            return Ok((None, None));
-                        }
-                        let outcome = run_source_tests(&by_speed)?;
-                        let mut verified = None;
-                        if outcome == Outcome::Pass
-                            && let Some(baseline) = selected_root
-                        {
-                            let test_source = search.test_source();
-                            let observe = |source: &str| -> Result<Option<String>> {
-                                state.write(
-                                    &root_file,
-                                    &format!("{source}{root_suffix}{test_source}"),
-                                )?;
-                                let build = cargo_build()?;
-                                if !build.status.success() {
-                                    return Ok(None);
+                        if paired {
+                            for edit in &candidate.edits {
+                                if suite(std::slice::from_ref(edit))? != Some(Outcome::Fail) {
+                                    return Ok(WitnessTrial::NotApplicable);
                                 }
-                                let artifacts = parse_build_output(
-                                    &String::from_utf8_lossy(&build.stdout),
-                                    &[package.name.as_str()],
-                                );
-                                let Some(exe) = root_test_exe(&artifacts) else {
-                                    return Ok(None);
-                                };
-                                observe_position(baseline, exe, wrapper.as_deref())
-                            };
-                            let distinction = (|| -> Result<_> {
-                                let Some(original) = observe(&file.original)? else {
-                                    return Ok(None);
-                                };
-                                let Some(mutant) = observe(&mutated)? else {
-                                    return Ok(None);
-                                };
-                                Ok(search.verified(original, mutant))
-                            })();
-                            match distinction {
-                                Ok(witness) => verified = witness,
-                                Err(err) => note(&format!(
-                                    "could not check a distinguishing input for {}: {err:#}",
-                                    search.call
-                                )),
                             }
                         }
-                        Ok((Some(outcome), verified))
+                        let Some(outcome) = suite(&candidate.edits)? else {
+                            return Ok(WitnessTrial::BuildFailed);
+                        };
+                        let mut evidence = None;
+                        if outcome == Outcome::Pass {
+                            for (scenario, baseline) in scenarios {
+                                let distinction = (|| -> Result<_> {
+                                    let Some(original) = observe(scenario, baseline, &[], None)?
+                                    else {
+                                        return Ok(None);
+                                    };
+                                    if !witness::is_expected_literal(&original.value) {
+                                        return Ok(None);
+                                    }
+                                    let Some(mutant) = observe(
+                                        scenario,
+                                        baseline,
+                                        &candidate.edits,
+                                        Some(&original.value),
+                                    )?
+                                    else {
+                                        return Ok(None);
+                                    };
+                                    if mutant.equals_expected != Some(false)
+                                        || original.value == mutant.value
+                                    {
+                                        return Ok(None);
+                                    }
+                                    let Some(checked) =
+                                        observe(scenario, baseline, &[], Some(&original.value))?
+                                    else {
+                                        return Ok(None);
+                                    };
+                                    Ok((checked.equals_expected == Some(true)
+                                        && checked.value == original.value)
+                                        .then(|| scenario.verified(original.value, mutant.value))
+                                        .flatten())
+                                })();
+                                match distinction {
+                                    Ok(Some(mut verified)) => {
+                                        verified.individually_killed =
+                                            paired.then_some(candidate.edits.len());
+                                        evidence = Some(verified);
+                                        break;
+                                    }
+                                    Ok(None) => {}
+                                    Err(err) => note(&format!(
+                                        "could not check a distinguishing test for {}: {err:#}",
+                                        scenario.expression,
+                                    )),
+                                }
+                            }
+                        }
+                        Ok(WitnessTrial::Evaluated(outcome, evidence))
                     })();
                     state.write(&root_file, &restore)?;
-                    let (outcome, witness) = attempted?;
-                    progress.complete(outcome.map_or(progress::Outcome::Unable, Into::into));
-                    let Some(outcome) = outcome else {
-                        report.unviable_mutants += 1;
-                        continue;
-                    };
-                    report.mutants_run += 1;
-                    report.mutants_killed += usize::from(outcome != Outcome::Pass);
-                    report.mutants_timed_out += usize::from(outcome == Outcome::Timeout);
-                    if outcome == Outcome::Pass {
-                        report.findings.push(Finding::Survivor {
-                            at: report::Location {
-                                file: file.display.clone(),
-                                line: search.method_line,
-                                column: search.column,
-                                code: "position".to_owned(),
-                                ..Default::default()
-                            },
-                            survivors: vec![witness::MUTATION.to_owned()],
-                            witness,
-                        });
+                    match attempted? {
+                        WitnessTrial::NotApplicable => progress.complete(progress::Outcome::Unable),
+                        WitnessTrial::BuildFailed => {
+                            progress.complete(progress::Outcome::Unable);
+                            report.unviable_mutants += usize::from(!candidate.existing);
+                        }
+                        WitnessTrial::Evaluated(outcome, evidence) => {
+                            progress.complete(outcome.into());
+                            if let Some(index) = existing {
+                                if let Some(evidence) = evidence {
+                                    report.findings[index].set_witness(evidence);
+                                }
+                                continue;
+                            }
+                            report.mutants_run += 1;
+                            report.mutants_killed += usize::from(outcome != Outcome::Pass);
+                            report.mutants_timed_out += usize::from(outcome == Outcome::Timeout);
+                            if outcome == Outcome::Pass {
+                                report.findings.push(Finding::Survivor {
+                                    at,
+                                    survivors: vec![candidate.description.clone()],
+                                    witness: evidence,
+                                });
+                            }
+                        }
                     }
                 }
                 Ok(())

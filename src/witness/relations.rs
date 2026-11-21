@@ -587,7 +587,7 @@ fn push_candidate(
     out.push(Candidate {
         edits: vec![Edit { span, replacement }],
         scope: expression.start().line..=expression.end().line,
-        signature_line: function.sig.span().start().line,
+        signature_lines: vec![function.sig.span().start().line],
         description,
         existing: false,
         scenarios: vec![scenario],

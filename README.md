@@ -108,10 +108,21 @@ Running:
 - `--rebuild`: also run the mutants that need a build of their own (see "How it works", step 5). Without it the summary says how many were left out.
 - `--source-only`: build supported mutants directly from source and run them against the selected tests. Scope it with `--lines` or `--since` when tests launch children with `Command::env_clear()` or otherwise omit the probe environment. This mode is slower and reports surviving source mutants without trace-based input or assertion suggestions.
 
-With either rebuild mode, TMT also tries replacing `position` with `rposition` in simple integer-slice searches at the library crate root. If the mutant passes the selected tests and a selected library test harness is available, TMT tries a slice with two matches against both implementations. When their return values differ, the report shows the values and an assertion based on the original. The extra test runs in the working copy. JSON includes the evidence as `findings[].witness` on the survivor.
+With either rebuild mode, TMT can run an additional test in the working copy to show how the original and a surviving mutant differ. The report includes both observed values and an assertion based on the original. A selected library test harness is required, and JSON reports expose the evidence as `findings[].witness`.
+
+The rules recognize specific Rust patterns at the library crate root and simple tests in the same file:
+
+- In integer-slice searches, try two matches to distinguish `position` and `rposition`. For a surviving inclusive range, try editing just the extra zero in a literal test slice.
+- Try a partial multi-bit mask to distinguish any-bit and all-bit checks, and a non-ASCII character to distinguish text character counts and byte lengths.
+- Substitute same-type integer arguments or record fields in comparisons and put the two values on opposite sides of the boundary. For slice sorting by a record field, try two records whose order depends on the choice of key.
+- When a failing batch is only checked for an error, try a read borrowed from a nearby test for a key in the attempted batch.
+- When a test checks an integer codec by round trip, try changing the byte order on both sides. TMT checks that the selected tests detect each component change alone and pass with both changes. A fixed byte array on the encoding side can distinguish the implementations.
 
 ```sh
-cargo tmt fixtures/shapes --rebuild --lines src/lib.rs:28-29
+cargo tmt fixtures/shapes --rebuild --lines src/lib.rs:4-9 --lines src/lib.rs:28-29
+cargo tmt fixtures/operators --rebuild --lines src/lib.rs:72-74
+cargo tmt fixtures/distinguishing --rebuild
+cargo tmt fixtures/batch-store --rebuild --lines src/lib.rs:33
 ```
 
 Output: text by default, `--json`, or `--sarif` (SARIF 2.1.0 for code scanning: paths from the top of the git repository, the finding's id as `partialFingerprints`, and what the run looked at under the run's `properties`). The JSON report has the same under `analysis`: package, `--since` and `--lines`, features, and whether mutants were built and predictions re-run. `--show-unreached` lists sites with no recorded execution. Long campaigns print completed, failed, timed-out, survived and unevaluated counts on stderr. `--quiet` suppresses progress. If a baseline test fails, stderr includes the available diagnostics and the full log path.

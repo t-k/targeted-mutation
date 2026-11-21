@@ -127,6 +127,7 @@ mod tests {
             tests: vec!["tests::t".into()],
             effects: vec![],
             effects_of: None,
+            witness: None,
         }
     }
 

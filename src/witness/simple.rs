@@ -357,7 +357,7 @@ impl RangeFixtures<'_> {
         let test = self.tests.join("::");
         let expression = format!("{name}({changed}, {bound})");
         let scenarios = self.seeds.entry(name).or_default();
-        if scenarios.len() < 4
+        if scenarios.iter().filter(|seed| seed.test == test).count() < 4
             && !scenarios
                 .iter()
                 .any(|seed| seed.expression == expression && seed.test == test)
@@ -417,7 +417,7 @@ fn candidate(
             replacement,
         }],
         scope: span.start().line..=span.end().line,
-        signature_line: function.sig.span().start().line,
+        signature_lines: vec![function.sig.span().start().line],
         description,
         existing,
         scenarios,

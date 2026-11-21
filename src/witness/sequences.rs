@@ -197,6 +197,11 @@ fn byte_array(ty: &Type) -> Option<usize> {
 }
 
 fn codec(function: &ItemFn) -> Option<(bool, Codec)> {
+    if crate::instrument::is_skipped(&function.attrs)
+        || crate::instrument::is_test_only(&function.attrs)
+    {
+        return None;
+    }
     let signature = &function.sig;
     let FnArg::Typed(input) = single_arg(&signature.inputs)? else {
         return None;
@@ -327,14 +332,12 @@ fn round_trip_candidates(
         round_trip.visit_block(&test.function.block);
         for (encode, decode) in round_trip.functions {
             let scenarios = round_trips.entry((encode.clone(), decode)).or_default();
-            if scenarios.len() < MAX_SCENARIOS {
-                scenarios.push(Scenario {
-                    expression: format!("{encode}(0x0102)"),
-                    guidance: Some("Check the encoded bytes against the format contract.".into()),
-                    source_test: Some(test.name()),
-                    ..Scenario::default()
-                });
-            }
+            scenarios.push(Scenario {
+                expression: format!("{encode}(0x0102)"),
+                guidance: Some("Check the encoded bytes against the format contract.".into()),
+                source_test: Some(test.name()),
+                ..Scenario::default()
+            });
         }
     }
     for ((encode, decode), scenarios) in round_trips {
@@ -359,7 +362,7 @@ fn round_trip_candidates(
         out.push(Candidate {
             edits: edits.into(),
             scope: encoder_line.min(decoder_line)..=encoder_line.max(decoder_line),
-            signature_line: encoder.signature_line,
+            signature_lines: vec![encoder.signature_line, decoder.signature_line],
             description: format!(
                 "reverse the byte order together in `{encode}` (`{}`) and `{decode}` (`{}`)",
                 encoder.replacement, decoder.replacement
@@ -576,6 +579,7 @@ fn batch_candidates(
                 continue;
             };
             let test_name = test.name();
+            let limit = scenarios.len() + MAX_SCENARIOS;
             let braces = test.function.block.brace_token.span;
             let body = braces.open().byte_range().end..braces.close().byte_range().start;
             let Some(setup) = source.get(body) else {
@@ -599,7 +603,7 @@ fn batch_candidates(
                 .collect();
             for query in sibling_queries {
                 for key in &keys {
-                    if scenarios.len() >= MAX_SCENARIOS {
+                    if scenarios.len() >= limit {
                         break;
                     }
                     scenarios.push(Scenario {
@@ -625,7 +629,7 @@ fn batch_candidates(
                     replacement: String::new(),
                 }],
                 scope: span.start().line..=span.end().line,
-                signature_line: method.sig.span().start().line,
+                signature_lines: vec![method.sig.span().start().line],
                 description: format!("delete `{code}`"),
                 existing: true,
                 scenarios,

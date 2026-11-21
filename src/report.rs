@@ -59,6 +59,8 @@ pub enum Finding {
         effects: Vec<String>,
         /// The mutant whose effects those are, as it is written in `survivors`.
         effects_of: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        witness: Option<VerifiedWitness>,
     },
     /// A mutant that was built on its own passes every test, and nothing was recorded
     /// that says why: whether no test runs the code (nothing can be recorded in a
@@ -78,6 +80,10 @@ pub struct VerifiedWitness {
     pub original: String,
     pub mutant: String,
     pub assertion: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub guidance: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub individually_killed: Option<usize>,
 }
 
 impl Finding {
@@ -100,6 +106,17 @@ impl Finding {
         | Finding::AssertionGap { survivors, .. }
         | Finding::Survivor { survivors, .. }) = self;
         survivors
+    }
+
+    pub(crate) fn set_witness(&mut self, evidence: VerifiedWitness) {
+        match self {
+            Self::AssertionGap { witness, .. } | Self::Survivor { witness, .. } => {
+                if witness.is_none() {
+                    *witness = Some(evidence);
+                }
+            }
+            Self::InputGap { .. } => {}
+        }
     }
 
     /// The kind as the JSON report and the names of findings spell it.
@@ -326,7 +343,7 @@ pub fn location(file: &str, site: &Site) -> Location {
     }
 }
 
-fn one_line(code: &str) -> String {
+pub(crate) fn one_line(code: &str) -> String {
     let joined = code.split_whitespace().collect::<Vec<_>>().join(" ");
     if joined.chars().count() > 100 {
         format!("{}...", joined.chars().take(97).collect::<String>())
@@ -858,6 +875,7 @@ fn finding_body(finding: &Finding) -> Vec<String> {
             tests,
             effects,
             effects_of,
+            witness,
             ..
         } => {
             lines.push(format!("passes every test as: {}", survivors.join(", ")));
@@ -877,17 +895,16 @@ fn finding_body(finding: &Finding) -> Vec<String> {
                 }
                 lines.extend(effects.iter().cloned());
             }
+            if let Some(witness) = witness {
+                lines.extend(witness_lines(witness));
+            }
         }
         Finding::Survivor {
             survivors, witness, ..
         } => {
             lines.push(format!("passes every test as: {}", survivors.join(", ")));
             if let Some(witness) = witness {
-                lines.push(format!(
-                    "verified on `{}`: original returned {}, mutant returned {}",
-                    witness.call, witness.original, witness.mutant,
-                ));
-                lines.push(format!("add a test with `{}`", witness.assertion));
+                lines.extend(witness_lines(witness));
             } else {
                 lines.push(
                     "built on its own, where nothing can be recorded: either no test runs this code, or one does and does not check what it gives"
@@ -896,6 +913,21 @@ fn finding_body(finding: &Finding) -> Vec<String> {
             }
         }
     }
+    lines
+}
+
+fn witness_lines(witness: &VerifiedWitness) -> Vec<String> {
+    let mut lines = vec![format!(
+        "verified on `{}`: original returned {}, mutant returned {}",
+        witness.call, witness.original, witness.mutant,
+    )];
+    if let Some(killed) = witness.individually_killed {
+        lines.push(format!(
+            "the selected tests detected all {killed} component changes in isolation"
+        ));
+    }
+    lines.extend(witness.guidance.iter().cloned());
+    lines.push(format!("add a test with `{}`", witness.assertion));
     lines
 }
 
@@ -1684,6 +1716,7 @@ mod tests {
                     tests: vec!["t".into()],
                     effects: vec![],
                     effects_of: None,
+                    witness: None,
                 },
                 Finding::AssertionGap {
                     at: below,
@@ -1693,6 +1726,7 @@ mod tests {
                         "with the mutant, `t` no longer runs `s.count = 0;` (src/lib.rs:12)".into(),
                     ],
                     effects_of: None,
+                    witness: None,
                 },
             ],
             ..Report::default()
@@ -1848,6 +1882,7 @@ mod tests {
                 tests: (0..7).map(|i| format!("tests::t{i}")).collect(),
                 effects: vec![],
                 effects_of: None,
+                witness: None,
             }],
             unreached: vec![at.clone()],
             unstable: vec![at],
@@ -2016,6 +2051,7 @@ mod tests {
             tests: vec!["tests::t".into()],
             effects: vec!["with the mutant, `tests::t` now runs `x;` (src/lib.rs:2)".into()],
             effects_of: effects_of.map(str::to_string),
+            witness: None,
         };
         // Of several mutants one was followed: the report says which.
         let body = finding_body(&gap(&["`a <= b`", "`a == b`"], Some("`a <= b`")));
@@ -2200,6 +2236,7 @@ mod tests {
             tests: vec![],
             effects: vec![],
             effects_of: None,
+            witness: None,
         };
         let mut report = Report {
             findings: vec![

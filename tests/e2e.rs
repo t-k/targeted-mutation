@@ -1441,7 +1441,7 @@ exec "$@"
         .unwrap();
     assert!(result.get("witness").is_none(), "{result:#}");
     let copied = fs::read_to_string(dir.join("target/tmt/src/src/lib.rs")).unwrap();
-    assert!(!copied.contains("__tmt_position_witness"));
+    assert!(!copied.contains("__tmt_witness"));
     assert!(!copied.contains("rposition"));
 
     let retry = tmt(&dir, &at);
@@ -1452,6 +1452,278 @@ exec "$@"
         .find(|finding| finding["code"] == "position")
         .unwrap();
     assert_eq!(result["witness"]["mutant"], "Some(1)", "{result:#}");
+}
+
+#[test]
+fn verified_witnesses_respect_rebuild_mode_and_existing_tests() {
+    for rule in ["mask", "range", "pair"] {
+        for pinned in [false, true] {
+            let crate_name = if rule == "mask" {
+                "operators"
+            } else {
+                "shapes"
+            };
+            let dir = fixture(crate_name, &format!("verified-witness-{rule}-{pinned}"));
+            let source = dir.join("src/lib.rs");
+            let (lines, at, expected) = match rule {
+                "mask" => {
+                    if pinned {
+                        append(
+                            &source,
+                            "\n#[test] fn partial_mask() { assert!(has_flag(0b01, 0b11)); }\n",
+                        );
+                    }
+                    ("src/lib.rs:72-74", "has_flag", ("true", "false"))
+                }
+                "range" => {
+                    if pinned {
+                        let input = fs::read_to_string(&source).unwrap();
+                        fs::write(&source, input.replace("[1, 2, 0]", "[1, 2, 1]")).unwrap();
+                    }
+                    ("src/lib.rs:4-9", "sum_first", ("3", "4"))
+                }
+                "pair" => {
+                    fs::write(
+                        &source,
+                        r#"pub fn encode(value: u16) -> [u8; 2] { value.to_le_bytes() }
+pub fn decode(bytes: [u8; 2]) -> u16 { u16::from_le_bytes(bytes) }
+#[test]
+fn round_trip() { assert_eq!(decode(encode(0x0102)), 0x0102); }
+"#,
+                    )
+                    .unwrap();
+                    if pinned {
+                        append(
+                            &source,
+                            "#[test] fn wire_format() { assert_eq!(encode(0x0102), [2, 1]); }\n",
+                        );
+                    }
+                    ("src/lib.rs:1-2", "encode", ("[2, 1]", "[1, 2]"))
+                }
+                _ => unreachable!(),
+            };
+            let before = fs::read_to_string(&source).unwrap();
+            for mode in [None, Some("--rebuild"), Some("--source-only")] {
+                let args: Vec<_> = ["--json", "--quiet", "--lines", lines]
+                    .into_iter()
+                    .chain(mode)
+                    .collect();
+                let run = tmt(&dir, &args);
+                assert!(
+                    matches!(run.code, 0 | 2 | 3),
+                    "{rule} {args:?}: {}",
+                    run.stderr
+                );
+                let report: Value = serde_json::from_str(&run.stdout).unwrap();
+                let matching = report["findings"].as_array().unwrap().iter().find(|f| {
+                    f["item"] == at
+                        && f["witness"]["original"] == expected.0
+                        && f["witness"]["mutant"] == expected.1
+                });
+                assert_eq!(
+                    matching.is_some(),
+                    mode.is_some() && !pinned,
+                    "{rule} {pinned} {args:?}: {report:#}"
+                );
+                if let Some(finding) = matching {
+                    if rule == "range" {
+                        assert_eq!(finding["witness"]["call"], "sum_first(&[1, 2, 1], 2)");
+                        assert!(
+                            finding["witness"]["guidance"]
+                                .as_str()
+                                .unwrap()
+                                .contains("[1, 2, 0]")
+                        );
+                    }
+                    if rule == "pair" {
+                        assert_eq!(finding["witness"]["individually_killed"], 2);
+                        assert!(
+                            finding["witness"]["assertion"]
+                                .as_str()
+                                .unwrap()
+                                .contains("encode(")
+                        );
+                        let survivor = strings(&finding["survivors"]).join(" ");
+                        assert!(
+                            survivor.contains("to_be_bytes") && survivor.contains("from_be_bytes")
+                        );
+                    }
+                }
+                assert_eq!(fs::read_to_string(&source).unwrap(), before);
+            }
+        }
+    }
+}
+
+#[test]
+fn unicode_arguments_fields_and_sort_keys_get_distinguishing_tests() {
+    let dir = fixture("distinguishing", "verified-witness-relations");
+    let run = tmt(&dir, &["--json", "--quiet", "--rebuild"]);
+    assert_eq!(run.code, 2, "{}", run.stderr);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    let mut suggestions = Vec::new();
+    for item in ["chars", "expiry", "field_expiry", "order"] {
+        let finding = findings(&report, "survivor")
+            .into_iter()
+            .find(|f| f["item"] == item && f.get("witness").is_some());
+        let finding = finding.unwrap_or_else(|| panic!("no witness for {item}: {report:#}"));
+        let witness = &finding["witness"];
+        assert_ne!(witness["original"], witness["mutant"]);
+        assert!(
+            witness["assertion"]
+                .as_str()
+                .unwrap()
+                .contains("assert_eq!")
+        );
+        if item == "chars" {
+            assert_eq!(witness["original"], "1");
+            assert_eq!(witness["mutant"], "2");
+        }
+        suggestions.push((
+            item,
+            strings(&finding["survivors"])[0],
+            witness["assertion"].as_str().unwrap(),
+        ));
+    }
+    for (item, _, assertion) in &suggestions {
+        append(
+            &dir.join("src/lib.rs"),
+            &format!("\n#[test] fn check_{item}() {{ {assertion} }}\n"),
+        );
+    }
+    let run = tmt(&dir, &["--json", "--quiet", "--rebuild"]);
+    assert!(matches!(run.code, 0 | 2), "{}", run.stderr);
+    let closed: Value = serde_json::from_str(&run.stdout).unwrap();
+    for (item, mutation, _) in suggestions {
+        assert!(
+            !findings(&closed, "survivor")
+                .iter()
+                .any(|f| { f["item"] == item && strings(&f["survivors"]).contains(&mutation) }),
+            "{item} {mutation}: {closed:#}"
+        );
+    }
+}
+
+#[test]
+fn a_failing_batch_gets_an_assertion_on_its_persisted_state() {
+    let dir = fixture("batch-store", "verified-witness-after-error");
+    let args = ["--json", "--quiet", "--rebuild", "--lines", "src/lib.rs:33"];
+    let run = tmt(&dir, &args);
+    assert_eq!(run.code, 2, "{}", run.stderr);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    let finding = findings(&report, "assertion_gap")
+        .into_iter()
+        .find(|f| f["code"] == "self.check_preconditions(batch)?;")
+        .unwrap();
+    assert_eq!(finding["witness"]["original"], "None", "{finding:#}");
+    assert_eq!(finding["witness"]["mutant"], "Some(\"1\")", "{finding:#}");
+    assert_eq!(
+        finding["witness"]["assertion"],
+        "assert_eq!(store.get(\"a\"), None);"
+    );
+
+    let success_only = tmt(
+        &dir,
+        &[
+            args.as_slice(),
+            &[
+                "--include-test",
+                "tests::batch_writes_are_visible_after_commit",
+            ],
+        ]
+        .concat(),
+    );
+    assert!(
+        matches!(success_only.code, 0 | 2),
+        "{}",
+        success_only.stderr
+    );
+    assert!(
+        !success_only.stdout.contains("\"witness\""),
+        "{}",
+        success_only.stdout
+    );
+
+    let path = dir.join("src/lib.rs");
+    let input = fs::read_to_string(&path).unwrap();
+    fs::write(&path, input.replace("assert_eq!(result, Err(CommitError::NotFound(\"b\".into())));", "assert_eq!(result, Err(CommitError::NotFound(\"b\".into())));\n        assert_eq!(store.get(\"a\"), None);")).unwrap();
+    let closed = tmt(&dir, &args);
+    assert!(matches!(closed.code, 0 | 2), "{}", closed.stderr);
+    assert!(
+        !closed
+            .stdout
+            .contains("delete `self.check_preconditions(batch)?;`"),
+        "{}",
+        closed.stdout
+    );
+}
+
+#[test]
+fn a_debug_value_with_the_wrong_assertion_type_is_not_suggested() {
+    let dir = fixture("batch-store", "verified-witness-debug-type");
+    let path = dir.join("src/lib.rs");
+    let source = fs::read_to_string(&path).unwrap()
+        .replace("#[derive(Default)]\n", "")
+        .replace("impl Store {", "impl Default for Store {\n    fn default() -> Self { Self { docs: BTreeMap::from([(String::from(\"a\"), String::from(\"old\"))]) } }\n}\nimpl Store {")
+        .replace("Option<&str>", "Option<&String>")
+        .replace("self.docs.get(key).map(String::as_str)", "self.docs.get(key)")
+        .replace("Some(\"2\")", "Some(&String::from(\"2\"))");
+    fs::write(&path, source).unwrap();
+    let run = tmt(&dir, &["--json", "--quiet", "--rebuild"]);
+    assert_eq!(run.code, 2, "{}", run.stderr);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    let finding = findings(&report, "assertion_gap")
+        .into_iter()
+        .find(|f| f["code"] == "self.check_preconditions(batch)?;")
+        .unwrap();
+    assert!(finding.get("witness").is_none(), "{finding:#}");
+}
+
+#[test]
+fn paired_witnesses_respect_decoder_scope_test_selection_and_skip_attributes() {
+    let dir = fixture("shapes", "verified-witness-selected-pair");
+    let path = dir.join("src/lib.rs");
+    let mut source = String::from(
+        "pub fn encode(value: u16) -> [u8; 2] { value.to_le_bytes() }\npub fn decode(bytes: [u8; 2]) -> u16\n{\n    u16::from_le_bytes(bytes)\n}\n",
+    );
+    for number in 0..5 {
+        source.push_str(&format!(
+            "#[test] fn earlier_{number}() {{ assert_eq!(decode(encode(0x0102)), 0x0102); }}\n"
+        ));
+    }
+    source.push_str("#[test] fn selected() { assert_eq!(decode(encode(0x0102)), 0x0102); }\n");
+    fs::write(&path, &source).unwrap();
+    let selected = tmt(
+        &dir,
+        &[
+            "--json",
+            "--quiet",
+            "--rebuild",
+            "--include-test",
+            "selected",
+            "--lines",
+            "src/lib.rs:2",
+        ],
+    );
+    assert_eq!(selected.code, 2, "{}", selected.stderr);
+    let report: Value = serde_json::from_str(&selected.stdout).unwrap();
+    assert!(
+        findings(&report, "survivor")
+            .iter()
+            .any(|f| f["witness"]["individually_killed"] == 2),
+        "{report:#}"
+    );
+
+    for attribute in ["#[cfg(test)]", "#[cfg_attr(any(), mutants::skip)]"] {
+        fs::write(&path, format!("{attribute}\n{source}")).unwrap();
+        let rejected = tmt(&dir, &["--json", "--quiet", "--rebuild"]);
+        assert!(matches!(rejected.code, 0 | 2 | 3), "{}", rejected.stderr);
+        assert!(
+            !rejected.stdout.contains("reverse the byte order together"),
+            "{}",
+            rejected.stdout
+        );
+    }
 }
 
 #[test]
