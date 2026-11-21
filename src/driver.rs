@@ -681,6 +681,7 @@ struct TestBinary {
     filtered_timings:
         std::sync::Mutex<BTreeMap<Vec<String>, std::sync::Arc<std::sync::OnceLock<Duration>>>>,
     trace: Trace,
+    effects_baseline: std::sync::OnceLock<propagation::BaselineIndex>,
 }
 
 impl TestBinary {
@@ -2151,6 +2152,7 @@ fn observe_witness(
         report_slow: false,
         filtered_timings: Default::default(),
         trace: Trace::default(),
+        effects_baseline: std::sync::OnceLock::new(),
     };
     static RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let path = reserve_file(&test.marks, "witness", &RUNS)?;
@@ -2998,8 +3000,10 @@ impl Session {
             let mutated = Trace::parse(&text);
             let ran: Option<BTreeSet<String>> =
                 filter.as_ref().map(|names| names.iter().cloned().collect());
-            for (test, found) in propagation::changes(&bin.trace, &mutated, ran.as_ref(), job.site)
-            {
+            let baseline = bin
+                .effects_baseline
+                .get_or_init(|| propagation::BaselineIndex::new(&bin.trace));
+            for (test, found) in baseline.changes(&mutated, ran.as_ref(), job.site) {
                 all.entry(test).or_default().extend(found);
             }
         }
@@ -4333,6 +4337,7 @@ fn run_package(
                     report_slow: options.progress,
                     filtered_timings: Default::default(),
                     trace: Trace::default(),
+                    effects_baseline: std::sync::OnceLock::new(),
                 };
                 session.note(&format!("tracing `{}`", bin.name));
                 let started = Instant::now();
@@ -5703,6 +5708,7 @@ mod tests {
             report_slow: false,
             filtered_timings: Default::default(),
             trace: Trace::default(),
+            effects_baseline: std::sync::OnceLock::new(),
         };
         assert!(bin.filtered_limit(Some(&["fast".to_string()]), false) < Duration::from_secs(7));
         assert_eq!(
@@ -6394,6 +6400,7 @@ serde = { path = "../../serde-fork" }
             report_slow: false,
             filtered_timings: Default::default(),
             trace: Trace::default(),
+            effects_baseline: std::sync::OnceLock::new(),
         };
         let started = Instant::now();
         assert_eq!(
@@ -6461,6 +6468,7 @@ fn main() {
             report_slow: false,
             filtered_timings: Default::default(),
             trace: Trace::default(),
+            effects_baseline: std::sync::OnceLock::new(),
         };
         let started = Instant::now();
         let outcome = run_binary(
