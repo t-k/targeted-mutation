@@ -512,6 +512,137 @@ fn no_std_crate_and_custom_work_dir() {
 }
 
 #[test]
+fn file_scopes_keep_catalogue_diagnostics_and_candidates() {
+    for row in include_str!("data/scoped-files.pict.tsv").lines().skip(1) {
+        let columns: Vec<_> = row.split('\t').collect();
+        let [scope, peer, copy] = columns.as_slice() else {
+            panic!("{row}")
+        };
+        let dir = fixture("eligibility", &format!("file-scope-{scope}-{peer}-{copy}"));
+        let declaration = if *peer == "disabled" {
+            "#[cfg(test)] mod leaf;"
+        } else {
+            "mod leaf;"
+        };
+        let code = "pub fn allowed(n: u8) -> bool { n >= 10 }";
+        fs::write(dir.join("src/lib.rs"), format!("{declaration}\n{code}\n")).unwrap();
+        fs::write(
+            dir.join("src/leaf.rs"),
+            if *peer == "malformed" {
+                "fn invalid("
+            } else {
+                code
+            },
+        )
+        .unwrap();
+
+        if *copy == "warm" {
+            let warm = tmt(&dir, &["--list", "--json", "--quiet"]);
+            assert_eq!(warm.code, 0, "{row}: {}", warm.stderr);
+        }
+        let mut args = vec!["--list", "--json", "--quiet"];
+        if *scope != "leaf" {
+            args.extend(["--lines", "src/lib.rs"]);
+        }
+        if *scope != "root" {
+            args.extend(["--lines", "src/leaf.rs"]);
+        }
+        let run = tmt(&dir, &args);
+        assert_eq!(run.code, 0, "{row}: {}", run.stderr);
+        let report: Value = serde_json::from_str(&run.stdout).unwrap();
+        let candidates: std::collections::BTreeSet<_> = report["mutants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| m["edits"][0]["file"].as_str().unwrap())
+            .collect();
+        assert_eq!(candidates.contains("src/lib.rs"), *scope != "leaf", "{row}");
+        assert_eq!(
+            candidates.contains("src/leaf.rs"),
+            *scope != "root" && *peer == "valid",
+            "{row}"
+        );
+        assert_eq!(
+            report["skipped"].as_array().map_or(0, Vec::len),
+            usize::from(*scope != "root" && *peer == "malformed"),
+            "{row}"
+        );
+    }
+}
+
+#[test]
+fn root_source_mutants_keep_the_runtime_only_for_probes_in_other_files() {
+    for peer in [false, true] {
+        let dir = fixture("eligibility", &format!("source-root-runtime-{peer}"));
+        let work = dir.join("target/source-root");
+        let mut source = r#"
+pub const fn const_rule(value: u8) -> bool { value >= 10 }
+pub fn probe_rule(value: u8) -> bool { value >= 10 }
+#[test]
+fn checks() {
+    for rule in [const_rule, probe_rule] {
+        assert!(!rule(9));
+        assert!(rule(10));
+        assert!(rule(11));
+    }
+}
+"#
+        .to_owned();
+        if peer {
+            source.push_str(
+                "mod peer;\n#[test] fn checks_peer() { assert!(peer::probe_rule(10)); }\n",
+            );
+            fs::write(
+                dir.join("src/peer.rs"),
+                "pub fn probe_rule(value: u8) -> bool { value >= 10 }",
+            )
+            .unwrap();
+        }
+        fs::write(dir.join("src/lib.rs"), source).unwrap();
+        fs::write(
+            dir.join("build.rs"),
+            r#"
+use std::io::Write as _;
+fn main() {
+    println!("cargo:rerun-if-changed=src/lib.rs");
+    let source = std::fs::read_to_string("src/lib.rs").unwrap();
+    let has_probes = source.contains("crate::__tmt_rt::");
+    let has_runtime = source.lines().any(|line| line.trim() == "mod __tmt_rt;");
+    let mut log = std::fs::OpenOptions::new().create(true).append(true)
+        .open("../root-probe-log").unwrap();
+    writeln!(log, "{has_probes} {has_runtime}").unwrap();
+}
+"#,
+        )
+        .unwrap();
+        let run = tmt(
+            &dir,
+            &[
+                "--rebuild",
+                "--no-effects",
+                "--quiet",
+                "--json",
+                "--work-dir",
+                work.to_str().unwrap(),
+            ],
+        );
+        assert!(matches!(run.code, 0 | 2), "{}\n{}", run.stderr, run.stdout);
+        let log = fs::read_to_string(work.join("root-probe-log")).unwrap();
+        assert!(log.lines().any(|line| line == "true true"), "{log}");
+        assert!(
+            log.lines().any(|line| line == format!("false {peer}")),
+            "{log}"
+        );
+        assert!(
+            !log.lines().any(|line| line == format!("false {}", !peer)),
+            "{log}"
+        );
+        let restored = fs::read_to_string(work.join("src/src/lib.rs")).unwrap();
+        assert!(restored.contains("crate::__tmt_rt::") && restored.contains("mod __tmt_rt;"));
+    }
+}
+
+#[test]
 fn a_scoped_campaign_numbers_only_retained_probes() {
     let dir = fixture("eligibility", "compact-probe-ids");
     let work = dir.join("target/scoped");

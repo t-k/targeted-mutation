@@ -1,0 +1,10 @@
+Scope	Peer	Copy
+leaf	malformed	fresh
+both	malformed	warm
+root	disabled	warm
+leaf	valid	warm
+both	valid	fresh
+root	valid	fresh
+leaf	disabled	fresh
+root	malformed	warm
+both	disabled	warm

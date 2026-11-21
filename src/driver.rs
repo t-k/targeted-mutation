@@ -3662,12 +3662,19 @@ fn run_package(
         let Some(original) = state.original(&path, &workspace)? else {
             continue; // left by an earlier run; gone or rewritten before the build
         };
+        let selected_file = scope.as_ref().is_none_or(|scope| {
+            let relative = path.strip_prefix(&copy).unwrap_or(&path).to_string_lossy();
+            scope.touches(&relative, 1, usize::MAX)
+        });
+        if !selected_file && path != root_file {
+            continue;
+        }
         let display = relative_source(&path, &package_dir).display().to_string();
         match instrument::parse_source(&original) {
             Ok(parsed) => {
                 let mut found =
                     instrument::discover_parsed(&original, &parsed, next_id, &error_values);
-                if want_witnesses && path == root_file {
+                if want_witnesses && selected_file && path == root_file {
                     witness_candidates = witness::discover_parsed(&original, &parsed);
                 }
                 next_id += found.sites.len() as u32;
@@ -3697,11 +3704,7 @@ fn run_package(
                 });
             }
             Err(err) => {
-                let relative = path.strip_prefix(&copy).unwrap_or(&path).to_string_lossy();
-                if scope
-                    .as_ref()
-                    .is_none_or(|scope| scope.touches(&relative, 1, usize::MAX))
-                {
+                if selected_file {
                     let diagnostic = format!("{err:#}");
                     note(&format!("skipping {display}: {diagnostic}"));
                     let end_line = scope::line_of(&original, original.len());
@@ -4876,6 +4879,18 @@ fn run_package(
     }
     let mut by_speed: Vec<&TestBinary> = session.binaries.iter().collect();
     by_speed.sort_by_key(|bin| bin.baseline);
+    // A root replacement removes all of its probes. Other files may still use the runtime.
+    let root_mutant_suffix = if files.iter().any(|file| {
+        file.path != root_file
+            && file
+                .rendered
+                .as_ref()
+                .is_some_and(|rendered| rendered.text != file.original)
+    }) {
+        root_suffix.as_str()
+    } else {
+        ""
+    };
     if !built.is_empty() {
         if options.timeout_seconds.is_some()
             && built
@@ -4907,9 +4922,9 @@ fn run_package(
             "building {} mutants one by one (code a probe cannot be put in, or to compare with the probe)",
             built.len()
         ));
-        let instrumented = |file: &SourceFile, text: &str| {
+        let instrumented = |file: &SourceFile, text: &str, suffix: &str| {
             if file.path == root_file {
-                format!("{text}{root_suffix}")
+                format!("{text}{suffix}")
             } else {
                 text.to_string()
             }
@@ -4961,7 +4976,10 @@ fn run_package(
                         );
                         // `None`: it does not build. Otherwise what stopped it, if anything did.
                         let attempt = || -> Result<Option<Outcome>> {
-                            state.write(&file.path, &instrumented(file, &mutated))?;
+                            state.write(
+                                &file.path,
+                                &instrumented(file, &mutated, root_mutant_suffix),
+                            )?;
                             if !cargo_build()?.status.success() {
                                 return Ok(None);
                             }
@@ -4970,7 +4988,10 @@ fn run_package(
                         let attempted = attempt();
                         // The file as it was, before another one is changed and whatever went wrong.
                         let rendered = file.rendered.as_ref().expect("rendered before building");
-                        state.write(&file.path, &instrumented(file, &rendered.text))?;
+                        state.write(
+                            &file.path,
+                            &instrumented(file, &rendered.text, &root_suffix),
+                        )?;
                         let outcome = attempted?;
                         if let Some(phase) = &source_checkpoint {
                             phase.record(index, &outcome)?;
@@ -5049,19 +5070,6 @@ fn run_package(
             .expect("witness candidates in the root file");
         let rendered = file.rendered.as_ref().expect("rendered before building");
         let restore = format!("{}{root_suffix}", rendered.text);
-        // These builds replace every probe in the library root with the source.
-        // Keep the runtime only if another file in this build still contains probes.
-        let witness_suffix = if files.iter().any(|other| {
-            other.path != root_file
-                && other
-                    .rendered
-                    .as_ref()
-                    .is_some_and(|r| r.text != other.original)
-        }) {
-            root_suffix.as_str()
-        } else {
-            ""
-        };
         let library_runners: Vec<_> = session
             .binaries
             .iter()
@@ -5104,7 +5112,7 @@ fn run_package(
             let Some(source) = witness::render_edits(&file.original, edits, None) else {
                 return Ok(false);
             };
-            state.write(&root_file, &format!("{source}{witness_suffix}"))?;
+            state.write(&root_file, &format!("{source}{root_mutant_suffix}"))?;
             Ok(true)
         };
         let suite = |edits: &[witness::Edit]| -> Result<Option<Outcome>> {
