@@ -1316,36 +1316,101 @@ fn values_of(ty: &syn::Type, error_values: &[&str]) -> Vec<String> {
 /// `#[mutants::skip]`, also inside `cfg_attr`: the mark cargo-mutants uses for code that
 /// is not to be mutated.
 pub(crate) fn is_skipped(attrs: &[syn::Attribute]) -> bool {
-    attrs
-        .iter()
-        .any(|attr| squeezed(&attr.meta.to_token_stream().to_string()).contains("mutants::skip"))
+    fn marked(meta: &syn::Meta) -> bool {
+        let path = meta.path();
+        if path.segments.len() == 2
+            && path.segments[0].ident == "mutants"
+            && path.segments[1].ident == "skip"
+        {
+            return true;
+        }
+        if path.is_ident("cfg_attr")
+            && let syn::Meta::List(list) = meta
+            && let Ok(parts) = list.parse_args_with(
+                syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+            )
+        {
+            return parts.iter().skip(1).any(marked);
+        }
+        false
+    }
+
+    attrs.iter().any(|attr| marked(&attr.meta))
 }
 
-/// `#[test]`, `#[tokio::test]`, `#[cfg(test)]`, `#[cfg(all(test, ...))]`; not `#[cfg(not(test))]`.
+/// Detect test attributes and cfg predicates that require `test` to be true.
 pub(crate) fn is_test_only(attrs: &[syn::Attribute]) -> bool {
+    // Other cfg atoms are unknown. Keep the item whenever it could occur in a
+    // production build, even if it can also occur in tests.
+    fn possible(meta: &syn::Meta, desired: bool) -> bool {
+        if meta.path().is_ident("test") {
+            return !desired;
+        }
+        let syn::Meta::List(list) = meta else {
+            return true;
+        };
+        let Ok(parts) = list.parse_args_with(
+            syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+        ) else {
+            return true;
+        };
+        if list.path.is_ident("not") && parts.len() == 1 {
+            return possible(&parts[0], !desired);
+        }
+        if list.path.is_ident("all") || list.path.is_ident("any") {
+            return if list.path.is_ident("all") == desired {
+                parts.iter().all(|part| possible(part, desired))
+            } else {
+                parts.iter().any(|part| possible(part, desired))
+            };
+        }
+        true
+    }
+
     attrs.iter().any(|attr| {
         let path = attr.path();
         if path.segments.last().is_some_and(|s| s.ident == "test") {
             return true;
         }
-        if !path.is_ident("cfg") {
-            return false;
-        }
-        let syn::Meta::List(list) = &attr.meta else {
-            return false;
-        };
-        has_ident(list.tokens.clone(), "test") && !has_ident(list.tokens.clone(), "not")
+        path.is_ident("cfg")
+            && attr
+                .parse_args::<syn::Meta>()
+                .is_ok_and(|meta| !possible(&meta, true))
     })
 }
 
 impl<'ast> Visit<'ast> for Finder<'_> {
-    // Nothing in these can call a non-const function or is worth mutating.
     fn visit_attribute(&mut self, _: &'ast syn::Attribute) {}
-    fn visit_type(&mut self, _: &'ast syn::Type) {}
-    fn visit_pat(&mut self, _: &'ast syn::Pat) {}
-    fn visit_generics(&mut self, _: &'ast syn::Generics) {}
-    fn visit_generic_argument(&mut self, _: &'ast syn::GenericArgument) {}
-    fn visit_variant(&mut self, _: &'ast syn::Variant) {}
+    fn visit_pat(&mut self, node: &'ast syn::Pat) {
+        if let syn::Pat::Type(binding) = node {
+            self.visit_type(&binding.ty);
+        }
+    }
+    fn visit_type_macro(&mut self, _: &'ast syn::TypeMacro) {}
+    fn visit_type_array(&mut self, node: &'ast syn::TypeArray) {
+        self.visit_type(&node.elem);
+        self.constant(&[], &node.len);
+    }
+    fn visit_const_param(&mut self, node: &'ast syn::ConstParam) {
+        self.visit_type(&node.ty);
+        if let Some(default) = &node.default {
+            self.constant(&node.attrs, default);
+        }
+    }
+    fn visit_generic_argument(&mut self, node: &'ast syn::GenericArgument) {
+        match node {
+            syn::GenericArgument::Const(value) => self.constant(&[], value),
+            _ => visit::visit_generic_argument(self, node),
+        }
+    }
+    fn visit_variant(&mut self, node: &'ast syn::Variant) {
+        if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) {
+            self.visit_fields(&node.fields);
+            if let Some((_, value)) = &node.discriminant {
+                self.constant(&[], value);
+            }
+        }
+    }
     fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
         self.constant(&node.attrs, &node.expr);
     }
@@ -1360,7 +1425,13 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             self.constant(&node.attrs, value);
         }
     }
-    fn visit_expr_const(&mut self, _: &'ast syn::ExprConst) {}
+    fn visit_expr_const(&mut self, node: &'ast syn::ExprConst) {
+        if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) {
+            self.const_depth += 1;
+            self.visit_block(&node.block);
+            self.const_depth -= 1;
+        }
+    }
 
     fn visit_macro(&mut self, node: &'ast syn::Macro) {
         let Some(name) = node.path.segments.last().map(|s| s.ident.to_string()) else {
@@ -1394,7 +1465,8 @@ impl<'ast> Visit<'ast> for Finder<'_> {
     }
 
     fn visit_expr_repeat(&mut self, node: &'ast syn::ExprRepeat) {
-        self.visit_expr(&node.expr); // the length is a const expression
+        self.visit_expr(&node.expr);
+        self.constant(&node.attrs, &node.len);
     }
 
     fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
@@ -4104,6 +4176,68 @@ mod tests {
     }
 
     #[test]
+    fn compile_time_expressions_get_source_mutants_but_never_probes() {
+        // Full strength-three table from const.pict.
+        for (place, context) in [
+            ("inline", "let _ = const { 6 * 7 };"),
+            ("repeat", "let _ = [0u8; 6 * 7];"),
+            ("type length", "let _: [u8; 6 * 7];"),
+            ("discriminant", "enum Value { One = 6 * 7 }"),
+            ("const argument", "let _: Items<{ 6 * 7 }>;"),
+            ("const default", "struct Items<const N: usize = { 6 * 7 }>;"),
+        ] {
+            for qualifier in ["", "const "] {
+                for marker in ["", "#[mutants::skip] "] {
+                    let source =
+                        format!("{marker}{qualifier}fn f(x: u32) -> u32 {{ {context} x * 2 }}");
+                    let found = discover(&source, 0).unwrap();
+                    let variants: Vec<_> = found
+                        .rebuild_sites
+                        .iter()
+                        .filter(|site| site.text == "6 * 7")
+                        .flat_map(source_mutants)
+                        .map(|mutant| mutant.into)
+                        .collect();
+                    let expected: &[&str] = if marker.is_empty() { &["/", "+"] } else { &[] };
+                    assert_eq!(variants, expected, "{place}: {source}");
+                    assert!(
+                        found.sites.iter().all(|site| site.text != "6 * 7"),
+                        "{source}"
+                    );
+                    assert_eq!(
+                        found.sites.iter().any(|site| site.text == "x * 2"),
+                        marker.is_empty() && qualifier.is_empty(),
+                        "{source}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_test_branch_or_skip_documentation_does_not_exclude_production_code() {
+        let source = r#"
+            /// The mutants::skip attribute is documented here.
+            #[cfg(any(test, feature = "production"))]
+            fn public(x: u32) -> u32 { x + 1 }
+
+            #[cfg(all(test, feature = "production"))]
+            fn for_tests(x: u32) -> u32 { x + 2 }
+
+            #[cfg_attr(any(), mutants::skip)]
+            fn skipped(x: u32) -> u32 { x + 3 }
+        "#;
+        let found = discover(source, 0).unwrap();
+        let arithmetic: Vec<_> = found
+            .sites
+            .iter()
+            .filter(|site| matches!(site.kind, SiteKind::Arith { .. }))
+            .map(|site| site.text.as_str())
+            .collect();
+        assert_eq!(arithmetic, ["x + 1"]);
+    }
+
+    #[test]
     fn constants_and_literal_arithmetic_are_mutated_in_the_source() {
         let src = "const HALF: u64 = SPAN / 2;\n\
                    static LIMIT: i32 = -(1 << 4);\n\
@@ -4143,13 +4277,15 @@ mod tests {
                 "A < B: < -> <=",
                 "3 + 4: + -> -",
                 "3 + 4: + -> *",
+                "2 + 3: + -> -",
+                "2 + 3: + -> *",
                 // Two literals in ordinary code too: a probe would give them a type.
                 "60 * 60: * -> /",
                 "60 * 60: * -> +",
             ]
         );
         mutated(src, &found.rebuild_sites);
-        // The rest of that function is probed as usual; an array length is left alone.
+        // The surrounding arithmetic is still probed.
         let probed: Vec<&str> = found
             .sites
             .iter()
