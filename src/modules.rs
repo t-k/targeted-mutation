@@ -19,7 +19,12 @@ fn production(attrs: &[Attribute]) -> bool {
     !is_skipped(attrs) && !is_test_only(attrs)
 }
 
-pub(crate) fn external(source: &str, file: &Path, directory: &Path, active: bool) -> Vec<Module> {
+pub(crate) fn external(source: &str, file: &Path, directory: &Path) -> Vec<Module> {
+    // An explicit module or a recognized include must contain its keyword or macro name.
+    // Matches in comments and literals still go through the parser.
+    if !source.contains("mod") && !source.contains("include") {
+        return vec![];
+    }
     let Ok(parsed) = syn::parse_file(source) else {
         return vec![];
     };
@@ -135,7 +140,7 @@ pub(crate) fn external(source: &str, file: &Path, directory: &Path, active: bool
         file_dir: file.parent().unwrap_or(Path::new(".")),
         inline: vec![],
         directory,
-        active: active && production(&parsed.attrs),
+        active: production(&parsed.attrs),
         result: vec![],
     };
     modules.visit_file(&parsed);
@@ -178,4 +183,61 @@ fn path_alternatives(
         _ => {}
     }
     false
+}
+
+#[cfg(test)]
+#[test]
+fn module_edges_match_the_coverage_table() {
+    for row in include_str!("../tests/data/shared-source-modules.pict.tsv")
+        .lines()
+        .skip(1)
+    {
+        let fields: Vec<_> = row.split('\t').collect();
+        let [kind, visible, location] = fields.as_slice() else {
+            panic!("invalid PICT row: {row}");
+        };
+        let contents = match *kind {
+            "absent" => "fn sample() { let π = 1; }",
+            "default" => "mod child;",
+            "raw" => "mod r#type;",
+            "path" => r#"#[path = "generated.rs"] mod child;"#,
+            "include" => r#"include!(r"extra.rs");"#,
+            "macro" => "macro_rules! sample { () => { mod hidden; include!(\"hidden.rs\"); } }",
+            _ => panic!("{row}"),
+        };
+        let attr = if *visible == "test-only" {
+            "#[cfg(test)]"
+        } else {
+            ""
+        };
+        let source = match *location {
+            "top" => format!("{}\n{contents}", attr.replace("#[", "#![")),
+            "inline" => format!("{attr} mod outer {{ {contents} }}"),
+            "function" => format!("{attr} fn wrapper() {{ {contents} }}"),
+            _ => panic!("{row}"),
+        };
+        let file = Path::new("src/nested.rs");
+        let directory = Path::new("src/nested");
+        let edges = external(&source, file, directory);
+        if matches!(*kind, "absent" | "macro") {
+            assert!(edges.is_empty(), "{row}");
+            continue;
+        }
+        let base = if *location == "inline" {
+            directory.join("outer")
+        } else {
+            directory.to_path_buf()
+        };
+        let paths = match *kind {
+            "default" => vec![base.join("child.rs"), base.join("child/mod.rs")],
+            "raw" => vec![base.join("type.rs"), base.join("type/mod.rs")],
+            "path" if *location == "inline" => vec![base.join("generated.rs")],
+            "path" => vec![PathBuf::from("src/generated.rs")],
+            "include" => vec![PathBuf::from("src/extra.rs")],
+            _ => panic!("{row}"),
+        };
+        assert_eq!(edges.len(), 1, "{row}");
+        assert_eq!(edges[0].paths, paths, "{row}");
+        assert_eq!(edges[0].production, *visible == "production", "{row}");
+    }
 }

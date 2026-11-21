@@ -1349,11 +1349,11 @@ struct ModuleOwners {
 fn source_graph(
     roots: impl IntoIterator<Item = (PathBuf, bool)>,
     copy: &Path,
-    state: &WorkCopy,
-    workspace: &Path,
+    mut original: impl FnMut(&Path) -> Result<Option<String>>,
 ) -> Result<BTreeMap<PathBuf, ModuleOwners>> {
-    use std::collections::VecDeque;
+    use std::collections::{VecDeque, btree_map::Entry};
     let mut files: BTreeMap<PathBuf, ModuleOwners> = BTreeMap::new();
+    let mut edges = BTreeMap::new();
     for (root, production) in roots {
         let directory = root.parent().expect("Cargo target directory").to_path_buf();
         let mut pending = VecDeque::from([(root.clone(), directory, production)]);
@@ -1362,24 +1362,38 @@ fn source_graph(
             if !seen.insert((path.clone(), directory.clone(), active)) {
                 continue;
             }
-            let Some(original) = state.original(&path, workspace)? else {
+            // A file can resolve relative modules differently as a target root or a module.
+            // Keep eligibility from the file itself so this can also be reused by test roots.
+            let children = match edges.entry((path.clone(), directory.clone())) {
+                Entry::Occupied(entry) => entry.into_mut(),
+                Entry::Vacant(entry) => {
+                    let children = original(&path)?.map(|source| {
+                        crate::modules::external(&source, &path, &directory)
+                            .into_iter()
+                            .filter_map(|module| {
+                                let file = module
+                                    .paths
+                                    .iter()
+                                    .map(|path| normalize(path))
+                                    .find(|path| path.starts_with(copy) && path.is_file())?;
+                                Some((file, normalize(&module.directory), module.production))
+                            })
+                            .collect::<Vec<_>>()
+                    });
+                    entry.insert(children)
+                }
+            };
+            let Some(children) = children else {
                 continue;
             };
-            let record = files.entry(path.clone()).or_default();
+            let record = files.entry(path).or_default();
             record.consumers.insert(root.clone());
             if active {
                 record.production.insert(root.clone());
             }
-            for module in crate::modules::external(&original, &path, &directory, active) {
-                if let Some(child) = module
-                    .paths
-                    .iter()
-                    .map(|path| normalize(path))
-                    .find(|path| path.starts_with(copy) && path.is_file())
-                {
-                    pending.push_back((child, normalize(&module.directory), module.production));
-                }
-            }
+            pending.extend(children.iter().map(|(child, directory, production)| {
+                (child.clone(), directory.clone(), active && *production)
+            }));
         }
     }
     files.retain(|_, owners| !owners.production.is_empty());
@@ -3636,7 +3650,7 @@ fn run_package(
             }
         }
     }
-    let paths = source_graph(roots, &copy, &state, &workspace)?;
+    let paths = source_graph(roots, &copy, |path| state.original(path, &workspace))?;
     let scope = requested_scope(options, &workspace, &package_dir, &copy)?;
     let mut skipped = vec![];
     let mut files = vec![];
@@ -6010,10 +6024,72 @@ mod tests {
     }
 
     #[test]
+    fn source_graph_shares_edges_without_sharing_resolution_or_ownership() {
+        let scratch = scratch("shared-source-graph");
+        let copy = scratch.join("work/src");
+        let before = copy.join("before.rs");
+        let library = copy.join("lib.rs");
+        let after = copy.join("after.rs");
+        let shared = copy.join("shared.rs");
+        let leaf = copy.join("leaf.rs");
+        let nested_leaf = copy.join("shared/leaf.rs");
+        let sources = BTreeMap::from([
+            (before.clone(), r#"#[path = "shared.rs"] mod dep;"#),
+            (
+                library.clone(),
+                r#"mod shared; #[path = "shared.rs"] mod dep;"#,
+            ),
+            (after.clone(), r#"include!("shared.rs");"#),
+            (shared.clone(), "mod leaf;"),
+            (leaf.clone(), "fn top() {}"),
+            (nested_leaf.clone(), "fn nested() {}"),
+        ]);
+        for path in sources.keys() {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::File::create(path).unwrap();
+        }
+        let mut reads = BTreeMap::new();
+        let graph = source_graph(
+            [
+                (before.clone(), false),
+                (library.clone(), true),
+                (after.clone(), false),
+            ],
+            &copy,
+            |path| {
+                *reads.entry(path.to_path_buf()).or_insert(0) += 1;
+                Ok(sources.get(path).map(|source| (*source).to_string()))
+            },
+        )
+        .unwrap();
+        fs::remove_dir_all(scratch).unwrap();
+
+        assert_eq!(
+            reads[&shared], 2,
+            "one load in each of two resolution contexts"
+        );
+        assert_eq!(reads[&leaf], 1);
+        assert_eq!(reads[&nested_leaf], 1);
+        for path in [&leaf, &shared] {
+            assert_eq!(
+                graph[path].consumers,
+                BTreeSet::from([before.clone(), library.clone(), after.clone()])
+            );
+            assert_eq!(graph[path].production, BTreeSet::from([library.clone()]));
+        }
+        assert_eq!(
+            graph[&nested_leaf].consumers,
+            BTreeSet::from([library.clone()])
+        );
+        assert_eq!(graph[&nested_leaf].production, BTreeSet::from([library]));
+        assert!(!graph.contains_key(&before) && !graph.contains_key(&after));
+    }
+
+    #[test]
     fn out_of_line_module_locations() {
         let file = Path::new("src/cli.rs");
         let statements = "mod child; #[path = \"spec/support.rs\"] mod helper;";
-        let roots = crate::modules::external(statements, file, Path::new("src"), true);
+        let roots = crate::modules::external(statements, file, Path::new("src"));
         assert_eq!(
             roots[0].paths,
             [
@@ -6022,7 +6098,7 @@ mod tests {
             ]
         );
         assert_eq!(roots[1].paths, [PathBuf::from("src/spec/support.rs")]);
-        let module = crate::modules::external(statements, file, Path::new("src/cli"), true);
+        let module = crate::modules::external(statements, file, Path::new("src/cli"));
         assert_eq!(module[0].paths[0], PathBuf::from("src/cli/child.rs"));
         assert_eq!(module[1].paths[0], PathBuf::from("src/spec/support.rs"));
     }
