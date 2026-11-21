@@ -93,7 +93,8 @@ fn keys_of(source: &str, site: &Site) -> Vec<Key> {
             // other of `min` / `max`, the end of a range, a deleted statement.
             // Not one of cargo-mutants either, but it can be written in the source.
             SiteKind::Range { .. } => key("range", site.line, &mutant.what, &mutant.into),
-            SiteKind::Return { .. } | SiteKind::MinMax { .. } | SiteKind::Stmt => {
+            SiteKind::Stmt => key("statement", site.line, &site.text, ""),
+            SiteKind::Return { .. } | SiteKind::MinMax { .. } => {
                 unreachable!("no source mutants")
             }
         })

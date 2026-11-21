@@ -164,6 +164,8 @@ pub struct Analysis {
     pub tests_of: Vec<String>,
     pub cargo: CargoConfig,
     pub opt_level: Option<u8>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u64>,
     /// Mutants that need a build of their own were run.
     pub rebuild: bool,
     /// Predicted survivors were re-run.
@@ -215,6 +217,7 @@ pub enum SkipReason {
     ProbeCompileError,
     ProbeReplacedBySourceRebuild,
     RequiresSourceRebuild,
+    SourceNotBuilt,
     UnparseableSource,
 }
 
@@ -430,10 +433,16 @@ pub fn describe(site: &Site, m: Mutation) -> String {
             }
             _ => format!("another guard than `{}`", one_line(&site.text)),
         },
-        SiteKind::Field { from_base, .. } => format!(
+        SiteKind::Field {
+            from_base: Some(from_base),
+            ..
+        } => format!(
             "without the field `{}` (it is then `{from_base}`)",
             one_line(&site.text)
         ),
+        SiteKind::Field {
+            from_base: None, ..
+        } => format!("without the field `{}`", one_line(&site.text)),
         SiteKind::Body { name, value, .. } => format!("the body of `{name}` replaced by `{value}`"),
         SiteKind::Not { operand, .. } => format!("`{}`", one_line(operand)),
         SiteKind::Return { name, option, .. } => match (m, option) {
@@ -1635,6 +1644,7 @@ mod tests {
             kind: SiteKind::Arm {
                 pattern: "Kind::Update { key, .. }".into(),
                 guard: crate::instrument::ArmGuard::None(0),
+                removal: (0, 0),
             },
             ..assign.clone()
         };

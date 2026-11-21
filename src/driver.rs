@@ -62,6 +62,8 @@ pub struct Options {
     pub test_selection: TestSelection,
     /// Optimisation level to build the tests with, instead of the profile's own.
     pub opt_level: Option<u8>,
+    /// Override the time allowed for each test runner under a mutant.
+    pub timeout_seconds: Option<u64>,
     /// Run this many surviving mutants against all tests and record the tests twice.
     pub audit: Option<usize>,
     /// Cargo's choice of features and of the lock file, the same for every cargo command.
@@ -194,11 +196,17 @@ struct Target {
     kind: Vec<String>,
     src_path: PathBuf,
     test: bool,
+    #[serde(default)]
+    doctest: bool,
     #[serde(default, rename = "required-features")]
     required_features: Vec<String>,
 }
 
 impl Target {
+    fn is_production(&self) -> bool {
+        matches!(self.test_build_arg(), Some(("--lib" | "--bin", _)))
+    }
+
     /// The Cargo selector and its optional name. `--lib` selects every package's library.
     fn test_build_arg(&self) -> Option<(&'static str, Option<&str>)> {
         match self.kind.first()?.as_str() {
@@ -274,6 +282,8 @@ struct CargoMessage {
     target: Option<ArtifactTarget>,
     profile: Option<Profile>,
     executable: Option<PathBuf>,
+    #[serde(default)]
+    filenames: Vec<PathBuf>,
     message: Option<Diagnostic>,
 }
 
@@ -281,6 +291,7 @@ struct CargoMessage {
 struct ArtifactTarget {
     name: String,
     kind: Vec<String>,
+    src_path: Option<PathBuf>,
 }
 
 #[derive(Deserialize)]
@@ -324,6 +335,7 @@ struct BuildOutput {
     /// `(target name, executable, package, target kind)` of the test binaries.
     test_binaries: Vec<(String, PathBuf, String, Vec<String>)>,
     errors: Vec<CompileError>,
+    artifacts: Vec<(PathBuf, Vec<PathBuf>)>,
 }
 
 /// The workspace packages that depend on `package`, directly or through others.
@@ -362,12 +374,13 @@ fn parse_build_output(stdout: &str, packages: &[&str]) -> BuildOutput {
         };
         match msg.reason.as_str() {
             "compiler-artifact" => {
-                if let (Some(exe), Some(target), Some(profile), Some(id)) = (
-                    msg.executable,
-                    msg.target,
-                    msg.profile,
-                    msg.package_id.as_deref(),
-                ) && profile.test
+                let Some(target) = msg.target else { continue };
+                if let Some(path) = target.src_path {
+                    out.artifacts.push((normalize(&path), msg.filenames));
+                }
+                if let (Some(exe), Some(profile), Some(id)) =
+                    (msg.executable, msg.profile, msg.package_id.as_deref())
+                    && profile.test
                     && let Some(package) = packages.iter().find(|name| is_package(id, name))
                 {
                     out.test_binaries
@@ -411,11 +424,149 @@ fn parse_build_output(stdout: &str, packages: &[&str]) -> BuildOutput {
     out
 }
 
+/// Cargo puts each rustc dep-info file beside an artifact with the crate's stem.
+fn dependency_file(artifact: &Path) -> Option<String> {
+    let stem = artifact.file_stem()?.to_str()?;
+    let unprefixed = match artifact.extension().and_then(|ext| ext.to_str()) {
+        Some("a" | "so" | "dylib" | "rlib" | "rmeta") => stem.strip_prefix("lib"),
+        _ => None,
+    };
+    unprefixed
+        .and_then(|stem| fs::read_to_string(artifact.with_file_name(format!("{stem}.d"))).ok())
+        .or_else(|| fs::read_to_string(artifact.with_extension("d")).ok())
+}
+
+fn dep_inputs(text: &str, copy: &Path) -> BTreeSet<PathBuf> {
+    // Rustc writes one empty rule per input. This avoids counting output
+    // artifacts and excludes Cargo's transitive, promoted dependency file.
+    text.lines()
+        .filter_map(|line| line.strip_suffix(':'))
+        .map(|name| name.replace("\\ ", " ").replace("\\#", "#"))
+        .map(|name| normalize(&copy.join(name)))
+        .filter(|path| path.starts_with(copy))
+        .collect()
+}
+
+fn directory_entries(path: &Path) -> impl Iterator<Item = PathBuf> + use<> {
+    fs::read_dir(path)
+        .into_iter()
+        .flatten()
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+}
+
+fn same_binary(a: &Path, b: &Path) -> Option<bool> {
+    use std::io::{BufRead, BufReader, Read};
+    let (a, mut b) = (fs::File::open(a).ok()?, fs::File::open(b).ok()?);
+    let (left, right) = (a.metadata().ok()?, b.metadata().ok()?);
+    if !left.is_file() || !right.is_file() || left.len() != right.len() {
+        return Some(false);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if left.ino() == right.ino() && left.dev() == right.dev() {
+            return Some(true);
+        }
+    }
+    let mut a = BufReader::new(a);
+    let mut other = [0; 8192];
+    loop {
+        let bytes = a.fill_buf().ok()?;
+        let len = bytes.len();
+        if len == 0 {
+            return Some(true);
+        }
+        b.read_exact(&mut other[..len]).ok()?;
+        if bytes != &other[..len] {
+            return Some(false);
+        }
+        a.consume(len);
+    }
+}
+
+fn artifact_inputs(artifact: &Path, root: &Path, copy: &Path) -> BTreeSet<PathBuf> {
+    let read = |binary: &Path| {
+        dependency_file(binary)
+            .map(|text| dep_inputs(&text, copy))
+            .filter(|inputs| inputs.contains(root))
+    };
+    if let Some(inputs) = read(artifact) {
+        return inputs;
+    }
+    // Cargo exposes binaries linked for integration tests at the top of the
+    // profile. Match the actual rustc output beside its private dep-info file.
+    let Some((profile, stem)) = artifact
+        .parent()
+        .zip(artifact.file_stem().and_then(|s| s.to_str()))
+    else {
+        return BTreeSet::new();
+    };
+    let crate_stem = stem.replace('-', "_");
+    let hashed = format!("{crate_stem}-");
+    let old = directory_entries(&profile.join("deps")).filter(|path| {
+        path.extension() == artifact.extension()
+            && path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .is_some_and(|name| name.starts_with(&hashed))
+    });
+    let mut private_name = std::ffi::OsString::from(crate_stem);
+    if let Some(extension) = artifact.extension() {
+        private_name.push(".");
+        private_name.push(extension);
+    }
+    let new = directory_entries(&profile.join("build"))
+        .flat_map(|package| directory_entries(&package))
+        .map(|unit| unit.join("out").join(&private_name));
+    // A cached binary can have identical bytes and different inputs. Require
+    // the source to be present in every matching compilation.
+    old.chain(new)
+        .filter_map(|path| {
+            let inputs = read(&path)?;
+            (same_binary(artifact, &path) == Some(true)).then_some(inputs)
+        })
+        .reduce(|left, right| left.intersection(&right).cloned().collect())
+        .unwrap_or_default()
+}
+
+#[derive(Default)]
+struct BuiltSources(BTreeMap<PathBuf, BTreeSet<PathBuf>>);
+
+impl BuiltSources {
+    fn from_artifacts(artifacts: &[(PathBuf, Vec<PathBuf>)], copy: &Path) -> Self {
+        let mut built = Self::default();
+        for (root, artifacts) in artifacts {
+            if !root.starts_with(copy) {
+                continue;
+            }
+            let files = built.0.entry(root.clone()).or_default();
+            files.insert(root.clone());
+            if let Some(inputs) = artifacts
+                .iter()
+                .map(|file| artifact_inputs(file, root, copy))
+                .find(|inputs| !inputs.is_empty())
+            {
+                files.extend(inputs);
+            }
+        }
+        built
+    }
+
+    fn contains(&self, source: &SourceFile) -> bool {
+        source.owners.iter().any(|root| {
+            self.0
+                .get(root)
+                .is_some_and(|files| files.contains(&source.path))
+        })
+    }
+}
+
 struct SourceFile {
     /// Path relative to the package directory, for reports.
     display: String,
     /// Path inside the working copy.
     path: PathBuf,
+    owners: BTreeSet<PathBuf>,
     original: String,
     sites: Vec<Site>,
     /// Sites whose mutants are built one by one.
@@ -477,7 +628,14 @@ struct TestBinary {
     baseline: Duration,
     /// How long they took while recording.
     traced: Duration,
+    timeout: Option<Duration>,
     trace: Trace,
+}
+
+impl TestBinary {
+    fn mutant_limit(&self, baseline: Duration) -> Duration {
+        self.timeout.unwrap_or_else(|| mutant_timeout(baseline))
+    }
 }
 
 #[derive(Debug, PartialEq, Clone, Copy)]
@@ -898,27 +1056,6 @@ fn copy_fixture_entry(
     Ok(())
 }
 
-fn rust_files(dir: &Path, skip: &dyn Fn(&Path) -> bool, out: &mut Vec<PathBuf>) -> Result<()> {
-    let mut entries: Vec<PathBuf> = fs::read_dir(dir)?
-        .map(|e| e.map(|e| e.path()))
-        .collect::<std::io::Result<_>>()?;
-    entries.sort();
-    for path in entries {
-        let Ok(kind) = fs::symlink_metadata(&path).map(|m| m.file_type()) else {
-            continue;
-        };
-        if skip(&path) || kind.is_symlink() {
-            continue;
-        }
-        if kind.is_dir() {
-            rust_files(&path, skip, out)?;
-        } else if path.extension().is_some_and(|e| e == "rs") {
-            out.push(path);
-        }
-    }
-    Ok(())
-}
-
 /// The files under `dir` that git tracks or would track (not ignored), relative to `dir`.
 /// `None` when `dir` is not in a git work tree, or is itself ignored: then git has nothing
 /// to say about which files matter.
@@ -1009,20 +1146,50 @@ fn copy_git_visible(
     Ok(copied)
 }
 
-/// Where the out-of-line module `module` declared in `file` lives.
-fn module_paths(file: &Path, module: &instrument::TestModule) -> Vec<PathBuf> {
-    let dir = file.parent().unwrap_or(Path::new("."));
-    if let Some(path) = &module.path {
-        return vec![dir.join(path)];
+#[derive(Default)]
+struct ModuleOwners {
+    production: BTreeSet<PathBuf>,
+    consumers: BTreeSet<PathBuf>,
+}
+
+fn source_graph(
+    roots: impl IntoIterator<Item = (PathBuf, bool)>,
+    copy: &Path,
+    state: &WorkCopy,
+    workspace: &Path,
+) -> Result<BTreeMap<PathBuf, ModuleOwners>> {
+    use std::collections::VecDeque;
+    let mut files: BTreeMap<PathBuf, ModuleOwners> = BTreeMap::new();
+    for (root, production) in roots {
+        let directory = root.parent().expect("Cargo target directory").to_path_buf();
+        let mut pending = VecDeque::from([(root.clone(), directory, production)]);
+        let mut seen = HashSet::new();
+        while let Some((path, directory, active)) = pending.pop_front() {
+            if !seen.insert((path.clone(), directory.clone(), active)) {
+                continue;
+            }
+            let Some(original) = state.original(&path, workspace)? else {
+                continue;
+            };
+            let record = files.entry(path.clone()).or_default();
+            record.consumers.insert(root.clone());
+            if active {
+                record.production.insert(root.clone());
+            }
+            for module in crate::modules::external(&original, &path, &directory, active) {
+                if let Some(child) = module
+                    .paths
+                    .iter()
+                    .map(|path| normalize(path))
+                    .find(|path| path.starts_with(copy) && path.is_file())
+                {
+                    pending.push_back((child, normalize(&module.directory), module.production));
+                }
+            }
+        }
     }
-    let name = &module.name;
-    let stem = file.file_stem().and_then(|s| s.to_str()).unwrap_or("");
-    let base = if matches!(stem, "lib" | "main" | "mod") {
-        dir.to_path_buf()
-    } else {
-        dir.join(stem)
-    };
-    vec![base.join(format!("{name}.rs")), base.join(name)]
+    files.retain(|_, owners| !owners.production.is_empty());
+    Ok(files)
 }
 
 /// Resolves `.` and `..` without touching the file system.
@@ -1038,6 +1205,17 @@ fn normalize(path: &Path) -> PathBuf {
         }
     }
     out
+}
+
+fn relative_source(path: &Path, package: &Path) -> PathBuf {
+    for (depth, ancestor) in package.ancestors().enumerate() {
+        if let Ok(local) = path.strip_prefix(ancestor) {
+            let mut relative: PathBuf = std::iter::repeat_n("..", depth).collect();
+            relative.push(local);
+            return relative;
+        }
+    }
+    path.to_path_buf()
 }
 
 /// Rewrites `path = "../outside"` dependencies of a manifest to absolute paths when they
@@ -1692,7 +1870,7 @@ fn run_source_tests(binaries: &[&TestBinary]) -> Result<Outcome> {
             bin,
             None,
             &[],
-            mutant_timeout(bin.baseline),
+            bin.mutant_limit(bin.baseline),
             RunOutput::FirstFailure,
             1,
         )?;
@@ -1727,6 +1905,7 @@ fn observe_witness(
         },
         baseline: baseline.baseline,
         traced: Duration::ZERO,
+        timeout: baseline.timeout,
         trace: Trace::default(),
     };
     static RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -1739,7 +1918,7 @@ fn observe_witness(
             &test,
             None,
             &[(witness::OUTPUT_ENV, output)],
-            mutant_timeout(test.baseline),
+            test.mutant_limit(test.baseline),
             RunOutput::Quiet,
             1,
         )? != Outcome::Pass
@@ -1924,7 +2103,7 @@ fn requested_scope(
     let lines: Vec<String> = options
         .lines
         .iter()
-        .map(|spec| prefix.join(spec).to_string_lossy().into_owned())
+        .map(|spec| normalize(&prefix.join(spec)).to_string_lossy().into_owned())
         .collect();
     let mut scope = Scope::parse_lines(&lines)?;
     if let Some(revision) = &options.since {
@@ -2495,7 +2674,7 @@ impl Session {
                 bin,
                 filter.as_deref(),
                 &[("TMT_MUTANT", &spec)],
-                mutant_timeout(bin.baseline),
+                bin.mutant_limit(bin.baseline),
                 RunOutput::FirstFailure,
                 sharing,
             )?;
@@ -2540,7 +2719,7 @@ impl Session {
                 bin,
                 filter.as_deref(),
                 &[("TMT_MUTANT", &spec), ("TMT_TRACE", &trace_env)],
-                mutant_timeout(bin.traced),
+                bin.mutant_limit(bin.traced),
                 RunOutput::Quiet,
                 sharing,
             )?;
@@ -3010,48 +3189,35 @@ fn run_package(
         .expect("source file has a parent")
         .to_path_buf();
 
-    // 3. Find the sites.
-    let mut other_roots = HashSet::new();
-    let mut other_dirs = HashSet::new();
-    for target in &package.targets {
-        if target.src_path == root_target.src_path {
-            continue;
+    // 3. Walk all production roots. Other Cargo targets can include a production
+    // module by path, so record them as consumers when deciding what can be probed.
+    let mut roots = BTreeMap::new();
+    for owner in &metadata.packages {
+        for target in &owner.targets {
+            let production = owner.name == package.name && target.is_production();
+            if let Ok(path) = in_copy(&target.src_path)
+                && path.is_file()
+            {
+                let selected = roots.entry(path).or_insert(false);
+                *selected |= production;
+            }
         }
-        let path = in_copy(&target.src_path)?;
-        if let Some(parent) = path.parent().filter(|p| *p != source_dir) {
-            other_dirs.insert(parent.to_path_buf());
-        }
-        other_roots.insert(path);
     }
-    let mut paths = vec![];
-    rust_files(
-        &source_dir,
-        &|p| {
-            other_roots.contains(p)
-                || other_dirs.contains(p)
-                || p.file_name().is_some_and(|n| n == "target")
-        },
-        &mut paths,
-    )?;
+    let paths = source_graph(roots, &copy, &state, &workspace)?;
     let scope = requested_scope(options, &workspace, &package_dir, &copy)?;
     let mut skipped = vec![];
     let mut files = vec![];
-    let mut test_only = HashSet::new();
     let mut next_id = 0u32;
-    for path in paths {
+    for (path, owners) in paths {
         let Some(original) = state.original(&path, &workspace)? else {
             continue; // left by an earlier run; gone or rewritten before the build
         };
-        let display = path
-            .strip_prefix(&package_dir)
-            .unwrap_or(&path)
-            .display()
-            .to_string();
+        let display = relative_source(&path, &package_dir).display().to_string();
         match instrument::discover_with_errors(&original, next_id, &error_values) {
-            Ok(found) => {
+            Ok(mut found) => {
                 next_id += found.sites.len() as u32;
-                for module in &found.test_modules {
-                    test_only.extend(module_paths(&path, module));
+                if owners.consumers.len() != 1 || !owners.consumers.contains(&root_file) {
+                    found.rebuild_sites.append(&mut found.sites);
                 }
                 let places = found
                     .sites
@@ -3065,6 +3231,7 @@ fn run_package(
                 files.push(SourceFile {
                     display,
                     path,
+                    owners: owners.production,
                     original,
                     places,
                     sites: found.sites,
@@ -3096,7 +3263,6 @@ fn run_package(
             }
         }
     }
-    files.retain(|f| !f.path.ancestors().any(|a| test_only.contains(a)));
 
     // Only the requested lines, if any were requested.
     if let Some(scope) = &scope {
@@ -3242,6 +3408,7 @@ fn run_package(
             tests_of: test_packages.iter().map(|p| p.name.clone()).collect(),
             cargo: options.cargo.clone(),
             opt_level: options.opt_level,
+            timeout_seconds: options.timeout_seconds,
             rebuild: options.rebuild || options.source_only,
             verified: options.verify && !options.source_only,
             doc_tests: options.doc,
@@ -3335,7 +3502,7 @@ fn run_package(
     let root_source = state
         .original(&root_file, &workspace)?
         .with_context(|| format!("{} is missing", root_target.src_path.display()))?;
-    let root_suffix = if options.source_only {
+    let root_suffix = if options.source_only || files.iter().all(|file| file.sites.is_empty()) {
         String::new()
     } else {
         state.write(
@@ -3466,7 +3633,11 @@ fn run_package(
             );
         }
     };
-    if build.test_binaries.is_empty() {
+    let built_sources = BuiltSources::from_artifacts(&build.artifacts, &copy);
+    let doc_packages = test_packages
+        .iter()
+        .filter(|p| options.doc && p.targets.iter().any(|target| target.doctest));
+    if build.test_binaries.is_empty() && doc_packages.clone().next().is_none() {
         bail!("{build_note}`{}` has no test binaries", package.name);
     }
 
@@ -3589,15 +3760,21 @@ fn run_package(
             .map(|path| path.display().to_string()),
         tests: runners.iter().map(|(name, _, _)| name.clone()).collect(),
     });
-    if options.doc && is_kind(root_target, &["lib", "rlib", "proc-macro"]) {
+    for owner in doc_packages {
         let doc = Runner::Doc {
             copy: copy.clone(),
             target_dir: build_target.clone(),
-            package: package.name.clone(),
+            package: owner.name.clone(),
             opt_level: options.opt_level,
             flags: options.cargo.flags(),
         };
-        runners.push(("doc tests".to_string(), doc, session.package_dir.clone()));
+        let name = if owner.name == package.name {
+            "doc tests".to_owned()
+        } else {
+            format!("{}::doc tests", owner.name)
+        };
+        let cwd = in_copy(owner.manifest_path.parent().expect("manifest has a parent"))?;
+        runners.push((name, doc, cwd));
     }
     // The marks by which a run says that it gave up are made where nothing else makes
     // files: the working directory is this analysis's alone while it is locked. A
@@ -3616,6 +3793,7 @@ fn run_package(
             runner,
             baseline: Duration::ZERO,
             traced: Duration::ZERO,
+            timeout: options.timeout_seconds.map(Duration::from_secs),
             trace: Trace::default(),
         };
         session.note(&format!("tracing `{}`", bin.name));
@@ -4066,6 +4244,7 @@ fn run_package(
         };
         // All tests are run against each of them; the quick ones first, since one
         // failure is enough.
+        let mut skipped_targets = BTreeSet::new();
         let mut survivors: Vec<(report::Location, Vec<String>)> = vec![];
         progress::track(
             options.progress,
@@ -4073,6 +4252,24 @@ fn run_package(
             built.len(),
             |progress| -> Result<()> {
                 for (file, site, mutant, twin) in &built {
+                    if !built_sources.contains(file) {
+                        if twin.is_none() {
+                            report.mutants_not_evaluated += 1;
+                            if skipped_targets.insert((&file.path, site.start, site.end)) {
+                                report.skipped.push(report::SkippedSite::new(
+                                    report::location(&file.display, site),
+                                    &file.original,
+                                    site.end,
+                                    report::SkipReason::SourceNotBuilt,
+                                    None,
+                                ));
+                            }
+                        } else if let Some(audit) = report.audit.as_mut() {
+                            audit.not_compared += 1;
+                        }
+                        progress.complete(progress::Outcome::Unable);
+                        continue;
+                    }
                     let mutated = format!(
                         "{}{}{}",
                         &file.original[..mutant.start],
@@ -4118,6 +4315,7 @@ fn run_package(
                     }
                     match outcome {
                         None => report.unviable_mutants += 1,
+                        Some(Outcome::Unable) => report.mutants_not_evaluated += 1,
                         Some(outcome) => {
                             report.mutants_run += 1;
                             report.mutants_killed += (outcome != Outcome::Pass) as usize;
@@ -4127,7 +4325,12 @@ fn run_package(
                     let survived = outcome == Some(Outcome::Pass);
                     if survived {
                         let at = report::location(&file.display, site);
-                        let text = report::describe(site, mutation_of(site, mutant));
+                        let text = match (&site.kind, mutant.replacement.is_empty()) {
+                            (SiteKind::Field { .. }, true) => {
+                                format!("without the field `{}`", report::one_line(&site.text))
+                            }
+                            _ => report::describe(site, mutation_of(site, mutant)),
+                        };
                         match survivors.last_mut() {
                             Some((last, texts)) if *last == at => texts.push(text),
                             _ => survivors.push((at, vec![text])),
@@ -4930,36 +5133,20 @@ mod tests {
 
     #[test]
     fn out_of_line_module_locations() {
-        let tests = instrument::TestModule {
-            name: "tests".into(),
-            path: None,
-        };
+        let file = Path::new("src/cli.rs");
+        let statements = "mod child; #[path = \"spec/support.rs\"] mod helper;";
+        let roots = crate::modules::external(statements, file, Path::new("src"), true);
         assert_eq!(
-            module_paths(Path::new("src/lib.rs"), &tests),
-            [PathBuf::from("src/tests.rs"), PathBuf::from("src/tests")]
-        );
-        assert_eq!(
-            module_paths(Path::new("src/store.rs"), &tests),
+            roots[0].paths,
             [
-                PathBuf::from("src/store/tests.rs"),
-                PathBuf::from("src/store/tests")
+                PathBuf::from("src/child.rs"),
+                PathBuf::from("src/child/mod.rs")
             ]
         );
-        assert_eq!(
-            module_paths(Path::new("src/store/mod.rs"), &tests),
-            [
-                PathBuf::from("src/store/tests.rs"),
-                PathBuf::from("src/store/tests")
-            ]
-        );
-        let with_path = instrument::TestModule {
-            name: "rt".into(),
-            path: Some("runtime/rt.rs".into()),
-        };
-        assert_eq!(
-            module_paths(Path::new("src/lib.rs"), &with_path),
-            [PathBuf::from("src/runtime/rt.rs")]
-        );
+        assert_eq!(roots[1].paths, [PathBuf::from("src/spec/support.rs")]);
+        let module = crate::modules::external(statements, file, Path::new("src/cli"), true);
+        assert_eq!(module[0].paths[0], PathBuf::from("src/cli/child.rs"));
+        assert_eq!(module[1].paths[0], PathBuf::from("src/spec/support.rs"));
     }
 
     #[test]
@@ -5327,6 +5514,7 @@ serde = { path = "../../serde-fork" }
             runner: Runner::Exe(exe),
             baseline: Duration::ZERO,
             traced: Duration::ZERO,
+            timeout: None,
             trace: Trace::default(),
         };
         let started = Instant::now();
@@ -5387,6 +5575,7 @@ fn main() {
             runner: Runner::Exe(exe),
             baseline: Duration::ZERO,
             traced: Duration::ZERO,
+            timeout: None,
             trace: Trace::default(),
         };
         let started = Instant::now();
@@ -5887,6 +6076,7 @@ fn main() {
             ("Not", "", "DropNot"),
             ("Range", "..", "RangeEnd"),
             ("Range", "..=", "RangeEnd"),
+            ("Stmt", "", "Delete"),
         ];
         // A comparison is planned in other words than it is written in: the mutations
         // that are the same change, as an audit looks for them.

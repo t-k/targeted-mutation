@@ -217,17 +217,26 @@ fn awkward_constructs() {
             .unwrap_or_else(|| panic!("no {kind} at `{code}`: {report:#}"))
     };
 
-    // `let value; value = ...;` and a diverging call cannot be guarded: skipped, not fatal.
-    assert_eq!(report["skipped_sites"], 2, "{report:#}");
-    let skipped = report["skipped"].as_array().unwrap();
-    assert!(
-        skipped
-            .iter()
-            .any(|site| site["reason"] == "probe_compile_error"
-                && site["file"] == "src/lib.rs"
-                && site["line"].as_u64().unwrap() > 0
-                && site["end_line"].as_u64().unwrap() >= site["line"].as_u64().unwrap()
+    // Both deletions fail as probes but are attempted as source edits.
+    assert_eq!(report["skipped_sites"], 0, "{report:#}");
+    let repaired: Vec<_> = report["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|site| site["reason"] == "probe_replaced_by_source_rebuild")
+        .collect();
+    assert_eq!(repaired.len(), 2, "{report:#}");
+    for line in [64, 104] {
+        assert!(
+            repaired.iter().any(|site| site["file"] == "src/lib.rs"
+                && site["line"] == line
+                && site["end_line"].as_u64().unwrap() >= line
                 && !site["diagnostic"].as_str().unwrap().is_empty()),
+            "{report:#}"
+        );
+    }
+    assert!(
+        report["unviable_mutants"].as_u64().unwrap() >= 2,
         "{report:#}"
     );
     assert!(
@@ -424,6 +433,23 @@ fn broken_source_stops_the_analysis() {
 }
 
 #[test]
+fn source_timeout_reports_incomplete_analysis_to_ci() {
+    let dir = fixture("looping", "source-loop-timeout");
+    let run = tmt(
+        &dir,
+        &["--source-only", "--timeout", "1", "--quiet", "--json"],
+    );
+    assert_eq!(run.code, 3, "{}", run.stderr);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(report["mutants_timed_out"], 2, "{report:#}");
+    assert!(
+        report["findings"].as_array().unwrap().is_empty(),
+        "{report:#}"
+    );
+    assert_eq!(report["analysis"]["timeout_seconds"], 1, "{report:#}");
+}
+
+#[test]
 fn endless_loop_mutant_is_killed_by_the_timeout() {
     let dir = fixture("looping", "looping");
     let started = std::time::Instant::now();
@@ -468,6 +494,392 @@ fn no_std_crate_and_custom_work_dir() {
     assert!(work.join("src/src/lib.rs").exists());
     assert!(work.join("target").exists());
     assert!(!dir.join("target").exists());
+}
+
+#[test]
+fn all_production_targets_follow_modules_and_report_unbuilt_targets() {
+    let dir = fixture("eligibility", "all-production-targets");
+    let manifest = dir.join("Cargo.toml");
+    append(
+        &manifest,
+        r#"
+[lib]
+name = "engine"
+path = "src/engine.rs"
+
+[[bin]]
+name = "cli-tool"
+path = "src/cli_entry.rs"
+
+[[bin]]
+name = "gated"
+path = "gated/entry.rs"
+required-features = ["optional"]
+
+[features]
+optional = []
+"#,
+    );
+    let write = |path: &str, content: &str| {
+        let dest = dir.join(path);
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        fs::write(dest, content).unwrap();
+    };
+    let marker = r#"
+pub fn marker(n: u32) -> u32 { n + 1 }
+#[test] fn checks_marker() { assert_eq!(marker(2), 3); }
+"#;
+    let shared = r#"
+mod shared_direct;
+mod shared_nested { mod leaf; }
+#[path = "../common/shared.rs"] mod shared_explicit;
+"#;
+    write(
+        "src/engine.rs",
+        &format!(
+            r#"{marker}{shared} mod primary_nested {{ mod leaf; }} #[path = "../common/primary.rs"] mod primary_explicit; #[cfg(test)] mod decoy;"#
+        ),
+    );
+    write(
+        "src/cli_entry.rs",
+        &format!(
+            r#"{marker}{shared} fn main() {{ println!("{{}}:{{}}", marker(2), secondary_nested::leaf::marker(2)); }} mod secondary_nested {{ pub(super) mod leaf; }} #[cfg(feature = "optional")] mod secondary_inactive; #[path = "../common/secondary.rs"] mod secondary_explicit;"#
+        ),
+    );
+    write(
+        "gated/entry.rs",
+        &format!(
+            r#"{marker} fn main() {{}} mod nested {{ mod leaf; }} #[path = "../common/gated.rs"] mod explicit;"#
+        ),
+    );
+    let active = [
+        ("src/engine.rs", false),
+        ("src/primary_nested/leaf.rs", false),
+        ("common/primary.rs", false),
+        ("src/cli_entry.rs", true),
+        ("src/secondary_nested/leaf.rs", true),
+        ("src/secondary_inactive.rs", true),
+        ("common/secondary.rs", true),
+        ("gated/entry.rs", true),
+        ("gated/nested/leaf.rs", true),
+        ("common/gated.rs", true),
+        ("src/shared_direct.rs", true),
+        ("src/shared_nested/leaf.rs", true),
+        ("common/shared.rs", true),
+    ];
+    for (path, _) in &active {
+        if !path.ends_with("engine.rs")
+            && !path.ends_with("cli_entry.rs")
+            && !path.ends_with("entry.rs")
+        {
+            write(path, marker);
+        }
+    }
+    write("src/secondary_inactive.rs", marker);
+    write("src/orphan.rs", marker);
+    write("src/decoy.rs", marker);
+    write("src/lib.rs", marker);
+    let run = tmt(&dir, &["--list", "--json", "--quiet"]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    let catalog: Value = serde_json::from_str(&run.stdout).unwrap();
+    let additions: Vec<_> = catalog["mutants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|entry| entry["what"] == "+" && entry["into"] == "-")
+        .map(|entry| {
+            (
+                entry["edits"][0]["file"].as_str().unwrap(),
+                entry["requires_rebuild"].as_bool().unwrap(),
+            )
+        })
+        .collect();
+    assert_eq!(additions.len(), active.len(), "{additions:?}");
+    for expected in active {
+        assert!(additions.contains(&expected), "{expected:?}: {additions:?}");
+    }
+    write(
+        "tests/process.rs",
+        r#"
+#[test]
+fn checks_binary() {
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_cli-tool")).output().unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"3:3\n");
+}
+"#,
+    );
+    let run = tmt(
+        &dir,
+        &[
+            "--source-only",
+            "--json",
+            "--quiet",
+            "--test-target",
+            "process",
+            "--lines",
+            "src/cli_entry.rs:2",
+        ],
+    );
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(report["mutants_run"], 4, "{report:#}");
+    assert_eq!(report["mutants_killed"], 4, "{report:#}");
+    for (file, code, killed, unevaluated) in [
+        ("src/secondary_nested/leaf.rs", 0, 4, 0),
+        ("src/secondary_inactive.rs", 3, 0, 4),
+    ] {
+        let run = tmt(
+            &dir,
+            &[
+                "--source-only",
+                "--json",
+                "--quiet",
+                "--test-target",
+                "process",
+                "--lines",
+                file,
+            ],
+        );
+        assert_eq!(run.code, code, "{}{}", run.stderr, run.stdout);
+        let report: Value = serde_json::from_str(&run.stdout).unwrap();
+        assert_eq!(report["mutants_killed"], killed, "{report:#}");
+        assert_eq!(report["mutants_not_evaluated"], unevaluated, "{report:#}");
+        assert!(
+            report["findings"].as_array().unwrap().is_empty(),
+            "{report:#}"
+        );
+    }
+
+    for feature in [false, true] {
+        let mut args = vec![
+            "--rebuild",
+            "--json",
+            "--quiet",
+            "--lines",
+            "gated/nested/leaf.rs",
+        ];
+        if feature {
+            args.extend(["--features", "optional"]);
+        }
+        let run = tmt(&dir, &args);
+        assert_eq!(run.code, if feature { 0 } else { 3 }, "{}", run.stderr);
+        let report: Value = serde_json::from_str(&run.stdout).unwrap();
+        assert_eq!(
+            report["mutants_run"],
+            if feature { 4 } else { 0 },
+            "{report:#}"
+        );
+        assert_eq!(
+            report["mutants_not_evaluated"],
+            if feature { 0 } else { 4 },
+            "{report:#}"
+        );
+        assert_eq!(
+            report["mutants_killed"],
+            if feature { 4 } else { 0 },
+            "{report:#}"
+        );
+        assert!(
+            report["findings"].as_array().unwrap().is_empty(),
+            "{report:#}"
+        );
+    }
+}
+
+#[test]
+fn source_only_distinguishes_inactive_modules_from_survivors() {
+    let dir = fixture("eligibility", "conditional-source-module");
+    append(&dir.join("Cargo.toml"), "\n[features]\noptional = []\n");
+    append(
+        &dir.join("src/lib.rs"),
+        r#"
+#[cfg(feature = "optional")]
+#[cfg_attr(feature = "optional", path = "optional impl.rs")]
+mod optional;
+#[cfg(feature = "optional")]
+#[test]
+fn checks_optional() { assert_eq!(optional::add(1, 2), 3); }
+
+#[cfg_attr(test, path = "test_engine.rs")]
+mod engine;
+include!("included.rs");
+#[test]
+fn checks_included() { assert_eq!(included(1, 2), 3); }
+"#,
+    );
+    fs::write(
+        dir.join("src/optional impl.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("src/included.rs"),
+        "pub fn included(a: i32, b: i32) -> i32 { a + b }\n",
+    )
+    .unwrap();
+    fs::create_dir(dir.join("tests")).unwrap();
+    fs::write(
+        dir.join("tests/fixture.rs"),
+        r#"
+#[test]
+fn can_read_disabled_source_as_text() {
+    assert!(include_str!("../src/optional impl.rs").contains("pub fn add"));
+}
+"#,
+    )
+    .unwrap();
+    for file in ["engine.rs", "test_engine.rs"] {
+        fs::write(dir.join("src").join(file), "pub fn value() -> u32 { 4 }\n").unwrap();
+    }
+    let run = tmt(&dir, &["--source-only", "--list", "--quiet", "--json"]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    let catalogue: Value = serde_json::from_str(&run.stdout).unwrap();
+    let mutants = catalogue["mutants"].as_array().unwrap();
+    for file in ["src/optional impl.rs", "src/included.rs"] {
+        assert!(
+            mutants
+                .iter()
+                .any(|entry| entry["edits"][0]["file"] == file),
+            "{catalogue:#}"
+        );
+    }
+    assert!(
+        mutants
+            .iter()
+            .any(|entry| entry["edits"][0]["file"] == "src/engine.rs")
+    );
+    assert!(
+        !mutants
+            .iter()
+            .any(|entry| entry["edits"][0]["file"] == "src/test_engine.rs")
+    );
+    let baseline = [
+        "--source-only",
+        "--quiet",
+        "--json",
+        "--lines",
+        "src/optional impl.rs",
+    ];
+    let run = tmt(&dir, &baseline);
+    assert_eq!(run.code, 3, "{}{}", run.stderr, run.stdout);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(report["mutants_not_evaluated"], 5, "{report:#}");
+    assert!(
+        report["findings"].as_array().unwrap().is_empty(),
+        "{report:#}"
+    );
+    let run = tmt(&dir, &[&baseline[..], &["--features", "optional"]].concat());
+    assert_eq!(run.code, 0, "{}{}", run.stderr, run.stdout);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(report["mutants_killed"], 5, "{report:#}");
+    assert_eq!(report["mutants_not_evaluated"], 0, "{report:#}");
+}
+
+#[test]
+fn a_library_root_directly_included_in_a_test_still_builds() {
+    let dir = fixture("eligibility", "test-includes-library-root");
+    fs::create_dir(dir.join("tests")).unwrap();
+    fs::write(
+        dir.join("tests/direct.rs"),
+        r#"
+#[path = "../src/lib.rs"]
+mod api;
+
+#[test]
+fn checks_library() {
+    assert_eq!(api::add(1, 2), 3);
+}
+"#,
+    )
+    .unwrap();
+    fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n",
+    )
+    .unwrap();
+    let run = tmt(&dir, &["--rebuild", "--quiet", "--json"]);
+    assert_eq!(run.code, 0, "{}{}", run.stderr, run.stdout);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(report["mutants_killed"], 5, "{report:#}");
+}
+
+#[test]
+fn member_relative_module_paths_can_be_reused_in_line_filters() {
+    let root = fixture("multi", "member-relative-module");
+    let ws = root.join("ws");
+    append(
+        &ws.join("core/src/lib.rs"),
+        "\n#[path = \"../../shared.rs\"] mod shared;\n",
+    );
+    fs::write(
+        ws.join("shared.rs"),
+        "pub fn add(a: i32, b: i32) -> i32 { a + b }\n",
+    )
+    .unwrap();
+    let run = tmt(
+        &ws,
+        &[
+            "--package",
+            "ws-core",
+            "--list",
+            "--json",
+            "--quiet",
+            "--lines",
+            "../shared.rs:1",
+        ],
+    );
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    let catalogue: Value = serde_json::from_str(&run.stdout).unwrap();
+    let mutants = catalogue["mutants"].as_array().unwrap();
+    assert!(!mutants.is_empty(), "{catalogue:#}");
+    assert!(
+        mutants
+            .iter()
+            .all(|mutant| mutant["edits"][0]["file"] == "../shared.rs")
+    );
+}
+
+#[test]
+fn source_only_can_use_doctests_of_other_workspace_members() {
+    let root = fixture("multi", "other-member-doctest");
+    let ws = root.join("ws");
+    append(
+        &ws.join("core/src/lib.rs"),
+        "\npub fn only_doc(n: i32) -> i32 { n + 1 }\n",
+    );
+    append(
+        &ws.join("app/src/lib.rs"),
+        r#"
+/// ```
+/// assert_eq!(ws_core::only_doc(7), 8);
+/// ```
+pub fn doc_checks_the_core() {}
+"#,
+    );
+    let source = fs::read_to_string(ws.join("core/src/lib.rs")).unwrap();
+    let line = source.lines().count();
+    let run = tmt(
+        &ws,
+        &[
+            "--package",
+            "ws-core",
+            "--test-workspace",
+            "--doc",
+            "--source-only",
+            "--quiet",
+            "--json",
+            "--lines",
+            &format!("src/lib.rs:{line}"),
+        ],
+    );
+    assert_eq!(run.code, 0, "{}{}", run.stderr, run.stdout);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert!(report["mutants_killed"].as_u64().unwrap() > 0, "{report:#}");
+    assert_eq!(
+        report["mutants_killed"], report["mutants_run"],
+        "{report:#}"
+    );
 }
 
 #[test]

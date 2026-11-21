@@ -93,6 +93,7 @@ pub enum SiteKind {
         pattern: String,
         /// Where to put the probe: the start of the `=>`, or the range of an existing guard.
         guard: ArmGuard,
+        removal: (usize, usize),
     },
     /// A call or assignment statement that can be deleted.
     Stmt,
@@ -115,8 +116,10 @@ pub enum SiteKind {
         name: String,
         /// Written without its name (`S { name, ..base }`).
         shorthand: bool,
-        /// The expression that reads the field from the base.
-        from_base: String,
+        /// The expression used by a probe, where the base can safely be read again.
+        from_base: Option<String>,
+        /// The field and its trailing comma, including any attributes.
+        removal: (usize, usize),
     },
     /// The whole body of a function, replaced by a value of its return type. The site's
     /// range is the inside of the body's braces and its text is the function signature.
@@ -429,23 +432,27 @@ impl Finder<'_> {
             return;
         }
         let written = sole_expr.map(|(from, to)| tokens_of(&self.source[from..to]));
-        // An iterator of another type cannot be returned beside the body's own.
-        for value in iterator_values_with_errors(&sig.output, self.error_values) {
-            self.found.rebuild_sites.push(Site {
-                id: NO_ID,
-                kind: SiteKind::Body {
-                    name: name.clone(),
-                    value,
-                    sole_expr: sole_plain,
-                },
-                line: at.line,
-                column: at.column + 1,
-                start,
-                end,
-                text: text.clone(),
-            });
+        let probe_values = body_values_with_errors(&sig.output, self.error_values, false);
+        for value in body_values_with_errors(&sig.output, self.error_values, true) {
+            if !probe_values.contains(&value)
+                && written.as_deref() != Some(tokens_of(&value).as_str())
+            {
+                self.add_rebuild(Site {
+                    id: NO_ID,
+                    kind: SiteKind::Body {
+                        name: name.clone(),
+                        value,
+                        sole_expr: sole_plain,
+                    },
+                    line: at.line,
+                    column: at.column + 1,
+                    start,
+                    end,
+                    text: text.clone(),
+                });
+            }
         }
-        for value in body_values_with_errors(&sig.output, self.error_values) {
+        for value in probe_values {
             if written.as_deref() != Some(tokens_of(&value).as_str()) {
                 push(
                     self,
@@ -533,10 +540,14 @@ impl Finder<'_> {
     }
 
     /// Registers a site: numbered, or among those that need a build of their own.
+    fn add_rebuild(&mut self, mut site: Site) {
+        site.id = NO_ID;
+        self.found.rebuild_sites.push(site);
+    }
+
     fn add(&mut self, mut site: Site) {
         if self.const_depth > 0 {
-            site.id = NO_ID;
-            self.found.rebuild_sites.push(site);
+            self.add_rebuild(site);
         } else {
             site.id = self.next_id;
             self.found.sites.push(site);
@@ -983,9 +994,12 @@ pub fn source_mutants(site: &Site) -> Vec<SourceMutant> {
                 value,
             )]
         }
-        // An arm whose guard is `false` is an arm that is not there.
-        SiteKind::Arm { pattern, guard } => vec![match guard {
-            ArmGuard::None(arrow) => change(*arrow, *arrow, "if false ".into(), "arm", pattern),
+        SiteKind::Arm {
+            pattern,
+            guard,
+            removal,
+        } => vec![match guard {
+            ArmGuard::None(_) => change(removal.0, removal.1, String::new(), "arm", pattern),
             ArmGuard::Existing(from, to) => change(*from, *to, "false".into(), "arm", pattern),
         }],
         SiteKind::Guard { can_be_false } => [true, false]
@@ -1001,24 +1015,10 @@ pub fn source_mutants(site: &Site) -> Vec<SourceMutant> {
                 )
             })
             .collect(),
-        SiteKind::Field {
-            name,
-            shorthand,
-            from_base,
-        } => {
-            let prefix = if *shorthand {
-                format!("{name}: ")
-            } else {
-                String::new()
-            };
-            vec![change(
-                site.start,
-                site.end,
-                format!("{prefix}{from_base}"),
-                "field",
-                name,
-            )]
+        SiteKind::Field { name, removal, .. } => {
+            vec![change(removal.0, removal.1, String::new(), "field", name)]
         }
+        SiteKind::Stmt => vec![change(site.start, site.end, String::new(), "statement", "")],
         // The end taken in or left out: the two dots and the `=` are all that changes.
         SiteKind::Range { inclusive, gap, .. } => {
             let (from, to) = if *inclusive {
@@ -1028,7 +1028,7 @@ pub fn source_mutants(site: &Site) -> Vec<SourceMutant> {
             };
             vec![change(gap.0, gap.1, to.to_string(), from, to)]
         }
-        SiteKind::Return { .. } | SiteKind::MinMax { .. } | SiteKind::Stmt => vec![],
+        SiteKind::Return { .. } | SiteKind::MinMax { .. } => vec![],
     }
 }
 
@@ -1053,16 +1053,20 @@ pub(crate) fn literal_operator_mutants(source: &str, site: &Site, mutants: &mut 
 /// The iterators to return in place of the body of a function that returns
 /// `impl Iterator<Item = T>`: an empty one, and one of each value of `T`.
 pub fn iterator_values(output: &syn::ReturnType) -> Vec<String> {
-    iterator_values_with_errors(output, &[])
-}
-
-fn iterator_values_with_errors(output: &syn::ReturnType, error_values: &[&str]) -> Vec<String> {
     let syn::ReturnType::Type(_, ty) = output else {
         return vec![];
     };
     let syn::Type::ImplTrait(opaque) = &**ty else {
         return vec![];
     };
+    iterator_type_values(opaque, &[], false)
+}
+
+fn iterator_type_values(
+    opaque: &syn::TypeImplTrait,
+    error_values: &[&str],
+    extended: bool,
+) -> Vec<String> {
     let item = opaque.bounds.iter().find_map(|bound| {
         let syn::TypeParamBound::Trait(bound) = bound else {
             return None;
@@ -1080,12 +1084,12 @@ fn iterator_values_with_errors(output: &syn::ReturnType, error_values: &[&str]) 
     let Some(item) = item else {
         return vec![];
     };
-    if has_ident(item.to_token_stream(), "impl") {
+    if !extended && has_ident(item.to_token_stream(), "impl") {
         return vec!["::core::iter::empty()".to_string()];
     }
     let mut values = vec!["::core::iter::empty()".to_string()];
     values.extend(
-        values_of(item, error_values)
+        values_of(item, error_values, extended)
             .iter()
             .map(|value| format!("::core::iter::once({value})")),
     );
@@ -1161,19 +1165,23 @@ fn does_nothing_else(expr: &syn::Expr) -> bool {
 /// The values to replace a function's body with, by its return type. The table is that
 /// of cargo-mutants (https://mutants.rs/mutants.html), applied to the type as written.
 pub fn body_values(output: &syn::ReturnType) -> Vec<String> {
-    body_values_with_errors(output, &[])
+    body_values_with_errors(output, &[], false)
 }
 
-fn body_values_with_errors(output: &syn::ReturnType, error_values: &[&str]) -> Vec<String> {
+fn body_values_with_errors(
+    output: &syn::ReturnType,
+    error_values: &[&str],
+    extended: bool,
+) -> Vec<String> {
     match output {
         syn::ReturnType::Default => vec!["()".to_string()],
         syn::ReturnType::Type(_, ty) => {
             // What an `impl Trait` stands for is the type of the body: no other value
             // can be returned beside it.
-            if has_ident(ty.to_token_stream(), "impl") {
+            if !extended && has_ident(ty.to_token_stream(), "impl") {
                 return vec![];
             }
-            values_of(ty, error_values)
+            values_of(ty, error_values, extended)
         }
     }
 }
@@ -1192,23 +1200,24 @@ fn product(parts: &[Vec<String>]) -> Vec<Vec<String>> {
     })
 }
 
-fn values_of(ty: &syn::Type, error_values: &[&str]) -> Vec<String> {
+fn values_of(ty: &syn::Type, error_values: &[&str], extended: bool) -> Vec<String> {
     let each = |inner: &syn::Type, wrap: &dyn Fn(&str) -> String| -> Vec<String> {
-        values_of(inner, error_values)
+        values_of(inner, error_values, extended)
             .iter()
             .map(|v| wrap(v))
             .collect()
     };
     match ty {
-        syn::Type::Paren(t) => values_of(&t.elem, error_values),
-        syn::Type::Group(t) => values_of(&t.elem, error_values),
+        syn::Type::Paren(t) => values_of(&t.elem, error_values, extended),
+        syn::Type::Group(t) => values_of(&t.elem, error_values, extended),
         syn::Type::Never(_) => vec![],
+        syn::Type::ImplTrait(opaque) => iterator_type_values(opaque, error_values, extended),
         // Also the empty one: one row of no values, written `()`.
         syn::Type::Tuple(t) => {
             let parts: Vec<Vec<String>> = t
                 .elems
                 .iter()
-                .map(|ty| values_of(ty, error_values))
+                .map(|ty| values_of(ty, error_values, extended))
                 .collect();
             product(&parts)
                 .into_iter()
@@ -1319,15 +1328,18 @@ fn values_of(ty: &syn::Type, error_values: &[&str]) -> Vec<String> {
                 ("BTreeMap" | "HashMap", [key, value]) => {
                     let mut values = vec![format!("{bare}::new()")];
                     values.extend(
-                        product(&[values_of(key, error_values), values_of(value, error_values)])
-                            .into_iter()
-                            .map(|row| format!("{bare}::from_iter([({})])", row.join(", "))),
+                        product(&[
+                            values_of(key, error_values, extended),
+                            values_of(value, error_values, extended),
+                        ])
+                        .into_iter()
+                        .map(|row| format!("{bare}::from_iter([({})])", row.join(", "))),
                     );
                     values
                 }
                 ("Cow", [inner]) => {
                     let borrowed: syn::Type = syn::parse_quote!(&#inner);
-                    values_of(&borrowed, error_values)
+                    values_of(&borrowed, error_values, extended)
                         .iter()
                         .flat_map(|v| {
                             [
@@ -1338,6 +1350,17 @@ fn values_of(ty: &syn::Type, error_values: &[&str]) -> Vec<String> {
                         .collect()
                 }
                 ("HttpResponse", []) => vec![format!("{bare}::Ok().finish()")],
+                (_, [inner]) if extended => {
+                    let mut values = vec![format!("{bare}::new()")];
+                    for value in values_of(inner, error_values, extended) {
+                        values.extend([
+                            format!("{bare}::from_iter([{value}])"),
+                            format!("{bare}::new({value})"),
+                            format!("{bare}::from({value})"),
+                        ]);
+                    }
+                    values
+                }
                 _ => vec!["Default::default()".to_string()],
             }
         }
@@ -1370,35 +1393,38 @@ pub(crate) fn is_skipped(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attr| marked(&attr.meta))
 }
 
+/// Whether the predicate may have the desired value while `test` is false.
+pub(crate) fn cfg_possible_without_test(meta: &syn::Meta, desired: bool) -> bool {
+    if meta.path().is_ident("test") {
+        return !desired;
+    }
+    let syn::Meta::List(list) = meta else {
+        return true;
+    };
+    let Ok(parts) = list.parse_args_with(
+        syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+    ) else {
+        return true;
+    };
+    if list.path.is_ident("not") && parts.len() == 1 {
+        return cfg_possible_without_test(&parts[0], !desired);
+    }
+    if list.path.is_ident("all") || list.path.is_ident("any") {
+        return if list.path.is_ident("all") == desired {
+            parts
+                .iter()
+                .all(|part| cfg_possible_without_test(part, desired))
+        } else {
+            parts
+                .iter()
+                .any(|part| cfg_possible_without_test(part, desired))
+        };
+    }
+    true
+}
+
 /// Detect test attributes and cfg predicates that require `test` to be true.
 pub(crate) fn is_test_only(attrs: &[syn::Attribute]) -> bool {
-    // Other cfg atoms are unknown. Keep the item whenever it could occur in a
-    // production build, even if it can also occur in tests.
-    fn possible(meta: &syn::Meta, desired: bool) -> bool {
-        if meta.path().is_ident("test") {
-            return !desired;
-        }
-        let syn::Meta::List(list) = meta else {
-            return true;
-        };
-        let Ok(parts) = list.parse_args_with(
-            syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
-        ) else {
-            return true;
-        };
-        if list.path.is_ident("not") && parts.len() == 1 {
-            return possible(&parts[0], !desired);
-        }
-        if list.path.is_ident("all") || list.path.is_ident("any") {
-            return if list.path.is_ident("all") == desired {
-                parts.iter().all(|part| possible(part, desired))
-            } else {
-                parts.iter().any(|part| possible(part, desired))
-            };
-        }
-        true
-    }
-
     attrs.iter().any(|attr| {
         let path = attr.path();
         if path.segments.last().is_some_and(|s| s.ident == "test") {
@@ -1407,7 +1433,7 @@ pub(crate) fn is_test_only(attrs: &[syn::Attribute]) -> bool {
         path.is_ident("cfg")
             && attr
                 .parse_args::<syn::Meta>()
-                .is_ok_and(|meta| !possible(&meta, true))
+                .is_ok_and(|meta| !cfg_possible_without_test(&meta, true))
     })
 }
 
@@ -1729,53 +1755,71 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                     _ => false,
                 }
         };
-        // Where the arms that can be removed start.
-        let mut removable: Vec<usize> = vec![];
-        if let Some((last, others)) = node.arms.split_last()
-            && catches_all(last)
-        {
-            for arm in others
-                .iter()
-                .filter(|arm| arm.attrs.is_empty() && !catches_all(arm))
-            {
-                let (Some((start, pat_end)), Some((_, end)), Some((arrow, _))) = (
-                    self.range(arm.pat.span()),
-                    self.range(arm.body.span()),
-                    self.range(arm.fat_arrow_token.span()),
-                ) else {
-                    continue;
-                };
-                let guard = match &arm.guard {
-                    None => ArmGuard::None(arrow),
-                    Some((_, expr)) => match self.range(expr.span()) {
-                        Some((from, to)) => ArmGuard::Existing(from, to),
-                        None => continue,
-                    },
-                };
-                let pattern = match guard {
-                    ArmGuard::Existing(from, to) => {
-                        format!(
-                            "{} if {}",
-                            &self.source[start..pat_end],
-                            &self.source[from..to]
-                        )
-                    }
-                    ArmGuard::None(_) => self.source[start..pat_end].to_string(),
-                };
-                let at = arm.pat.span().start();
-                removable.push(start);
-                self.add(Site {
-                    id: 0,
-                    kind: SiteKind::Arm {
-                        pattern: pattern.clone(),
-                        guard,
-                    },
-                    line: at.line,
-                    column: at.column + 1,
-                    start,
-                    end,
-                    text: format!("{pattern} => .."),
-                });
+        let mut removable = vec![];
+        let has_wildcard = node
+            .arms
+            .iter()
+            .any(|arm| matches!(arm.pat, syn::Pat::Wild(_)));
+        let final_catches_all = node.arms.last().is_some_and(catches_all);
+        for (index, arm) in node.arms.iter().enumerate() {
+            if is_test_only(&arm.attrs) || is_skipped(&arm.attrs) {
+                continue;
+            }
+            let probe = index + 1 < node.arms.len()
+                && final_catches_all
+                && arm.attrs.is_empty()
+                && !catches_all(arm);
+            let literal =
+                has_wildcard && !matches!(arm.pat, syn::Pat::Wild(_)) && arm.guard.is_none();
+            if !probe && !literal {
+                continue;
+            }
+            let (Some((start, pat_end)), Some((remove_start, remove_end)), Some((arrow, _))) = (
+                self.range(arm.pat.span()),
+                self.range(arm.span()),
+                self.range(arm.fat_arrow_token.span()),
+            ) else {
+                continue;
+            };
+            let guard = match &arm.guard {
+                None => ArmGuard::None(arrow),
+                Some((_, expr)) => match self.range(expr.span()) {
+                    Some((from, to)) => ArmGuard::Existing(from, to),
+                    None => continue,
+                },
+            };
+            let pattern = match guard {
+                ArmGuard::Existing(from, to) => format!(
+                    "{} if {}",
+                    &self.source[start..pat_end],
+                    &self.source[from..to]
+                ),
+                ArmGuard::None(_) => self.source[start..pat_end].to_string(),
+            };
+            let end = arm
+                .comma
+                .as_ref()
+                .and_then(|comma| self.range(comma.span()))
+                .map_or(remove_end, |(_, end)| end);
+            let at = arm.pat.span().start();
+            removable.push(start);
+            let site = Site {
+                id: 0,
+                kind: SiteKind::Arm {
+                    pattern: pattern.clone(),
+                    guard,
+                    removal: (remove_start, end),
+                },
+                line: at.line,
+                column: at.column + 1,
+                start,
+                end,
+                text: format!("{pattern} => .."),
+            };
+            if probe {
+                self.add(site);
+            } else {
+                self.add_rebuild(site);
             }
         }
         // Any guard can be `true` or `false` instead: a guarded arm never counts for
@@ -1796,10 +1840,27 @@ impl<'ast> Visit<'ast> for Finder<'_> {
         visit::visit_expr_match(self, node);
     }
 
+    fn visit_arm(&mut self, arm: &'ast syn::Arm) {
+        if !is_test_only(&arm.attrs) && !is_skipped(&arm.attrs) {
+            visit::visit_arm(self, arm);
+        }
+    }
+
+    fn visit_field_value(&mut self, field: &'ast syn::FieldValue) {
+        if !is_test_only(&field.attrs) && !is_skipped(&field.attrs) {
+            visit::visit_field_value(self, field);
+        }
+    }
+
     fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
-        // The base is read a second time by the mutant, so it has to be something that
-        // can be: a place, or a call without arguments (`Default::default()`).
+        if is_test_only(&node.attrs) || is_skipped(&node.attrs) {
+            return;
+        }
+        // Only probes read the base again. Source mutants delete a field in place.
         let from_base = node.rest.as_deref().and_then(|base| {
+            if !node.attrs.is_empty() || node.qself.is_some() {
+                return None;
+            }
             let (from, to) = self.range(base.span())?;
             let written = &self.source[from..to];
             match base {
@@ -1813,41 +1874,53 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                 _ => None,
             }
         });
-        if let Some(from_base) = from_base
-            && node.attrs.is_empty()
-            && node.qself.is_none()
-        {
-            for field in node.fields.iter().filter(|field| field.attrs.is_empty()) {
+        if node.rest.is_some() {
+            for pair in node.fields.pairs() {
+                let field = pair.value();
+                if is_test_only(&field.attrs) || is_skipped(&field.attrs) {
+                    continue;
+                }
                 let name = match &field.member {
-                    syn::Member::Named(ident) => ident.to_string(),
+                    syn::Member::Named(name) => name.to_string(),
                     syn::Member::Unnamed(index) => index.index.to_string(),
                 };
-                let (Some((start, _)), Some((_, end))) = (
+                let (Some((start, _)), Some((value, end)), Some((remove_start, _))) = (
                     self.range(field.member.span()),
                     self.range(field.expr.span()),
+                    self.range(field.span()),
                 ) else {
                     continue;
                 };
-                let Some((value, _)) = self.range(field.expr.span()) else {
-                    continue;
-                };
-                let shorthand = field.colon_token.is_none();
+                let remove_end = pair
+                    .punct()
+                    .and_then(|comma| self.range(comma.span()))
+                    .map_or(end, |(_, end)| end);
+                let from_base = from_base
+                    .as_ref()
+                    .filter(|_| field.attrs.is_empty())
+                    .map(|base| format!("{base}.{name}"));
+                let probe = from_base.is_some();
                 let kind = SiteKind::Field {
-                    from_base: format!("{from_base}.{name}"),
+                    from_base,
                     name,
-                    shorthand,
+                    shorthand: field.colon_token.is_none(),
+                    removal: (remove_start, remove_end),
                 };
                 let at = field.member.span().start();
-                self.add(Site {
+                let site = Site {
                     id: 0,
                     kind,
                     line: at.line,
                     column: at.column + 1,
-                    // The probe goes around the value; the report shows the whole field.
-                    start: value,
+                    start: if probe { value } else { remove_start },
                     end,
                     text: self.source[start..end].to_string(),
-                });
+                };
+                if probe {
+                    self.add(site);
+                } else {
+                    self.add_rebuild(site);
+                }
             }
         }
         visit::visit_expr_struct(self, node);
@@ -2253,7 +2326,8 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
             SiteKind::Field {
                 name,
                 shorthand,
-                from_base,
+                from_base: Some(from_base),
+                ..
             } => (
                 format!(
                     "{}if {rt}::live({}u32) {{ ",
@@ -2266,6 +2340,9 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                 ),
                 format!(" }} else {{ {from_base} }}"),
             ),
+            SiteKind::Field {
+                from_base: None, ..
+            } => continue,
             SiteKind::Body { value, .. } => (
                 format!(" if !{rt}::live({}u32) {{ return {value}; }}", site.id),
                 String::new(),
@@ -3042,7 +3119,7 @@ mod tests {
                     rhs,
                     ..
                 } => Some(format!("range {lhs} {rhs} inclusive={inclusive}")),
-                SiteKind::Arm { pattern, guard } => Some(format!(
+                SiteKind::Arm { pattern, guard, .. } => Some(format!(
                     "arm {pattern} guarded={}",
                     matches!(guard, ArmGuard::Existing(..))
                 )),
@@ -3713,7 +3790,8 @@ mod tests {
                 SiteKind::Field {
                     name,
                     shorthand,
-                    from_base,
+                    from_base: Some(from_base),
+                    ..
                 } => Some(format!(
                     "field {} | {name} | shorthand={shorthand} | {from_base}",
                     s.text
@@ -3892,6 +3970,116 @@ mod tests {
     }
 
     #[test]
+    fn fields_are_removed_from_arbitrary_struct_updates() {
+        // Full-strength table from fields.pict.
+        for base in ["base", "make(seed)", "builder.make(seed)"] {
+            for field in ["value: 9", "value"] {
+                for attribute in ["", "#[cfg(any())] "] {
+                    let original =
+                        format!("fn f() -> S {{ S {{ {attribute}{field}, other: 2, ..{base} }} }}");
+                    let found = discover(&original, 0).unwrap();
+                    let fields: Vec<_> = found
+                        .sites
+                        .iter()
+                        .chain(&found.rebuild_sites)
+                        .flat_map(source_mutants)
+                        .filter(|mutant| mutant.what == "field" && mutant.into == "value")
+                        .collect();
+                    if attribute.is_empty() {
+                        assert_eq!(fields.len(), 1, "{original}");
+                        let m = &fields[0];
+                        let changed = format!(
+                            "{}{}{}",
+                            &original[..m.start],
+                            m.replacement,
+                            &original[m.end..]
+                        );
+                        assert_eq!(
+                            changed,
+                            format!("fn f() -> S {{ S {{  other: 2, ..{base} }} }}")
+                        );
+                        syn::parse_file(&changed).unwrap();
+                    } else {
+                        assert!(fields.is_empty(), "{original}");
+                    }
+                }
+            }
+        }
+        let plain = discover("fn plain() -> S { S { value: 9 } }", 0).unwrap();
+        assert!(
+            plain
+                .sites
+                .iter()
+                .chain(&plain.rebuild_sites)
+                .flat_map(source_mutants)
+                .all(|m| m.what != "field")
+        );
+    }
+
+    #[test]
+    fn unknown_wrappers_and_nested_iterators_have_source_body_candidates() {
+        // Full-strength table from generics.pict.
+        for outer in ["Wrapper", "Option", "Result"] {
+            for inner in ["bool", "impl Iterator<Item = u8>"] {
+                for error in [false, true] {
+                    let error_values: &[&str] = if error { &["7"] } else { &[] };
+                    let extra = if outer == "Result" { ", u8" } else { "" };
+                    let source = format!("fn f() -> {outer}<{inner}{extra}> {{ todo!() }}");
+                    let found = discover_with_errors(&source, 0, error_values).unwrap();
+                    let values: Vec<&str> = found
+                        .sites
+                        .iter()
+                        .chain(&found.rebuild_sites)
+                        .filter_map(|site| match &site.kind {
+                            SiteKind::Body { value, .. } => Some(value.as_str()),
+                            _ => None,
+                        })
+                        .collect();
+                    let example = match (outer, inner) {
+                        ("Wrapper", "bool") => "Wrapper::from_iter([false])",
+                        ("Option", "bool") => "Some(false)",
+                        ("Result", "bool") => "Ok(false)",
+                        ("Wrapper", _) => "Wrapper::new(::core::iter::once(1))",
+                        ("Option", _) => "Some(::core::iter::once(1))",
+                        ("Result", _) => "Ok(::core::iter::once(1))",
+                        _ => unreachable!(),
+                    };
+                    assert!(values.contains(&example), "{source}: {values:?}");
+                    assert_eq!(
+                        values.contains(&"Err(7)"),
+                        outer == "Result" && error,
+                        "{source}"
+                    );
+                    if inner != "bool" {
+                        assert!(found.sites.is_empty(), "{source}");
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn source_deletes_the_whole_statement_and_the_unguarded_arm() {
+        let source = "fn clear(v: &mut Vec<u8>) { v.clear(); }\n\
+            fn select(x: u8) -> u8 { match x { 0 => 4, #[allow(unused)] 1 => 5, _ => 6 } }";
+        let found = discover(source, 0).unwrap();
+        let removals: Vec<_> = found
+            .sites
+            .iter()
+            .chain(&found.rebuild_sites)
+            .flat_map(source_mutants)
+            .filter(|mutant| mutant.replacement.is_empty())
+            .map(|mutant| &source[mutant.start..mutant.end])
+            .collect();
+        assert!(removals.contains(&"v.clear();"), "{removals:?}");
+        assert!(removals.contains(&"0 => 4,"), "{removals:?}");
+        assert!(
+            removals.contains(&"#[allow(unused)] 1 => 5,"),
+            "{removals:?}"
+        );
+    }
+
+    #[test]
     fn source_mutants_of_every_kind() {
         let src = "fn f(a: i32, b: i32, k: K, base: O) -> O { \
                    let x = match k { K::A(n) if n >= 1 => !(a != b) || a <= -b, K::B => a % b > 0 && a == b, _ => false }; \
@@ -3915,9 +4103,9 @@ mod tests {
         assert_eq!(
             changes,
             [
-                // An arm goes by a guard that is never true.
+                // A guarded arm uses a false guard, and an unguarded arm is removed.
                 "arm -> K::A(n) if n >= 1 | `n >= 1` becomes `false`",
-                "arm -> K::B | `` becomes `if false `",
+                "arm -> K::B | `K::B => a % b > 0 && a == b,` becomes ``",
                 "guard -> true | `n >= 1` becomes `true`",
                 ">= -> < | ` >= ` becomes ` < `",
                 "|| -> && | `!(a != b) || a <= -b` becomes `(!(a != b)) && (a <= -b)`",
@@ -3932,18 +4120,15 @@ mod tests {
                 "% -> / | ` % ` becomes ` / `",
                 "% -> + | `a % b` becomes `(a + b)`",
                 "== -> != | ` == ` becomes ` != `",
-                "field -> on | `x` becomes `(base).on`",
-                "field -> a | `a` becomes `a: (base).a`",
+                "field -> on | `on: x,` becomes ``",
+                "field -> a | `a,` becomes ``",
             ]
         );
         // What exists only as a probe has no mutant of the source.
         let src = "fn f(a: u8, b: u8) -> bool { g(); for _ in a..b {} a.max(b) > 1 }";
         let sites = discover(src, 0).unwrap().sites;
         for site in &sites {
-            let none = matches!(
-                site.kind,
-                SiteKind::Return { .. } | SiteKind::Stmt | SiteKind::MinMax { .. }
-            );
+            let none = matches!(site.kind, SiteKind::Return { .. } | SiteKind::MinMax { .. });
             assert_eq!(source_mutants(site).is_empty(), none, "{:?}", site.kind);
         }
         // A range has its end taken in or left out, whichever it is not.

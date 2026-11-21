@@ -136,6 +136,9 @@ struct Cli {
     /// exactly as `cargo test` builds them.
     #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(0..=3))]
     opt_level: Option<u8>,
+    /// Time allowed for each test runner under a mutant, in seconds.
+    #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
+    timeout: Option<u64>,
     /// Features of the package to build with (as for `cargo test`; repeatable).
     #[arg(long, short = 'F', value_name = "FEATURES", value_delimiter = ',')]
     features: Vec<String>,
@@ -164,7 +167,7 @@ struct Cli {
     quiet: bool,
 }
 
-/// Exit codes: 0 no gaps, 1 analysis failed, 2 gaps found, 3 no mutations executed.
+/// Exit codes: 0 no gaps, 1 analysis failed, 2 gaps found, 3 incomplete evaluation.
 fn main() -> ExitCode {
     let cli = Cli::parse_from(arguments(std::env::args_os()));
     let nextest = matches!(cli.test_tool, TestTool::Nextest);
@@ -207,6 +210,7 @@ fn main() -> ExitCode {
             wrapper: cli.test_wrapper,
         },
         opt_level: cli.opt_level,
+        timeout_seconds: cli.timeout,
         audit: cli.audit,
         cargo: driver::CargoConfig {
             features: cli.features,
@@ -242,8 +246,15 @@ fn main() -> ExitCode {
     }
 }
 
+fn incomplete_source_run(result: &report::Report) -> bool {
+    result.analysis.source_only
+        && (result.mutants_timed_out > 0 || result.mutants_not_evaluated > 0)
+}
+
 fn report_exit(result: &report::Report) -> u8 {
-    if result.has_gaps() {
+    if incomplete_source_run(result) {
+        3
+    } else if result.has_gaps() {
         2
     } else if result.evaluation == Some(report::Evaluation::NoMutantsExecuted) {
         3
@@ -337,6 +348,8 @@ fn show_workspace(
     }
     ExitCode::from(if !errors.is_empty() {
         1
+    } else if reports.iter().any(incomplete_source_run) {
+        3
     } else if reports.iter().any(|report| report_exit(report) == 2) {
         2
     } else if reports.iter().any(|report| report_exit(report) == 3) {
