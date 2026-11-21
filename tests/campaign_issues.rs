@@ -1,7 +1,10 @@
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+use common::fixture_command;
 use serde_json::Value;
 
 fn package(name: &str) -> PathBuf {
@@ -30,12 +33,8 @@ fn write(path: &Path, relative: &str, content: &str) {
 }
 
 fn command(path: &Path, args: &[&str]) -> Command {
-    let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-tmt"));
-    command
-        .arg(path)
-        .args(args)
-        .env_remove("TMT_MUTANT")
-        .env_remove("TMT_TRACE");
+    let mut command = fixture_command(env!("CARGO_BIN_EXE_cargo-tmt"));
+    command.arg(path).args(args);
     command
 }
 

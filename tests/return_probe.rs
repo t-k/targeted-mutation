@@ -1,7 +1,9 @@
+mod common;
+
 use std::fs;
 use std::path::Path;
-use std::process::Command;
 
+use common::fixture_command;
 use serde_json::Value;
 use targeted_mutation::instrument::{SiteKind, discover};
 
@@ -89,7 +91,7 @@ fn known_true_and_false_are_both_asserted() {
     )
     .unwrap();
     for mode in [None, Some("--source-only")] {
-        let run = Command::new(env!("CARGO_BIN_EXE_cargo-tmt"))
+        let run = fixture_command(env!("CARGO_BIN_EXE_cargo-tmt"))
             .arg(&dir)
             .args(["--no-effects", "--quiet", "--json"])
             .args(mode)

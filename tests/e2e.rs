@@ -1,9 +1,12 @@
 //! Runs the `tmt` binary on the fixture crates.
 
+mod common;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+use common::fixture_command;
 use serde_json::Value;
 
 /// Copies a fixture into this test's own directory so tests can edit it and run in parallel.
@@ -40,11 +43,9 @@ struct Run {
 }
 
 fn tmt(dir: &Path, args: &[&str]) -> Run {
-    let output = Command::new(env!("CARGO_BIN_EXE_cargo-tmt"))
+    let output = fixture_command(env!("CARGO_BIN_EXE_cargo-tmt"))
         .arg(dir)
         .args(args)
-        .env_remove("TMT_TRACE")
-        .env_remove("TMT_MUTANT")
         .output()
         .unwrap();
     Run {
@@ -1470,7 +1471,7 @@ fn cargo_intermediates_stay_inside_the_work_directory() {
     let dir = fixture("doc-tested", "cargo-build-dir");
     let work = dir.join("mutation");
     let ordinary = dir.join("ordinary-build");
-    let output = Command::new(env!("CARGO_BIN_EXE_cargo-tmt"))
+    let output = fixture_command(env!("CARGO_BIN_EXE_cargo-tmt"))
         .arg(&dir)
         .args(["--json", "--quiet", "--doc", "--rebuild", "--work-dir"])
         .arg(&work)
@@ -3385,13 +3386,11 @@ fn a_run_given_up_inside_a_program_a_test_started_is_not_a_failed_test() {
 
     // The mark is found wherever the temporary directory is said to be, also where that
     // is said from the directory the run was started in.
-    let output = Command::new(env!("CARGO_BIN_EXE_cargo-tmt"))
+    let output = fixture_command(env!("CARGO_BIN_EXE_cargo-tmt"))
         .arg(".")
         .args(["--json", "--quiet"])
         .current_dir(&dir)
         .env("TMPDIR", ".")
-        .env_remove("TMT_TRACE")
-        .env_remove("TMT_MUTANT")
         .output()
         .unwrap();
     let relative: Value = serde_json::from_slice(&output.stdout)
@@ -3410,12 +3409,10 @@ fn started_by_cargo_as_one_of_its_subcommands() {
     let exe = Path::new(env!("CARGO_BIN_EXE_cargo-tmt"));
     let mut path = vec![exe.parent().unwrap().to_path_buf()];
     path.extend(std::env::split_paths(&std::env::var_os("PATH").unwrap()));
-    let output = Command::new("cargo")
+    let output = fixture_command("cargo")
         .args(["tmt", "--json", "--quiet"])
         .current_dir(&dir)
         .env("PATH", std::env::join_paths(path).unwrap())
-        .env_remove("TMT_TRACE")
-        .env_remove("TMT_MUTANT")
         .output()
         .unwrap();
     assert_eq!(
@@ -3430,7 +3427,7 @@ fn started_by_cargo_as_one_of_its_subcommands() {
     // Started by its own name it is the same, and it says how it is called.
     let (_, direct) = json(&dir);
     assert_eq!(direct["findings"], report["findings"]);
-    let help = Command::new(exe).arg("--help").output().unwrap();
+    let help = fixture_command(exe).arg("--help").output().unwrap();
     assert!(
         String::from_utf8_lossy(&help.stdout).contains("Usage: cargo tmt"),
         "{}",
