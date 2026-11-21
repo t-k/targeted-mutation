@@ -60,8 +60,8 @@ pub enum SiteKind {
         bang: (usize, usize),
         operand: String,
     },
-    /// The body of a function that returns `bool`. The site's range is the inside of the
-    /// body's braces and its text is the function signature.
+    /// The result of a function whose exits reach the probe. The site's range is the
+    /// inside of the body's braces and its text is the function signature.
     Return {
         name: String,
         /// `None` for a function returning `bool`; for one returning `Option<T>`, the
@@ -412,7 +412,9 @@ impl Finder<'_> {
             });
         };
         let name = sig.ident.to_string();
-        if let Some(option) = self.result_kind(&sig.output) {
+        if let Some(option) = self.result_kind(&sig.output)
+            && !may_bypass_result_probe(body)
+        {
             let kind = SiteKind::Return {
                 name: name.clone(),
                 option,
@@ -1108,6 +1110,37 @@ fn tokens_of(text: &str) -> String {
         Ok(tokens) => tokens.to_string(),
         Err(_) => text.to_string(),
     }
+}
+
+/// The result probe runs after the original body has evaluated. Early exits and
+/// unexpanded macros in that body's control-flow scope could bypass it.
+fn may_bypass_result_probe(body: &syn::Block) -> bool {
+    struct EarlyExit(bool);
+
+    impl<'ast> Visit<'ast> for EarlyExit {
+        fn visit_expr(&mut self, expr: &'ast syn::Expr) {
+            if self.0 {
+                return;
+            }
+            match expr {
+                syn::Expr::Return(_) | syn::Expr::Try(_) | syn::Expr::Verbatim(_) => self.0 = true,
+                syn::Expr::Async(_) | syn::Expr::Closure(_) | syn::Expr::Const(_) => {}
+                _ => visit::visit_expr(self, expr),
+            }
+        }
+
+        fn visit_macro(&mut self, _: &'ast syn::Macro) {
+            self.0 = true;
+        }
+
+        fn visit_item(&mut self, _: &'ast syn::Item) {}
+        fn visit_pat(&mut self, _: &'ast syn::Pat) {}
+        fn visit_type(&mut self, _: &'ast syn::Type) {}
+    }
+
+    let mut exits = EarlyExit(false);
+    exits.visit_block(body);
+    exits.0
 }
 
 /// Whether evaluating the expression does nothing but give its value, as far as the
@@ -3107,6 +3140,7 @@ mod tests {
             }
             fn exhaustive(k: Kind) -> u8 { match k { Kind::A => 1, Kind::B => 2 } }
             fn hidden() -> Option<impl Sized> { Some(1) }
+            fn first(v: &[u32]) -> Option<u32> { v.first().copied() }
         "#;
         let sites = discover(src, 0).unwrap().sites;
         let kinds: Vec<String> = sites
@@ -3135,7 +3169,6 @@ mod tests {
         assert_eq!(
             kinds,
             [
-                "return find Some(\"Option<u32>\")",
                 "range 0 v.len() inclusive=false",
                 "minmax v[i].min(limit) 1 max=true",
                 "minmax v[i] limit max=false",
@@ -3145,14 +3178,22 @@ mod tests {
                 "arm 1..=3 guarded=false",
                 // `1..=2` and `'a'..'z'` have literals at both ends.
                 "range 1 limit as usize inclusive=true",
+                "return first Some(\"Option<u32>\")",
             ]
         );
         let out = render(src, &sites, &all).text;
         syn::parse_file(&out).expect("instrumented source parses");
         assert_eq!(out.lines().count(), src.lines().count());
-        assert!(out.contains("let __tmt_v: Option<u32> = {"), "{out}");
+        let option = sites
+            .iter()
+            .find(|site| matches!(&site.kind, SiteKind::Return { name, .. } if name == "first"))
+            .unwrap();
+        assert_eq!(out.matches("let __tmt_v: Option<u32> = {").count(), 1);
         assert!(
-            out.contains("crate::__tmt_rt::ret_opt(0u32, __tmt_v)"),
+            out.contains(&format!(
+                "crate::__tmt_rt::ret_opt({}u32, __tmt_v)",
+                option.id
+            )),
             "{out}"
         );
         assert!(out.contains("0 if crate::__tmt_rt::arm("), "{out}");
@@ -3170,10 +3211,10 @@ mod tests {
         assert!(
             out.contains("(match (&(v[i]), limit) {")
                 && out.contains(
-                    "Mm(__tmt_a, &__tmt_b)).tmt_other(6u32) { (*__tmt_a).max(__tmt_b) } else { (*__tmt_a).min(__tmt_b) }"
+                    "Mm(__tmt_a, &__tmt_b)).tmt_other(5u32) { (*__tmt_a).max(__tmt_b) } else { (*__tmt_a).min(__tmt_b) }"
                 )
                 && out.contains(
-                    ".tmt_other(5u32) { (*__tmt_a).min(__tmt_b) } else { (*__tmt_a).max(__tmt_b) }"
+                    ".tmt_other(4u32) { (*__tmt_a).min(__tmt_b) } else { (*__tmt_a).max(__tmt_b) }"
                 ),
             "{out}"
         );
@@ -3308,7 +3349,6 @@ mod tests {
                 // Only a body that is one expression has a "sole expression".
                 ("one".to_string(), None, Some("a > 1")),
                 ("two".to_string(), None, None),
-                ("early".to_string(), None, None),
             ]
         );
     }
