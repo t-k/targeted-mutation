@@ -108,6 +108,15 @@ Running:
 - `--rebuild`: also run the mutants that need a build of their own (see "How it works", step 5). Without it the summary says how many were left out.
 - `--error EXPR`: add `Err(EXPR)` body replacements for return types written as `Result`, including nested values such as `Option<Result<T, E>>`. For a function returning `impl Iterator<Item = Result<T, E>>`, use it with `--rebuild` or `--source-only`. Repeat this flag for more error payloads. The expression is Rust code evaluated in the function's scope. For a `Result<T, String>`, use `--error '"mutated".into()'`.
 - `--source-only`: build supported mutants directly from source and run them against the selected tests. Scope it with `--lines` or `--since` when tests launch children with `Command::env_clear()` or otherwise omit the probe environment. This mode is slower and reports surviving source mutants without trace-based input or assertion suggestions.
+- `--timeout SECONDS`: set the time limit for each test runner under a mutant. The default scales from the baseline duration. In source-only mode, a timeout or an unevaluated mutant causes exit status 3, even if the report also contains survivors.
+
+For a project switching its existing mutation testing command to TMT:
+
+```sh
+cargo tmt --source-only --literal-operators --doc
+```
+
+This runs source edits with Rust's operator precedence and includes doctests. Add `--workspace` to mutate every workspace member, or `--test-workspace` to let sibling packages' tests kill the selected package's mutants. Use `--test-tool nextest --nextest-profile ci` without `--doc` for a CI job that uses a Nextest profile. The exit statuses are 0 for success, 1 for an analysis error, 2 for test gaps, and 3 for an incomplete analysis.
 
 For Cargo workspace workflows:
 
@@ -144,7 +153,7 @@ cargo tmt fixtures/batch-store --rebuild --lines src/lib.rs:33
 
 Output: text by default, `--json`, or `--sarif` (SARIF 2.1.0 for code scanning: paths from the top of the git repository, the finding's id as `partialFingerprints`, and what the run looked at under the run's `properties`). The JSON report has the same under `analysis`: package, `--since` and `--lines`, features, and whether mutants were built and predictions re-run. `--show-unreached` lists sites with no recorded execution. Long campaigns print completed, failed, timed-out, survived and unevaluated counts on stderr. `--quiet` suppresses progress. If a baseline test fails, stderr includes the available diagnostics and the full log path.
 
-Exit status: `0` no gaps, `2` gaps found or a prediction failed its re-run (`UNSTABLE`), `1` the analysis could not run (tests fail on the unmutated code, the crate does not build, ...), and `3` there was work to evaluate, but no mutants executed and no gaps were reported. A scoped selection with zero sites skips the build and baseline. JSON and SARIF expose `evaluation` as `no_sites` or `no_mutants_executed`. Structured `skipped` records include their source span and reason, with a compiler diagnostic for repaired probes.
+Exit status: `0` no gaps, `1` analysis error (such as failing unmutated tests), `2` gaps or an unstable prediction, and `3` work selected but no mutations executed. In source-only mode, `3` also takes precedence when a mutant times out or its source was not compiled. A scoped selection with zero sites skips the build and baseline. JSON and SARIF expose `evaluation` as `no_sites` or `no_mutants_executed` for those cases. Structured `skipped` records include their source span and reason, with a compiler diagnostic for repaired probes.
 
 Your source tree is never modified. In a git repository only the files git does not ignore are copied (submodules by their own rules), so build output, caches and local files kept out of the repository stay where they are. The copy contains no symbolic links: a linked file is copied as a file, and a linked directory is followed only if it lies inside the workspace. The workspace is copied to `<target dir>/tmt/src` (or `--work-dir`) and built in a `target` directory next to that copy. Cargo intermediates also stay in that directory, even if `build.build-dir` is configured for ordinary builds. Path dependencies that point outside the workspace are rewritten to absolute paths in the copy.
 
@@ -155,7 +164,7 @@ Your source tree is never modified. In a git repository only the files git does 
 3. **Plan.** An integer comparison is a threshold on `lhs - rhs`. Every threshold between the nearest observation below and the nearest observation above gives the same result on all observed values, so every test executes such a mutant exactly as it executes the original. Those mutants are input gaps, found by arithmetic. By default one of them is re-run to confirm (`--no-verify` skips that).
 4. **Run.** The remaining mutants change the outcome of some observation. Each is run only against the tests whose observations it changes. If they all pass, no assertion noticed: an assertion gap.
 
-5. **Build the rest one by one.** Some code cannot carry a probe: nothing in a `const fn` or in the value of a `const` or `static` can ask at run time which mutant is on, a function that returns `impl Iterator` cannot return an iterator of another type beside its own, two literals (`60 * 60`) have no type of their own for a probe to work with, and for a compound assignment to more than a variable (`*map.entry(k).or_insert(0) += 1`) the order of evaluation depends on the type. The mutants of such code, and of every site whose probe did not compile, are written into the source, built and run against all tests, one after the other, the way cargo-mutants does it. This is the slow part, so it is done only with `--rebuild`; without it the summary says how many mutants were left out.
+5. **Build the rest one by one.** Some code cannot carry a probe: nothing in a `const fn` or in the value of a `const` or `static` can ask at run time which mutant is on, a function that returns `impl Iterator` cannot return an iterator of another type beside its own, two literals (`60 * 60`) have no type of their own for a probe to work with, and for a compound assignment to more than a variable (`*map.entry(k).or_insert(0) += 1`) the order of evaluation depends on the type. The mutants of such code, and of every site whose probe did not compile, are written into the source, built and run against all tests, one after the other, the way cargo-mutants does it. This is the slow part, so it is done with `--rebuild` or `--source-only`; without it the summary says how many mutants were left out.
 
 Mutants that cannot differ from the original within the operand types (`x >= 0` for an unsigned `x`) are not reported.
 
@@ -188,7 +197,7 @@ A finding is not repeated by what encloses it: if `a > 0` is true in every test,
 
 Code in the arguments of `assert_eq!`, `assert_ne!`, `vec!`, `format!`, `print!`, `println!`, `eprint!`, `eprintln!`, `write!`, `writeln!`, `panic!`, `unreachable!`, `todo!`, `unimplemented!`, `format_args!` and `matches!` is mutated like any other code. `assert!`, `debug_assert!` and `dbg!` put the source text of their argument into their output, so their arguments are not touched.
 
-A probe that does not compile at some site is dropped and the build is retried. With `--rebuild` the mutants of that site are then built one by one (step 5), and only a site that has no mutant in source form (a deleted `let x; x = ...;`) is counted as skipped in the summary line; without it every such site is. A value that does not have the function's return type (`Default::default()` for a type without a default) is not a mutant; the summary counts those as left out.
+A probe that does not compile at some site is dropped and the build is retried. With `--rebuild` the source mutants of that site are built one by one (step 5). The summary reports skipped sites and candidates that need a source build. A value that does not have the function's return type (`Default::default()` for a type without a default) is not a mutant; the summary counts those as left out.
 
 Functions, `impl` blocks and modules marked `#[mutants::skip]` (also inside `cfg_attr`) are not mutated.
 
@@ -221,6 +230,7 @@ The probes are written to leave the unmutated program alone: every operand is ev
 - `formal/tla/JobPool.tla`: the parallel runner runs every mutant exactly once and has every result when the workers stop. Checked with TLC.
 - `formal/tla/TraceBacklog.tla`: the observations a thread keeps back while recording. Nothing a thread knows is anywhere but in the trace, in its backlog or on its way, and when every thread has ended the trace has the nearest distance. Three wrong variants (no write at the end of a thread, a backlog that keeps the first value, news that is dropped) are told apart. Checked with TLC.
 - `formal/tla/WorkCopy.tla`: the working copy across runs. Whatever earlier runs left behind, and wherever one was interrupted, the build of a run sees exactly the files that run wants, and instrumented text is never in the copy without the log naming it. Checked with TLC.
+- `formal/tla/TargetCoverage.tla`: a source mutant with no compiled file is unevaluated, and a changed file is restored before its result is recorded. Checked with TLC.
 - `formal/pict/workcopy.pict`: what a file was after the last run, what the user did to it since, and whether this run instruments it. The table (`tests/data/workcopy.pict.tsv`) is replayed in `driver::tests::work_copy_table`.
 
 ```text
@@ -231,9 +241,9 @@ java -jar tla2tools.jar formal/tla/RepairLoop.tla
 
 ## Limits
 
-- Each package is analysed through its library or a binary target. Workspace runs select multiple packages. The direct runner sets the libtest thread count, and the isolated runner uses one test per process. Nextest configuration applies when using the Unix source-only nextest runner.
+- Each package contributes its production libraries and binaries. TMT follows explicit Rust module declarations and literal `include!` paths, and analyses a file included by multiple targets once per package. Workspace runs select multiple packages. The direct runner sets the libtest thread count, and the isolated runner uses one test per process. Nextest configuration applies when using the Unix source-only nextest runner.
 - Probe recording and probe mutants need the environment variables passed to the process under test. A subprocess that clears them can execute code without recording it. Use `--source-only` for those sites.
-- A module that two targets of the package both declare (`mod common;` in `lib.rs` and in `main.rs`) cannot be probed; its sites are counted as skipped.
+- Secondary targets and modules shared by targets need a source build. Run with `--rebuild` or `--source-only` to evaluate them. Cargo artifacts and rustc dependency files identify source files that were absent from the build. Their candidates are reported as unevaluated. This check is at file granularity. Use the feature and target settings that enable the Rust items you want to test.
 - Source files that start with a byte order mark or a `#!` line are not instrumented.
 - A macro that shadows a standard one is only recognised when it is defined at the top level of the same file.
 - Code in the arguments of macros other than the ones listed above and in test code is not mutated. Supported mutations in inline const blocks, array lengths, enum discriminants, const generic expressions, `const fn` and constant initializers need a source build.
@@ -246,7 +256,7 @@ java -jar tla2tools.jar formal/tla/RepairLoop.tla
 - Equivalent mutants are not always detected. If `max(a, b)` is written with `a >= b`, then `a > b` is reported although no test could observe it. The same goes for an operand that is constant by construction (`is_large(n) && FEATURE_ENABLED`).
 - Observations made on threads that a test spawns, and all observations of doc tests, cannot be attributed to a single test; the mutant is then run against the whole test binary.
 - A thread without a name, and the main thread, write every observation at once (slow in a loop); a thread with a name keeps distances back as described under "Speed". If such a thread is still running when the process exits, what it observed in its last 20 ms can be missing from the trace, as anything it would have observed a moment later is. A survivor predicted from that is re-run like every other and shows up as `UNSTABLE` if the prediction was wrong.
-- A comparison, a guard or an operand that a mutant replaces by a constant is still evaluated, and so is a field's value when the mutant takes the field from the base (which is then evaluated twice). A test that only notices that a call inside them no longer happens does not count against these mutants; built with `--rebuild`, a guard or a field is replaced outright.
+- A comparison, a guard or an operand that a mutant replaces by a constant is still evaluated, and so is a field's value when the mutant takes the field from the base (which is then evaluated twice). The source edit for a field removes it from the update and evaluates the existing base expression once. Use `--source-only` when the test needs to distinguish these evaluation effects.
 - A probe keeps the order of evaluation and the life of temporaries of the code it stands for, with two exceptions that need unusual code to be seen: a temporary with a destructor inside the value of a field of a struct literal with a base (`S { x: guard().value(), ..base }`) is dropped before the next field is evaluated, and `*p += f()` on a number takes the place before it calls `f`, which a `DerefMut` with side effects can observe.
 - A thread that a test names exactly like another test of the same binary is taken for that test, and mutants are then run against the wrong test. `--audit` shows it.
 - A replaced operator in a mutant that is built keeps its operands by parentheses where the new operator binds otherwise (`8 - (2 + 3)`). A crate that denies `unused_parens` rejects those where they turn out not to be needed; they are then counted as not compiling.
