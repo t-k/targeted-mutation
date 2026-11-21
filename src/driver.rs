@@ -593,6 +593,7 @@ struct SourceFile {
     path: PathBuf,
     owners: BTreeSet<PathBuf>,
     original: String,
+    lines: scope::LineIndex,
     sites: Vec<Site>,
     /// Sites whose mutants are built one by one.
     rebuild_sites: Vec<Site>,
@@ -2187,11 +2188,11 @@ fn candidate_edit(
     end: usize,
     replacement: String,
 ) -> report::CandidateEdit {
-    let prefix = &file.original[..start];
+    let (line, column) = file.lines.position(&file.original, start);
     report::CandidateEdit {
         file: file.display.clone(),
-        line: scope::line_of(&file.original, start),
-        column: prefix.rsplit('\n').next().unwrap_or("").chars().count() + 1,
+        line,
+        column,
         start,
         end,
         before: file.original[start..end].to_string(),
@@ -2201,11 +2202,10 @@ fn candidate_edit(
 
 fn witness_location(source: &SourceFile, candidate: &witness::Candidate) -> report::Location {
     let span = &candidate.edits[0].span;
-    let prefix = &source.original[..span.start];
-    let column = prefix.rsplit('\n').next().unwrap_or("").chars().count() + 1;
+    let (line, column) = source.lines.position(&source.original, span.start);
     report::Location {
         file: source.display.clone(),
-        line: scope::line_of(&source.original, span.start),
+        line,
         column,
         code: report::one_line(&source.original[span.clone()]),
         ..Default::default()
@@ -3661,6 +3661,7 @@ fn run_package(
                     display,
                     path,
                     owners: owners.production,
+                    lines: scope::LineIndex::new(&original),
                     original,
                     places,
                     sites: found.sites,
@@ -3702,9 +3703,8 @@ fn run_package(
                 .unwrap_or(&file.path)
                 .to_string_lossy()
                 .into_owned();
-            let original = &file.original;
             let in_scope = |site: &Site| {
-                scope.touches(&relative, scope::line_of(original, site.start), scope::line_of(original, site.end))
+                scope.touches(&relative, file.lines.line_of(site.start), file.lines.line_of(site.end))
                     // A function is in scope by its signature line too.
                     || scope.touches(&relative, site.line, site.line)
             };
@@ -3741,8 +3741,8 @@ fn run_package(
                     candidate.edits.iter().any(|edit| {
                         scope.touches(
                             &relative,
-                            scope::line_of(&file.original, edit.span.start),
-                            scope::line_of(&file.original, edit.span.end),
+                            file.lines.line_of(edit.span.start),
+                            file.lines.line_of(edit.span.end),
                         )
                     })
                 };
@@ -5349,6 +5349,7 @@ fn run_package(
         .map(|file| FilePlaces {
             display: &file.display,
             source: &file.original,
+            lines: &file.lines,
             places: &file.places,
         })
         .collect();
@@ -5418,6 +5419,7 @@ fn spread(count: usize, wanted: usize) -> Vec<usize> {
 struct FilePlaces<'a> {
     display: &'a str,
     source: &'a str,
+    lines: &'a scope::LineIndex,
     /// Every site of the file as (line, column, code), whatever part of it was analysed.
     places: &'a [(usize, usize, String)],
 }
@@ -5427,32 +5429,43 @@ struct FilePlaces<'a> {
 /// sites of the file, not over the findings: a finding keeps its number when the one
 /// before it is closed.
 fn name_findings(findings: &mut [Finding], files: &[FilePlaces]) {
+    let mut by_file: BTreeMap<String, Vec<&mut Finding>> = BTreeMap::new();
+    for finding in findings {
+        by_file
+            .entry(finding.at().file.clone())
+            .or_default()
+            .push(finding);
+    }
     for file in files {
-        let items = instrument::named_items(file.source);
-        let item_at = |line: usize, column: usize| -> String {
-            instrument::offset_of(file.source, line, column)
-                .map_or("", |offset| instrument::enclosing_item(&items, offset))
-                .to_string()
+        let Some(findings) = by_file.remove(file.display) else {
+            continue;
         };
-        // Every place of the file a finding can be at: where, in which item, on which code.
-        let places: BTreeSet<(String, &str, usize, usize)> = file
-            .places
-            .iter()
-            .map(|(line, column, code)| (item_at(*line, *column), code.as_str(), *line, *column))
-            .collect();
-        for finding in findings.iter_mut() {
+        let items = instrument::named_items(file.source);
+        let index = instrument::ItemIndex::new(&items);
+        let item_at = |line, column| {
+            file.lines
+                .offset_of(file.source, line, column)
+                .map_or("", |offset| index.at(offset))
+        };
+        let mut positions: BTreeMap<(&str, &str), Vec<(usize, usize)>> = BTreeMap::new();
+        for (line, column, code) in file.places {
+            positions
+                .entry((item_at(*line, *column), code))
+                .or_default()
+                .push((*line, *column));
+        }
+        for places in positions.values_mut() {
+            places.sort_unstable();
+            places.dedup();
+        }
+        for finding in findings {
             let kind = finding.kind();
             let at = finding.at_mut();
-            if at.file != file.display {
-                continue;
-            }
-            at.item = item_at(at.line, at.column);
-            let nth = places
-                .iter()
-                .filter(|(item, code, line, column)| {
-                    *item == at.item && *code == at.code && (*line, *column) < (at.line, at.column)
-                })
-                .count();
+            let item = item_at(at.line, at.column);
+            let nth = positions.get(&(item, &at.code)).map_or(0, |places| {
+                places.partition_point(|&place| place < (at.line, at.column))
+            });
+            at.item = item.to_string();
             at.id = report::finding_id(kind, at, nth);
         }
     }
@@ -6837,7 +6850,7 @@ fn main() {
     fn a_finding_keeps_its_number_when_the_one_before_it_is_closed() {
         let source = "impl S {\n    fn f(a: u8, b: u8) -> u8 {\n        let x = if a > b { 1 } else { 0 };\n        let y = if a > b { 2 } else { 0 };\n        x + y\n    }\n}\nfn g(a: u8, b: u8) -> bool {\n    a > b\n}\n";
         let found = instrument::discover(source, 0).unwrap();
-        let all: Vec<(usize, usize, String)> = found
+        let mut all: Vec<(usize, usize, String)> = found
             .sites
             .iter()
             .map(|site| {
@@ -6845,9 +6858,17 @@ fn main() {
                 (at.line, at.column, at.code)
             })
             .collect();
+        all.push(
+            all.iter()
+                .find(|(line, _, code)| *line == 3 && code == "a > b")
+                .unwrap()
+                .clone(),
+        );
+        all.reverse();
         let places = [FilePlaces {
             display: "src/lib.rs",
             source,
+            lines: &scope::LineIndex::new(source),
             places: &all,
         }];
         let gap = |line: usize, column: usize, file: &str| Finding::InputGap {
@@ -6873,6 +6894,7 @@ fn main() {
             gap(4, 20, "src/lib.rs"),
             gap(9, 5, "src/lib.rs"),
             gap(9, 5, "src/other.rs"),
+            gap(5, 9, "src/lib.rs"), // A finding without a corresponding catalogued location.
         ];
         name_findings(&mut findings, &places);
         assert_eq!(
@@ -6891,6 +6913,13 @@ fn main() {
         );
         // A finding of a file that is not among the given ones is left without a name.
         assert_eq!(name(&findings[2]), (String::new(), String::new()));
+        assert_eq!(
+            name(&findings[3]),
+            (
+                "S::f".to_string(),
+                "input_gap|src/lib.rs|S::f|a > b|2".to_string()
+            )
+        );
     }
 
     #[test]

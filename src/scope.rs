@@ -108,6 +108,50 @@ impl Scope {
     }
 }
 
+/// Byte offsets of the line starts in one source file.
+pub(crate) struct LineIndex(Vec<usize>);
+
+impl LineIndex {
+    pub(crate) fn new(source: &str) -> Self {
+        Self(
+            std::iter::once(0)
+                .chain(
+                    source
+                        .bytes()
+                        .enumerate()
+                        .filter(|&(_, byte)| byte == b'\n')
+                        .map(|(offset, _)| offset + 1),
+                )
+                .collect(),
+        )
+    }
+
+    pub(crate) fn line_of(&self, offset: usize) -> usize {
+        self.0.partition_point(|&start| start <= offset)
+    }
+
+    pub(crate) fn position(&self, source: &str, offset: usize) -> (usize, usize) {
+        let line = self.line_of(offset);
+        let column = source[self.0[line - 1]..offset].chars().count() + 1;
+        (line, column)
+    }
+
+    pub(crate) fn offset_of(&self, source: &str, line: usize, column: usize) -> Option<usize> {
+        // As in the unindexed lookup, out-of-range lines and columns clamp to EOF.
+        let start = self
+            .0
+            .get(line.checked_sub(1)?)
+            .copied()
+            .unwrap_or(source.len());
+        let rest = &source[start..];
+        let within = rest
+            .char_indices()
+            .nth(column.checked_sub(1)?)
+            .map_or(rest.len(), |(offset, _)| offset);
+        Some(start + within)
+    }
+}
+
 /// 1-based line of the byte at `offset`.
 pub fn line_of(source: &str, offset: usize) -> usize {
     source.as_bytes()[..offset.min(source.len())]
@@ -244,6 +288,52 @@ new file mode 100644
                 && !scope.touches("a.rs", 5, 5)
         );
         assert!(scope.touches("b.rs", 12345, 12345));
+    }
+
+    #[test]
+    fn indexed_positions_match_the_previous_scans() {
+        for row in include_str!("../tests/data/source-positions.pict.tsv")
+            .lines()
+            .skip(1)
+        {
+            let fields: Vec<_> = row.split('\t').collect();
+            let [text, newline, ending, query] = fields.as_slice() else {
+                panic!("invalid fixture row {row}");
+            };
+            let word = if *text == "unicode" { "é🦀" } else { "xyz" };
+            let newline = if *newline == "crlf" { "\r\n" } else { "\n" };
+            let source = match *ending {
+                "empty" => String::new(),
+                "newline" => format!("{word}{newline}{word}{newline}"),
+                "none" => format!("{word}{newline}{word}"),
+                _ => panic!("invalid ending in {row}"),
+            };
+            let lines = LineIndex::new(&source);
+            for offset in 0..=source.len() + 1 {
+                assert_eq!(lines.line_of(offset), line_of(&source, offset), "{row}");
+                if offset <= source.len() && source.is_char_boundary(offset) {
+                    let prefix = &source[..offset];
+                    let column = prefix.rsplit('\n').next().unwrap().chars().count() + 1;
+                    assert_eq!(
+                        lines.position(&source, offset),
+                        (line_of(&source, offset), column),
+                        "{row}"
+                    );
+                }
+            }
+            let (line, column) = match *query {
+                "first" => (1, 1),
+                "boundary" => (2, 2),
+                "beyond" => (20, 99),
+                "zero" => (1, 0),
+                _ => panic!("invalid query in {row}"),
+            };
+            assert_eq!(
+                lines.offset_of(&source, line, column),
+                crate::instrument::offset_of(&source, line, column),
+                "{row}"
+            );
+        }
     }
 
     #[test]

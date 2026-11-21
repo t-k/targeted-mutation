@@ -862,6 +862,87 @@ pub fn offset_of(source: &str, line: usize, column: usize) -> Option<usize> {
     Some(start + within)
 }
 
+/// The innermost item's name for each interval between item boundaries.
+pub(crate) struct ItemIndex<'a>(Vec<(usize, &'a str)>);
+
+impl<'a> ItemIndex<'a> {
+    pub(crate) fn new(items: &'a [NamedItem]) -> Self {
+        use std::{cmp::Reverse, collections::BinaryHeap};
+
+        let mut starts: Vec<_> = items.iter().enumerate().collect();
+        starts.sort_unstable_by_key(|&(_, item)| item.start);
+        let mut boundaries: Vec<_> = items
+            .iter()
+            .flat_map(|item| [item.start, item.end])
+            .collect();
+        boundaries.sort_unstable();
+        boundaries.dedup();
+
+        let mut starts = starts.into_iter().peekable();
+        let mut active = BinaryHeap::new();
+        let mut intervals = Vec::new();
+        for boundary in boundaries {
+            while let Some(&(index, item)) =
+                starts.peek().filter(|(_, item)| item.start <= boundary)
+            {
+                starts.next();
+                // Span length chooses the innermost item. Equal spans keep visitor order.
+                active.push(Reverse((item.end - item.start, index)));
+            }
+            while active
+                .peek()
+                .is_some_and(|&Reverse((_, index))| items[index].end <= boundary)
+            {
+                active.pop();
+            }
+            let name = active
+                .peek()
+                .map_or("", |&Reverse((_, index))| items[index].name.as_str());
+            if intervals
+                .last()
+                .is_none_or(|&(_, previous)| previous != name)
+            {
+                intervals.push((boundary, name));
+            }
+        }
+        Self(intervals)
+    }
+
+    pub(crate) fn at(&self, offset: usize) -> &'a str {
+        let end = self.0.partition_point(|&(start, _)| start <= offset);
+        self.0[..end].last().map_or("", |&(_, name)| name)
+    }
+}
+
+#[cfg(test)]
+#[test]
+fn indexed_item_boundaries_agree_with_the_previous_search() {
+    let items = [
+        (6, 10, "first tie"),
+        (0, 16, "outer"),
+        (2, 6, "before tie"),
+        (6, 10, "second tie"),
+        (4, 13, "overlap"),
+        (7, 9, "inner"),
+        (7, 7, "empty"),
+        (17, 18, "after outer"),
+    ]
+    .map(|(start, end, name)| NamedItem {
+        start,
+        end,
+        name: name.to_string(),
+    });
+    let indexed = ItemIndex::new(&items);
+    for offset in 0..=20 {
+        assert_eq!(
+            indexed.at(offset),
+            enclosing_item(&items, offset),
+            "{offset}"
+        );
+        assert_eq!(ItemIndex::new(&[]).at(offset), "");
+    }
+}
+
 /// A mutant as a change of the source text: `replacement` in place of `start..end`.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct SourceMutant {
