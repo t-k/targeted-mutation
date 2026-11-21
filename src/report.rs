@@ -67,7 +67,17 @@ pub enum Finding {
         #[serde(flatten)]
         at: Location,
         survivors: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        witness: Option<VerifiedWitness>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct VerifiedWitness {
+    pub call: String,
+    pub original: String,
+    pub mutant: String,
+    pub assertion: String,
 }
 
 impl Finding {
@@ -868,12 +878,22 @@ fn finding_body(finding: &Finding) -> Vec<String> {
                 lines.extend(effects.iter().cloned());
             }
         }
-        Finding::Survivor { survivors, .. } => {
+        Finding::Survivor {
+            survivors, witness, ..
+        } => {
             lines.push(format!("passes every test as: {}", survivors.join(", ")));
-            lines.push(
-                "built on its own, where nothing can be recorded: either no test runs this code, or one does and does not check what it gives"
-                    .to_string(),
-            );
+            if let Some(witness) = witness {
+                lines.push(format!(
+                    "verified on `{}`: original returned {}, mutant returned {}",
+                    witness.call, witness.original, witness.mutant,
+                ));
+                lines.push(format!("add a test with `{}`", witness.assertion));
+            } else {
+                lines.push(
+                    "built on its own, where nothing can be recorded: either no test runs this code, or one does and does not check what it gives"
+                        .to_string(),
+                );
+            }
         }
     }
     lines
@@ -1758,6 +1778,7 @@ mod tests {
                 ..Location::default()
             },
             survivors: vec!["the body of `limit` replaced by `0`".into()],
+            witness: None,
         };
         assert_eq!(survivor.kind(), "survivor");
         assert_eq!(survivor.at().line, 2);

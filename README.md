@@ -108,6 +108,12 @@ Running:
 - `--rebuild`: also run the mutants that need a build of their own (see "How it works", step 5). Without it the summary says how many were left out.
 - `--source-only`: build supported mutants directly from source and run them against the selected tests. Scope it with `--lines` or `--since` when tests launch children with `Command::env_clear()` or otherwise omit the probe environment. This mode is slower and reports surviving source mutants without trace-based input or assertion suggestions.
 
+With either rebuild mode, TMT also tries replacing `position` with `rposition` in simple integer-slice searches at the library crate root. If the mutant passes the selected tests and a selected library test harness is available, TMT tries a slice with two matches against both implementations. When their return values differ, the report shows the values and an assertion based on the original. The extra test runs in the working copy. JSON includes the evidence as `findings[].witness` on the survivor.
+
+```sh
+cargo tmt fixtures/shapes --rebuild --lines src/lib.rs:28-29
+```
+
 Output: text by default, `--json`, or `--sarif` (SARIF 2.1.0 for code scanning: paths from the top of the git repository, the finding's id as `partialFingerprints`, and what the run looked at under the run's `properties`). The JSON report has the same under `analysis`: package, `--since` and `--lines`, features, and whether mutants were built and predictions re-run. `--show-unreached` lists sites with no recorded execution. Long campaigns print completed, failed, timed-out, survived and unevaluated counts on stderr. `--quiet` suppresses progress. If a baseline test fails, stderr includes the available diagnostics and the full log path.
 
 Exit status: `0` no gaps, `2` gaps found or a prediction failed its re-run (`UNSTABLE`), `1` the analysis could not run (tests fail on the unmutated code, the crate does not build, ...), and `3` there was work to evaluate, but no mutants executed and no gaps were reported. A scoped selection with zero sites skips the build and baseline. JSON and SARIF expose `evaluation` as `no_sites` or `no_mutants_executed`. Structured `skipped` records include their source span and reason, with a compiler diagnostic for repaired probes.

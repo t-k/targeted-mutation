@@ -10,6 +10,7 @@ pub mod propagation;
 pub mod report;
 pub mod scope;
 pub mod trace;
+mod witness;
 
 /// The runtime injected into the crate under test, compiled here so that its logic can be
 /// checked against the planner.

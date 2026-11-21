@@ -1255,6 +1255,206 @@ fn closes_the_gaps() {
 }
 
 #[test]
+fn first_and_last_match_are_distinguished_by_a_verified_test() {
+    for pinned in [false, true] {
+        for library in [false, true] {
+            let dir = fixture("shapes", &format!("position-witness-{pinned}-{library}"));
+            let target = if library { "shapes" } else { "selected" };
+            let source = if library {
+                dir.join("src/lib.rs")
+            } else {
+                fs::create_dir(dir.join("tests")).unwrap();
+                let test_path = dir.join("tests/selected.rs");
+                fs::write(&test_path, "use shapes::position_of;\n").unwrap();
+                test_path
+            };
+            if !library || pinned {
+                append(
+                    &source,
+                    "\n#[test]\nfn searches() {\n    assert_eq!(position_of(&[4, 5], 5), Some(1));\n    assert_eq!(position_of(&[4, 5], 6), None);\n",
+                );
+                if pinned {
+                    append(
+                        &source,
+                        "    assert_eq!(position_of(&[5, 5], 5), Some(0));\n",
+                    );
+                }
+                append(&source, "}\n");
+            }
+            let original = fs::read_to_string(dir.join("src/lib.rs")).unwrap();
+            for mode in [None, Some("--rebuild"), Some("--source-only")] {
+                let mut args = vec![
+                    "--json",
+                    "--quiet",
+                    "--lines",
+                    "src/lib.rs:28-29",
+                    "--test-target",
+                    target,
+                ];
+                args.extend(mode);
+                let run = tmt(&dir, &args);
+                assert_ne!(run.code, 1, "{args:?}: {}", run.stderr);
+                let report: Value = serde_json::from_str(&run.stdout).unwrap();
+                let expected = mode.is_some() && !pinned;
+                let survivor = findings(&report, "survivor").into_iter().find(|finding| {
+                    strings(&finding["survivors"]).contains(&"replace `position` with `rposition`")
+                });
+                assert_eq!(
+                    survivor.is_some(),
+                    expected,
+                    "{args:?} {pinned}: {report:#}"
+                );
+                if let Some(finding) = survivor {
+                    assert_eq!(finding["item"], "position_of");
+                    if library {
+                        assert_eq!(
+                            finding["witness"],
+                            serde_json::json!({
+                                "call": "position_of(&[5, 5], 5)",
+                                "original": "Some(0)",
+                                "mutant": "Some(1)",
+                                "assertion": "assert_eq!(position_of(&[5, 5], 5), Some(0));"
+                            })
+                        );
+                    } else {
+                        assert!(finding.get("witness").is_none(), "{finding:#}");
+                    }
+                }
+                assert_eq!(
+                    fs::read_to_string(dir.join("src/lib.rs")).unwrap(),
+                    original
+                );
+            }
+        }
+    }
+
+    let dir = fixture("shapes", "position-witness-formats");
+    let args = ["--quiet", "--rebuild", "--lines", "src/lib.rs:28-29"];
+    for format in [None, Some("--sarif")] {
+        let flags: Vec<_> = args.into_iter().chain(format).collect();
+        let run = tmt(&dir, &flags);
+        assert_eq!(run.code, 2, "{}", run.stderr);
+        assert!(
+            run.stdout.contains("original returned Some(0)"),
+            "{}",
+            run.stdout
+        );
+        assert!(
+            run.stdout.contains("mutant returned Some(1)"),
+            "{}",
+            run.stdout
+        );
+        assert!(
+            run.stdout
+                .contains("assert_eq!(position_of(&[5, 5], 5), Some(0));"),
+            "{}",
+            run.stdout
+        );
+    }
+
+    let outside = tmt(
+        &dir,
+        &["--json", "--quiet", "--rebuild", "--lines", "src/lib.rs:4"],
+    );
+    let report: Value = serde_json::from_str(&outside.stdout).unwrap();
+    assert!(!outside.stdout.contains("rposition"), "{report:#}");
+}
+
+#[test]
+fn position_witness_honors_predicate_scope_and_works_without_the_std_prelude() {
+    for (name, no_std) in [("edition-2015", false), ("no-std", true)] {
+        let dir = fixture("shapes", &format!("position-witness-{name}"));
+        let path = dir.join("src/lib.rs");
+        let src = fs::read_to_string(&path).unwrap().replace(
+            ".position(|v| *v == wanted)",
+            ".position(\n        |v| *v == wanted,\n    )",
+        );
+        let src = if no_std {
+            format!("#![no_std]\n{src}")
+        } else {
+            src
+        };
+        fs::write(path, src).unwrap();
+        if !no_std {
+            let path = dir.join("Cargo.toml");
+            let manifest = fs::read_to_string(&path).unwrap();
+            assert!(manifest.contains("\"2021\""));
+            fs::write(path, manifest.replace("\"2021\"", "\"2015\"")).unwrap();
+        }
+        let predicate = if no_std {
+            "src/lib.rs:31"
+        } else {
+            "src/lib.rs:30"
+        };
+        let mode = if no_std { "--rebuild" } else { "--source-only" };
+        let run = tmt(&dir, &["--json", "--quiet", mode, "--lines", predicate]);
+        assert_eq!(run.code, 2, "{name}: {}", run.stderr);
+        let report: Value = serde_json::from_str(&run.stdout).unwrap();
+        let witness = findings(&report, "survivor")
+            .into_iter()
+            .find(|f| f["code"] == "position");
+        assert_eq!(
+            witness.map(|f| &f["witness"]["original"]),
+            Some(&serde_json::json!("Some(0)")),
+            "{name}: {report:#}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn a_failed_position_observation_leaves_a_survivor_and_restores_the_copy() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = fixture("shapes", "position-witness-retry");
+    let wrapper = dir.join("wrapper.sh");
+    fs::write(
+        &wrapper,
+        r#"#!/bin/sh
+if [ -n "${TMT_WITNESS_OUTPUT:-}" ]; then
+    printf 'Some(42)\n' >> "$TMT_WITNESS_OUTPUT"
+    exit 1
+fi
+exec "$@"
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&wrapper, fs::Permissions::from_mode(0o755)).unwrap();
+    let at = [
+        "--json",
+        "--quiet",
+        "--rebuild",
+        "--lines",
+        "src/lib.rs:28-29",
+        "--test-target",
+        "shapes",
+    ];
+    let first = tmt(
+        &dir,
+        &[at.as_slice(), &["--test-wrapper", "wrapper.sh"]].concat(),
+    );
+    assert_eq!(first.code, 2, "{}", first.stderr);
+    let report: Value = serde_json::from_str(&first.stdout).unwrap();
+    let result = findings(&report, "survivor")
+        .into_iter()
+        .find(|finding| finding["code"] == "position")
+        .unwrap();
+    assert!(result.get("witness").is_none(), "{result:#}");
+    let copied = fs::read_to_string(dir.join("target/tmt/src/src/lib.rs")).unwrap();
+    assert!(!copied.contains("__tmt_position_witness"));
+    assert!(!copied.contains("rposition"));
+
+    let retry = tmt(&dir, &at);
+    assert_eq!(retry.code, 2, "{}", retry.stderr);
+    let report: Value = serde_json::from_str(&retry.stdout).unwrap();
+    let result = findings(&report, "survivor")
+        .into_iter()
+        .find(|finding| finding["code"] == "position")
+        .unwrap();
+    assert_eq!(result["witness"]["mutant"], "Some(1)", "{result:#}");
+}
+
+#[test]
 fn the_mutants_of_cargo_mutants() {
     let dir = fixture("genres", "genres");
     let run = tmt(&dir, &["--json", "--quiet", "--rebuild"]);

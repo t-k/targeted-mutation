@@ -62,9 +62,8 @@ struct Cli {
     /// Do not trace surviving mutants to say what they change.
     #[arg(long)]
     no_effects: bool,
-    /// Also run the mutants that need a build of their own (code in a `const fn` and
-    /// other places a probe cannot be put in). Slow: one build and one run of all tests
-    /// for each of them.
+    /// Also run mutants that need a build of their own and verify distinguishing inputs
+    /// for supported survivors. Slower than probes alone.
     #[arg(long)]
     rebuild: bool,
     /// Build every supported mutant in the selected source instead of using probes.

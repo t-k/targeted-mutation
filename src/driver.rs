@@ -20,7 +20,7 @@ use crate::propagation::{self, Change};
 use crate::report::{self, Finding, Report};
 use crate::scope::{self, Scope};
 use crate::trace::Trace;
-use crate::{git_index, progress};
+use crate::{git_index, progress, witness};
 
 pub struct Options {
     /// Directory of the package (or workspace) to analyse.
@@ -435,6 +435,15 @@ enum Runner {
         opt_level: Option<u8>,
         flags: Vec<String>,
     },
+}
+
+impl Runner {
+    fn executable(&self) -> Option<&Path> {
+        match self {
+            Self::Exe(exe) | Self::Isolated { exe, .. } => Some(exe),
+            Self::Doc { .. } => None,
+        }
+    }
 }
 
 struct TestBinary {
@@ -1176,7 +1185,7 @@ fn run_binary(
     let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
     let threads = test_threads(cores, sharing);
     static RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
-    let unable_mark = reserve_mark(&bin.marks, &RUNS)?;
+    let unable_mark = reserve_file(&bin.marks, "unable", &RUNS)?;
 
     let mut cmd = match &bin.runner {
         Runner::Exe(exe) => {
@@ -1233,6 +1242,7 @@ fn run_binary(
     cmd.env_remove("TMT_TRACE")
         .env_remove("TMT_MUTANT")
         .env_remove("TMT_TEST")
+        .env_remove(witness::OUTPUT_ENV)
         .env("TMT_UNABLE", &unable_mark)
         .envs(env.iter().copied())
         .stdin(Stdio::null());
@@ -1466,13 +1476,13 @@ fn work_directory(work: &Path, name: &str) -> Result<PathBuf> {
 ///
 /// The file is new: one of the same name that is there already is left as it is, and
 /// another name is tried.
-fn reserve_mark(dir: &Path, runs: &std::sync::atomic::AtomicUsize) -> Result<PathBuf> {
+fn reserve_file(dir: &Path, label: &str, runs: &std::sync::atomic::AtomicUsize) -> Result<PathBuf> {
     // The tests run in a directory of their own, and so does what they start: a place
     // given from here (`TMPDIR=.`) has to be the same place there.
     let dir = std::path::absolute(dir).unwrap_or(dir.to_path_buf());
     loop {
         let mark = dir.join(format!(
-            "tmt-unable-{}-{}",
+            "tmt-{label}-{}-{}",
             std::process::id(),
             runs.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
         ));
@@ -1489,6 +1499,70 @@ fn reserve_mark(dir: &Path, runs: &std::sync::atomic::AtomicUsize) -> Result<Pat
             }
         }
     }
+}
+
+fn run_source_tests(binaries: &[&TestBinary]) -> Result<Outcome> {
+    for bin in binaries {
+        let outcome = run_binary(
+            bin,
+            None,
+            &[],
+            mutant_timeout(bin.baseline),
+            RunOutput::FirstFailure,
+            1,
+        )?;
+        if outcome != Outcome::Pass {
+            return Ok(outcome);
+        }
+    }
+    Ok(Outcome::Pass)
+}
+
+fn observe_position(
+    baseline: &TestBinary,
+    exe: PathBuf,
+    wrapper: Option<&Path>,
+) -> Result<Option<String>> {
+    use std::io::Read as _;
+    let test = TestBinary {
+        name: witness::TEST_NAME.to_owned(),
+        cwd: baseline.cwd.clone(),
+        marks: baseline.marks.clone(),
+        git_ceiling: baseline.git_ceiling.clone(),
+        tests: BTreeSet::new(),
+        runner: Runner::Isolated {
+            exe,
+            test: witness::TEST_NAME.to_owned(),
+            ignored: false,
+            wrapper: wrapper.map(Path::to_path_buf),
+        },
+        baseline: baseline.baseline,
+        traced: Duration::ZERO,
+        trace: Trace::default(),
+    };
+    static RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let path = reserve_file(&test.marks, "witness", &RUNS)?;
+    let result = (|| {
+        let Some(output) = path.to_str() else {
+            return Ok(None);
+        };
+        if run_binary(
+            &test,
+            None,
+            &[(witness::OUTPUT_ENV, output)],
+            mutant_timeout(test.baseline),
+            RunOutput::Quiet,
+            1,
+        )? != Outcome::Pass
+        {
+            return Ok(None);
+        }
+        let mut text = String::new();
+        fs::File::open(&path)?.take(128).read_to_string(&mut text)?;
+        Ok(witness::parse_observation(&text))
+    })();
+    release_mark(&path)?;
+    result
 }
 
 /// Takes the mark away after the run and says whether the run had given up (the mark
@@ -2545,10 +2619,34 @@ pub fn run(options: &Options) -> Result<Report> {
         }
         files.retain(|f| !f.sites.is_empty() || !f.rebuild_sites.is_empty() || f.path == root_file);
     }
+    let mut position_searches = vec![];
+    if (options.rebuild || options.source_only)
+        && root_target.test_build_arg() == Some(("--lib", None))
+        && let Some(file) = files.iter_mut().find(|file| file.path == root_file)
+    {
+        let relative = file
+            .path
+            .strip_prefix(&copy)
+            .unwrap_or(&file.path)
+            .to_string_lossy();
+        position_searches = witness::position_searches(&file.original);
+        file.places.extend(
+            position_searches
+                .iter()
+                .map(|search| (search.method_line, search.column, "position".to_owned())),
+        );
+        position_searches.retain(|search| {
+            scope.as_ref().is_none_or(|scope| {
+                scope.touches(&relative, *search.lines.start(), *search.lines.end())
+                    || scope.touches(&relative, search.signature_line, search.signature_line)
+            })
+        });
+    }
     let total_sites: usize = files
         .iter()
         .map(|f| f.sites.len() + f.rebuild_sites.len())
-        .sum();
+        .sum::<usize>()
+        + position_searches.len();
     note(&format!("{} sites in {} files", total_sites, files.len()));
     if options.source_only {
         for file in &mut files {
@@ -2751,6 +2849,18 @@ pub fn run(options: &Options) -> Result<Report> {
         })
         .transpose()?;
     let mut runners: Vec<(String, Runner, PathBuf)> = vec![];
+    let root_test_exe = |built: &BuildOutput| {
+        built
+            .test_binaries
+            .iter()
+            .find(|(name, _, owner, kind)| {
+                *name == root_target.name && *owner == package.name && *kind == root_target.kind
+            })
+            .map(|(_, exe, _, _)| exe.clone())
+    };
+    let root_exe = (!position_searches.is_empty())
+        .then(|| root_test_exe(&build))
+        .flatten();
     for (name, exe, owner, kind) in build.test_binaries {
         if !selection.targets.is_empty() && !selection.targets.contains(&name) {
             continue;
@@ -3266,6 +3376,8 @@ pub fn run(options: &Options) -> Result<Report> {
         let mut twins: Vec<Option<_>> = twins.into_iter().map(Some).collect();
         built.extend(chosen.into_iter().filter_map(|nth| twins[nth].take()));
     }
+    let mut by_speed: Vec<&TestBinary> = session.binaries.iter().collect();
+    by_speed.sort_by_key(|bin| bin.baseline);
     if !built.is_empty() {
         session.note(&format!(
             "building {} mutants one by one (code a probe cannot be put in, or to compare with the probe)",
@@ -3280,8 +3392,6 @@ pub fn run(options: &Options) -> Result<Report> {
         };
         // All tests are run against each of them; the quick ones first, since one
         // failure is enough.
-        let mut by_speed: Vec<&TestBinary> = session.binaries.iter().collect();
-        by_speed.sort_by_key(|bin| bin.baseline);
         let mut survivors: Vec<(report::Location, Vec<String>)> = vec![];
         progress::track(
             options.progress,
@@ -3301,20 +3411,7 @@ pub fn run(options: &Options) -> Result<Report> {
                         if !cargo_build()?.status.success() {
                             return Ok(None);
                         }
-                        for bin in &by_speed {
-                            let outcome = run_binary(
-                                bin,
-                                None,
-                                &[],
-                                mutant_timeout(bin.baseline),
-                                RunOutput::FirstFailure,
-                                1,
-                            )?;
-                            if outcome != Outcome::Pass {
-                                return Ok(Some(outcome));
-                            }
-                        }
-                        Ok(Some(Outcome::Pass))
+                        run_source_tests(&by_speed).map(Some)
                     };
                     let attempted = attempt();
                     // The file as it was, before another one is changed and whatever went wrong.
@@ -3369,8 +3466,114 @@ pub fn run(options: &Options) -> Result<Report> {
         report.findings.extend(
             survivors
                 .into_iter()
-                .map(|(at, survivors)| Finding::Survivor { at, survivors }),
+                .map(|(at, survivors)| Finding::Survivor {
+                    at,
+                    survivors,
+                    witness: None,
+                }),
         );
+    }
+
+    if !position_searches.is_empty() {
+        let file = files
+            .iter()
+            .find(|file| file.path == root_file)
+            .expect("searches in the root file");
+        let baseline_text = &file
+            .rendered
+            .as_ref()
+            .expect("rendered before building")
+            .text;
+        let restore = format!("{baseline_text}{root_suffix}");
+        let selected_root = root_exe.as_deref().and_then(|exe| {
+            session
+                .binaries
+                .iter()
+                .find(|bin| bin.runner.executable() == Some(exe))
+        });
+        progress::track(
+            options.progress,
+            "position mutants",
+            position_searches.len(),
+            |progress| -> Result<()> {
+                for search in &position_searches {
+                    let mut mutated = file.original.clone();
+                    mutated.replace_range(search.method.clone(), "rposition");
+                    let attempted = (|| -> Result<_> {
+                        state.write(&root_file, &format!("{mutated}{root_suffix}"))?;
+                        if !cargo_build()?.status.success() {
+                            return Ok((None, None));
+                        }
+                        let outcome = run_source_tests(&by_speed)?;
+                        let mut verified = None;
+                        if outcome == Outcome::Pass
+                            && let Some(baseline) = selected_root
+                        {
+                            let test_source = search.test_source();
+                            let observe = |source: &str| -> Result<Option<String>> {
+                                state.write(
+                                    &root_file,
+                                    &format!("{source}{root_suffix}{test_source}"),
+                                )?;
+                                let build = cargo_build()?;
+                                if !build.status.success() {
+                                    return Ok(None);
+                                }
+                                let artifacts = parse_build_output(
+                                    &String::from_utf8_lossy(&build.stdout),
+                                    &[package.name.as_str()],
+                                );
+                                let Some(exe) = root_test_exe(&artifacts) else {
+                                    return Ok(None);
+                                };
+                                observe_position(baseline, exe, wrapper.as_deref())
+                            };
+                            let distinction = (|| -> Result<_> {
+                                let Some(original) = observe(&file.original)? else {
+                                    return Ok(None);
+                                };
+                                let Some(mutant) = observe(&mutated)? else {
+                                    return Ok(None);
+                                };
+                                Ok(search.verified(original, mutant))
+                            })();
+                            match distinction {
+                                Ok(witness) => verified = witness,
+                                Err(err) => note(&format!(
+                                    "could not check a distinguishing input for {}: {err:#}",
+                                    search.call
+                                )),
+                            }
+                        }
+                        Ok((Some(outcome), verified))
+                    })();
+                    state.write(&root_file, &restore)?;
+                    let (outcome, witness) = attempted?;
+                    progress.complete(outcome.map_or(progress::Outcome::Unable, Into::into));
+                    let Some(outcome) = outcome else {
+                        report.unviable_mutants += 1;
+                        continue;
+                    };
+                    report.mutants_run += 1;
+                    report.mutants_killed += usize::from(outcome != Outcome::Pass);
+                    report.mutants_timed_out += usize::from(outcome == Outcome::Timeout);
+                    if outcome == Outcome::Pass {
+                        report.findings.push(Finding::Survivor {
+                            at: report::Location {
+                                file: file.display.clone(),
+                                line: search.method_line,
+                                column: search.column,
+                                code: "position".to_owned(),
+                                ..Default::default()
+                            },
+                            survivors: vec![witness::MUTATION.to_owned()],
+                            witness,
+                        });
+                    }
+                }
+                Ok(())
+            },
+        )?;
     }
 
     report.record_evaluation();
@@ -4856,7 +5059,7 @@ fn main() {
         // and the mark gets another name.
         fs::write(name(0), "not ours").unwrap();
         fs::write(name(1), "nor this").unwrap();
-        let mark = reserve_mark(&dir, &runs).unwrap();
+        let mark = reserve_file(&dir, "unable", &runs).unwrap();
         assert_eq!(mark, name(2));
         assert!(mark.is_absolute());
         assert_eq!(fs::read_to_string(&mark).unwrap(), "");
@@ -4866,7 +5069,7 @@ fn main() {
         assert!(!release_mark(&mark).unwrap());
         assert!(!mark.exists());
         // Gone: the run gave up.
-        let mark = reserve_mark(&dir, &runs).unwrap();
+        let mark = reserve_file(&dir, "unable", &runs).unwrap();
         assert_eq!(mark, name(3));
         fs::remove_file(&mark).unwrap();
         assert!(release_mark(&mark).unwrap());
@@ -4879,7 +5082,7 @@ fn main() {
         assert!(refused.contains("a-directory"), "{refused}");
         assert!(in_the_way.is_dir());
         // A mark cannot be made in what is no directory, and that is not tried for ever.
-        let unmade = format!("{:#}", reserve_mark(&name(0), &runs).unwrap_err());
+        let unmade = format!("{:#}", reserve_file(&name(0), "unable", &runs).unwrap_err());
         assert!(unmade.contains("creating"), "{unmade}");
         assert_eq!(fs::read_to_string(name(0)).unwrap(), "not ours");
         fs::remove_dir_all(&dir).unwrap();
