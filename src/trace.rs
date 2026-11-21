@@ -111,8 +111,14 @@ impl Trace {
     }
 
     fn parse_line(&mut self, line: &str) -> Option<()> {
-        let cols: Vec<&str> = line.split('\t').collect();
-        match cols[..] {
+        // The comparison record is the widest. Reject extra fields without allocating.
+        let mut cols = [""; 10];
+        let mut len = 0;
+        for field in line.split('\t') {
+            *cols.get_mut(len)? = field;
+            len += 1;
+        }
+        match cols[..len] {
             [
                 "O",
                 site,
@@ -260,6 +266,44 @@ mod tests {
         assert_eq!(trace.malformed_lines, 5);
         assert!(trace.cmp.is_empty());
         assert_eq!(trace.reach.len(), 1);
+    }
+
+    #[test]
+    fn trace_records_need_the_exact_number_of_fields_with_any_line_ending() {
+        for record in [
+            "O\t3\ttests::a\t5\t0\t-1\t2\t1\t-\t-",
+            "R\t3\ttests::a\t1",
+            "L\t3\ttests::a\t1",
+            "A\t3\ttests::a\t1",
+            "B\t3\ttests::a\t1",
+            "T\t3\t0\t255\t0\t255",
+        ] {
+            let (short, _) = record.rsplit_once('\t').unwrap();
+            let long = format!("{record}\t");
+            for ending in ["\n", "\r\n", ""] {
+                let parsed = Trace::parse(&format!("{record}{ending}"));
+                assert_eq!(parsed.malformed_lines, 0, "{record:?} {ending:?}");
+                assert_ne!(parsed, Trace::default());
+                for malformed in [short, long.as_str()] {
+                    assert_eq!(
+                        Trace::parse(&format!("{malformed}{ending}")),
+                        Trace {
+                            malformed_lines: 1,
+                            ..Trace::default()
+                        },
+                        "{malformed:?} {ending:?}"
+                    );
+                }
+            }
+        }
+
+        let parsed = Trace::parse(&format!(
+            "R\t3\ttests::a\t1{}\nR\t4\ttests::b\t1\n",
+            "\t".repeat(32)
+        ));
+        assert_eq!(parsed.malformed_lines, 1);
+        assert!(!parsed.reach.contains_key(&3));
+        assert!(parsed.reach[&4].contains("tests::b"));
     }
 
     #[test]
