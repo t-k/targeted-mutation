@@ -6748,6 +6748,7 @@ fn main() {
                     return Err(io::ErrorKind::Interrupted.into());
                 }
                 if self.fail {
+                    self.fail = false;
                     return Err(io::ErrorKind::PermissionDenied.into());
                 }
                 let limit = out.len().min(self.chunk);
@@ -6783,7 +6784,7 @@ fn main() {
                 }
                 _ => panic!("{row}"),
             }
-            let make_reader = |first, rest| Chunks {
+            let make_reader = |first, rest, fail_first| Chunks {
                 rest,
                 chunk: if *reads == "regular" {
                     usize::MAX
@@ -6793,10 +6794,16 @@ fn main() {
                     2063
                 },
                 interrupt: *reads == "interrupted",
-                fail: !first && *reads == "failed",
+                fail: first == fail_first && *reads == "failed",
             };
-            for (a, b) in [(&left[..], &right[..]), (&right[..], &left[..])] {
-                let compared = compare_streams(make_reader(true, a), make_reader(false, b));
+            for (a, b, fail_first) in [
+                (&left[..], &right[..], true),
+                (&right[..], &left[..], false),
+            ] {
+                let compared = compare_streams(
+                    make_reader(true, a, fail_first),
+                    make_reader(false, b, fail_first),
+                );
                 if *reads == "failed" {
                     assert_eq!(
                         compared.unwrap_err().kind(),
