@@ -2506,6 +2506,13 @@ struct Job {
     tests: Vec<(usize, Option<Vec<String>>)>,
 }
 
+// Jobs are appended in the same order as the numbered probe sites.
+fn jobs_for_site(jobs: &[Job], site: u32) -> std::ops::Range<usize> {
+    let first = jobs.partition_point(|job| job.site < site);
+    let count = jobs[first..].partition_point(|job| job.site == site);
+    first..first + count
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct JobResult {
     first_pass_timeout: bool,
@@ -4858,9 +4865,11 @@ fn run_package(
                     let seen = bin.trace.merged(site.id);
                     !seen.reached() || seen.valued()
                 });
+                let candidates = jobs_for_site(&jobs, site.id);
                 let job_of = |mutation: Mutation| {
-                    jobs.iter()
-                        .position(|job| job.site == site.id && job.mutation == mutation)
+                    candidates
+                        .clone()
+                        .find(|&index| jobs[index].mutation == mutation)
                 };
                 let mut compared = vec![];
                 for mutant in instrument::source_mutants(site) {
@@ -7137,6 +7146,37 @@ fn main() {
                 "input_gap|src/lib.rs|S::f|a > b|2".to_string()
             )
         );
+    }
+
+    #[test]
+    fn an_audit_searches_only_the_jobs_for_its_site() {
+        let jobs: Vec<_> = [1, 1, 3, 8, 8]
+            .into_iter()
+            .map(|site| Job {
+                site,
+                mutation: Mutation::Negate,
+                tests: vec![],
+            })
+            .collect();
+        for (site, range) in [
+            (0, 0..0),
+            (1, 0..2),
+            (2, 2..2),
+            (3, 2..3),
+            (4, 3..3),
+            (8, 3..5),
+            (9, 5..5),
+        ] {
+            let found = jobs_for_site(&jobs, site);
+            assert_eq!(found, range);
+            assert_eq!(
+                found
+                    .clone()
+                    .find(|&index| jobs[index].mutation == Mutation::Negate),
+                jobs.iter()
+                    .position(|job| job.site == site && job.mutation == Mutation::Negate)
+            );
+        }
     }
 
     #[test]
