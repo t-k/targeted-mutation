@@ -4142,7 +4142,11 @@ fn run_package(
             );
         }
     };
-    let built_sources = BuiltSources::from_artifacts(&build.artifacts, &copy);
+    let built_sources = if options.rebuild || options.source_only || options.audit.is_some() {
+        BuiltSources::from_artifacts(&build.artifacts, &copy)
+    } else {
+        BuiltSources::default()
+    };
     output_fixture::stage(&workspace, &work, &build_target, &options.output_fixtures)?;
     let checkpoint_path = report.analysis.checkpoint.as_deref();
     let checkpoint = checkpoint_path.map(Checkpoint::open).transpose()?;
