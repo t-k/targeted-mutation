@@ -657,3 +657,230 @@ fn main() {
     write(&path, "target/mode", "loose");
     assert_eq!(json(&run(), 2)["mutants_killed"], 0);
 }
+
+#[test]
+fn explicit_timeout_warns_once_for_the_selected_slow_test() {
+    let path = package("explicit-timeout-slow-baseline");
+    write(
+        &path,
+        "src/lib.rs",
+        r#"pub fn is_positive(value: i32) -> bool { value > 0 }
+#[test]
+fn slow_test() {
+    std::thread::sleep(std::time::Duration::from_millis(1_300));
+    assert!(is_positive(1));
+    assert!(!is_positive(0));
+}
+#[test]
+fn fast_test() {
+    assert!(is_positive(1));
+    assert!(!is_positive(0));
+}
+"#,
+    );
+    let args = [
+        "--json",
+        "--jobs",
+        "8",
+        "--no-effects",
+        "--timeout-recheck",
+        "none",
+        "--include-test",
+        "slow_test",
+        "--timeout",
+        "1",
+    ];
+    let run = command(&path, &args).output().unwrap();
+    let report = json(&run, 3);
+    assert_eq!(report["analysis"]["timeout_seconds"], 1);
+    assert!(report["timeout_rechecks"]["unconfirmed"].as_u64().unwrap() > 1);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    let mut warnings = stderr.lines().filter(|line| line.contains("warning:"));
+    let warning = warnings
+        .next()
+        .unwrap_or_else(|| panic!("missing warning:\n{stderr}"));
+    assert!(
+        warning.contains("slow_test") && warning.contains("--timeout 1"),
+        "{warning}"
+    );
+    assert!(
+        warning.contains("took ") || warning.contains("still running after "),
+        "{warning}"
+    );
+    assert!(warnings.next().is_none(), "{stderr}");
+    assert!(stderr.find(warning).unwrap() < stderr.find("waiting for mutant tests").unwrap());
+
+    let run = command(
+        &path,
+        &[
+            "--json",
+            "--quiet",
+            "--no-effects",
+            "--include-test",
+            "fast_test",
+            "--timeout",
+            "1",
+        ],
+    )
+    .output()
+    .unwrap();
+    let report = json(&run, 0);
+    assert_eq!(report["mutants_timed_out"], 0);
+    assert!(!String::from_utf8_lossy(&run.stderr).contains("warning:"));
+}
+
+#[test]
+fn timeout_warning_does_not_use_the_whole_binary_for_an_automatic_filter() {
+    let path = package("explicit-timeout-filtered-baseline");
+    write(
+        &path,
+        "src/lib.rs",
+        r#"pub fn is_positive(value: i32) -> bool { value > 0 }
+#[test]
+fn slow_unrelated_test() {
+    std::thread::sleep(std::time::Duration::from_millis(1_300));
+}
+#[test]
+fn relevant_test() {
+    assert!(is_positive(1));
+    assert!(!is_positive(0));
+}
+"#,
+    );
+    let run = command(
+        &path,
+        &[
+            "--json",
+            "--quiet",
+            "--lines",
+            "src/lib.rs:1",
+            "--no-effects",
+            "--timeout",
+            "1",
+        ],
+    )
+    .output()
+    .unwrap();
+    let report = json(&run, 0);
+    assert!(report["mutants_run"].as_u64().unwrap() > 0);
+    assert!(!String::from_utf8_lossy(&run.stderr).contains("warning:"));
+}
+
+#[test]
+fn source_only_timeout_warning_remains_visible_in_quiet_json_mode() {
+    let path = package("explicit-timeout-source-baseline");
+    write(
+        &path,
+        "src/lib.rs",
+        r#"pub fn value() -> bool { true }
+#[test]
+fn slow_test() {
+    std::thread::sleep(std::time::Duration::from_millis(1_300));
+    assert!(value());
+}
+"#,
+    );
+    let run = command(
+        &path,
+        &[
+            "--json",
+            "--quiet",
+            "--source-only",
+            "--lines",
+            "src/lib.rs:1",
+            "--include-test",
+            "slow_test",
+            "--timeout",
+            "1",
+        ],
+    )
+    .output()
+    .unwrap();
+    let report = json(&run, 3);
+    assert_eq!(report["mutants_timed_out"], 1);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("warning:")
+            && stderr.contains("slow_test")
+            && stderr.contains("--timeout 1"),
+        "{stderr}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn tracing_overhead_alone_does_not_trigger_the_timeout_warning() {
+    let path = package("explicit-timeout-trace-overhead");
+    wrapper(
+        &path,
+        r#"#!/bin/sh
+if [ -n "${TMT_TRACE:-}" ]; then
+    sleep 1.3
+fi
+exec "$@"
+"#,
+    );
+    let run = command(
+        &path,
+        &[
+            "--json",
+            "--quiet",
+            "--no-effects",
+            "--test-wrapper",
+            "wrap",
+            "--timeout",
+            "1",
+        ],
+    )
+    .output()
+    .unwrap();
+    let report = json(&run, 0);
+    assert!(report["mutants_run"].as_u64().unwrap() > 0);
+    assert!(!String::from_utf8_lossy(&run.stderr).contains("warning:"));
+}
+
+#[test]
+fn timeout_warning_uses_the_baseline_when_the_filter_names_every_test() {
+    let path = package("explicit-timeout-all-test-names");
+    write(
+        &path,
+        "src/lib.rs",
+        r#"pub fn is_positive(value: i32) -> bool { value > 0 }
+#[test]
+fn slow_test() {
+    std::thread::sleep(std::time::Duration::from_millis(1_300));
+    assert!(is_positive(1));
+    assert!(!is_positive(0));
+}
+"#,
+    );
+    let run = command(
+        &path,
+        &[
+            "--quiet",
+            "--json",
+            "--no-effects",
+            "--jobs",
+            "8",
+            "--timeout-recheck",
+            "none",
+            "--lines",
+            "src/lib.rs:1",
+            "--timeout",
+            "1",
+        ],
+    )
+    .output()
+    .unwrap();
+    let report = json(&run, 3);
+    assert!(report["timeout_rechecks"]["unconfirmed"].as_u64().unwrap() > 1);
+    let stderr = String::from_utf8_lossy(&run.stderr);
+    assert_eq!(stderr.lines().count(), 1, "{stderr}");
+    assert!(
+        stderr.contains("warning:")
+            && stderr.contains("campaign_example")
+            && stderr.contains("--timeout 1"),
+        "{stderr}"
+    );
+}

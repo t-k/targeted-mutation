@@ -640,6 +640,22 @@ impl Runner {
     }
 }
 
+#[derive(Clone, Copy)]
+enum BaselineTiming {
+    Completed(Duration),
+    StillRunning(Duration),
+}
+
+fn explicit_timeout_conflict(
+    timeout: Option<Duration>,
+    baseline: Duration,
+    selected_count: Option<usize>,
+    test_count: usize,
+) -> Option<Duration> {
+    let entire_runner = selected_count.is_none_or(|count| count == test_count);
+    timeout.filter(|&limit| entire_runner && baseline >= limit)
+}
+
 struct TestBinary {
     name: String,
     /// Directory the tests run in: their package's, as under `cargo test`.
@@ -653,6 +669,9 @@ struct TestBinary {
     runner: Runner,
     /// How long the tests take when nothing is recorded: what a mutant is measured against.
     baseline: Duration,
+    /// A comparable measurement, with trace recording disabled.
+    untraced_baseline: Option<BaselineTiming>,
+    timeout_diagnostic: std::sync::Once,
     /// How long they took while recording.
     traced: Duration,
     timeout: Option<Duration>,
@@ -666,6 +685,41 @@ struct TestBinary {
 impl TestBinary {
     fn mutant_limit(&self, baseline: Duration) -> Duration {
         self.timeout.unwrap_or_else(|| mutant_timeout(baseline))
+    }
+
+    fn warn_timeout_conflict(&self, filter: Option<&[String]>) {
+        // The initial timing can include tracing or tests outside this filter.
+        let Some(limit) = explicit_timeout_conflict(
+            self.timeout,
+            self.baseline,
+            filter.map(<[String]>::len),
+            self.tests.len(),
+        ) else {
+            return;
+        };
+        self.timeout_diagnostic.call_once(|| {
+            let timing = self.untraced_baseline.or_else(|| {
+                let started = Instant::now();
+                // Bound the check by the original traced run. If it times
+                // out, exclude time spent stopping it from the lower bound.
+                match run_binary(self, None, &[], self.traced, RunOutput::Quiet, 1) {
+                    Ok(Outcome::Pass) => Some(BaselineTiming::Completed(started.elapsed())),
+                    Ok(Outcome::Timeout) => Some(BaselineTiming::StillRunning(self.traced)),
+                    _ => None,
+                }
+            });
+            let (elapsed, message) = match timing {
+                Some(BaselineTiming::Completed(elapsed)) => (elapsed, "took"),
+                Some(BaselineTiming::StillRunning(elapsed)) => (elapsed, "was still running after"),
+                None => return,
+            };
+            if elapsed >= limit {
+                eprintln!(
+                    "tmt: warning: unmutated baseline for `{}` {message} {:.3}s, meeting or exceeding --timeout {}",
+                    self.name, elapsed.as_secs_f64(), limit.as_secs()
+                );
+            }
+        });
     }
 
     fn filtered_limit(&self, filter: Option<&[String]>, traced: bool) -> Duration {
@@ -2048,6 +2102,7 @@ fn reserve_file(dir: &Path, label: &str, runs: &std::sync::atomic::AtomicUsize) 
 
 fn run_source_tests(binaries: &[&TestBinary]) -> Result<Outcome> {
     for bin in binaries {
+        bin.warn_timeout_conflict(None);
         let outcome = run_binary(
             bin,
             None,
@@ -2087,6 +2142,8 @@ fn observe_witness(
             wrapper: wrapper.map(Path::to_path_buf),
         },
         baseline: baseline.baseline,
+        untraced_baseline: None,
+        timeout_diagnostic: std::sync::Once::new(),
         traced: Duration::ZERO,
         timeout: baseline.timeout,
         wrapper_grace: baseline.wrapper_grace,
@@ -2961,6 +3018,15 @@ impl Session {
         label: &str,
         checkpoint: Option<&Phase<'_>>,
     ) -> Result<Vec<JobResult>> {
+        if self
+            .binaries
+            .first()
+            .is_some_and(|bin| bin.timeout.is_some())
+        {
+            for (index, filter) in jobs.iter().flat_map(|job| &job.tests) {
+                self.binaries[*index].warn_timeout_conflict(filter.as_deref());
+            }
+        }
         let run = |index: usize, sharing| self.run_job(&jobs[index], sharing);
         evaluate_jobs(
             jobs.len(),
@@ -4259,6 +4325,8 @@ fn run_package(
                     tests: BTreeSet::new(),
                     runner,
                     baseline: Duration::ZERO,
+                    untraced_baseline: None,
+                    timeout_diagnostic: std::sync::Once::new(),
                     traced: Duration::ZERO,
                     timeout: options.timeout_seconds.map(Duration::from_secs),
                     wrapper_grace: options.wrapper_grace,
@@ -4279,18 +4347,26 @@ fn run_package(
                 )?;
                 bin.traced = started.elapsed();
                 bin.baseline = bin.traced;
+                if options.source_only {
+                    bin.untraced_baseline = Some(BaselineTiming::Completed(bin.baseline));
+                }
                 // Recording slows code in loops down a lot, and the time limit of every mutant
                 // is a multiple of this: where it matters, time the tests as the mutants run them.
                 if !options.source_only && bin.traced > SLOW_TRACE {
                     let started = Instant::now();
-                    if run_baseline(
+                    let passed = run_baseline(
                         &bin,
                         &[],
                         bin.traced,
                         &work.join(format!("baseline-{index}-untraced.log")),
                         true,
-                    )? {
-                        bin.baseline = started.elapsed();
+                    )?;
+                    let elapsed = started.elapsed();
+                    if passed {
+                        bin.untraced_baseline = Some(BaselineTiming::Completed(elapsed));
+                        bin.baseline = elapsed;
+                    } else {
+                        bin.untraced_baseline = Some(BaselineTiming::StillRunning(bin.traced));
                     }
                 }
                 // No file means no probe was reached. Anything else unreadable or malformed means
@@ -4765,6 +4841,15 @@ fn run_package(
     let mut by_speed: Vec<&TestBinary> = session.binaries.iter().collect();
     by_speed.sort_by_key(|bin| bin.baseline);
     if !built.is_empty() {
+        if options.timeout_seconds.is_some()
+            && built
+                .iter()
+                .any(|(file, _, _, _)| built_sources.contains(file))
+        {
+            for bin in &by_speed {
+                bin.warn_timeout_conflict(None);
+            }
+        }
         let source_checkpoint = if checkpoint.is_some() {
             let keys = built
                 .iter()
@@ -5480,6 +5565,38 @@ mod tests {
     use crate::trace::UNKNOWN_TEST;
 
     #[test]
+    fn explicit_timeout_conflict_matches_the_coverage_table() {
+        for row in include_str!("../tests/data/timeout-baseline.pict.tsv")
+            .lines()
+            .skip(1)
+        {
+            let columns: Vec<_> = row.split('\t').collect();
+            let &[limit, baseline, selection] = columns.as_slice() else {
+                panic!("invalid PICT row: {row}");
+            };
+            let timeout = (limit == "explicit").then_some(Duration::from_secs(1));
+            let measured = Duration::from_millis(match baseline {
+                "below" => 999,
+                "equal" => 1_000,
+                "above" => 1_001,
+                _ => panic!("invalid baseline: {baseline}"),
+            });
+            let selected_count = match selection {
+                "full" => None,
+                "all-names" => Some(2),
+                "filtered" => Some(1),
+                _ => panic!("invalid selection: {selection}"),
+            };
+            let expected = limit == "explicit" && baseline != "below" && selection != "filtered";
+            assert_eq!(
+                explicit_timeout_conflict(timeout, measured, selected_count, 2).is_some(),
+                expected,
+                "{row}"
+            );
+        }
+    }
+
+    #[test]
     fn campaign_phase_combinations() {
         let rows = include_str!("../tests/data/campaign-phases.pict.tsv");
         for line in rows.lines().skip(1) {
@@ -5565,6 +5682,8 @@ mod tests {
                 .collect(),
             runner: Runner::Exe(exe),
             baseline: Duration::from_secs(70),
+            untraced_baseline: None,
+            timeout_diagnostic: std::sync::Once::new(),
             traced: Duration::from_secs(70),
             timeout: None,
             wrapper_grace: Duration::ZERO,
@@ -6254,6 +6373,8 @@ serde = { path = "../../serde-fork" }
             tests: BTreeSet::new(),
             runner: Runner::Exe(exe),
             baseline: Duration::ZERO,
+            untraced_baseline: None,
+            timeout_diagnostic: std::sync::Once::new(),
             traced: Duration::ZERO,
             timeout: None,
             wrapper_grace: Duration::ZERO,
@@ -6319,6 +6440,8 @@ fn main() {
             tests: BTreeSet::new(),
             runner: Runner::Exe(exe),
             baseline: Duration::ZERO,
+            untraced_baseline: None,
+            timeout_diagnostic: std::sync::Once::new(),
             traced: Duration::ZERO,
             timeout: None,
             wrapper_grace: Duration::ZERO,
