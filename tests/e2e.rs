@@ -67,6 +67,20 @@ fn but_how(mut report: Value) -> Value {
     report
 }
 
+fn after_confirmed_timeouts(mut report: Value, count: usize) -> Value {
+    let rechecks = report.as_object_mut().unwrap().remove("timeout_rechecks");
+    assert_eq!(
+        rechecks,
+        Some(serde_json::json!({
+            "first_pass": count,
+            "confirmed": count,
+            "recovered": 0,
+            "unconfirmed": 0,
+        }))
+    );
+    report
+}
+
 fn findings<'a>(report: &'a Value, kind: &str) -> Vec<&'a Value> {
     report["findings"]
         .as_array()
@@ -356,10 +370,10 @@ fn awkward_constructs() {
         "{report:#}"
     );
 
-    // Running mutants in parallel gives the same report.
+    // The verdicts match after the extra timeout rechecks.
     let parallel = tmt(&dir, &["--json", "--quiet", "--rebuild", "--jobs", "4"]);
     let parallel: Value = serde_json::from_str(&parallel.stdout).unwrap();
-    assert_eq!(parallel, report);
+    assert_eq!(after_confirmed_timeouts(parallel, 2), report);
     assert_eq!(
         report["unstable"].as_array().unwrap().len(),
         0,
@@ -469,10 +483,10 @@ fn endless_loop_mutant_is_killed_by_the_timeout() {
         "and the mutant was stopped"
     );
     // Run three at a time, a mutant that ran out of time is run once more on its own:
-    // the two that never end run out of time again, and the report is the same.
+    // the two that never end run out of time again, with the same final verdicts.
     let run = tmt(&dir, &["--json", "--quiet", "--jobs", "3"]);
     let together: Value = serde_json::from_str(&run.stdout).unwrap();
-    assert_eq!(together, report);
+    assert_eq!(after_confirmed_timeouts(together, 2), report);
 }
 
 #[test]
