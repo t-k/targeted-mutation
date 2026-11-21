@@ -39,6 +39,7 @@ pub(crate) struct Scenario {
     pub expression: String,
     pub assertion_prefix: String,
     pub guidance: Option<String>,
+    pub fixture_expectation: Option<String>,
     pub placement: Option<Placement>,
     pub source_test: Option<String>,
     position: bool,
@@ -124,6 +125,15 @@ fn {TEST_NAME}() {{
                 .expression
                 .strip_prefix("self::")
                 .unwrap_or(&self.expression);
+            let guidance = self
+                .guidance
+                .as_ref()
+                .filter(|_| {
+                    self.fixture_expectation
+                        .as_ref()
+                        .is_none_or(|expected| *expected == original)
+                })
+                .cloned();
             VerifiedWitness {
                 call: call.to_owned(),
                 assertion: if self.assertion_prefix.is_empty() {
@@ -136,7 +146,7 @@ fn {TEST_NAME}() {{
                 },
                 original,
                 mutant,
-                guidance: self.guidance.clone(),
+                guidance,
                 individually_killed: None,
             }
         })
@@ -447,6 +457,16 @@ mod tests {
             replacement: "wrong".into(),
         };
         assert_eq!(render_edits(source, &[bad], None), None);
+        let mut reversed = Edit {
+            span: 2..3,
+            replacement: "wrong".into(),
+        };
+        reversed.span.end = 0;
+        assert_eq!(render_edits(source, &[reversed], None), None);
+        assert_eq!(
+            render_edits(source, &[], Some((2, "!"))).as_deref(),
+            Some("é!xy")
+        );
         let overlapping = [
             Edit {
                 span: 0..3,
@@ -465,6 +485,8 @@ mod tests {
         for valid in [
             "None",
             "Some(\"old\")",
+            "Ok(-3)",
+            "Err(\"why\")",
             "[2, 1]",
             "false",
             "-3",
@@ -475,6 +497,10 @@ mod tests {
         for invalid in [
             "Missing",
             "Some(fetch())",
+            "Some(1, 2)",
+            "None(1)",
+            "-true",
+            "!1",
             "[file.remove()]",
             "counter.next()",
             "{ 1 }",
@@ -489,6 +515,7 @@ mod tests {
         let observed_only = scenario.observation("2\n", false).unwrap();
         assert_eq!(observed_only.value, "2");
         assert_eq!(observed_only.equals_expected, None);
+        assert!(scenario.observation("\n", false).is_none());
         for corrupted in ["2\n", "2\tunknown\n", "2\n2\ttrue\n", "2\ttrue"] {
             assert!(
                 scenario.observation(corrupted, true).is_none(),

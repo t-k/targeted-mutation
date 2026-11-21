@@ -24,7 +24,7 @@ pub(super) fn discover(source: &str, file: &syn::File, out: &mut Vec<Candidate>)
         out.extend(bit_mask(source, function));
         out.extend(string_length(source, function));
         if let Some(seeds) = fixtures.seeds.get(&function.sig.ident.to_string()) {
-            out.extend(range_mutation(function, seeds));
+            out.extend(range_mutation(source, function, seeds));
         }
     }
 }
@@ -107,6 +107,20 @@ fn integer_literal(expr: &Expr) -> Option<&syn::LitInt> {
         return None;
     };
     Some(value)
+}
+
+fn decimal_value(expr: &Expr) -> Option<String> {
+    let expr = unparen(expr);
+    let (negative, value) = match expr {
+        Expr::Unary(unary) if matches!(unary.op, syn::UnOp::Neg(_)) => (true, unary.expr.as_ref()),
+        _ => (false, expr),
+    };
+    let value = integer_literal(value)?.base10_parse::<u128>().ok()?;
+    Some(if negative && value != 0 {
+        format!("-{value}")
+    } else {
+        value.to_string()
+    })
 }
 
 fn bit_mask(source: &str, function: &ItemFn) -> Option<Candidate> {
@@ -218,7 +232,7 @@ fn plain_method(method: &syn::ExprMethodCall) -> bool {
     method.args.is_empty() && method.turbofish.is_none()
 }
 
-fn range_mutation(function: &ItemFn, seeds: &[RangeSeed]) -> Option<Candidate> {
+fn range_mutation(source: &str, function: &ItemFn, seeds: &[RangeSeed]) -> Option<Candidate> {
     let mut arguments = function.sig.inputs.iter();
     let (slice_name, ty) = parameter(arguments.next()?)?;
     let (bound, bound_type) = parameter(arguments.next()?)?;
@@ -238,7 +252,7 @@ fn range_mutation(function: &ItemFn, seeds: &[RangeSeed]) -> Option<Candidate> {
     {
         return None;
     }
-    let (range, first) = function.block.stmts.iter().find_map(|stmt| {
+    let range = function.block.stmts.iter().find_map(|stmt| {
         let Stmt::Expr(Expr::ForLoop(iteration), _) = stmt else {
             return None;
         };
@@ -265,10 +279,16 @@ fn range_mutation(function: &ItemFn, seeds: &[RangeSeed]) -> Option<Candidate> {
             && path(&accumulation.left).is_some()
             && path(&value.expr) == Some(slice_name)
             && path(&value.index) == Some(&index.ident))
-        .then_some((range, first))
+        .then_some(range)
     })?;
-    let replacement = format!("{first}..={bound}");
-    let description = format!("`{replacement}`");
+    let first = source.get(range.start.as_deref()?.span().byte_range())?;
+    let end = source.get(range.end.as_deref()?.span().byte_range())?;
+    let replacement = format!("{first}..={end}");
+    let description = format!(
+        "`{}..={}`",
+        crate::report::one_line(first),
+        crate::report::one_line(end)
+    );
     Some(candidate(
         function,
         range.span(),
@@ -279,7 +299,8 @@ fn range_mutation(function: &ItemFn, seeds: &[RangeSeed]) -> Option<Candidate> {
             .iter()
             .map(|seed| Scenario {
                 expression: seed.expression.clone(),
-                guidance: Some(seed.guidance.clone()),
+                guidance: seed.expected.as_ref().map(|_| seed.guidance.clone()),
+                fixture_expectation: seed.expected.clone(),
                 source_test: Some(seed.test.clone()),
                 ..Scenario::default()
             })
@@ -291,6 +312,7 @@ struct RangeSeed {
     expression: String,
     guidance: String,
     test: String,
+    expected: Option<String>,
 }
 
 struct RangeFixtures<'src> {
@@ -300,7 +322,7 @@ struct RangeFixtures<'src> {
 }
 
 impl RangeFixtures<'_> {
-    fn seed(&mut self, expr: &Expr) -> Option<()> {
+    fn seed(&mut self, expr: &Expr, expected: &Expr) -> Option<()> {
         let Expr::Call(call) = unparen(expr) else {
             return None;
         };
@@ -366,6 +388,7 @@ impl RangeFixtures<'_> {
                 expression,
                 guidance: format!("In `{test}`, change `{original}` to `{changed}`."),
                 test,
+                expected: decimal_value(expected),
             });
         }
         Some(())
@@ -395,10 +418,10 @@ impl<'ast> Visit<'ast> for RangeFixtures<'_> {
         if mac.path.is_ident("assert_eq")
             && let Ok(args) = syn::punctuated::Punctuated::<Expr, syn::Token![,]>::parse_terminated
                 .parse2(mac.tokens.clone())
+            && let Some((left, right)) = args.first().zip(args.iter().nth(1))
         {
-            for arg in args.iter().take(2) {
-                self.seed(arg);
-            }
+            self.seed(left, right);
+            self.seed(right, left);
         }
     }
 }
@@ -485,7 +508,7 @@ mod checks {
     use super::*;
     #[test]
     fn preserves_sum() {
-        assert_eq!(total_of(&[4, 5, 0], 2), 9);
+        assert_eq!((0x9_u32), total_of(&[4, 5, 0], 2));
         assert_eq!(total_of(&[4], 1), 4);
     }
 }
@@ -500,6 +523,7 @@ mod checks {
         assert_eq!(candidate.scenarios.len(), 1);
         let scenario = &candidate.scenarios[0];
         assert_eq!(scenario.expression, "total_of(&[4, 5, 1], 2)");
+        assert_eq!(scenario.fixture_expectation.as_deref(), Some("9"));
         assert_eq!(
             scenario.source_test.as_deref(),
             Some("checks::preserves_sum")
@@ -508,5 +532,18 @@ mod checks {
             scenario.guidance.as_deref(),
             Some("In `checks::preserves_sum`, change `&[4, 5, 0]` to `&[4, 5, 1]`."),
         );
+    }
+
+    #[test]
+    fn fixture_expectations_use_the_same_integer_spelling_as_runtime_values() {
+        for (input, expected) in [
+            ("-0x9_i32", Some("-9")),
+            ("-0", Some("0")),
+            ("EXPECTED", None),
+            ("!0", None),
+        ] {
+            let value = syn::parse_str(input).unwrap();
+            assert_eq!(decimal_value(&value).as_deref(), expected, "{input}");
+        }
     }
 }

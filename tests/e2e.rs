@@ -1556,6 +1556,62 @@ fn round_trip() { assert_eq!(decode(encode(0x0102)), 0x0102); }
 }
 
 #[test]
+fn range_witnesses_preserve_the_range_and_check_the_existing_assertion() {
+    for grouped in [false, true] {
+        for keeps_expectation in [false, true] {
+            let dir = fixture(
+                "shapes",
+                &format!("range-witness-{grouped}-{keeps_expectation}"),
+            );
+            let path = dir.join("src/lib.rs");
+            let mut source = fs::read_to_string(&path).unwrap();
+            let survivor = if grouped {
+                source = source.replace("for i in 0..n {", "for i in (0)..(n) {");
+                "`(0)..=(n)`"
+            } else {
+                "`0..=n`"
+            };
+            if !keeps_expectation {
+                source = source.replace("let mut total = 0;", "let mut total = values[n];");
+            }
+            fs::write(&path, source).unwrap();
+            for mode in ["--rebuild", "--source-only"] {
+                let run = tmt(
+                    &dir,
+                    &["--json", "--quiet", "--lines", "src/lib.rs:4-9", mode],
+                );
+                assert_eq!(run.code, 2, "{mode}: {}", run.stderr);
+                let report: Value = serde_json::from_str(&run.stdout).unwrap();
+                let finding = report["findings"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|finding| {
+                        finding["item"] == "sum_first"
+                            && strings(&finding["survivors"]).contains(&survivor)
+                    })
+                    .unwrap_or_else(|| panic!("{survivor} {mode}: {report:#}"));
+                let expected = if keeps_expectation { "3" } else { "4" };
+                let witness = &finding["witness"];
+                assert_eq!(
+                    witness["original"], expected,
+                    "{survivor} {mode}: {finding:#}"
+                );
+                assert_eq!(
+                    witness["assertion"],
+                    format!("assert_eq!(sum_first(&[1, 2, 1], 2), {expected});")
+                );
+                assert_eq!(
+                    witness.get("guidance").is_some(),
+                    keeps_expectation,
+                    "{finding:#}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
 fn unicode_arguments_fields_and_sort_keys_get_distinguishing_tests() {
     let dir = fixture("distinguishing", "verified-witness-relations");
     let run = tmt(&dir, &["--json", "--quiet", "--rebuild"]);
@@ -1677,6 +1733,59 @@ fn a_debug_value_with_the_wrong_assertion_type_is_not_suggested() {
         .find(|f| f["code"] == "self.check_preconditions(batch)?;")
         .unwrap();
     assert!(finding.get("witness").is_none(), "{finding:#}");
+}
+
+#[test]
+fn distinguishing_witness_checks_actual_equality_in_both_variants() {
+    let template = r#"
+pub struct Observed(usize);
+
+impl std::fmt::Debug for Observed {
+    fn fmt(&self, fmt: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Debug::fmt(&self.0, fmt)
+    }
+}
+
+impl PartialEq<usize> for Observed {
+    fn eq(&self, expected: &usize) -> bool {
+        COMPARISON
+    }
+}
+"#;
+    for (label, equality) in [
+        ("mutant-equal", "*expected == 0 || self.0 == *expected"),
+        ("original-unequal", "*expected != 0 && self.0 == *expected"),
+    ] {
+        let dir = fixture("batch-store", &format!("witness-{label}"));
+        let path = dir.join("src/lib.rs");
+        let source = fs::read_to_string(&path)
+            .unwrap()
+            .replace(
+                "impl Store {",
+                &format!(
+                    "{}\nimpl Store {{",
+                    template.replace("COMPARISON", equality)
+                ),
+            )
+            .replace("Option<&str>", "Observed")
+            .replace(
+                "self.docs.get(key).map(String::as_str)",
+                "Observed(usize::from(self.docs.contains_key(key)))",
+            )
+            .replace(
+                "assert_eq!(store.get(\"a\"), Some(\"2\"));",
+                "assert_eq!(store.get(\"a\"), 1);",
+            );
+        fs::write(&path, source).unwrap();
+        let run = tmt(&dir, &["--json", "--quiet", "--rebuild"]);
+        assert_eq!(run.code, 2, "{label}: {}", run.stderr);
+        let report: Value = serde_json::from_str(&run.stdout).unwrap();
+        let finding = findings(&report, "assertion_gap")
+            .into_iter()
+            .find(|f| f["code"] == "self.check_preconditions(batch)?;")
+            .unwrap();
+        assert!(finding.get("witness").is_none(), "{label}: {finding:#}");
+    }
 }
 
 #[test]
