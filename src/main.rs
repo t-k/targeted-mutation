@@ -4,6 +4,12 @@ use std::process::ExitCode;
 use clap::Parser;
 use targeted_mutation::{driver, report};
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum Sharding {
+    Slice,
+    RoundRobin,
+}
+
 /// Targeted mutation testing: finds the wrong implementations your tests would let
 /// through, and says which input or assertion would catch them.
 #[derive(Parser)]
@@ -12,9 +18,21 @@ struct Cli {
     /// Directory of the cargo package to analyse.
     #[arg(default_value = ".")]
     dir: PathBuf,
-    /// Package to analyse, when the directory is a workspace.
-    #[arg(short, long)]
-    package: Option<String>,
+    /// Directory of the Cargo package or workspace to analyse.
+    #[arg(short = 'd', long = "dir", conflicts_with = "dir")]
+    directory: Option<PathBuf>,
+    /// Package to analyse, when the directory is a workspace (repeatable).
+    #[arg(short, long, value_delimiter = ',', conflicts_with = "workspace")]
+    package: Vec<String>,
+    /// Analyse all workspace members.
+    #[arg(long)]
+    workspace: bool,
+    /// List source candidates and their edits without building or running tests.
+    #[arg(long, conflicts_with_all = ["sarif", "baseline", "write_baseline"])]
+    list: bool,
+    /// Run the whole workspace's tests against every mutation.
+    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
+    test_workspace: Option<bool>,
     /// Print the report as JSON.
     #[arg(long)]
     json: bool,
@@ -72,6 +90,15 @@ struct Cli {
     /// Build every supported mutant in the selected source instead of using probes.
     #[arg(long, conflicts_with_all = ["rebuild", "audit", "no_verify"])]
     source_only: bool,
+    /// Replace just the operator token, using Rust precedence for the new spelling.
+    #[arg(long, requires = "source_only")]
+    literal_operators: bool,
+    /// Select a zero-based source-only shard K/N within each package.
+    #[arg(long, requires = "source_only", value_name = "K/N")]
+    shard: Option<report::Shard>,
+    /// Method for distributing candidates across shards (default: slice).
+    #[arg(long, requires = "shard", value_enum)]
+    sharding: Option<Sharding>,
     /// Run one selected libtest test per process, including its child threads.
     #[arg(long)]
     isolate_tests: bool,
@@ -128,8 +155,10 @@ struct Cli {
 fn main() -> ExitCode {
     let cli = Cli::parse_from(arguments(std::env::args_os()));
     let options = driver::Options {
-        dir: cli.dir,
-        package: cli.package,
+        dir: cli.directory.unwrap_or(cli.dir),
+        package: cli.package.first().cloned(),
+        list: cli.list,
+        test_workspace: cli.test_workspace.unwrap_or(false),
         verify: !cli.no_verify,
         work_dir: cli.work_dir,
         progress: !cli.quiet,
@@ -143,6 +172,11 @@ fn main() -> ExitCode {
         rebuild: cli.rebuild,
         error_values: cli.error_values,
         source_only: cli.source_only,
+        literal_operators: cli.literal_operators,
+        shard: cli.shard.map(|mut shard| {
+            shard.round_robin = matches!(cli.sharding, Some(Sharding::RoundRobin));
+            shard
+        }),
         test_selection: driver::TestSelection {
             isolate: cli.isolate_tests,
             targets: cli.test_target,
@@ -165,31 +199,129 @@ fn main() -> ExitCode {
         copy_fixtures: cli.copy_fixture,
         doc: cli.doc,
     };
+    if cli.workspace || cli.package.len() > 1 {
+        let members = match driver::run_packages(&options, &cli.package) {
+            Ok(members) => members,
+            Err(err) => {
+                eprintln!("tmt: error: {err:#}");
+                return ExitCode::FAILURE;
+            }
+        };
+        return show_workspace(members, cli.json, cli.sarif, cli.show_unreached);
+    }
     match driver::run(&options) {
         Ok(result) => {
-            if cli.sarif {
-                println!("{}", report::render_sarif(&result));
-            } else if cli.json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&result).expect("report serialises")
-                );
-            } else {
-                print!("{}", report::render_text(&result, cli.show_unreached));
-            }
-            if result.has_gaps() {
-                ExitCode::from(2)
-            } else if result.evaluation == Some(report::Evaluation::NoMutantsExecuted) {
-                ExitCode::from(3)
-            } else {
-                ExitCode::SUCCESS
-            }
+            show_report(&result, cli.json, cli.sarif, cli.show_unreached);
+            ExitCode::from(report_exit(&result))
         }
         Err(err) => {
             eprintln!("tmt: error: {err:#}");
             ExitCode::FAILURE
         }
     }
+}
+
+fn report_exit(result: &report::Report) -> u8 {
+    if result.has_gaps() {
+        2
+    } else if result.evaluation == Some(report::Evaluation::NoMutantsExecuted) {
+        3
+    } else {
+        0
+    }
+}
+
+fn report_json(result: &report::Report) -> serde_json::Value {
+    if let Some(mutants) = &result.mutants {
+        serde_json::json!({
+            "package": result.package,
+            "analysis": result.analysis,
+            "mutants": mutants,
+            "skipped": result.skipped,
+        })
+    } else {
+        serde_json::to_value(result).expect("report serialises")
+    }
+}
+
+fn show_report(result: &report::Report, json: bool, sarif: bool, show_unreached: bool) {
+    if sarif {
+        println!("{}", report::render_sarif(result));
+    } else if json {
+        if result.mutants.is_some() {
+            println!("{:#}", report_json(result));
+        } else {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(result).expect("report serialises")
+            );
+        }
+    } else if let Some(mutants) = &result.mutants {
+        println!("{}: {} source candidates", result.package, mutants.len());
+        for candidate in mutants {
+            let edit = &candidate.edits[0];
+            println!(
+                "{}:{}:{}: {} -> {}",
+                edit.file, edit.line, edit.column, candidate.what, candidate.into
+            );
+        }
+    } else {
+        print!("{}", report::render_text(result, show_unreached));
+    }
+}
+
+fn show_workspace(
+    members: Vec<(String, anyhow::Result<report::Report>)>,
+    json: bool,
+    sarif: bool,
+    show_unreached: bool,
+) -> ExitCode {
+    let mut reports = vec![];
+    let mut errors = vec![];
+    for (package, result) in members {
+        match result {
+            Ok(result) => reports.push(result),
+            Err(err) => {
+                let message = format!("{err:#}");
+                eprintln!("tmt: {package}: {message}");
+                errors.push(serde_json::json!({"package": package, "error": message}));
+            }
+        }
+    }
+    if json {
+        let packages: Vec<_> = reports.iter().map(report_json).collect();
+        println!(
+            "{:#}",
+            serde_json::json!({"packages": packages, "errors": errors})
+        );
+    } else if sarif {
+        let mut combined: serde_json::Value =
+            serde_json::from_str(&report::render_sarif(&report::Report::default()))
+                .expect("SARIF serialises");
+        let runs: Vec<_> = reports
+            .iter()
+            .map(|result| {
+                let mut sarif: serde_json::Value =
+                    serde_json::from_str(&report::render_sarif(result)).expect("SARIF serialises");
+                sarif["runs"][0].take()
+            })
+            .collect();
+        combined["runs"] = serde_json::Value::Array(runs);
+        println!("{combined:#}");
+    } else {
+        for result in &reports {
+            show_report(result, false, false, show_unreached);
+        }
+    }
+    ExitCode::from(if !errors.is_empty() {
+        1
+    } else if reports.iter().any(|report| report_exit(report) == 2) {
+        2
+    } else if reports.iter().any(|report| report_exit(report) == 3) {
+        3
+    } else {
+        0
+    })
 }
 
 /// The arguments as they were meant. Cargo starts `cargo tmt --json` as

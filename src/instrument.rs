@@ -1018,6 +1018,26 @@ pub fn source_mutants(site: &Site) -> Vec<SourceMutant> {
     }
 }
 
+/// Replace only the operator tokens, preserving their surrounding source.
+pub(crate) fn literal_operator_mutants(source: &str, site: &Site) -> Vec<SourceMutant> {
+    let mut mutants = source_mutants(site);
+    let gap = match &site.kind {
+        SiteKind::Cmp { gap, .. } | SiteKind::Logic { gap, .. } | SiteKind::Arith { gap, .. } => {
+            gap
+        }
+        _ => return mutants,
+    };
+    if let Ok(operator) = syn::parse_str::<syn::BinOp>(&source[gap.0..gap.1]) {
+        let span = operator.span().byte_range();
+        for mutant in &mut mutants {
+            mutant.start = gap.0 + span.start;
+            mutant.end = gap.0 + span.end;
+            mutant.replacement.clone_from(&mutant.into);
+        }
+    }
+    mutants
+}
+
 /// The iterators to return in place of the body of a function that returns
 /// `impl Iterator<Item = T>`: an empty one, and one of each value of `T`.
 pub fn iterator_values(output: &syn::ReturnType) -> Vec<String> {

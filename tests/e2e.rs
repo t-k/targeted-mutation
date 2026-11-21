@@ -514,6 +514,211 @@ fn workspace_member_by_name_and_by_directory() {
 }
 
 #[test]
+fn workspace_and_catalog_use_the_same_package_selection() {
+    let root = fixture("multi", "compatibility-cli");
+    let workspace = root.join("ws");
+    let work = workspace.join("analysis");
+    // Full strength-three table from cli.pict.
+    for selector in [
+        &["-p", "ws-core"][..],
+        &["--workspace"][..],
+        &["-p", "ws-core", "-p", "ws-app"][..],
+    ] {
+        for json in [false, true] {
+            for list in [true, false] {
+                let mut args = vec!["--quiet", "--work-dir", work.to_str().unwrap()];
+                args.extend(selector);
+                args.extend(json.then_some("--json"));
+                args.extend(list.then_some("--list"));
+                let run = tmt(&workspace, &args);
+                assert_eq!(
+                    run.code,
+                    if list { 0 } else { 2 },
+                    "{args:?}: {}",
+                    run.stderr
+                );
+                assert!(run.stdout.contains("ws-core"), "{args:?}: {}", run.stdout);
+                assert_eq!(run.stdout.contains("ws-app"), selector.len() != 2);
+                assert!(!run.stdout.lines().any(|line| line.starts_with("outside:")));
+                if !json {
+                    continue;
+                }
+                let data: Value = serde_json::from_str(&run.stdout).unwrap();
+                if selector.len() != 2 {
+                    assert_eq!(data["packages"].as_array().unwrap().len(), 2, "{data:#}");
+                    assert_eq!(data["packages"][0]["package"], "ws-app");
+                    assert_eq!(data["packages"][1]["package"], "ws-core");
+                } else {
+                    assert_eq!(data["package"], "ws-core");
+                }
+            }
+        }
+    }
+    let run = tmt(
+        &workspace,
+        &["--quiet", "--workspace", "--test-workspace", "--json"],
+    );
+    assert_eq!(run.code, 2, "{}", run.stderr);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    for entry in report["packages"].as_array().unwrap() {
+        let tests = strings(&entry["analysis"]["tests_of"]);
+        assert!(tests.contains(&"ws-app") && tests.contains(&"ws-core"));
+    }
+}
+
+#[test]
+fn workspace_failure_keeps_other_reports_and_has_a_distinct_exit_status() {
+    let dir = fixture("multi", "workspace-failed-member").join("ws");
+    append(
+        &dir.join("app/src/lib.rs"),
+        "\ncompile_error!(\"broken member\");\n",
+    );
+    for format in ["--json", "--sarif"] {
+        let run = tmt(&dir, &["--workspace", "--quiet", format]);
+        assert_eq!(run.code, 1, "{}", run.stderr);
+        assert!(run.stderr.contains("broken member"), "{}", run.stderr);
+        let value: Value = serde_json::from_str(&run.stdout).unwrap();
+        if format == "--json" {
+            assert_eq!(value["errors"][0]["package"], "ws-app");
+            assert_eq!(value["packages"][0]["package"], "ws-core");
+        } else {
+            assert_eq!(value["runs"].as_array().unwrap().len(), 1);
+            assert!(!value["runs"][0]["results"].as_array().unwrap().is_empty());
+        }
+    }
+}
+
+#[test]
+fn source_only_can_use_the_literal_operator_edit_used_by_cargo_mutants() {
+    let dir = fixture("eligibility", "literal-operator");
+    let original = "pub fn answer() -> u32 { 8 - 2 * 3 }\n\
+                    #[test] fn checks_answer() { assert_ne!(answer(), 9); }\n";
+    fs::write(dir.join("src/lib.rs"), original).unwrap();
+    let mut kills = vec![];
+    for literal in [false, true] {
+        let mut args = vec!["--source-only", "--quiet", "--json"];
+        args.extend(literal.then_some("--literal-operators"));
+        args.push("--list");
+        let run = tmt(&dir, &args);
+        assert_eq!(run.code, 0, "{}", run.stderr);
+        let list: Value = serde_json::from_str(&run.stdout).unwrap();
+        let edit = &list["mutants"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|candidate| candidate["what"] == "*" && candidate["into"] == "+")
+            .unwrap()["edits"][0];
+        let start = edit["start"].as_u64().unwrap() as usize;
+        let end = edit["end"].as_u64().unwrap() as usize;
+        let changed = format!(
+            "{}{}{}",
+            &original[..start],
+            edit["replacement"].as_str().unwrap(),
+            &original[end..]
+        );
+        let expected = if literal { "8 - 2 + 3" } else { "8 - (2 + 3)" };
+        assert!(changed.contains(expected), "{changed}");
+        args.pop();
+        let run = tmt(&dir, &args);
+        assert_eq!(run.code, 2, "{}", run.stderr);
+        let report: Value = serde_json::from_str(&run.stdout).unwrap();
+        kills.push(report["mutants_killed"].as_u64().unwrap());
+    }
+    assert_eq!(kills, [0, 1]);
+}
+
+#[test]
+fn source_shards_partition_the_catalog_and_the_executed_mutants() {
+    let dir = fixture("eligibility", "source-shards");
+    fs::write(
+        dir.join("src/lib.rs"),
+        "pub fn answer() -> u32 { const { 6 * 7 } }\n\
+         #[test] fn right_answer() { assert_eq!(answer(), 42); }\n",
+    )
+    .unwrap();
+    let base = ["--source-only", "--json", "--quiet"];
+    let catalog = tmt(&dir, &[base.as_slice(), &["--list"]].concat());
+    let catalog: Value = serde_json::from_str(&catalog.stdout).unwrap();
+    let mut expected: Vec<_> = catalog["mutants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(Value::to_string)
+        .collect();
+    expected.sort();
+    assert_eq!(expected.len(), 4);
+    // Full strength-three table from shard.pict.
+    for method in ["slice", "round-robin"] {
+        for total in [2, 5] {
+            let mut seen = vec![];
+            for index in 0..total {
+                let shard = format!("{index}/{total}");
+                let args = [base.as_slice(), &["--shard", &shard, "--sharding", method]].concat();
+                let list = tmt(&dir, &[args.as_slice(), &["--list"]].concat());
+                assert_eq!(list.code, 0, "{}", list.stderr);
+                let entries: Value = serde_json::from_str(&list.stdout).unwrap();
+                let own = entries["mutants"].as_array().unwrap();
+                seen.extend(own.iter().map(Value::to_string));
+                let run = tmt(&dir, &args);
+                assert_eq!(run.code, 0, "{}", run.stderr);
+                let report: Value = serde_json::from_str(&run.stdout).unwrap();
+                assert_eq!(report["mutants_run"], own.len(), "{shard}: {report:#}");
+                assert_eq!(report["mutants_killed"], own.len(), "{shard}: {report:#}");
+            }
+            seen.sort();
+            assert_eq!(seen, expected, "{method} {total}");
+        }
+    }
+    let invalid = tmt(&dir, &["--source-only", "--shard", "2/2"]);
+    assert_ne!(invalid.code, 0);
+    assert!(invalid.stderr.contains("shard index"), "{}", invalid.stderr);
+}
+
+#[test]
+fn source_catalog_shows_actual_const_edits_without_building() {
+    let dir = fixture("eligibility", "source-catalog-const");
+    let path = dir.join("src/lib.rs");
+    let clean = r#"pub fn answer() -> u32 {
+    const { 6 * 7 }
+}
+
+#[test]
+fn checks_answer() { assert_eq!(answer(), 42); }
+"#;
+    fs::write(
+        &path,
+        format!("{clean}compile_error!(\"list must not build\");\n"),
+    )
+    .unwrap();
+    let run = tmt(&dir, &["--list", "--json", "--quiet"]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    let data: Value = serde_json::from_str(&run.stdout).unwrap();
+    let actual: Vec<_> = data["mutants"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|candidate| candidate["what"] == "*")
+        .map(|candidate| (candidate["into"].as_str().unwrap(), &candidate["edits"][0]))
+        .collect();
+    assert_eq!(actual.len(), 2, "{data:#}");
+    for (operator, edit) in actual {
+        assert!(["+", "/"].contains(&operator));
+        assert_eq!(edit["file"], "src/lib.rs");
+        assert_eq!(edit["line"], 2);
+        let start = edit["start"].as_u64().unwrap() as usize;
+        let end = edit["end"].as_u64().unwrap() as usize;
+        assert!(clean[start..end].contains('*'));
+    }
+
+    fs::write(&path, clean).unwrap();
+    let run = tmt(&dir, &["--source-only", "--json", "--quiet"]);
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(report["mutants_run"], 4, "{report:#}");
+    assert_eq!(report["mutants_killed"], 4, "{report:#}");
+}
+
+#[test]
 fn boolean_and_arithmetic_operators_and_macro_arguments() {
     let dir = fixture("operators", "operators");
     let (code, report) = json(&dir);

@@ -22,10 +22,15 @@ use crate::scope::{self, Scope};
 use crate::trace::Trace;
 use crate::{git_index, progress, witness};
 
+#[derive(Clone)]
 pub struct Options {
     /// Directory of the package (or workspace) to analyse.
     pub dir: PathBuf,
     pub package: Option<String>,
+    /// Return source candidates without running a build.
+    pub list: bool,
+    /// Run every member's tests against the selected package.
+    pub test_workspace: bool,
     /// Re-run the tests against one survivor per input gap to confirm the prediction.
     pub verify: bool,
     /// Where to put the copy and its build. Default: `<target dir>/tmt`.
@@ -51,6 +56,8 @@ pub struct Options {
     /// Rust expressions used as the payload of a Result error mutation.
     pub error_values: Vec<String>,
     pub source_only: bool,
+    pub literal_operators: bool,
+    pub shard: Option<report::Shard>,
     pub test_selection: TestSelection,
     /// Optimisation level to build the tests with, instead of the profile's own.
     pub opt_level: Option<u8>,
@@ -68,7 +75,7 @@ pub struct Options {
     pub doc: bool,
 }
 
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct TestSelection {
     pub isolate: bool,
     pub targets: Vec<String>,
@@ -1589,6 +1596,24 @@ fn observe_witness(
     result
 }
 
+fn candidate_edit(
+    file: &SourceFile,
+    start: usize,
+    end: usize,
+    replacement: String,
+) -> report::CandidateEdit {
+    let prefix = &file.original[..start];
+    report::CandidateEdit {
+        file: file.display.clone(),
+        line: scope::line_of(&file.original, start),
+        column: prefix.rsplit('\n').next().unwrap_or("").chars().count() + 1,
+        start,
+        end,
+        before: file.original[start..end].to_string(),
+        replacement,
+    }
+}
+
 fn witness_location(source: &SourceFile, candidate: &witness::Candidate) -> report::Location {
     let span = &candidate.edits[0].span;
     let prefix = &source.original[..span.start];
@@ -2439,7 +2464,99 @@ fn run_pool<T: Send>(
         .collect())
 }
 
+impl std::str::FromStr for report::Shard {
+    type Err = anyhow::Error;
+
+    fn from_str(text: &str) -> Result<Self> {
+        let (index, count) = text.split_once('/').context("expected a shard index K/N")?;
+        let index: usize = index.parse().context("invalid shard index")?;
+        let count: usize = count.parse().context("invalid shard count")?;
+        if index >= count {
+            bail!("shard index must be less than the shard count");
+        }
+        Ok(Self {
+            index,
+            count,
+            round_robin: false,
+        })
+    }
+}
+
+impl report::Shard {
+    fn contains(self, candidate: usize, candidates: usize) -> bool {
+        candidate < candidates
+            && (if self.round_robin {
+                candidate % self.count
+            } else {
+                candidate / candidates.div_ceil(self.count)
+            }) == self.index
+    }
+}
+
+fn cargo_metadata(dir: &Path, cargo: &CargoConfig) -> Result<Metadata> {
+    let output = Command::new("cargo")
+        .args(["metadata", "--no-deps", "--format-version", "1"])
+        .args(cargo.flags())
+        .current_dir(dir)
+        .output()
+        .context("running cargo metadata")?;
+    if !output.status.success() {
+        bail!(
+            "cargo metadata failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    serde_json::from_slice(&output.stdout).context("parsing cargo metadata")
+}
+
+/// A workspace or explicit package selection. An error in one package belongs to
+/// that package, and the remaining packages can still be evaluated.
+pub fn run_packages(options: &Options, names: &[String]) -> Result<Vec<(String, Result<Report>)>> {
+    if options.baseline.is_some() || options.write_baseline.is_some() {
+        bail!("baseline files require a single package");
+    }
+    let metadata = cargo_metadata(&options.dir, &options.cargo)?;
+    let all: BTreeSet<_> = metadata.packages.iter().map(|p| p.name.clone()).collect();
+    let selected = if names.is_empty() {
+        all.clone()
+    } else {
+        names.iter().cloned().collect()
+    };
+    if let Some(unknown) = selected.difference(&all).next() {
+        bail!("no package `{unknown}` in the workspace");
+    }
+    let base = options
+        .work_dir
+        .clone()
+        .unwrap_or_else(|| metadata.target_directory.join("tmt-workspace"));
+    fs::create_dir_all(&base).with_context(|| format!("creating {}", base.display()))?;
+    let base = base.canonicalize()?;
+    if metadata.workspace_root.canonicalize()?.starts_with(&base) {
+        bail!(
+            "the work directory {} contains the workspace",
+            base.display()
+        );
+    }
+    let mut reports = vec![];
+    for name in selected {
+        let mut member = options.clone();
+        member.package = Some(name.clone());
+        member.work_dir = Some(base.join(&name));
+        reports.push((name, run_package(&member, Some(&base))));
+    }
+    Ok(reports)
+}
+
 pub fn run(options: &Options) -> Result<Report> {
+    run_package(options, None)
+}
+
+fn run_package(options: &Options, workspace_work: Option<&Path>) -> Result<Report> {
+    if let Some(shard) = options.shard {
+        if !options.source_only || shard.index >= shard.count {
+            bail!("shards require --source-only and a valid shard index");
+        }
+    }
     let mut seen_errors = HashSet::new();
     let mut error_values = vec![];
     for expression in &options.error_values {
@@ -2464,21 +2581,7 @@ pub fn run(options: &Options) -> Result<Report> {
         .canonicalize()
         .with_context(|| format!("no such directory: {}", options.dir.display()))?;
 
-    // 1. Locate the package.
-    let output = Command::new("cargo")
-        .args(["metadata", "--no-deps", "--format-version", "1"])
-        .args(options.cargo.flags())
-        .current_dir(&dir)
-        .output()
-        .context("running cargo metadata")?;
-    if !output.status.success() {
-        bail!(
-            "cargo metadata failed:\n{}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
-    let metadata: Metadata =
-        serde_json::from_slice(&output.stdout).context("parsing cargo metadata")?;
+    let metadata = cargo_metadata(&dir, &options.cargo)?;
     let package = match &options.package {
         Some(name) => metadata.packages.iter().find(|p| &p.name == name),
         None => metadata
@@ -2503,6 +2606,19 @@ pub fn run(options: &Options) -> Result<Report> {
         if !test_packages.iter().any(|p| p.name == other.name) {
             test_packages.push(other);
         }
+    }
+    if options.test_workspace {
+        test_packages.extend(
+            metadata
+                .packages
+                .iter()
+                .filter(|other| {
+                    !test_packages
+                        .iter()
+                        .any(|selected| selected.name == other.name)
+                })
+                .collect::<Vec<_>>(),
+        );
     }
     if options.dependents {
         for name in dependents_of(&package.name, &metadata.packages) {
@@ -2558,6 +2674,7 @@ pub fn run(options: &Options) -> Result<Report> {
     let forbidden = |path: &Path| {
         path == target_dir
             || path == work
+            || workspace_work.is_some_and(|root| path == root)
             || path.file_name().is_some_and(|n| n == ".git")
             || (path.parent() == Some(workspace.as_path())
                 && path.file_name().is_some_and(|n| n == "target"))
@@ -2764,7 +2881,7 @@ pub fn run(options: &Options) -> Result<Report> {
         files.retain(|f| !f.sites.is_empty() || !f.rebuild_sites.is_empty() || f.path == root_file);
     }
     let mut witness_candidates = vec![];
-    if (options.rebuild || options.source_only)
+    if (options.list || options.rebuild || options.source_only)
         && root_target.test_build_arg() == Some(("--lib", None))
         && let Some(file) = files.iter_mut().find(|file| file.path == root_file)
     {
@@ -2819,9 +2936,52 @@ pub fn run(options: &Options) -> Result<Report> {
         }
     }
 
+    let source_mutants = |file: &SourceFile, site: &Site| {
+        if options.literal_operators {
+            instrument::literal_operator_mutants(&file.original, site)
+        } else {
+            instrument::source_mutants(site)
+        }
+    };
+    let counts = options.shard.map(|_| {
+        let regular: usize = files
+            .iter()
+            .map(|file| {
+                file.rebuild_sites
+                    .iter()
+                    .map(|site| {
+                        source_mutants(file, site).len()
+                            + usize::from(instrument::source_boundary_mutant(site).is_some())
+                    })
+                    .sum::<usize>()
+            })
+            .sum();
+        let total = regular
+            + witness_candidates
+                .iter()
+                .filter(|candidate| !candidate.existing)
+                .count();
+        (regular, total)
+    });
+    let in_shard = |index| match (options.shard, counts) {
+        (Some(shard), Some((_, total))) => shard.contains(index, total),
+        _ => true,
+    };
+    if let Some((mut index, _)) = counts {
+        witness_candidates.retain(|candidate| {
+            if candidate.existing {
+                return true;
+            }
+            let selected = in_shard(index);
+            index += 1;
+            selected
+        });
+    }
+    let empty_shard = counts.is_some_and(|(_, total)| !(0..total).any(in_shard));
+
     let mut report = Report {
         package: package.name.clone(),
-        sites: total_sites,
+        sites: if empty_shard { 0 } else { total_sites },
         analysis: report::Analysis {
             package_path: repository_prefix(
                 package.manifest_path.parent().unwrap_or(Path::new(".")),
@@ -2835,6 +2995,8 @@ pub fn run(options: &Options) -> Result<Report> {
             verified: options.verify && !options.source_only,
             doc_tests: options.doc,
             source_only: options.source_only,
+            literal_operators: options.literal_operators,
+            shard: options.shard,
             error_values: error_values
                 .iter()
                 .map(|value| (*value).to_owned())
@@ -2846,7 +3008,77 @@ pub fn run(options: &Options) -> Result<Report> {
         skipped,
         ..Report::default()
     };
-    if scope.is_some() && total_sites == 0 {
+    if options.list {
+        state.settle(&workspace)?;
+        let mut candidates: Vec<_> = files
+            .iter()
+            .flat_map(|file| {
+                file.sites
+                    .iter()
+                    .map(|site| (site, false))
+                    .chain(file.rebuild_sites.iter().map(|site| (site, true)))
+                    .flat_map(move |(site, requires_rebuild)| {
+                        source_mutants(file, site)
+                            .into_iter()
+                            .chain(instrument::source_boundary_mutant(site))
+                            .map(move |mutant| report::Candidate {
+                                what: mutant.what,
+                                into: mutant.into,
+                                requires_rebuild,
+                                edits: vec![candidate_edit(
+                                    file,
+                                    mutant.start,
+                                    mutant.end,
+                                    mutant.replacement,
+                                )],
+                            })
+                    })
+            })
+            .collect();
+        let mut index = 0;
+        candidates.retain(|_| {
+            let selected = in_shard(index);
+            index += 1;
+            selected
+        });
+        if let Some(root) = files.iter().find(|file| file.path == root_file) {
+            candidates.extend(
+                witness_candidates
+                    .iter()
+                    .filter(|candidate| !candidate.existing)
+                    .map(|candidate| report::Candidate {
+                        what: "witness".into(),
+                        into: candidate.description.clone(),
+                        requires_rebuild: true,
+                        edits: candidate
+                            .edits
+                            .iter()
+                            .map(|edit| {
+                                candidate_edit(
+                                    root,
+                                    edit.span.start,
+                                    edit.span.end,
+                                    edit.replacement.clone(),
+                                )
+                            })
+                            .collect(),
+                    }),
+            );
+        }
+        candidates.sort_by(|a, b| {
+            let a_edit = &a.edits[0];
+            let b_edit = &b.edits[0];
+            (&a_edit.file, a_edit.start, a_edit.end, &a.into).cmp(&(
+                &b_edit.file,
+                b_edit.start,
+                b_edit.end,
+                &b.into,
+            ))
+        });
+        report.mutants = Some(candidates);
+        return Ok(report);
+    }
+    if empty_shard || (scope.is_some() && total_sites == 0) {
         // Restore files changed by a previous run before reporting a selection with no work.
         state.settle(&workspace)?;
         if let Some(path) = &options.baseline {
@@ -3492,7 +3724,7 @@ pub fn run(options: &Options) -> Result<Report> {
         });
         for site in file.rebuild_sites.iter().chain(retried) {
             built.extend(
-                instrument::source_mutants(site)
+                source_mutants(file, site)
                     .into_iter()
                     .chain(
                         options
@@ -3503,6 +3735,14 @@ pub fn run(options: &Options) -> Result<Report> {
                     .map(|mutant| (file, site, mutant, None)),
             );
         }
+    }
+    if options.shard.is_some() {
+        let mut index = 0;
+        built.retain(|_| {
+            let selected = in_shard(index);
+            index += 1;
+            selected
+        });
     }
     if !options.rebuild && !options.source_only {
         report.mutants_not_built = built.len();

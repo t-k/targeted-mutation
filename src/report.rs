@@ -139,6 +139,13 @@ pub struct CargoConfig {
 }
 
 /// What a run looked at and how: a report says nothing about what is outside of it.
+#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+pub struct Shard {
+    pub index: usize,
+    pub count: usize,
+    pub round_robin: bool,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct Analysis {
     /// The package's directory in its git repository (`crates/core/`; empty at the top).
@@ -158,6 +165,10 @@ pub struct Analysis {
     pub doc_tests: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub source_only: bool,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub literal_operators: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub shard: Option<Shard>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub error_values: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -272,9 +283,31 @@ pub struct TraceDifference {
     pub records: usize,
 }
 
+/// A source edit in the candidate catalogue. Byte offsets refer to the original file.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct CandidateEdit {
+    pub file: String,
+    pub line: usize,
+    pub column: usize,
+    pub start: usize,
+    pub end: usize,
+    pub before: String,
+    pub replacement: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct Candidate {
+    pub what: String,
+    pub into: String,
+    pub requires_rebuild: bool,
+    pub edits: Vec<CandidateEdit>,
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct Report {
     pub package: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mutants: Option<Vec<Candidate>>,
     pub analysis: Analysis,
     /// Present when the run was asked to check itself.
     #[serde(skip_serializing_if = "Option::is_none")]
