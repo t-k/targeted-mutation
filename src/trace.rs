@@ -1048,6 +1048,36 @@ mod tests {
     }
 
     #[test]
+    fn summary_classifies_type_and_distance_changes_independently() {
+        use tmt_rt::{Diff, News, Summary};
+
+        let mut summary = Summary::default();
+        for (rel, diff, expected) in [
+            (1, Diff::Int(i128::MIN), News::Other),
+            (1, Diff::Int(i128::MIN), News::Nothing),
+            (1, Diff::Int(-1), News::Closer),
+            (1, Diff::Int(i128::MAX), News::Other),
+            (5, Diff::Int(1), News::Other),
+            (2, Diff::Float(-0.0), News::Other),
+            (2, Diff::Float(0.0), News::Nothing),
+            (2, Diff::Float(f64::NAN), News::Nothing),
+            (1, Diff::Float(-f64::MAX), News::Other),
+            (1, Diff::Float(-f64::MIN_POSITIVE), News::Closer),
+            (1, Diff::Float(-f64::MAX), News::Nothing),
+            (4, Diff::Float(f64::MAX), News::Other),
+            (4, Diff::Float(f64::MIN_POSITIVE), News::Closer),
+            (1, Diff::None, News::Nothing),
+        ] {
+            assert_eq!(summary.news(rel, diff), expected, "{rel} {diff:?}");
+        }
+        assert_eq!(summary.rels, 7);
+        assert!(summary.unvalued && summary.unfloat);
+        assert_eq!((summary.max_neg, summary.min_pos), (Some(-1), Some(1)));
+        assert_eq!(summary.f_max_neg, Some(-f64::MIN_POSITIVE));
+        assert_eq!(summary.f_min_pos, Some(f64::MIN_POSITIVE));
+    }
+
+    #[test]
     fn a_backlog_hands_out_the_latest_of_each_site_once() {
         use tmt_rt::{Backlog, Diff, Summary};
         let at = |d: i128| {

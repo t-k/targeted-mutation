@@ -281,49 +281,45 @@ impl Summary {
 
     /// Folds one observation in and says what kind of change that was.
     pub fn news(&mut self, rel: u8, d: Diff) -> News {
-        let before = *self;
-        if !self.fold(rel, d) {
-            return News::Nothing;
-        }
-        // The same but for distances that were there before: those can only have shrunk.
-        let mut rest = *self;
-        rest.max_neg = before.max_neg.or(rest.max_neg);
-        rest.min_pos = before.min_pos.or(rest.min_pos);
-        rest.f_max_neg = before.f_max_neg.or(rest.f_max_neg);
-        rest.f_min_pos = before.f_min_pos.or(rest.f_min_pos);
-        if rest == before {
-            News::Closer
-        } else {
-            News::Other
-        }
-    }
-
-    fn fold(&mut self, rel: u8, d: Diff) -> bool {
-        let before = *self;
+        let new_relation = self.rels & rel != rel;
         self.rels |= rel;
-        match d {
+        let (new_kind, distance) = match d {
             Diff::None => {
+                let new_kind = !self.unvalued || !self.unfloat;
                 self.unvalued = true;
                 self.unfloat = true;
+                (new_kind, News::Nothing)
             }
             Diff::Int(d) => {
+                let new_kind = !self.unfloat;
                 self.unfloat = true;
-                if d < 0 {
-                    self.max_neg = Some(self.max_neg.map_or(d, |m| m.max(d)));
+                let distance = if d < 0 {
+                    update_distance(&mut self.max_neg, d, |old| d > old)
                 } else if d > 0 {
-                    self.min_pos = Some(self.min_pos.map_or(d, |p| p.min(d)));
-                }
+                    update_distance(&mut self.min_pos, d, |old| d < old)
+                } else {
+                    News::Nothing
+                };
+                (new_kind, distance)
             }
             Diff::Float(d) => {
+                let new_kind = !self.unvalued;
                 self.unvalued = true;
-                if d < 0.0 {
-                    self.f_max_neg = Some(self.f_max_neg.map_or(d, |m| m.max(d)));
+                let distance = if d < 0.0 {
+                    update_distance(&mut self.f_max_neg, d, |old| d > old)
                 } else if d > 0.0 {
-                    self.f_min_pos = Some(self.f_min_pos.map_or(d, |p| p.min(d)));
-                }
+                    update_distance(&mut self.f_min_pos, d, |old| d < old)
+                } else {
+                    News::Nothing
+                };
+                (new_kind, distance)
             }
+        };
+        if new_relation || new_kind {
+            News::Other
+        } else {
+            distance
         }
-        *self != before
     }
 
     pub fn line(&self, site: u32, test: &str) -> String {
@@ -341,6 +337,24 @@ impl Summary {
             float(self.f_max_neg),
             float(self.f_min_pos)
         )
+    }
+}
+
+fn update_distance<T: Copy>(
+    distance: &mut Option<T>,
+    value: T,
+    closer: impl FnOnce(T) -> bool,
+) -> News {
+    match *distance {
+        None => {
+            *distance = Some(value);
+            News::Other
+        }
+        Some(old) if closer(old) => {
+            *distance = Some(value);
+            News::Closer
+        }
+        Some(_) => News::Nothing,
     }
 }
 
