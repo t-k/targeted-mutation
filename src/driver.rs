@@ -3655,26 +3655,35 @@ fn run_package(
     let mut skipped = vec![];
     let mut files = vec![];
     let mut next_id = 0u32;
+    let want_witnesses = (options.list || options.rebuild || options.source_only)
+        && root_target.test_build_arg() == Some(("--lib", None));
+    let mut witness_candidates = vec![];
     for (path, owners) in paths {
         let Some(original) = state.original(&path, &workspace)? else {
             continue; // left by an earlier run; gone or rewritten before the build
         };
         let display = relative_source(&path, &package_dir).display().to_string();
-        match instrument::discover_with_errors(&original, next_id, &error_values) {
-            Ok(mut found) => {
+        match instrument::parse_source(&original) {
+            Ok(parsed) => {
+                let mut found =
+                    instrument::discover_parsed(&original, &parsed, next_id, &error_values);
+                if want_witnesses && path == root_file {
+                    witness_candidates = witness::discover_parsed(&original, &parsed);
+                }
                 next_id += found.sites.len() as u32;
                 if owners.consumers.len() != 1 || !owners.consumers.contains(&root_file) {
                     found.rebuild_sites.append(&mut found.sites);
                 }
-                let places = found
-                    .sites
-                    .iter()
-                    .chain(&found.rebuild_sites)
-                    .map(|site| {
-                        let at = report::location("", site);
-                        (at.line, at.column, at.code)
-                    })
-                    .collect();
+                let places = if options.list {
+                    vec![]
+                } else {
+                    found
+                        .sites
+                        .iter()
+                        .chain(&found.rebuild_sites)
+                        .map(|site| (site.line, site.column, report::one_line(&site.text)))
+                        .collect()
+                };
                 files.push(SourceFile {
                     display,
                     path,
@@ -3731,9 +3740,7 @@ fn run_package(
         }
         files.retain(|f| !f.sites.is_empty() || !f.rebuild_sites.is_empty() || f.path == root_file);
     }
-    let mut witness_candidates = vec![];
-    if (options.list || options.rebuild || options.source_only)
-        && root_target.test_build_arg() == Some(("--lib", None))
+    if !witness_candidates.is_empty()
         && let Some(file) = files.iter_mut().find(|file| file.path == root_file)
     {
         let relative = file
@@ -3741,16 +3748,17 @@ fn run_package(
             .strip_prefix(&copy)
             .unwrap_or(&file.path)
             .to_string_lossy();
-        witness_candidates = witness::discover(&file.original);
-        let locations: Vec<_> = witness_candidates
-            .iter()
-            .filter(|candidate| !candidate.existing)
-            .map(|candidate| {
-                let at = witness_location(file, candidate);
-                (at.line, at.column, at.code)
-            })
-            .collect();
-        file.places.extend(locations);
+        if !options.list {
+            let locations: Vec<_> = witness_candidates
+                .iter()
+                .filter(|candidate| !candidate.existing)
+                .map(|candidate| {
+                    let at = witness_location(file, candidate);
+                    (at.line, at.column, at.code)
+                })
+                .collect();
+            file.places.extend(locations);
+        }
         witness_candidates.retain(|candidate| {
             scope.as_ref().is_none_or(|scope| {
                 let site_in_scope = if candidate.edits.len() == 1 {

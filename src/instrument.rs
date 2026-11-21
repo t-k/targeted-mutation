@@ -331,12 +331,25 @@ pub(crate) fn discover_with_errors(
     first_id: u32,
     error_values: &[&str],
 ) -> Result<Discovery> {
+    let file = parse_source(source)?;
+    Ok(discover_parsed(source, &file, first_id, error_values))
+}
+
+pub(crate) fn parse_source(source: &str) -> Result<syn::File> {
     // The parser drops a byte order mark and a `#!` line before it numbers bytes, so its
     // offsets would not be offsets into `source`.
     if source.starts_with('\u{feff}') || (source.starts_with("#!") && !source.starts_with("#![")) {
         anyhow::bail!("starts with a byte order mark or a `#!` line");
     }
-    let file = syn::parse_file(source).context("not parseable as a Rust source file")?;
+    syn::parse_file(source).context("not parseable as a Rust source file")
+}
+
+pub(crate) fn discover_parsed(
+    source: &str,
+    file: &syn::File,
+    first_id: u32,
+    error_values: &[&str],
+) -> Discovery {
     // A macro defined here under the name of a standard one (`macro_rules! vec`) can do
     // anything with its arguments.
     let local_macros = file
@@ -356,8 +369,8 @@ pub(crate) fn discover_with_errors(
         error_values,
         for_ranges: std::collections::HashSet::new(),
     };
-    finder.visit_file(&file);
-    Ok(finder.found)
+    finder.visit_file(file);
+    finder.found
 }
 
 struct Finder<'s> {

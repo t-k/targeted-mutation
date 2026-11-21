@@ -222,14 +222,11 @@ impl PositionSearch {
     }
 }
 
-pub(crate) fn discover(source: &str) -> Vec<Candidate> {
-    let Ok(file) = syn::parse_file(source) else {
-        return vec![];
-    };
+pub(crate) fn discover_parsed(source: &str, file: &syn::File) -> Vec<Candidate> {
     if crate::instrument::is_test_only(&file.attrs) || crate::instrument::is_skipped(&file.attrs) {
         return vec![];
     }
-    let mut candidates = position_searches(source, &file)
+    let mut candidates = position_searches(source, file)
         .into_iter()
         .map(|search| {
             let scenario = search.scenario();
@@ -246,9 +243,9 @@ pub(crate) fn discover(source: &str) -> Vec<Candidate> {
             }
         })
         .collect();
-    simple::discover(source, &file, &mut candidates);
-    relations::discover(source, &file, &mut candidates);
-    sequences::discover(source, &file, &mut candidates);
+    simple::discover(source, file, &mut candidates);
+    relations::discover(source, file, &mut candidates);
+    sequences::discover(source, file, &mut candidates);
     candidates
 }
 
@@ -446,6 +443,7 @@ mod tests {
 
     #[test]
     fn test_only_library_does_not_propose_source_witnesses() {
+        let discover = |source: &str| discover_parsed(source, &syn::parse_file(source).unwrap());
         let code = "pub fn chars(text: &str) -> usize { text.chars().count() }";
         assert!(!discover(code).is_empty());
         assert!(discover(&format!("#![cfg(test)]\n{code}")).is_empty());
