@@ -1161,6 +1161,17 @@ fn mutant_timeout(baseline: Duration) -> Duration {
     Duration::from_secs(5) + baseline * 5
 }
 
+const TEST_POLL_INITIAL: Duration = Duration::from_micros(250);
+const TEST_POLL_CAP: Duration = Duration::from_millis(5);
+
+/// Short-running tests often finish before the old polling interval. Back off for
+/// longer runs so they do not pay for frequent exit and failure-output checks.
+fn next_test_poll(delay: &mut Duration, remaining: Duration) -> Duration {
+    let wait = (*delay).min(remaining);
+    *delay = (*delay * 2).min(TEST_POLL_CAP);
+    wait
+}
+
 /// The test threads of one test binary when `sharing` of them run at the same time: its
 /// share of the cores. Never fewer than two, because the harness runs the tests of a
 /// single thread on the main thread, where they have no name to be told apart by.
@@ -1278,6 +1289,7 @@ fn run_binary(
         let _ = child.wait();
     };
     let started = Instant::now();
+    let mut delay = TEST_POLL_INITIAL;
     let result: Result<Outcome> = (|| loop {
         if let Some(status) = child.try_wait()? {
             if matches!(bin.runner, Runner::Isolated { .. }) || output_to_watch.is_some() {
@@ -1298,11 +1310,12 @@ fn run_binary(
             kill(&mut child);
             return Ok(Outcome::Fail);
         }
-        if started.elapsed() > timeout {
+        let elapsed = started.elapsed();
+        if elapsed >= timeout {
             kill(&mut child);
             return Ok(Outcome::Timeout);
         }
-        std::thread::sleep(Duration::from_millis(5));
+        std::thread::sleep(next_test_poll(&mut delay, timeout - elapsed));
     })();
     drop(output_to_watch);
     if result.is_err() {
@@ -4548,6 +4561,21 @@ serde = { path = "../../serde-fork" }
             mutant_timeout(Duration::from_secs(2)),
             Duration::from_secs(15)
         );
+    }
+
+    #[test]
+    fn test_polling_backs_off_and_respects_the_remaining_time() {
+        let mut delay = TEST_POLL_INITIAL;
+        for micros in [250, 500, 1_000, 2_000, 4_000, 5_000, 5_000] {
+            assert_eq!(
+                next_test_poll(&mut delay, Duration::from_secs(1)),
+                Duration::from_micros(micros)
+            );
+        }
+        let remaining = Duration::from_micros(120);
+        assert_eq!(next_test_poll(&mut delay, remaining), remaining);
+        assert_eq!(next_test_poll(&mut delay, Duration::ZERO), Duration::ZERO);
+        assert_eq!(delay, Duration::from_millis(5));
     }
     /// A scratch directory of its own for one test.
     fn scratch(name: &str) -> PathBuf {
