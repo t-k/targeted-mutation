@@ -166,6 +166,11 @@ pub struct Analysis {
     pub opt_level: Option<u8>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_jobs: Option<usize>,
+    pub timeout_recheck: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub wrapper_grace_seconds: Option<u64>,
     /// Mutants that need a build of their own were run.
     pub rebuild: bool,
     /// Predicted survivors were re-run.
@@ -209,6 +214,20 @@ pub enum TestBuildScope {
 pub enum Evaluation {
     NoSites,
     NoMutantsExecuted,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct TimeoutRechecks {
+    pub first_pass: usize,
+    pub confirmed: usize,
+    pub recovered: usize,
+    pub unconfirmed: usize,
+}
+
+impl TimeoutRechecks {
+    fn is_empty(&self) -> bool {
+        self.first_pass == 0
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
@@ -342,6 +361,8 @@ pub struct Report {
     pub mutants_killed: usize,
     /// Killed mutants that were stopped by the timeout (typically an endless loop).
     pub mutants_timed_out: usize,
+    #[serde(skip_serializing_if = "TimeoutRechecks::is_empty")]
+    pub timeout_rechecks: TimeoutRechecks,
     pub findings: Vec<Finding>,
     /// Findings left out because of a `// tmt:ignore` comment or the baseline.
     pub suppressed: usize,
@@ -1065,6 +1086,13 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
     if unexplained > 0 {
         out.push_str(&format!(
             ", {unexplained} survivors of mutants built on their own"
+        ));
+    }
+    if !report.timeout_rechecks.is_empty() {
+        let rechecks = &report.timeout_rechecks;
+        out.push_str(&format!(
+            ", {} parallel timeouts ({} confirmed, {} recovered, {} unconfirmed)",
+            rechecks.first_pass, rechecks.confirmed, rechecks.recovered, rechecks.unconfirmed
         ));
     }
     if report.suppressed > 0 {
@@ -1929,6 +1957,7 @@ mod tests {
             mutants_run: 3,
             mutants_killed: 2,
             mutants_timed_out: 0,
+            timeout_rechecks: TimeoutRechecks::default(),
             suppressed: 0,
             findings: vec![Finding::AssertionGap {
                 at: at.clone(),

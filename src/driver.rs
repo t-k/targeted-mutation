@@ -64,6 +64,9 @@ pub struct Options {
     pub opt_level: Option<u8>,
     /// Override the time allowed for each test runner under a mutant.
     pub timeout_seconds: Option<u64>,
+    pub baseline_jobs: usize,
+    pub serial_timeout_rechecks: bool,
+    pub wrapper_grace: Duration,
     /// Run this many surviving mutants against all tests and record the tests twice.
     pub audit: Option<usize>,
     /// Cargo's choice of features and of the lock file, the same for every cargo command.
@@ -303,6 +306,7 @@ struct Profile {
 struct Diagnostic {
     level: String,
     rendered: Option<String>,
+    message: Option<String>,
     spans: Vec<DiagnosticSpan>,
 }
 
@@ -335,6 +339,7 @@ struct BuildOutput {
     /// `(target name, executable, package, target kind)` of the test binaries.
     test_binaries: Vec<(String, PathBuf, String, Vec<String>)>,
     errors: Vec<CompileError>,
+    diagnostics: Vec<String>,
     artifacts: Vec<(PathBuf, Vec<PathBuf>)>,
 }
 
@@ -392,6 +397,10 @@ fn parse_build_output(stdout: &str, packages: &[&str]) -> BuildOutput {
                 if diag.level != "error" {
                     continue;
                 }
+                let rendered = diag.rendered.or(diag.message).unwrap_or_default();
+                if !rendered.is_empty() && !out.diagnostics.contains(&rendered) {
+                    out.diagnostics.push(rendered.clone());
+                }
                 let span = |s: &DiagnosticSpan| ErrorSpan {
                     file: s.file_name.clone(),
                     byte_start: s.byte_start,
@@ -410,7 +419,7 @@ fn parse_build_output(stdout: &str, packages: &[&str]) -> BuildOutput {
                         .filter(|s| !s.is_primary)
                         .map(span)
                         .collect(),
-                    rendered: diag.rendered.unwrap_or_default(),
+                    rendered,
                 };
                 // "aborting due to N previous errors" and friends carry no location, and the
                 // lib is compiled twice (plain and test), which reports everything twice.
@@ -578,6 +587,7 @@ struct SourceFile {
 }
 
 /// How a group of tests is started.
+#[derive(Clone)]
 enum Runner {
     /// A libtest executable.
     Exe(PathBuf),
@@ -629,12 +639,50 @@ struct TestBinary {
     /// How long they took while recording.
     traced: Duration,
     timeout: Option<Duration>,
+    wrapper_grace: Duration,
+    report_slow: bool,
+    filtered_timings:
+        std::sync::Mutex<BTreeMap<Vec<String>, std::sync::Arc<std::sync::OnceLock<Duration>>>>,
     trace: Trace,
 }
 
 impl TestBinary {
     fn mutant_limit(&self, baseline: Duration) -> Duration {
         self.timeout.unwrap_or_else(|| mutant_timeout(baseline))
+    }
+
+    fn filtered_limit(&self, filter: Option<&[String]>, traced: bool) -> Duration {
+        let baseline = if traced { self.traced } else { self.baseline };
+        let Some(filter) =
+            filter.filter(|names| !names.is_empty() && names.len() < self.tests.len())
+        else {
+            return self.mutant_limit(baseline);
+        };
+        if self.timeout.is_some() || baseline < SLOW_TRACE || !matches!(self.runner, Runner::Exe(_))
+        {
+            return self.mutant_limit(baseline);
+        }
+        let timed = {
+            let mut groups = self.filtered_timings.lock().unwrap();
+            groups.entry(filter.to_vec()).or_default().clone()
+        };
+        let timing = *timed.get_or_init(|| {
+            let untraced = self.baseline;
+            let started = Instant::now();
+            // One measured group is shared by all jobs with this exact filter.
+            // A failing or inconclusive timing run keeps the conservative limit.
+            match run_binary(self, Some(filter), &[], untraced, RunOutput::Quiet, 1) {
+                Ok(Outcome::Pass) => started.elapsed(),
+                _ => untraced,
+            }
+        });
+        self.mutant_limit(if traced {
+            timing.max(
+                timing.mul_f64(self.traced.as_secs_f64() / self.baseline.as_secs_f64().max(0.001)),
+            )
+        } else {
+            timing
+        })
     }
 }
 
@@ -1520,6 +1568,9 @@ fn run_binary(
     };
     let started = Instant::now();
     let mut delay = TEST_POLL_INITIAL;
+    let mut waiting_reported = false;
+    let running_mutant = env.iter().any(|(key, _)| *key == "TMT_MUTANT")
+        || matches!(output, RunOutput::FirstFailure);
     let result: Result<Outcome> = (|| loop {
         if let Some(status) = child.try_wait()? {
             if matches!(bin.runner, Runner::Isolated { .. }) || output_to_watch.is_some() {
@@ -1544,7 +1595,41 @@ fn run_binary(
             return Ok(Outcome::Fail);
         }
         let elapsed = started.elapsed();
+        if bin.report_slow
+            && running_mutant
+            && !waiting_reported
+            && elapsed >= Duration::from_secs(5).min(timeout / 2)
+        {
+            let selected = tests
+                .filter(|names| !names.is_empty())
+                .map(|names| names.join(", "))
+                .unwrap_or_else(|| bin.name.clone());
+            eprintln!(
+                "tmt: waiting for mutant tests `{selected}` (limit {:.2}s)",
+                timeout.as_secs_f64()
+            );
+            waiting_reported = true;
+        }
         if elapsed >= timeout {
+            if cfg!(unix)
+                && !bin.wrapper_grace.is_zero()
+                && matches!(
+                    &bin.runner,
+                    Runner::Isolated {
+                        wrapper: Some(_),
+                        ..
+                    }
+                )
+            {
+                signal_test_group(group, 15);
+                let began = Instant::now();
+                while began.elapsed() < bin.wrapper_grace && child.try_wait().ok() == Some(None) {
+                    std::thread::sleep(
+                        Duration::from_millis(10)
+                            .min(bin.wrapper_grace.saturating_sub(began.elapsed())),
+                    );
+                }
+            }
             kill(&mut child);
             return Ok(Outcome::Timeout);
         }
@@ -1906,6 +1991,9 @@ fn observe_witness(
         baseline: baseline.baseline,
         traced: Duration::ZERO,
         timeout: baseline.timeout,
+        wrapper_grace: baseline.wrapper_grace,
+        report_slow: false,
+        filtered_timings: Default::default(),
         trace: Trace::default(),
     };
     static RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -2218,6 +2306,7 @@ fn domain_of(
 
 struct Session {
     progress: bool,
+    serial_timeout_rechecks: bool,
     package_dir: PathBuf,
     binaries: Vec<TestBinary>,
 }
@@ -2232,11 +2321,28 @@ struct Job {
 
 #[derive(Debug, Clone, PartialEq)]
 struct JobResult {
+    first_pass_timeout: bool,
+    unconfirmed_timeout: bool,
     /// The tests the mutant passed, when it passed all of them.
     survived: Option<Vec<String>>,
     timed_out: bool,
     /// The mutant could not be run as what it is: neither found out nor passed.
     unable: bool,
+}
+
+impl report::TimeoutRechecks {
+    fn include(&mut self, result: &JobResult) {
+        if result.first_pass_timeout {
+            self.first_pass += 1;
+            if result.unconfirmed_timeout || result.unable {
+                self.unconfirmed += 1;
+            } else if result.timed_out {
+                self.confirmed += 1;
+            } else {
+                self.recovered += 1;
+            }
+        }
+    }
 }
 
 impl JobResult {
@@ -2674,12 +2780,14 @@ impl Session {
                 bin,
                 filter.as_deref(),
                 &[("TMT_MUTANT", &spec)],
-                bin.mutant_limit(bin.baseline),
+                bin.filtered_limit(filter.as_deref(), false),
                 RunOutput::FirstFailure,
                 sharing,
             )?;
             if outcome != Outcome::Pass {
                 return Ok(JobResult {
+                    first_pass_timeout: false,
+                    unconfirmed_timeout: false,
                     survived: None,
                     timed_out: outcome == Outcome::Timeout,
                     unable: outcome == Outcome::Unable,
@@ -2694,6 +2802,8 @@ impl Session {
             }
         }
         Ok(JobResult {
+            first_pass_timeout: false,
+            unconfirmed_timeout: false,
             survived: Some(passed),
             timed_out: false,
             unable: false,
@@ -2719,7 +2829,7 @@ impl Session {
                 bin,
                 filter.as_deref(),
                 &[("TMT_MUTANT", &spec), ("TMT_TRACE", &trace_env)],
-                bin.mutant_limit(bin.traced),
+                bin.filtered_limit(filter.as_deref(), true),
                 RunOutput::Quiet,
                 sharing,
             )?;
@@ -2745,26 +2855,71 @@ impl Session {
     /// were running may only have been slowed down by them: it gets a second run on its
     /// own, and that one counts.
     fn run_jobs(&self, jobs: &[Job], workers: usize, label: &str) -> Result<Vec<JobResult>> {
-        let sharing = workers.clamp(1, jobs.len().max(1));
-        progress::track(self.progress, label, jobs.len(), |progress| {
-            let mut results = run_pool(jobs.len(), workers, |index| {
-                let result = self.run_job(&jobs[index], sharing)?;
-                if !(sharing > 1 && result.timed_out) {
-                    progress.complete(result.progress_outcome());
-                }
-                Ok(result)
-            })?;
-            if sharing > 1 {
-                for (job, result) in jobs.iter().zip(&mut results) {
-                    if result.timed_out {
-                        *result = self.run_job(job, 1)?;
-                        progress.complete(result.progress_outcome());
-                    }
-                }
-            }
-            Ok(results)
-        })
+        let run = |index: usize, sharing| self.run_job(&jobs[index], sharing);
+        evaluate_jobs(
+            jobs.len(),
+            workers,
+            self.serial_timeout_rechecks,
+            self.progress,
+            label,
+            &run,
+        )
     }
+}
+
+fn evaluate_jobs(
+    count: usize,
+    workers: usize,
+    serial_rechecks: bool,
+    progress_enabled: bool,
+    label: &str,
+    run: &(impl Fn(usize, usize) -> Result<JobResult> + Sync),
+) -> Result<Vec<JobResult>> {
+    let sharing = workers.clamp(1, count.max(1));
+    let mut results = progress::track(progress_enabled, label, count, |progress| {
+        run_pool(count, workers, |index| {
+            let mut result = run(index, sharing)?;
+            if sharing > 1 && result.timed_out {
+                result.first_pass_timeout = true;
+                result.unconfirmed_timeout = true;
+            }
+            if !result.unconfirmed_timeout || !serial_rechecks {
+                progress.complete(result.progress_outcome());
+            }
+            Ok(result)
+        })
+    })?;
+    let pending: Vec<_> = results
+        .iter()
+        .enumerate()
+        .filter_map(|(index, result)| result.unconfirmed_timeout.then_some(index))
+        .collect();
+    if !pending.is_empty() && progress_enabled {
+        eprintln!(
+            "tmt: {label}: {} first-pass timeouts, {} pending serial rechecks",
+            pending.len(),
+            if serial_rechecks { pending.len() } else { 0 }
+        );
+    }
+    if serial_rechecks {
+        progress::track_timeout_rechecks(progress_enabled, pending.len(), |progress| {
+            for index in pending {
+                let mut confirmed = run(index, 1)?;
+                confirmed.first_pass_timeout = true;
+                let outcome = if confirmed.timed_out {
+                    progress::Outcome::TimedOut
+                } else if confirmed.unable {
+                    progress::Outcome::Unable
+                } else {
+                    progress::Outcome::Survived
+                };
+                results[index] = confirmed;
+                progress.complete(outcome);
+            }
+            Ok::<_, anyhow::Error>(())
+        })?;
+    }
+    Ok(results)
 }
 
 /// Calls `work(i)` once for every `i < count`, on up to `workers` threads, and returns the
@@ -2858,9 +3013,34 @@ struct WorkspaceShard {
     member_total: usize,
 }
 
-/// A workspace or explicit package selection. An error in one package belongs to
-/// that package, and the remaining packages can still be evaluated.
+struct CatalogueSnapshot {
+    path: PathBuf,
+    ready: std::cell::Cell<bool>,
+    _lock: WorkLock,
+}
+
+struct WorkspaceBatch<'a> {
+    metadata: &'a Metadata,
+    work: &'a Path,
+    catalogue: Option<CatalogueSnapshot>,
+}
+
+/// Collect the original aggregate report for callers that want it.
 pub fn run_packages(options: &Options, names: &[String]) -> Result<Vec<(String, Result<Report>)>> {
+    let mut reports = vec![];
+    run_packages_each(options, names, |name, result| {
+        reports.push((name, result));
+        Ok(())
+    })?;
+    Ok(reports)
+}
+
+/// Emit each completed package before starting the next one.
+pub fn run_packages_each(
+    options: &Options,
+    names: &[String],
+    mut completed: impl FnMut(String, Result<Report>) -> Result<()>,
+) -> Result<()> {
     if options.baseline.is_some() || options.write_baseline.is_some() {
         bail!("baseline files require a single package");
     }
@@ -2886,6 +3066,21 @@ pub fn run_packages(options: &Options, names: &[String]) -> Result<Vec<(String, 
             base.display()
         );
     }
+    let catalogue = if options.list || options.shard.is_some() {
+        let path = work_directory(&base, ".catalogue")?;
+        Some(CatalogueSnapshot {
+            _lock: WorkLock::take(&path)?,
+            path,
+            ready: std::cell::Cell::new(false),
+        })
+    } else {
+        None
+    };
+    let batch = WorkspaceBatch {
+        metadata: &metadata,
+        work: &base,
+        catalogue,
+    };
     let member_options = selected.into_iter().map(|name| {
         let mut member = options.clone();
         member.package = Some(name.clone());
@@ -2893,56 +3088,67 @@ pub fn run_packages(options: &Options, names: &[String]) -> Result<Vec<(String, 
         (name, member)
     });
     let Some(shard) = options.shard else {
-        return Ok(member_options
-            .map(|(name, member)| (name, run_package(&member, Some(&base), None)))
-            .collect());
+        for (name, member) in member_options {
+            let result = run_package(&member, Some(&batch), None);
+            completed(name, result)?;
+        }
+        return Ok(());
     };
     if !options.source_only || shard.index >= shard.count {
         bail!("shards require --source-only and a valid shard index");
     }
+    // A shard needs the counts of preceding members. For an executing batch
+    // retain counts only: the entire catalogue need not stay in memory.
     let catalogues: Vec<_> = member_options
         .map(|(name, member)| {
             let mut preview = member.clone();
             preview.list = true;
             preview.shard = None;
             preview.progress = false;
-            let catalogue = run_package(&preview, Some(&base), None);
+            let catalogue = run_package(&preview, Some(&batch), None).map(|mut report| {
+                let count = report.mutants.as_ref().map_or(0, Vec::len);
+                if !member.list {
+                    report.mutants = None;
+                }
+                (count, report)
+            });
             (name, member, catalogue)
         })
         .collect();
     let total = catalogues
         .iter()
-        .filter_map(|(_, _, catalogue)| catalogue.as_ref().ok()?.mutants.as_ref().map(Vec::len))
+        .filter_map(|(_, _, catalogue)| catalogue.as_ref().ok())
+        .map(|(count, _)| count)
         .sum();
     let mut offset = 0;
-    Ok(catalogues
-        .into_iter()
-        .map(|(name, member, catalogue)| {
-            let result = catalogue.and_then(|mut catalogue| {
-                let candidates = catalogue.mutants.as_mut().expect("source catalogue");
-                let member_total = candidates.len();
-                let range = WorkspaceShard {
-                    offset,
-                    total,
-                    member_total,
-                };
-                offset += member_total;
-                if member.list {
-                    catalogue.analysis.shard = Some(shard);
-                    let mut index = range.offset;
-                    candidates.retain(|_| {
+    for (name, member, catalogue) in catalogues {
+        let result = catalogue.and_then(|(member_total, mut report)| {
+            let range = WorkspaceShard {
+                offset,
+                total,
+                member_total,
+            };
+            offset += member_total;
+            if member.list {
+                report.analysis.shard = Some(shard);
+                let mut index = range.offset;
+                report
+                    .mutants
+                    .as_mut()
+                    .expect("source catalogue")
+                    .retain(|_| {
                         let keep = shard.contains(index, total);
                         index += 1;
                         keep
                     });
-                    Ok(catalogue)
-                } else {
-                    run_package(&member, Some(&base), Some(range))
-                }
-            });
-            (name, result)
-        })
-        .collect())
+                Ok(report)
+            } else {
+                run_package(&member, Some(&batch), Some(range))
+            }
+        });
+        completed(name, result)?;
+    }
+    Ok(())
 }
 
 pub fn run(options: &Options) -> Result<Report> {
@@ -2951,7 +3157,7 @@ pub fn run(options: &Options) -> Result<Report> {
 
 fn run_package(
     options: &Options,
-    workspace_work: Option<&Path>,
+    batch: Option<&WorkspaceBatch<'_>>,
     workspace_shard: Option<WorkspaceShard>,
 ) -> Result<Report> {
     if let Some(shard) = options.shard
@@ -2980,6 +3186,9 @@ fn run_package(
             );
         }
     }
+    if options.baseline_jobs > 1 && !selection.enabled() {
+        bail!("--baseline-jobs requires isolated tests or a test wrapper or selection");
+    }
     if options.doc && selection.enabled() {
         bail!("--doc cannot be combined with isolated test selection");
     }
@@ -2993,7 +3202,16 @@ fn run_package(
         .canonicalize()
         .with_context(|| format!("no such directory: {}", options.dir.display()))?;
 
-    let metadata = cargo_metadata(&dir, &options.cargo)?;
+    let local_metadata;
+    let metadata = if let Some(batch) = batch {
+        batch.metadata
+    } else {
+        local_metadata = cargo_metadata(&dir, &options.cargo)?;
+        &local_metadata
+    };
+    let catalogue = batch
+        .and_then(|batch| batch.catalogue.as_ref())
+        .filter(|_| options.list);
     let package = match &options.package {
         Some(name) => metadata.packages.iter().find(|p| &p.name == name),
         None => metadata
@@ -3056,7 +3274,10 @@ fn run_package(
 
     // 2. Copy the workspace.
     let workspace = metadata.workspace_root.canonicalize()?;
-    let work = match &options.work_dir {
+    let requested_work = catalogue
+        .map(|catalogue| &catalogue.path)
+        .or(options.work_dir.as_ref());
+    let work = match requested_work {
         Some(dir) => {
             fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
             dir.canonicalize()?
@@ -3073,6 +3294,11 @@ fn run_package(
     }
     fs::create_dir_all(&work).with_context(|| format!("creating {}", work.display()))?;
     let work = work.canonicalize()?;
+    let _lock = if catalogue.is_none() {
+        Some(WorkLock::take(&work)?)
+    } else {
+        None
+    };
     let copy = work.join("src");
     let marker = work.join(WORK_MARKER);
     if copy.exists() && !marker.exists() {
@@ -3086,12 +3312,11 @@ fn run_package(
         &marker,
         "Working directory of tmt (targeted-mutation). Safe to delete.\n",
     )?;
-    let _lock = WorkLock::take(&work)?;
     let target_dir = metadata.target_directory.clone();
     let forbidden = |path: &Path| {
         path == target_dir
             || path == work
-            || workspace_work.is_some_and(|root| path == root)
+            || batch.is_some_and(|batch| path == batch.work)
             || path.file_name().is_some_and(|n| n == ".git")
             || (path.parent() == Some(workspace.as_path())
                 && path.file_name().is_some_and(|n| n == "target"))
@@ -3099,74 +3324,80 @@ fn run_package(
     let skip =
         |path: &Path| forbidden(path) || path.file_name().is_some_and(|n| n == "node_modules");
     let state = WorkCopy::open(&work, &copy);
-    work_directory(&work, "src")?;
-    let visible = if options.all_files {
-        None
-    } else {
-        git_visible_files(&workspace)?
-    };
-    match visible {
-        // Only what git would not ignore: build output, caches, local notes and secrets
-        // that are kept out of the repository stay out of the copy too.
-        Some(files) => {
-            let copied = copy_git_visible(&workspace, &copy, files, &workspace, &skip, &state)?;
-            note(&format!(
-                "copied {copied} files (ignored files are left out)"
-            ));
+    if catalogue.is_none_or(|catalogue| !catalogue.ready.get()) {
+        work_directory(&work, "src")?;
+        let visible = if options.all_files {
+            None
+        } else {
+            git_visible_files(&workspace)?
+        };
+        match visible {
+            // Only what git would not ignore: build output, caches, local notes and secrets
+            // that are kept out of the repository stay out of the copy too.
+            Some(files) => {
+                let copied = copy_git_visible(&workspace, &copy, files, &workspace, &skip, &state)?;
+                note(&format!(
+                    "copied {copied} files (ignored files are left out)"
+                ));
+            }
+            None => copy_tree(&workspace, &copy, &workspace, &skip, &state)?,
         }
-        None => copy_tree(&workspace, &copy, &workspace, &skip, &state)?,
-    }
-    for relative in &options.copy_fixtures {
-        use std::path::Component;
-        let relative = relative
-            .components()
-            .filter(|c| *c != Component::CurDir)
-            .collect::<PathBuf>();
-        if relative.as_os_str().is_empty()
-            || relative
+        for relative in &options.copy_fixtures {
+            use std::path::Component;
+            let relative = relative
                 .components()
-                .any(|c| !matches!(c, Component::Normal(_)))
-        {
-            bail!(
-                "--copy-fixture must name a file or directory inside the workspace: {}",
-                relative.display()
-            );
+                .filter(|c| *c != Component::CurDir)
+                .collect::<PathBuf>();
+            if relative.as_os_str().is_empty()
+                || relative
+                    .components()
+                    .any(|c| !matches!(c, Component::Normal(_)))
+            {
+                bail!(
+                    "--copy-fixture must name a file or directory inside the workspace: {}",
+                    relative.display()
+                );
+            }
+            copy_fixture_entry(
+                &workspace.join(&relative),
+                &copy.join(&relative),
+                &workspace,
+                &forbidden,
+                &state,
+                &mut BTreeSet::new(),
+            )?;
         }
-        copy_fixture_entry(
-            &workspace.join(&relative),
-            &copy.join(&relative),
-            &workspace,
-            &forbidden,
-            &state,
-            &mut BTreeSet::new(),
-        )?;
-    }
-    prune(&copy, &state)?;
-    if options.git_index {
-        git_index::snapshot(&workspace, &copy)?;
-    }
-    // Relative path dependencies that leave the workspace would point nowhere from the copy.
-    let mut manifests: Vec<&Path> = metadata
-        .packages
-        .iter()
-        .map(|p| p.manifest_path.as_path())
-        .collect();
-    let root_manifest = metadata.workspace_root.join("Cargo.toml");
-    manifests.push(&root_manifest);
-    for manifest in manifests {
-        let Ok(canonical) = manifest.canonicalize() else {
-            continue;
-        };
-        let (Some(manifest_dir), Ok(relative)) =
-            (canonical.parent(), canonical.strip_prefix(&workspace))
-        else {
-            continue;
-        };
-        let text = fs::read_to_string(&canonical)?;
-        if let Some(rewritten) =
-            absolutize_path_dependencies(&text, manifest_dir, &workspace, &copy)?
-        {
-            state.write(&copy.join(relative), &rewritten)?;
+        prune(&copy, &state)?;
+        if options.git_index {
+            git_index::snapshot(&workspace, &copy)?;
+        }
+        // Relative path dependencies that leave the workspace would point nowhere from the copy.
+        let mut manifests: Vec<&Path> = metadata
+            .packages
+            .iter()
+            .map(|p| p.manifest_path.as_path())
+            .collect();
+        let root_manifest = metadata.workspace_root.join("Cargo.toml");
+        manifests.push(&root_manifest);
+        for manifest in manifests {
+            let Ok(canonical) = manifest.canonicalize() else {
+                continue;
+            };
+            let (Some(manifest_dir), Ok(relative)) =
+                (canonical.parent(), canonical.strip_prefix(&workspace))
+            else {
+                continue;
+            };
+            let text = fs::read_to_string(&canonical)?;
+            if let Some(rewritten) =
+                absolutize_path_dependencies(&text, manifest_dir, &workspace, &copy)?
+            {
+                state.write(&copy.join(relative), &rewritten)?;
+            }
+        }
+
+        if let Some(catalogue) = catalogue {
+            catalogue.ready.set(true);
         }
     }
 
@@ -3392,7 +3623,7 @@ fn run_package(
     let package_path = package.manifest_path.parent().unwrap_or(Path::new("."));
     let mut report_path = repository_prefix(package_path);
     if report_path.is_empty()
-        && workspace_work.is_some()
+        && batch.is_some()
         && let Ok(relative) = package_path.strip_prefix(&workspace)
         && !relative.as_os_str().is_empty()
     {
@@ -3409,6 +3640,16 @@ fn run_package(
             cargo: options.cargo.clone(),
             opt_level: options.opt_level,
             timeout_seconds: options.timeout_seconds,
+            baseline_jobs: (options.baseline_jobs > 1).then_some(options.baseline_jobs),
+            timeout_recheck: if options.serial_timeout_rechecks {
+                "serial"
+            } else {
+                "none"
+            },
+            wrapper_grace_seconds: selection
+                .wrapper
+                .as_ref()
+                .map(|_| options.wrapper_grace.as_secs()),
             rebuild: options.rebuild || options.source_only,
             verified: options.verify && !options.source_only,
             doc_tests: options.doc,
@@ -3595,23 +3836,26 @@ fn run_package(
         if output.status.success() {
             break build;
         }
+        let diagnostics = || {
+            [
+                build.diagnostics.join("\n"),
+                String::from_utf8_lossy(&output.stderr).into_owned(),
+            ]
+            .into_iter()
+            .filter(|part| !part.trim().is_empty())
+            .collect::<Vec<_>>()
+            .join("\n")
+        };
         if build.errors.is_empty() {
-            bail!(
-                "the build failed:\n{build_note}{}",
-                String::from_utf8_lossy(&output.stderr)
-            );
+            bail!("the build failed:\n{build_note}{}", diagnostics());
         }
         rounds += 1;
         let before = disabled.len();
-        let mut unexplained = vec![];
         let mut blamed_now: HashSet<u32> = HashSet::new();
         for error in &build.errors {
             let blamed = blame_error(error, &files, &copy, &disabled);
             if std::env::var_os("TMT_DEBUG").is_some() {
                 eprintln!("tmt: debug: blaming {blamed:?} for\n{}", error.rendered);
-            }
-            if blamed.is_empty() {
-                unexplained.push(error);
             }
             for id in blamed {
                 repairs
@@ -3622,14 +3866,10 @@ fn run_package(
         }
         disabled.extend(blamed_now);
         if disabled.len() == before || rounds > MAX_REPAIR_ROUNDS {
-            let shown = unexplained
-                .first()
-                .copied()
-                .or(build.errors.first())
-                .map_or("", |e| e.rendered.as_str());
             bail!(
-                "the crate does not build after instrumentation, and the error is not at a probe.\n\
-                 {build_note}Does `cargo test --no-run` pass on the original for the same targets?\n{shown}"
+                "the crate does not build after instrumentation.\n\
+                 {build_note}Does `cargo test --no-run` pass on the original for the same targets?\n{}",
+                diagnostics()
             );
         }
     };
@@ -3644,6 +3884,7 @@ fn run_package(
     // 5. Trace run: what does each test observe?
     let mut session = Session {
         progress: options.progress,
+        serial_timeout_rechecks: options.serial_timeout_rechecks,
         package_dir,
         binaries: vec![],
     };
@@ -3781,68 +4022,96 @@ fn run_package(
     // directory shared with others (the temporary one, between containers that count
     // their processes alike) could hand one run's mark to another.
     let marks = marks_dir(&work)?;
-    for (index, (name, runner, cwd)) in runners.into_iter().enumerate() {
-        let trace_path = work.join(format!("trace-{index}.tsv"));
-        let _ = fs::remove_file(&trace_path);
-        let mut bin = TestBinary {
-            name,
-            cwd,
-            marks: marks.clone(),
-            git_ceiling: work.clone(),
-            tests: BTreeSet::new(),
-            runner,
-            baseline: Duration::ZERO,
-            traced: Duration::ZERO,
-            timeout: options.timeout_seconds.map(Duration::from_secs),
-            trace: Trace::default(),
-        };
-        session.note(&format!("tracing `{}`", bin.name));
-        let started = Instant::now();
-        let trace_env = trace_path.to_string_lossy().into_owned();
-        let trace = [("TMT_TRACE", trace_env.as_str())];
-        run_baseline(
-            &bin,
-            if options.source_only { &[] } else { &trace },
-            Duration::from_secs(3600),
-            &work.join(format!("baseline-{index}.log")),
-            false,
-        )?;
-        bin.traced = started.elapsed();
-        bin.baseline = bin.traced;
-        // Recording slows code in loops down a lot, and the time limit of every mutant
-        // is a multiple of this: where it matters, time the tests as the mutants run them.
-        if !options.source_only && bin.traced > SLOW_TRACE {
-            let started = Instant::now();
-            if run_baseline(
-                &bin,
-                &[],
-                bin.traced,
-                &work.join(format!("baseline-{index}-untraced.log")),
-                true,
-            )? {
-                bin.baseline = started.elapsed();
-            }
-        }
-        // No file means no probe was reached. Anything else unreadable or malformed means
-        // the evidence is incomplete, and conclusions drawn from it would be wrong.
-        let text = match fs::read_to_string(&trace_path) {
-            Ok(text) => text,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
-            Err(err) => bail!("cannot read the trace of `{}`: {err}", bin.name),
-        };
-        bin.trace = Trace::parse(&text);
-        if bin.trace.malformed_lines > 0 {
-            bail!(
-                "the trace of `{}` has {} malformed lines; not drawing conclusions from it",
-                bin.name,
-                bin.trace.malformed_lines
-            );
-        }
-        if let Runner::Exe(exe) = &bin.runner {
-            bin.tests = list_tests(exe, &bin.cwd, &work, false, false)?;
-        }
-        session.binaries.push(bin);
+    let baseline_jobs = if selection.enabled() {
+        options.baseline_jobs
+    } else {
+        1
+    };
+    if options.progress {
+        eprintln!(
+            "tmt: baselines: 0/{} completed ({} workers)",
+            runners.len(),
+            baseline_jobs
+        );
     }
+
+    session.binaries = progress::track_baselines(options.progress, runners.len(), |progress| {
+        run_pool(runners.len(), baseline_jobs, |slot| {
+            let index = slot;
+            let (name, runner, cwd) = runners[index].clone();
+            let result = (|| {
+                let trace_path = work.join(format!("trace-{index}.tsv"));
+                let _ = fs::remove_file(&trace_path);
+                let mut bin = TestBinary {
+                    name,
+                    cwd,
+                    marks: marks.clone(),
+                    git_ceiling: work.clone(),
+                    tests: BTreeSet::new(),
+                    runner,
+                    baseline: Duration::ZERO,
+                    traced: Duration::ZERO,
+                    timeout: options.timeout_seconds.map(Duration::from_secs),
+                    wrapper_grace: options.wrapper_grace,
+                    report_slow: options.progress,
+                    filtered_timings: Default::default(),
+                    trace: Trace::default(),
+                };
+                session.note(&format!("tracing `{}`", bin.name));
+                let started = Instant::now();
+                let trace_env = trace_path.to_string_lossy().into_owned();
+                let trace = [("TMT_TRACE", trace_env.as_str())];
+                run_baseline(
+                    &bin,
+                    if options.source_only { &[] } else { &trace },
+                    Duration::from_secs(3600),
+                    &work.join(format!("baseline-{index}.log")),
+                    false,
+                )?;
+                bin.traced = started.elapsed();
+                bin.baseline = bin.traced;
+                // Recording slows code in loops down a lot, and the time limit of every mutant
+                // is a multiple of this: where it matters, time the tests as the mutants run them.
+                if !options.source_only && bin.traced > SLOW_TRACE {
+                    let started = Instant::now();
+                    if run_baseline(
+                        &bin,
+                        &[],
+                        bin.traced,
+                        &work.join(format!("baseline-{index}-untraced.log")),
+                        true,
+                    )? {
+                        bin.baseline = started.elapsed();
+                    }
+                }
+                // No file means no probe was reached. Anything else unreadable or malformed means
+                // the evidence is incomplete, and conclusions drawn from it would be wrong.
+                let text = match fs::read_to_string(&trace_path) {
+                    Ok(text) => text,
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => String::new(),
+                    Err(err) => bail!("cannot read the trace of `{}`: {err}", bin.name),
+                };
+                bin.trace = Trace::parse(&text);
+                if bin.trace.malformed_lines > 0 {
+                    bail!(
+                        "the trace of `{}` has {} malformed lines; not drawing conclusions from it",
+                        bin.name,
+                        bin.trace.malformed_lines
+                    );
+                }
+                if let Runner::Exe(exe) = &bin.runner {
+                    bin.tests = list_tests(exe, &bin.cwd, &work, false, false)?;
+                }
+                Ok(bin)
+            })();
+            progress.complete(if result.is_ok() {
+                progress::Outcome::Survived
+            } else {
+                progress::Outcome::Failed
+            });
+            result
+        })
+    })?;
 
     // 6. Plan every site, run the mutants, and put the findings together.
     report.analysis.test_selection = selected_tests;
@@ -3958,6 +4227,9 @@ fn run_package(
         options.jobs.max(1)
     ));
     let mut results = session.run_jobs(&jobs, options.jobs, "mutants")?;
+    for result in &results {
+        report.timeout_rechecks.include(result);
+    }
 
     // 6b. On request, check what the run rests on: that the tests chosen for a mutant
     // are the ones that could fail with it, and that the tests do the same twice.
@@ -3992,6 +4264,7 @@ fn run_package(
                 .iter()
                 .zip(session.run_jobs(&against_all, options.jobs, "audit mutants")?)
         {
+            report.timeout_rechecks.include(&again);
             if again.survived.is_none() {
                 // The verdict of all tests is the one that counts.
                 results[*job] = again;
@@ -4861,6 +5134,19 @@ mod tests {
     use crate::trace::UNKNOWN_TEST;
 
     #[test]
+    fn failed_build_retains_spanless_and_source_diagnostics() {
+        let stdout = r#"
+{"reason":"compiler-message","message":{"level":"error","message":"linking with cc failed","rendered":"ld: library not found for -liconv","spans":[]}}
+{"reason":"compiler-message","message":{"level":"error","message":"source error","rendered":null,"spans":[{"file_name":"src/lib.rs","byte_start":1,"line_start":2,"is_primary":true}]}}
+"#;
+        let failed = parse_build_output(stdout, &["p"]);
+        assert_eq!(failed.errors.len(), 1);
+        let text = failed.diagnostics.join("\n");
+        assert!(text.contains("ld: library not found for -liconv"), "{text}");
+        assert!(text.contains("source error"), "{text}");
+    }
+
+    #[test]
     fn test_build_scope_uses_only_known_local_features() {
         let package = Package {
             name: "pkg".to_owned(),
@@ -5515,6 +5801,9 @@ serde = { path = "../../serde-fork" }
             baseline: Duration::ZERO,
             traced: Duration::ZERO,
             timeout: None,
+            wrapper_grace: Duration::ZERO,
+            report_slow: false,
+            filtered_timings: Default::default(),
             trace: Trace::default(),
         };
         let started = Instant::now();
@@ -5576,6 +5865,9 @@ fn main() {
             baseline: Duration::ZERO,
             traced: Duration::ZERO,
             timeout: None,
+            wrapper_grace: Duration::ZERO,
+            report_slow: false,
+            filtered_timings: Default::default(),
             trace: Trace::default(),
         };
         let started = Instant::now();

@@ -60,6 +60,38 @@ pub(crate) fn track<T>(
     })
 }
 
+pub(crate) fn track_baselines<T>(
+    enabled: bool,
+    total: usize,
+    run: impl FnOnce(&Progress) -> T,
+) -> T {
+    track_with_reporter(enabled, total, UPDATE_INTERVAL, run, |counts| {
+        eprintln!(
+            "tmt: baselines: {}/{total} completed ({} failed)",
+            counts.completed(),
+            counts.failed
+        );
+    })
+}
+
+pub(crate) fn track_timeout_rechecks<T>(
+    enabled: bool,
+    total: usize,
+    run: impl FnOnce(&Progress) -> T,
+) -> T {
+    track_with_reporter(enabled, total, UPDATE_INTERVAL, run, |counts| {
+        eprintln!(
+            "tmt: serial timeout rechecks: {}/{} completed ({} pending, {} confirmed, {} recovered, {} unevaluated)",
+            counts.completed(),
+            total,
+            total - counts.completed(),
+            counts.timed_out,
+            counts.survived,
+            counts.unable
+        );
+    })
+}
+
 fn track_with_reporter<T>(
     enabled: bool,
     total: usize,

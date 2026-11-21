@@ -10,6 +10,12 @@ enum Sharding {
     RoundRobin,
 }
 
+#[derive(Clone, Copy, clap::ValueEnum)]
+enum TimeoutRecheck {
+    Serial,
+    None,
+}
+
 #[derive(Clone, Copy, Default, clap::ValueEnum)]
 enum TestTool {
     #[default]
@@ -43,6 +49,9 @@ struct Cli {
     /// Print the report as JSON.
     #[arg(long)]
     json: bool,
+    /// Emit one compact JSON report or error per completed package.
+    #[arg(long, conflicts_with_all = ["json", "sarif"])]
+    jsonl: bool,
     /// Trust the trace: do not re-run tests against predicted survivors.
     #[arg(long)]
     no_verify: bool,
@@ -139,6 +148,20 @@ struct Cli {
     /// Time allowed for each test runner under a mutant, in seconds.
     #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
     timeout: Option<u64>,
+    /// Concurrent isolated baselines (default: one).
+    #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
+    baseline_jobs: u32,
+    /// Retry timeouts from parallel mutation workers in isolation.
+    #[arg(long, value_enum, default_value = "serial")]
+    timeout_recheck: TimeoutRecheck,
+    /// Seconds for a test wrapper to clean up after timeout on Unix. Zero kills immediately.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        default_value_t = 2,
+        requires = "test_wrapper"
+    )]
+    wrapper_grace: u64,
     /// Features of the package to build with (as for `cargo test`; repeatable).
     #[arg(long, short = 'F', value_name = "FEATURES", value_delimiter = ',')]
     features: Vec<String>,
@@ -211,6 +234,9 @@ fn main() -> ExitCode {
         },
         opt_level: cli.opt_level,
         timeout_seconds: cli.timeout,
+        baseline_jobs: cli.baseline_jobs as usize,
+        serial_timeout_rechecks: matches!(cli.timeout_recheck, TimeoutRecheck::Serial),
+        wrapper_grace: std::time::Duration::from_secs(cli.wrapper_grace),
         audit: cli.audit,
         cargo: driver::CargoConfig {
             features: cli.features,
@@ -224,6 +250,13 @@ fn main() -> ExitCode {
         copy_fixtures: cli.copy_fixture,
         doc: cli.doc,
     };
+    if cli.jsonl {
+        return stream_reports(
+            &options,
+            &cli.package,
+            cli.workspace || cli.package.len() > 1,
+        );
+    }
     if cli.workspace || cli.package.len() > 1 {
         let members = match driver::run_packages(&options, &cli.package) {
             Ok(members) => members,
@@ -247,8 +280,9 @@ fn main() -> ExitCode {
 }
 
 fn incomplete_source_run(result: &report::Report) -> bool {
-    result.analysis.source_only
-        && (result.mutants_timed_out > 0 || result.mutants_not_evaluated > 0)
+    result.timeout_rechecks.unconfirmed > 0
+        || (result.analysis.source_only
+            && (result.mutants_timed_out > 0 || result.mutants_not_evaluated > 0))
 }
 
 fn report_exit(result: &report::Report) -> u8 {
@@ -300,6 +334,54 @@ fn show_report(result: &report::Report, json: bool, sarif: bool, show_unreached:
     } else {
         print!("{}", report::render_text(result, show_unreached));
     }
+}
+
+fn stream_reports(options: &driver::Options, packages: &[String], workspace: bool) -> ExitCode {
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout().lock();
+    let mut status = (0, 0);
+    let mut emit = |name: String, result: anyhow::Result<report::Report>| -> anyhow::Result<()> {
+        let (record, rank) = match result {
+            Ok(result) => {
+                let code = report_exit(&result);
+                let priority = if incomplete_source_run(&result) {
+                    3
+                } else {
+                    match code {
+                        2 => 2,
+                        3 => 1,
+                        _ => 0,
+                    }
+                };
+                (
+                    serde_json::json!({"package": result.package, "report": report_json(&result)}),
+                    (priority, code),
+                )
+            }
+            Err(err) => (
+                serde_json::json!({"package": name, "error": format!("{err:#}")}),
+                (4, 1),
+            ),
+        };
+        status = status.max(rank);
+        serde_json::to_writer(&mut stdout, &record)?;
+        writeln!(stdout)?;
+        stdout.flush()?;
+        Ok(())
+    };
+    let result = if workspace {
+        driver::run_packages_each(options, packages, &mut emit)
+    } else {
+        emit(
+            options.package.clone().unwrap_or_default(),
+            driver::run(options),
+        )
+    };
+    if let Err(err) = result {
+        eprintln!("tmt: error: {err:#}");
+        return ExitCode::FAILURE;
+    }
+    ExitCode::from(status.1)
 }
 
 fn show_workspace(
