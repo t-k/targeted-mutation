@@ -3979,6 +3979,16 @@ fn run_package(
         return Ok(report);
     }
 
+    // The injected runtime indexes its per-thread arrays by probe ID. Number the
+    // retained probes together so a narrow scope does not allocate slots for omitted sites.
+    for (id, site) in files
+        .iter_mut()
+        .flat_map(|file| &mut file.sites)
+        .enumerate()
+    {
+        site.id = id as u32;
+    }
+
     let root_source = state
         .original(&root_file, &workspace)?
         .with_context(|| format!("{} is missing", root_target.src_path.display()))?;

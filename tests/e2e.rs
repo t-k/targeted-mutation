@@ -512,6 +512,58 @@ fn no_std_crate_and_custom_work_dir() {
 }
 
 #[test]
+fn a_scoped_campaign_numbers_only_retained_probes() {
+    let dir = fixture("eligibility", "compact-probe-ids");
+    let work = dir.join("target/scoped");
+    let mut lib = "mod other;\n".to_string();
+    for n in 0..96 {
+        lib.push_str(&format!(
+            "pub fn earlier_{n}(x: u32) -> bool {{ x >= 10 }}\n"
+        ));
+    }
+    lib.push_str("pub fn selected(x: u32) -> bool { x >= 10 }\n");
+    lib.push_str(
+        "#[test] fn selected_boundaries() { for pred in [selected, other::selected] { \
+         assert!(!pred(9)); assert!(pred(10)); assert!(pred(11)); } }\n",
+    );
+    fs::write(dir.join("src/lib.rs"), lib).unwrap();
+    fs::write(
+        dir.join("src/other.rs"),
+        "pub fn selected(x: u32) -> bool { x >= 10 }\n",
+    )
+    .unwrap();
+    let run = tmt(
+        &dir,
+        &[
+            "--quiet",
+            "--json",
+            "--work-dir",
+            work.to_str().unwrap(),
+            "--lines",
+            "src/lib.rs:98",
+            "--lines",
+            "src/other.rs:1",
+        ],
+    );
+    assert_eq!(run.code, 0, "{}\n{}", run.stderr, run.stdout);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    let sites = report["sites"].as_u64().unwrap();
+    assert!(report["mutants_run"].as_u64().unwrap() > 0);
+    assert_eq!(report["mutants_run"], report["mutants_killed"]);
+    let ids: Vec<u64> = ["lib.rs", "other.rs"]
+        .into_iter()
+        .map(|file| {
+            let source = fs::read_to_string(work.join("src/src").join(file)).unwrap();
+            let (_, probe) = source.split_once("__tmt_rt::ord(").expect(&source);
+            let (id, _) = probe.split_once("u32,").expect(probe);
+            id.parse().unwrap()
+        })
+        .collect();
+    assert_ne!(ids[0], ids[1]);
+    assert!(ids.iter().all(|&id| id < sites), "{ids:?} >= {sites}");
+}
+
+#[test]
 fn all_production_targets_follow_modules_and_report_unbuilt_targets() {
     let dir = fixture("eligibility", "all-production-targets");
     let manifest = dir.join("Cargo.toml");
