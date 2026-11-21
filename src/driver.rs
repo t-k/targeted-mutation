@@ -480,8 +480,7 @@ fn directory_entries(path: &Path) -> impl Iterator<Item = PathBuf> + use<> {
 }
 
 fn same_binary(a: &Path, b: &Path) -> Option<bool> {
-    use std::io::{BufRead, BufReader, Read};
-    let (a, mut b) = (fs::File::open(a).ok()?, fs::File::open(b).ok()?);
+    let (a, b) = (fs::File::open(a).ok()?, fs::File::open(b).ok()?);
     let (left, right) = (a.metadata().ok()?, b.metadata().ok()?);
     if !left.is_file() || !right.is_file() || left.len() != right.len() {
         return Some(false);
@@ -493,19 +492,34 @@ fn same_binary(a: &Path, b: &Path) -> Option<bool> {
             return Some(true);
         }
     }
-    let mut a = BufReader::new(a);
-    let mut other = [0; 8192];
+    compare_streams(a, b).ok()
+}
+
+fn compare_streams(a: impl std::io::Read, b: impl std::io::Read) -> std::io::Result<bool> {
+    use std::io::{BufRead, BufReader, ErrorKind};
+    const BUFFER_BYTES: usize = 64 * 1024;
+    let mut a = BufReader::with_capacity(BUFFER_BYTES, a);
+    let mut b = BufReader::with_capacity(BUFFER_BYTES, b);
     loop {
-        let bytes = a.fill_buf().ok()?;
-        let len = bytes.len();
-        if len == 0 {
-            return Some(true);
+        let left = match a.fill_buf() {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        let right = match b.fill_buf() {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error),
+        };
+        let count = left.len().min(right.len());
+        if count == 0 {
+            return Ok(left.is_empty() && right.is_empty());
         }
-        b.read_exact(&mut other[..len]).ok()?;
-        if bytes != &other[..len] {
-            return Some(false);
+        if left[..count] != right[..count] {
+            return Ok(false);
         }
-        a.consume(len);
+        a.consume(count);
+        b.consume(count);
     }
 }
 
@@ -975,10 +989,10 @@ fn sync_file(src: &Path, dst: &Path, state: &WorkCopy) -> Result<()> {
 
 /// Whether two files hold the same bytes. One that cannot be read is not the same.
 fn same_bytes(a: &Path, b: &Path) -> bool {
-    fs::read(a)
-        .ok()
-        .zip(fs::read(b).ok())
-        .is_some_and(|(a, b)| a == b)
+    let (Ok(a), Ok(b)) = (fs::File::open(a), fs::File::open(b)) else {
+        return false;
+    };
+    compare_streams(a, b).unwrap_or(false)
 }
 
 /// Makes `dir` a directory of the working copy. Whatever else is in the way below the
@@ -6710,6 +6724,86 @@ fn main() {
             rows += 1;
         }
         assert_eq!(rows, 20);
+    }
+
+    #[test]
+    fn streaming_copy_comparison_matches_bytes() {
+        use std::io::{self, Read};
+
+        struct Chunks<'a> {
+            rest: &'a [u8],
+            chunk: usize,
+            interrupt: bool,
+            fail: bool,
+        }
+
+        impl Read for Chunks<'_> {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                if self.interrupt {
+                    self.interrupt = false;
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                if self.fail {
+                    return Err(io::ErrorKind::PermissionDenied.into());
+                }
+                let limit = out.len().min(self.chunk);
+                self.rest.read(&mut out[..limit])
+            }
+        }
+
+        for row in include_str!("../tests/data/workcopy-compare.pict.tsv")
+            .lines()
+            .skip(1)
+        {
+            let fields: Vec<_> = row.split('\t').collect();
+            let [size, relation, reads] = fields.as_slice() else {
+                panic!("{row}")
+            };
+            let size = match *size {
+                "empty" => 0,
+                "before" => 65535,
+                "boundary" => 65536,
+                "after" => 65537,
+                "multi" => 131079,
+                _ => panic!("{row}"),
+            };
+            let left: Vec<_> = (0..size).map(|i| (i % 251) as u8).collect();
+            let mut right = left.clone();
+            match *relation {
+                "equal" => (),
+                "early" => right[0] ^= 1,
+                "late" => right[size - 1] ^= 1,
+                "suffix" => right.push(1),
+                "shorter" => {
+                    right.pop();
+                }
+                _ => panic!("{row}"),
+            }
+            let make_reader = |first, rest| Chunks {
+                rest,
+                chunk: if *reads == "regular" {
+                    usize::MAX
+                } else if first {
+                    1031
+                } else {
+                    2063
+                },
+                interrupt: *reads == "interrupted",
+                fail: !first && *reads == "failed",
+            };
+            for (a, b) in [(&left[..], &right[..]), (&right[..], &left[..])] {
+                let compared = compare_streams(make_reader(true, a), make_reader(false, b));
+                if *reads == "failed" {
+                    assert_eq!(
+                        compared.unwrap_err().kind(),
+                        io::ErrorKind::PermissionDenied,
+                        "{row}"
+                    );
+                } else {
+                    assert_eq!(compared.unwrap(), a == b, "{row}");
+                }
+            }
+        }
     }
 
     #[test]
