@@ -345,8 +345,10 @@ mod tests {
 
     #[test]
     fn statements_that_start_or_stop_running() {
-        let original = Trace::parse("R\t1\tt\t1\nR\t2\tt\t1\nR\t2\tu\t1\n");
-        let mutated = Trace::parse("R\t1\tt\t1\nR\t3\tt\t1\nR\t2\tu\t1\n");
+        // Both traces reach site 4 after taking different paths through sites 2 and 3.
+        // The merge must find the shared site again without reporting it as an effect.
+        let original = Trace::parse("R\t1\tt\t1\nR\t2\tt\t1\nR\t2\tu\t1\nR\t4\tt\t1\n");
+        let mutated = Trace::parse("R\t1\tt\t1\nR\t3\tt\t1\nR\t2\tu\t1\nR\t4\tt\t1\n");
         let found = changes(&original, &mutated, None, 9);
         assert_eq!(found.len(), 1, "{found:?}");
         assert_eq!(
@@ -354,6 +356,13 @@ mod tests {
             [
                 Change::NowRuns { site: 3 },
                 Change::NoLongerRuns { site: 2 }
+            ]
+        );
+        assert_eq!(
+            kinds(&changes(&mutated, &original, None, 9)),
+            [
+                Change::NowRuns { site: 2 },
+                Change::NoLongerRuns { site: 3 }
             ]
         );
         // The mutated site itself is never reported.
