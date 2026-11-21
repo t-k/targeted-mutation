@@ -1,25 +1,72 @@
 use std::fs::{self, File, OpenOptions};
 use std::io;
 use std::path::Path;
+use std::process::Command;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, bail};
 
 /// Holds the work directory's lock until the OS closes the file handle.
 pub(crate) struct WorkLock {
-    _file: File,
+    _file: Arc<File>,
 }
 
 impl WorkLock {
+    /// Keep the lock across exec in a child that uses the working copy. A
+    /// command that has been configured but not started keeps the file alive
+    /// so it cannot accidentally inherit a reused descriptor.
+    #[cfg(unix)]
+    pub(crate) fn retain_for(&self, command: &mut Command) {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::process::CommandExt;
+
+        let file = Arc::clone(&self._file);
+        // SAFETY: the child's inherited File is still open, and the hook only
+        // borrows its descriptor and performs async-signal-safe fcntl calls.
+        unsafe { command.pre_exec(move || inherit_lock(file.as_raw_fd())) };
+    }
+
+    #[cfg(not(unix))]
+    pub(crate) fn retain_for(&self, _: &mut Command) {
+        // The exclusive Windows handle is owned by the parent.
+    }
+
     pub(crate) fn take(work: &Path) -> Result<Self> {
         let path = work.join(".tmt-lock");
         match acquire(&path) {
-            Ok(file) => Ok(Self { _file: file }),
+            Ok(file) => Ok(Self {
+                _file: Arc::new(file),
+            }),
             Err(err) if contended(&err) => {
                 bail!("another tmt run is using {}", work.display())
             }
             Err(err) => Err(err).with_context(|| format!("locking {}", path.display())),
         }
     }
+}
+
+#[cfg(unix)]
+fn inherit_lock(fd: std::os::fd::RawFd) -> io::Result<()> {
+    use std::os::raw::c_int;
+
+    unsafe extern "C" {
+        fn fcntl(fd: c_int, command: c_int, ...) -> c_int;
+    }
+    const F_GETFD: c_int = 1;
+    const F_SETFD: c_int = 2;
+    const FD_CLOEXEC: c_int = 1;
+
+    // SAFETY: the borrowed descriptor belongs to the command's open lock.
+    let flags = unsafe { fcntl(fd, F_GETFD) };
+    if flags == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: F_SETFD accepts one c_int argument. This updates only the
+    // descriptor in the child, leaving other spawned commands unaffected.
+    if unsafe { fcntl(fd, F_SETFD, flags & !FD_CLOEXEC) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(())
 }
 
 fn acquire(path: &Path) -> io::Result<File> {
@@ -249,6 +296,59 @@ mod tests {
             assert!(marker.is_file(), "release removed the lock file");
             let _next = WorkLock::take(&work.0).unwrap();
             assert_contended(&work.0);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn registered_child_keeps_the_lock_until_it_exits() {
+        // All eight rows of the child handoff PICT table.
+        for (legacy, parent_first, killed) in [
+            (false, true, true),
+            (true, false, false),
+            (true, true, true),
+            (true, true, false),
+            (true, false, true),
+            (false, true, false),
+            (false, false, true),
+            (false, false, false),
+        ] {
+            let work = Scratch::new();
+            if legacy {
+                fs::write(work.0.join(".tmt-lock"), []).unwrap();
+            }
+            let lock = WorkLock::take(&work.0).unwrap();
+            let mut cmd = Command::new("sh");
+            cmd.args(["-c", "read -r line"]).stdin(Stdio::piped());
+            lock.retain_for(&mut cmd);
+            // A command that was not registered never inherits the lock.
+            let unrelated = LockChild(
+                Command::new("sh")
+                    .args(["-c", "read -r line"])
+                    .stdin(Stdio::piped())
+                    .spawn()
+                    .unwrap(),
+            );
+            let mut child = LockChild(cmd.spawn().unwrap());
+            drop(cmd);
+            let mut parent = Some(lock);
+            if parent_first {
+                parent.take();
+            }
+            assert_contended(&work.0);
+
+            if killed {
+                child.0.kill().unwrap();
+            } else {
+                child.0.stdin.take().unwrap().write_all(b"done\n").unwrap();
+            }
+            assert_eq!(child.0.wait().unwrap().success(), !killed);
+            if !parent_first {
+                assert_contended(&work.0);
+            }
+            drop(parent);
+            let _next = WorkLock::take(&work.0).unwrap();
+            drop(unrelated);
         }
     }
 
