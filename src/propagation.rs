@@ -44,17 +44,24 @@ struct Seen {
     returned_false: bool,
 }
 
-fn per_test(trace: &Trace) -> BTreeMap<(&str, u32), Seen> {
-    let mut all: BTreeMap<(&str, u32), Seen> = BTreeMap::new();
+type Sites = BTreeMap<u32, Seen>;
+type IndexedSites = Box<[(u32, Seen)]>;
+
+fn per_test(trace: &Trace) -> BTreeMap<&str, Sites> {
+    let mut all: BTreeMap<&str, Sites> = BTreeMap::new();
     for (site, tests) in &trace.reach {
         for test in tests {
-            all.entry((test, *site)).or_default().reached = true;
+            all.entry(test)
+                .or_default()
+                .entry(*site)
+                .or_default()
+                .reached = true;
         }
     }
     for (site, tests) in &trace.cmp {
         for (test, obs) in tests {
             let Obs { lt, eq, gt, un, .. } = *obs;
-            let seen = all.entry((test, *site)).or_default();
+            let seen = all.entry(test).or_default().entry(*site).or_default();
             seen.reached |= obs.reached();
             // tmt:ignore the bits do not overlap, so `^` joins them just as well
             seen.outcomes |= lt as u8 | (eq as u8) << 1 | (gt as u8) << 2 | (un as u8) << 3;
@@ -69,7 +76,7 @@ fn per_test(trace: &Trace) -> BTreeMap<(&str, u32), Seen> {
                 // Not an outcome: it comes with every value the right operand gives.
                 rhs_started: _,
             } = *obs;
-            let seen = all.entry((test, *site)).or_default();
+            let seen = all.entry(test).or_default().entry(*site).or_default();
             seen.reached |= obs.reached();
             // tmt:ignore the bits do not overlap, so `^` joins them just as well
             seen.outcomes |= short as u8 | (rhs_true as u8) << 1 | (rhs_false as u8) << 2;
@@ -77,7 +84,11 @@ fn per_test(trace: &Trace) -> BTreeMap<(&str, u32), Seen> {
     }
     for (site, tests) in &trace.arith {
         for (test, obs) in tests {
-            all.entry((test, *site)).or_default().reached |= obs.same || obs.differs || obs.opaque;
+            all.entry(test)
+                .or_default()
+                .entry(*site)
+                .or_default()
+                .reached |= obs.same || obs.differs || obs.opaque;
         }
     }
     for (site, tests) in &trace.returns {
@@ -86,7 +97,7 @@ fn per_test(trace: &Trace) -> BTreeMap<(&str, u32), Seen> {
                 saw_true,
                 saw_false,
             } = *obs;
-            let seen = all.entry((test, *site)).or_default();
+            let seen = all.entry(test).or_default().entry(*site).or_default();
             seen.reached |= obs.reached();
             seen.returned_true |= saw_true;
             seen.returned_false |= saw_false;
@@ -104,20 +115,98 @@ pub fn changes(
     tests: Option<&BTreeSet<String>>,
     mutated_site: u32,
 ) -> BTreeMap<String, BTreeSet<Change>> {
-    let (before, after) = (per_test(original), per_test(mutated));
-    let in_scope =
-        |test: &str, site: u32| site != mutated_site && tests.is_none_or(|t| t.contains(test));
-    let mut out: BTreeMap<String, BTreeSet<Change>> = BTreeMap::new();
-    for ((test, site), now) in &after {
-        if !in_scope(test, *site) {
+    BaselineIndex::new(original).changes(mutated, tests, mutated_site)
+}
+
+/// Baseline observations grouped by test so survivor replays can look up only the tests
+/// they ran and share the index across comparisons.
+pub(crate) struct BaselineIndex(BTreeMap<String, IndexedSites>);
+
+impl BaselineIndex {
+    pub(crate) fn new(original: &Trace) -> Self {
+        Self(
+            per_test(original)
+                .into_iter()
+                .map(|(test, sites)| (test.to_owned(), sites.into_iter().collect()))
+                .collect(),
+        )
+    }
+
+    pub(crate) fn changes(
+        &self,
+        mutated: &Trace,
+        tests: Option<&BTreeSet<String>>,
+        mutated_site: u32,
+    ) -> BTreeMap<String, BTreeSet<Change>> {
+        let mut out = BTreeMap::new();
+        if tests.is_some_and(BTreeSet::is_empty) {
+            return out;
+        }
+        let mut after = per_test(mutated);
+        let mut compare = |test: &str, was: Option<&[(u32, Seen)]>, now: Option<&Sites>| {
+            let found = compare_sites(was.unwrap_or_default(), now, mutated_site);
+            if !found.is_empty() {
+                out.insert(test.to_owned(), found);
+            }
+        };
+        if let Some(tests) = tests {
+            for test in tests {
+                compare(
+                    test,
+                    self.0.get(test).map(Box::as_ref),
+                    after.get(test.as_str()),
+                );
+            }
+        } else {
+            for (test, was) in &self.0 {
+                compare(
+                    test,
+                    Some(was.as_ref()),
+                    after.remove(test.as_str()).as_ref(),
+                );
+            }
+            for (test, now) in &after {
+                compare(test, None, Some(now));
+            }
+        }
+        out
+    }
+}
+
+fn compare_sites(
+    before: &[(u32, Seen)],
+    after: Option<&Sites>,
+    mutated_site: u32,
+) -> BTreeSet<Change> {
+    let mut found = BTreeSet::new();
+    // Both sides are ordered by site, so each observation is visited once.
+    let mut before = before.iter().copied().peekable();
+    let mut after = after
+        .into_iter()
+        .flatten()
+        .map(|(&site, &seen)| (site, seen))
+        .peekable();
+    loop {
+        let site = match (before.peek(), after.peek()) {
+            (Some(&(left, _)), Some(&(right, _))) => left.min(right),
+            (Some(&(site, _)), None) | (None, Some(&(site, _))) => site,
+            (None, None) => break,
+        };
+        let was = before
+            .next_if(|entry| entry.0 == site)
+            .unwrap_or_default()
+            .1;
+        let now = after.next_if(|entry| entry.0 == site).unwrap_or_default().1;
+        if site == mutated_site {
             continue;
         }
-        let was = before.get(&(*test, *site)).copied().unwrap_or_default();
-        let found = out.entry(test.to_string()).or_default();
+        if was.reached && !now.reached {
+            found.insert(Change::NoLongerRuns { site });
+        }
         if now.reached && !was.reached {
-            found.insert(Change::NowRuns { site: *site });
+            found.insert(Change::NowRuns { site });
         } else if now.outcomes & !was.outcomes != 0 {
-            found.insert(Change::NewOutcome { site: *site });
+            found.insert(Change::NewOutcome { site });
         }
         for (value, now_seen, was_seen) in [
             (true, now.returned_true, was.returned_true),
@@ -125,22 +214,11 @@ pub fn changes(
         ] {
             // Only worth saying for a function the test already called.
             if now_seen && !was_seen && was.reached {
-                found.insert(Change::Returns { site: *site, value });
+                found.insert(Change::Returns { site, value });
             }
         }
     }
-    for ((test, site), was) in &before {
-        if in_scope(test, *site)
-            && was.reached
-            && !after.get(&(*test, *site)).is_some_and(|now| now.reached)
-        {
-            out.entry(test.to_string())
-                .or_default()
-                .insert(Change::NoLongerRuns { site: *site });
-        }
-    }
-    out.retain(|_, found| !found.is_empty());
-    out
+    found
 }
 
 #[cfg(test)]
@@ -149,6 +227,120 @@ mod tests {
 
     fn only(test: &str) -> BTreeSet<String> {
         [test.to_string()].into_iter().collect()
+    }
+
+    #[test]
+    fn indexed_effects_cover_attribution_filter_and_mutated_sites() {
+        let cases = [
+            ("", "R\t1\t{test}\t1\n", vec![Change::NowRuns { site: 1 }]),
+            (
+                "R\t1\t{test}\t1\n",
+                "",
+                vec![Change::NoLongerRuns { site: 1 }],
+            ),
+            (
+                "O\t1\t{test}\t1\t0\t-\t-\t1\t-\t-\n",
+                "O\t1\t{test}\t9\t0\t-\t-\t1\t-\t-\n",
+                vec![Change::NewOutcome { site: 1 }],
+            ),
+            (
+                "L\t1\t{test}\t8\n",
+                "L\t1\t{test}\t10\n",
+                vec![Change::NewOutcome { site: 1 }],
+            ),
+            (
+                "B\t1\t{test}\t2\n",
+                "B\t1\t{test}\t3\n",
+                vec![Change::Returns {
+                    site: 1,
+                    value: true,
+                }],
+            ),
+            (
+                "B\t1\t{test}\t1\n",
+                "B\t1\t{test}\t3\n",
+                vec![Change::Returns {
+                    site: 1,
+                    value: false,
+                }],
+            ),
+            ("O\t1\t{test}\t0\t0\t-\t-\t1\t-\t-\n", "", Vec::new()),
+            ("R\t1\t{test}\t1\n", "R\t1\t{test}\t1\n", Vec::new()),
+            (
+                "R\t1\t{test}\t1\nL\t1\t{test}\t8\nB\t1\t{test}\t2\n",
+                "L\t1\t{test}\t10\nB\t1\t{test}\t3\nA\t1\t{test}\t4\n",
+                vec![
+                    Change::Returns {
+                        site: 1,
+                        value: true,
+                    },
+                    Change::NewOutcome { site: 1 },
+                ],
+            ),
+        ];
+        let empty = BTreeSet::new();
+        for (before, after, changes) in cases {
+            for test in ["selected", crate::trace::UNKNOWN_TEST] {
+                let selected = only(test);
+                let before = Trace::parse(&format!(
+                    "{}R\t2\tbaseline_only\t1\n",
+                    before.replace("{test}", test)
+                ));
+                let after = Trace::parse(&format!(
+                    "{}R\t{}\tmutant_only\t1\n",
+                    after.replace("{test}", test),
+                    u32::MAX,
+                ));
+                let index = BaselineIndex::new(&before);
+                for tests in [None, Some(&selected), Some(&empty)] {
+                    for mutated_site in [0, 1] {
+                        let mut expected = BTreeMap::new();
+                        if tests.is_none() {
+                            expected.insert(
+                                "baseline_only".to_string(),
+                                BTreeSet::from([Change::NoLongerRuns { site: 2 }]),
+                            );
+                            expected.insert(
+                                "mutant_only".to_string(),
+                                BTreeSet::from([Change::NowRuns { site: u32::MAX }]),
+                            );
+                        }
+                        if tests != Some(&empty) && mutated_site != 1 && !changes.is_empty() {
+                            expected.insert(test.to_string(), changes.iter().cloned().collect());
+                        }
+                        assert_eq!(index.changes(&after, tests, mutated_site), expected);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn reusing_index_keeps_disjoint_test_runs_independent() {
+        let original = Trace::parse("R\t1\tt\t1\nR\t2\tu\t1\n");
+        let index = BaselineIndex::new(&original);
+        let mutant_t = Trace::parse("R\t3\tt\t1\nR\t4\t?\t1\n");
+        let mutant_u = Trace::parse("R\t2\tu\t1\n");
+        let expected = BTreeMap::from([(
+            "t".to_string(),
+            BTreeSet::from([
+                Change::NoLongerRuns { site: 1 },
+                Change::NowRuns { site: 3 },
+            ]),
+        )]);
+        assert_eq!(
+            index.changes(&mutant_t, Some(&only("t")), u32::MAX),
+            expected
+        );
+        assert!(
+            index
+                .changes(&mutant_u, Some(&only("u")), u32::MAX)
+                .is_empty()
+        );
+        assert_eq!(
+            index.changes(&mutant_t, Some(&only("t")), u32::MAX),
+            expected
+        );
     }
 
     #[test]
