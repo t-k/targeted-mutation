@@ -627,6 +627,58 @@ fn source_only_can_use_the_literal_operator_edit_used_by_cargo_mutants() {
     assert_eq!(kills, [0, 1]);
 }
 
+#[cfg(unix)]
+#[test]
+fn source_only_nextest_uses_the_chosen_profile() {
+    let installed = Command::new("cargo")
+        .args(["nextest", "--version"])
+        .output()
+        .is_ok_and(|output| output.status.success());
+    if !installed {
+        eprintln!("nextest executable is unavailable");
+        return;
+    }
+    let dir = fixture("eligibility", "nextest-profile");
+    fs::write(
+        dir.join("src/lib.rs"),
+        r#"pub fn answer() -> u32 { const { 6 * 7 } }
+#[test] fn good() { assert_eq!(answer(), 42); }
+#[test] fn excluded() { panic!("must not be run by the selected profile"); }
+"#,
+    )
+    .unwrap();
+    fs::create_dir(dir.join(".config")).unwrap();
+    fs::write(
+        dir.join(".config/nextest.toml"),
+        "[profile.tmt]\ndefault-filter = 'test(=good)'\n\
+         [profile.empty]\ndefault-filter = 'test(=missing)'\n",
+    )
+    .unwrap();
+    let common = [
+        "--source-only",
+        "--test-tool",
+        "nextest",
+        "--quiet",
+        "--json",
+    ];
+    let run = tmt(
+        &dir,
+        &[common.as_slice(), &["--nextest-profile", "tmt"]].concat(),
+    );
+    assert_eq!(run.code, 0, "{}", run.stderr);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(report["analysis"]["nextest"]["profile"], "tmt");
+    assert_eq!(report["mutants_run"], 4);
+    assert_eq!(report["mutants_killed"], 4);
+    let run = tmt(
+        &dir,
+        &[common.as_slice(), &["--nextest-profile", "empty"]].concat(),
+    );
+    assert_eq!(run.code, 1, "{}", run.stderr);
+    assert!(run.stderr.contains("nextest"), "{}", run.stderr);
+    assert!(run.stdout.is_empty());
+}
+
 #[test]
 fn source_shards_partition_the_catalog_and_the_executed_mutants() {
     let dir = fixture("eligibility", "source-shards");
@@ -639,13 +691,12 @@ fn source_shards_partition_the_catalog_and_the_executed_mutants() {
     let base = ["--source-only", "--json", "--quiet"];
     let catalog = tmt(&dir, &[base.as_slice(), &["--list"]].concat());
     let catalog: Value = serde_json::from_str(&catalog.stdout).unwrap();
-    let mut expected: Vec<_> = catalog["mutants"]
+    let expected: Vec<_> = catalog["mutants"]
         .as_array()
         .unwrap()
         .iter()
         .map(Value::to_string)
         .collect();
-    expected.sort();
     assert_eq!(expected.len(), 4);
     // Full strength-three table from shard.pict.
     for method in ["slice", "round-robin"] {
@@ -658,6 +709,21 @@ fn source_shards_partition_the_catalog_and_the_executed_mutants() {
                 assert_eq!(list.code, 0, "{}", list.stderr);
                 let entries: Value = serde_json::from_str(&list.stdout).unwrap();
                 let own = entries["mutants"].as_array().unwrap();
+                let chunk = expected.len().div_ceil(total);
+                let actual: Vec<_> = own.iter().map(Value::to_string).collect();
+                let assigned: Vec<_> = expected
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| {
+                        if method == "slice" {
+                            i / chunk == index
+                        } else {
+                            i % total == index
+                        }
+                    })
+                    .map(|(_, entry)| entry.clone())
+                    .collect();
+                assert_eq!(actual, assigned, "{method} {shard}");
                 seen.extend(own.iter().map(Value::to_string));
                 let run = tmt(&dir, &args);
                 assert_eq!(run.code, 0, "{}", run.stderr);
@@ -666,12 +732,53 @@ fn source_shards_partition_the_catalog_and_the_executed_mutants() {
                 assert_eq!(report["mutants_killed"], own.len(), "{shard}: {report:#}");
             }
             seen.sort();
-            assert_eq!(seen, expected, "{method} {total}");
+            let mut all = expected.clone();
+            all.sort();
+            assert_eq!(seen, all, "{method} {total}");
         }
     }
     let invalid = tmt(&dir, &["--source-only", "--shard", "2/2"]);
     assert_ne!(invalid.code, 0);
     assert!(invalid.stderr.contains("shard index"), "{}", invalid.stderr);
+}
+
+#[test]
+fn workspace_shards_partition_one_combined_catalogue() {
+    let dir = fixture("multi", "workspace-shards").join("ws");
+    let candidates = |extra: &[&str]| {
+        let args = [
+            &[
+                "--workspace",
+                "--source-only",
+                "--list",
+                "--json",
+                "--quiet",
+            ][..],
+            extra,
+        ]
+        .concat();
+        let run = tmt(&dir, &args);
+        assert_eq!(run.code, 0, "{}", run.stderr);
+        let report: Value = serde_json::from_str(&run.stdout).unwrap();
+        report["packages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .flat_map(|package| {
+                package["mutants"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|m| (package["package"].to_string(), m.to_string()))
+            })
+            .collect::<Vec<_>>()
+    };
+    let all = candidates(&[]);
+    assert!(all.iter().any(|(package, _)| package.contains("ws-app")));
+    assert!(all.iter().any(|(package, _)| package.contains("ws-core")));
+    let chunk = all.len().div_ceil(2);
+    assert_eq!(candidates(&["--shard", "0/2"]), all[..chunk]);
+    assert_eq!(candidates(&["--shard", "1/2"]), all[chunk..]);
 }
 
 #[test]

@@ -109,6 +109,22 @@ Running:
 - `--error EXPR`: add `Err(EXPR)` body replacements for return types written as `Result`, including nested values such as `Option<Result<T, E>>`. For a function returning `impl Iterator<Item = Result<T, E>>`, use it with `--rebuild` or `--source-only`. Repeat this flag for more error payloads. The expression is Rust code evaluated in the function's scope. For a `Result<T, String>`, use `--error '"mutated".into()'`.
 - `--source-only`: build supported mutants directly from source and run them against the selected tests. Scope it with `--lines` or `--since` when tests launch children with `Command::env_clear()` or otherwise omit the probe environment. This mode is slower and reports surviving source mutants without trace-based input or assertion suggestions.
 
+For Cargo workspace workflows:
+
+```sh
+cargo tmt --workspace
+cargo tmt -p app -p shared --test-workspace
+cargo tmt --workspace --source-only --shard 0/4 --json
+cargo tmt --source-only --test-tool nextest --nextest-profile ci
+```
+
+- `--workspace` selects all workspace members, and repeated `-p` selects specific members. Each package keeps its own working copy and report. An analysis failure in one member still leaves the other reports available. JSON has `packages` and `errors` arrays, and SARIF has one run per successful package. Baseline files and their paths apply to a single package. `--lines` paths remain relative to each selected package.
+- `--test-workspace` runs tests from all workspace members against each selected package's mutations.
+- `--list --json` previews source edits without compiling or running any tests. Each edit includes its package-relative file and original byte range. The catalogue includes source-based distinguishing candidates whose applicability still has to be verified. Trace-derived variants, including concrete integer thresholds, depend on a test run.
+- `--source-only --shard K/N` chooses a zero-based shard of the ordered catalogue. `--sharding slice` uses consecutive ranges and is the default. `--sharding round-robin` interleaves candidates. Use the same source, selection and configuration in every CI job. An empty shard succeeds without running tests.
+- `--source-only --literal-operators` changes just the operator token. It allows the replacement operator's precedence to affect the result. The default keeps the original operands together.
+- On Unix, `--source-only --test-tool nextest` uses an installed cargo-nextest and its workspace configuration. Use `--nextest-profile` to choose a profile and that profile's filters to select tests.
+
 With either rebuild mode, TMT can run an additional test in the working copy to show how the original and a surviving mutant differ. The report includes both observed values and an assertion based on the original. A selected library test harness is required, and JSON reports expose the evidence as `findings[].witness`.
 
 The rules recognize specific Rust patterns at the library crate root and simple tests in the same file:
@@ -180,9 +196,9 @@ Functions, `impl` blocks and modules marked `#[mutants::skip]` (also inside `cfg
 
 For `<` and `>`, `==` and the reverse operator are run as well. Only a replacement that answers like the original for everything the tests saw is not run (it passes them all, and the gap says so). For `<=` and `>=` the negation is run. On integers that is `>` and `<`. On anything else it is not: for operands without an order (NaN) the negation is true and the operator false, so there the operator is run as a mutant of its own, whether or not the tests gave such operands (a mutant that changes the way the code goes can be the first to). Two mutants that both change an outcome are never taken for one, even where they answer alike for all that was seen: once the code goes another way, the comparison meets values the tests never gave it.
 
-Every mutant that cargo-mutants 27.1.0 lists for the crates in `fixtures/` has a counterpart here: `tests/parity.rs` checks the stored lists (`tests/data/cargo-mutants`) against the sites this tool finds, and names the exceptions with their reason (a `||` inside a let chain, which does not compile). An empty body is not made for a function that consists of one statement, because deleting that statement is the same mutant. The same test checks any other crate on request (see its last function); that is how the table above was completed against real code. On top of those come the mutants that need the trace: shifted boundaries, an ignored operand of `&&` / `||`, a result replaced after the body ran, deleted statements, `min` / `max`, range ends.
+The repository compares TMT with stored cargo-mutants 27.1.0 mutation lists for eight fixture crates: `tests/parity.rs` checks the stored lists (`tests/data/cargo-mutants`) against the sites this tool finds, and names the exceptions with their reason (a `||` inside a let chain, which does not compile). An empty body is not made for a function that consists of one statement, because deleting that statement is the same mutant. The same test checks any other crate on request (see its last function); that is how the table above was completed against real code. On top of those come the mutants that need the trace: shifted boundaries, an ignored operand of `&&` / `||`, a result replaced after the body ran, deleted statements, `min` / `max`, range ends.
 
-The difference is in how they are run. cargo-mutants builds every mutant and runs all tests against it. Here one build carries all mutants that a probe can carry, each is run only against the tests that execute it, and those that provably pass every test are not run at all but reported with the input that is missing. Only the rest (step 5) costs a build each, and is run when `--rebuild` asks for it: with that option every mutant of cargo-mutants is run, without it the summary says how many were not.
+The difference is in how they are run. cargo-mutants builds every mutant and runs all tests against it. Here one build carries all mutants that a probe can carry, each is run only against the tests that execute it, and those that provably pass every test are not run at all but reported with the input that is missing. Only the rest (step 5) costs a build each, and is run when `--rebuild` asks for it: the summary reports how many TMT candidates require that option. The fixture comparison checks the family and location of a candidate. Exact source edits are visible with `--list --json`.
 
 ## What "guaranteed to survive" rests on
 
@@ -215,12 +231,12 @@ java -jar tla2tools.jar formal/tla/RepairLoop.tla
 
 ## Limits
 
-- Rust only, one package per run. The direct runner sets the libtest thread count, and the isolated runner uses one test per process. tmt does not load nextest configuration or Cargo target runners. Use the explicit selection and wrapper flags for suites with extra requirements.
+- Each package is analysed through its library or a binary target. Workspace runs select multiple packages. The direct runner sets the libtest thread count, and the isolated runner uses one test per process. Nextest configuration applies when using the Unix source-only nextest runner.
 - Probe recording and probe mutants need the environment variables passed to the process under test. A subprocess that clears them can execute code without recording it. Use `--source-only` for those sites.
 - A module that two targets of the package both declare (`mod common;` in `lib.rs` and in `main.rs`) cannot be probed; its sites are counted as skipped.
 - Source files that start with a byte order mark or a `#!` line are not instrumented.
 - A macro that shadows a standard one is only recognised when it is defined at the top level of the same file.
-- Code in the arguments of macros other than the ones listed above, in array lengths, enum discriminants, `const { }` blocks and const generic arguments, and in test code is not mutated. (`const fn` and the values of constants are: step 5.)
+- Code in the arguments of macros other than the ones listed above and in test code is not mutated. Supported mutations in inline const blocks, array lengths, enum discriminants, const generic expressions, `const fn` and constant initializers need a source build.
 - Casts are not mutated. The result of a `bool` or `Option` function is replaced only at its normal exit, not at an early `return` (the replaced body covers that case).
 - The body of a function that returns an `impl Trait` other than an iterator is not replaced: no value of the hidden type can be made up.
 - Two mutants can be the same program: a body replaced by `true` and a result that is always `true`. Both are reported, on the same line.

@@ -139,6 +139,12 @@ pub struct CargoConfig {
 }
 
 /// What a run looked at and how: a report says nothing about what is outside of it.
+#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+pub struct Nextest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Serialize)]
 pub struct Shard {
     pub index: usize,
@@ -169,6 +175,8 @@ pub struct Analysis {
     pub literal_operators: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub shard: Option<Shard>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nextest: Option<Nextest>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub error_values: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1897,6 +1905,7 @@ mod tests {
             ..Location::default()
         };
         let report = Report {
+            mutants: None,
             package: "p".into(),
             analysis: Analysis::default(),
             audit: None,

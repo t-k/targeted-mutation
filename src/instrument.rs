@@ -518,6 +518,20 @@ impl Finder<'_> {
         }
     }
 
+    fn typed_constant(
+        &mut self,
+        attrs: &[syn::Attribute],
+        ty: &syn::Type,
+        value: Option<&syn::Expr>,
+    ) {
+        if !is_test_only(attrs) && !is_skipped(attrs) {
+            self.visit_type(ty);
+            if let Some(value) = value {
+                self.constant(&[], value);
+            }
+        }
+    }
+
     /// Registers a site: numbered, or among those that need a build of their own.
     fn add(&mut self, mut site: Site) {
         if self.const_depth > 0 {
@@ -1019,23 +1033,21 @@ pub fn source_mutants(site: &Site) -> Vec<SourceMutant> {
 }
 
 /// Replace only the operator tokens, preserving their surrounding source.
-pub(crate) fn literal_operator_mutants(source: &str, site: &Site) -> Vec<SourceMutant> {
-    let mut mutants = source_mutants(site);
+pub(crate) fn literal_operator_mutants(source: &str, site: &Site, mutants: &mut [SourceMutant]) {
     let gap = match &site.kind {
         SiteKind::Cmp { gap, .. } | SiteKind::Logic { gap, .. } | SiteKind::Arith { gap, .. } => {
             gap
         }
-        _ => return mutants,
+        _ => return,
     };
     if let Ok(operator) = syn::parse_str::<syn::BinOp>(&source[gap.0..gap.1]) {
         let span = operator.span().byte_range();
-        for mutant in &mut mutants {
+        for mutant in mutants {
             mutant.start = gap.0 + span.start;
             mutant.end = gap.0 + span.end;
             mutant.replacement.clone_from(&mutant.into);
         }
     }
-    mutants
 }
 
 /// The iterators to return in place of the body of a function that returns
@@ -1401,6 +1413,11 @@ pub(crate) fn is_test_only(attrs: &[syn::Attribute]) -> bool {
 
 impl<'ast> Visit<'ast> for Finder<'_> {
     fn visit_attribute(&mut self, _: &'ast syn::Attribute) {}
+    fn visit_local(&mut self, node: &'ast syn::Local) {
+        if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) {
+            visit::visit_local(self, node);
+        }
+    }
     fn visit_pat(&mut self, node: &'ast syn::Pat) {
         if let syn::Pat::Type(binding) = node {
             self.visit_type(&binding.ty);
@@ -1431,19 +1448,66 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             }
         }
     }
+    fn visit_file(&mut self, node: &'ast syn::File) {
+        if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) {
+            visit::visit_file(self, node);
+        }
+    }
+    fn visit_item_enum(&mut self, node: &'ast syn::ItemEnum) {
+        if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) {
+            visit::visit_item_enum(self, node);
+        }
+    }
+    fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
+        if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) {
+            visit::visit_item_struct(self, node);
+        }
+    }
+    fn visit_item_union(&mut self, node: &'ast syn::ItemUnion) {
+        if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) {
+            visit::visit_item_union(self, node);
+        }
+    }
+    fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
+        if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) {
+            visit::visit_item_trait(self, node);
+        }
+    }
+    fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
+        if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) {
+            visit::visit_item_type(self, node);
+        }
+    }
+    fn visit_field(&mut self, node: &'ast syn::Field) {
+        if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) {
+            visit::visit_field(self, node);
+        }
+    }
+    fn visit_impl_item_type(&mut self, node: &'ast syn::ImplItemType) {
+        if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) {
+            visit::visit_impl_item_type(self, node);
+        }
+    }
+    fn visit_trait_item_type(&mut self, node: &'ast syn::TraitItemType) {
+        if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) {
+            visit::visit_trait_item_type(self, node);
+        }
+    }
     fn visit_item_const(&mut self, node: &'ast syn::ItemConst) {
-        self.constant(&node.attrs, &node.expr);
+        self.typed_constant(&node.attrs, &node.ty, Some(&node.expr));
     }
     fn visit_item_static(&mut self, node: &'ast syn::ItemStatic) {
-        self.constant(&node.attrs, &node.expr);
+        self.typed_constant(&node.attrs, &node.ty, Some(&node.expr));
     }
     fn visit_impl_item_const(&mut self, node: &'ast syn::ImplItemConst) {
-        self.constant(&node.attrs, &node.expr);
+        self.typed_constant(&node.attrs, &node.ty, Some(&node.expr));
     }
     fn visit_trait_item_const(&mut self, node: &'ast syn::TraitItemConst) {
-        if let Some((_, value)) = &node.default {
-            self.constant(&node.attrs, value);
-        }
+        self.typed_constant(
+            &node.attrs,
+            &node.ty,
+            node.default.as_ref().map(|(_, value)| value),
+        );
     }
     fn visit_expr_const(&mut self, node: &'ast syn::ExprConst) {
         if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) {
@@ -4193,6 +4257,27 @@ mod tests {
         ] {
             assert!(assigned.iter().any(|text| text == expected), "{assigned:?}");
         }
+    }
+
+    #[test]
+    fn excluded_parent_items_do_not_contribute_const_sites() {
+        let source = r#"
+            #[cfg(test)] enum TestEnum { A = 1 + 2 }
+            #[mutants::skip] struct Skip { a: [u8; 2 + 3] }
+            #[cfg(test)] type Alias = [u8; 3 + 4];
+            #[cfg(test)] union TestUnion { a: [u8; 4 + 5] }
+            #[mutants::skip] trait Hidden { const DATA: [u8; 5 + 6]; }
+            struct Data { #[cfg(test)] bytes: [u8; 6 + 7] }
+            fn f() { #[cfg(test)] let _: [u8; 8 + 9] = [0; 17]; }
+            const DATA: [u8; 7 + 8] = [0; 15];
+        "#;
+        let found = discover(source, 0).unwrap();
+        let sites: Vec<_> = found
+            .rebuild_sites
+            .iter()
+            .map(|site| site.text.as_str())
+            .collect();
+        assert_eq!(sites, ["7 + 8"]);
     }
 
     #[test]

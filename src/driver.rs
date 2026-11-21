@@ -58,6 +58,7 @@ pub struct Options {
     pub source_only: bool,
     pub literal_operators: bool,
     pub shard: Option<report::Shard>,
+    pub nextest: Option<report::Nextest>,
     pub test_selection: TestSelection,
     /// Optimisation level to build the tests with, instead of the profile's own.
     pub opt_level: Option<u8>,
@@ -435,6 +436,13 @@ enum Runner {
         ignored: bool,
         wrapper: Option<PathBuf>,
     },
+    Nextest {
+        copy: PathBuf,
+        target_dir: PathBuf,
+        profile: Option<String>,
+        opt_level: Option<u8>,
+        flags: Vec<String>,
+    },
     /// The package's doc tests, through `cargo test --doc` in the working copy. rustdoc
     /// compiles them on every run, and they cannot be selected by name.
     Doc {
@@ -450,7 +458,7 @@ impl Runner {
     fn executable(&self) -> Option<&Path> {
         match self {
             Self::Exe(exe) | Self::Isolated { exe, .. } => Some(exe),
-            Self::Doc { .. } => None,
+            Self::Doc { .. } | Self::Nextest { .. } => None,
         }
     }
 }
@@ -1194,6 +1202,15 @@ enum RunOutput<'a> {
     Capture(&'a fs::File),
 }
 
+fn nextest_outcome(code: Option<i32>) -> Result<Outcome> {
+    match code {
+        Some(0) => Ok(Outcome::Pass),
+        // Other exit codes indicate infrastructure errors or no selected tests.
+        Some(100) => Ok(Outcome::Fail),
+        _ => bail!("cargo nextest failed outside a test (exit code {code:?})"),
+    }
+}
+
 fn run_binary(
     bin: &TestBinary,
     tests: Option<&[String]>,
@@ -1241,6 +1258,25 @@ fn run_binary(
                 .env("CARGO_MANIFEST_DIR", &bin.cwd);
             cmd
         }
+        Runner::Nextest {
+            copy,
+            target_dir,
+            profile,
+            opt_level,
+            flags,
+        } => {
+            let mut cmd = Command::new("cargo");
+            cmd.args(["nextest", "run", "--no-tests=fail"]);
+            if let Some(profile) = profile {
+                cmd.args(["--profile", profile]);
+            }
+            cmd.args(flags)
+                .current_dir(copy)
+                .env("CARGO_TARGET_DIR", target_dir)
+                .env("CARGO_BUILD_BUILD_DIR", target_dir)
+                .envs(profile_env(*opt_level));
+            cmd
+        }
         Runner::Doc {
             copy,
             target_dir,
@@ -1269,12 +1305,13 @@ fn run_binary(
     if let Runner::Isolated { test, .. } = &bin.runner {
         cmd.env("TMT_TEST", test);
     }
+    let nextest = matches!(bin.runner, Runner::Nextest { .. });
     let mut output_to_watch = None;
     match output {
         RunOutput::Capture(file) => {
             cmd.stdout(file.try_clone()?).stderr(file.try_clone()?);
         }
-        RunOutput::FirstFailure if !matches!(bin.runner, Runner::Isolated { .. }) => {
+        RunOutput::FirstFailure if !nextest && !matches!(bin.runner, Runner::Isolated { .. }) => {
             // A regular file has a readable end even if a descendant keeps stdout.
             // Reuse the per-run marker, whose contents are never interpreted by probes.
             let writer = fs::OpenOptions::new().append(true).open(&unable_mark)?;
@@ -1293,6 +1330,12 @@ fn run_binary(
         .with_context(|| format!("starting the tests of `{}`", bin.name))?;
     let group = child.id();
     let kill = |child: &mut std::process::Child| {
+        if nextest {
+            // Nextest creates a process group per test. Let its signal handler
+            // forward SIGTERM and reap those groups before we return.
+            stop_nextest(child, Duration::from_secs(12));
+            return;
+        }
         kill_test_group(group);
         let _ = child.kill();
         let _ = child.wait();
@@ -1303,6 +1346,9 @@ fn run_binary(
         if let Some(status) = child.try_wait()? {
             if matches!(bin.runner, Runner::Isolated { .. }) || output_to_watch.is_some() {
                 kill_test_group(group);
+            }
+            if nextest {
+                return nextest_outcome(status.code());
             }
             return Ok(if status.success() {
                 Outcome::Pass
@@ -1381,27 +1427,144 @@ impl FailureOutput {
     }
 }
 
+fn stop_nextest(child: &mut std::process::Child, grace: Duration) {
+    let wait = |child: &mut std::process::Child, limit: Duration| {
+        let started = Instant::now();
+        loop {
+            match child.try_wait() {
+                Ok(Some(_)) => return true,
+                Ok(None) if started.elapsed() < limit => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                _ => return false,
+            }
+        }
+    };
+    if wait(child, Duration::ZERO) {
+        return;
+    }
+    let group = child.id();
+    // Snapshot the owned groups while the parent exists. A wrapper can exit
+    // before its independently grouped children are reparented and stopped.
+    #[cfg(unix)]
+    let mut owned = owned_test_processes(group);
+    signal_test_group(group, 15);
+    let mut reaped = wait(child, grace);
+    if !reaped {
+        // The second signal asks nextest to force its units to stop.
+        signal_test_group(group, 15);
+        reaped = wait(child, grace.min(Duration::from_secs(1)));
+    }
+    #[cfg(unix)]
+    {
+        if !reaped {
+            owned.extend(owned_test_processes(group));
+        }
+        let current = test_processes();
+        let surviving_groups: BTreeSet<_> = current
+            .iter()
+            .filter(|process| {
+                owned.iter().any(|before| {
+                    process.pid == before.pid
+                        && process.group == before.group
+                        && process.started == before.started
+                })
+            })
+            .map(|process| process.group)
+            .collect();
+        for surviving in surviving_groups {
+            kill_test_group(surviving);
+        }
+    }
+    if !reaped {
+        kill_test_group(group);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+}
+
+#[cfg(unix)]
+struct TestProcess {
+    pid: u32,
+    parent: u32,
+    group: u32,
+    started: String,
+}
+
+#[cfg(unix)]
+fn test_processes() -> Vec<TestProcess> {
+    let Ok(processes) = Command::new("ps")
+        .args([
+            "-e", "-o", "pid=", "-o", "ppid=", "-o", "pgid=", "-o", "lstart=",
+        ])
+        .output()
+    else {
+        return vec![];
+    };
+    String::from_utf8_lossy(&processes.stdout)
+        .lines()
+        .filter_map(|line| {
+            let mut fields = line.split_whitespace();
+            Some(TestProcess {
+                pid: fields.next()?.parse().ok()?,
+                parent: fields.next()?.parse().ok()?,
+                group: fields.next()?.parse().ok()?,
+                started: fields.collect::<Vec<_>>().join(" "),
+            })
+        })
+        .collect()
+}
+
+#[cfg(unix)]
+fn owned_test_processes(root: u32) -> Vec<TestProcess> {
+    let data = test_processes();
+    let mut owned = HashSet::from([root]);
+    loop {
+        let before = owned.len();
+        for process in &data {
+            if owned.contains(&process.parent) {
+                owned.insert(process.pid);
+            }
+        }
+        if owned.len() == before {
+            break;
+        }
+    }
+    // Only signal groups that are independently owned, rather than a group a
+    // child happened to join. Retain member identities in case its leader exits.
+    let groups: HashSet<_> = data
+        .iter()
+        .filter(|process| process.pid == process.group && owned.contains(&process.pid))
+        .map(|process| process.group)
+        .collect();
+    data.into_iter()
+        .filter(|process| owned.contains(&process.pid) && groups.contains(&process.group))
+        .collect()
+}
+
 fn kill_test_group(id: u32) {
+    signal_test_group(id, 9);
+}
+
+fn signal_test_group(id: u32, signal: i32) {
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         unsafe extern "C" {
             fn killpg(group: std::ffi::c_int, signal: std::ffi::c_int) -> std::ffi::c_int;
         }
-        const SIGKILL: std::ffi::c_int = 9;
         if let Ok(group) = std::ffi::c_int::try_from(id) {
             // SAFETY: the argument is the child PID used to create its own test group.
-            // SIGKILL is 9 on Linux and macOS.
-            unsafe { killpg(group, SIGKILL) };
+            unsafe { killpg(group, signal) };
         }
     }
     #[cfg(all(unix, not(any(target_os = "linux", target_os = "macos"))))]
     let _ = Command::new("kill")
-        .args(["-KILL", "--", &format!("-{id}")])
+        .args([format!("-{signal}"), "--".to_owned(), format!("-{id}")])
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .status();
     #[cfg(not(unix))]
-    let _ = id;
+    let _ = (id, signal);
 }
 
 /// Keeps diagnostics on disk so a descendant holding stdout open cannot hold up the driver.
@@ -2306,7 +2469,7 @@ impl Session {
                 }
                 let filter = match bin.runner {
                     Runner::Exe(_) => test_filter(&tests, &bin.tests),
-                    Runner::Doc { .. } | Runner::Isolated { .. } => None,
+                    Runner::Doc { .. } | Runner::Isolated { .. } | Runner::Nextest { .. } => None,
                 };
                 Some((index, filter))
             })
@@ -2509,6 +2672,13 @@ fn cargo_metadata(dir: &Path, cargo: &CargoConfig) -> Result<Metadata> {
     serde_json::from_slice(&output.stdout).context("parsing cargo metadata")
 }
 
+#[derive(Clone, Copy)]
+struct WorkspaceShard {
+    offset: usize,
+    total: usize,
+    member_total: usize,
+}
+
 /// A workspace or explicit package selection. An error in one package belongs to
 /// that package, and the remaining packages can still be evaluated.
 pub fn run_packages(options: &Options, names: &[String]) -> Result<Vec<(String, Result<Report>)>> {
@@ -2537,25 +2707,78 @@ pub fn run_packages(options: &Options, names: &[String]) -> Result<Vec<(String, 
             base.display()
         );
     }
-    let mut reports = vec![];
-    for name in selected {
+    let member_options = selected.into_iter().map(|name| {
         let mut member = options.clone();
         member.package = Some(name.clone());
         member.work_dir = Some(base.join(&name));
-        reports.push((name, run_package(&member, Some(&base))));
+        (name, member)
+    });
+    let Some(shard) = options.shard else {
+        return Ok(member_options
+            .map(|(name, member)| (name, run_package(&member, Some(&base), None)))
+            .collect());
+    };
+    if !options.source_only || shard.index >= shard.count {
+        bail!("shards require --source-only and a valid shard index");
     }
-    Ok(reports)
+    let catalogues: Vec<_> = member_options
+        .map(|(name, member)| {
+            let mut preview = member.clone();
+            preview.list = true;
+            preview.shard = None;
+            preview.progress = false;
+            let catalogue = run_package(&preview, Some(&base), None);
+            (name, member, catalogue)
+        })
+        .collect();
+    let total = catalogues
+        .iter()
+        .filter_map(|(_, _, catalogue)| catalogue.as_ref().ok()?.mutants.as_ref().map(Vec::len))
+        .sum();
+    let mut offset = 0;
+    Ok(catalogues
+        .into_iter()
+        .map(|(name, member, catalogue)| {
+            let result = catalogue.and_then(|mut catalogue| {
+                let candidates = catalogue.mutants.as_mut().expect("source catalogue");
+                let member_total = candidates.len();
+                let range = WorkspaceShard {
+                    offset,
+                    total,
+                    member_total,
+                };
+                offset += member_total;
+                if member.list {
+                    catalogue.analysis.shard = Some(shard);
+                    let mut index = range.offset;
+                    candidates.retain(|_| {
+                        let keep = shard.contains(index, total);
+                        index += 1;
+                        keep
+                    });
+                    Ok(catalogue)
+                } else {
+                    run_package(&member, Some(&base), Some(range))
+                }
+            });
+            (name, result)
+        })
+        .collect())
 }
 
 pub fn run(options: &Options) -> Result<Report> {
-    run_package(options, None)
+    run_package(options, None, None)
 }
 
-fn run_package(options: &Options, workspace_work: Option<&Path>) -> Result<Report> {
-    if let Some(shard) = options.shard {
-        if !options.source_only || shard.index >= shard.count {
-            bail!("shards require --source-only and a valid shard index");
-        }
+fn run_package(
+    options: &Options,
+    workspace_work: Option<&Path>,
+    workspace_shard: Option<WorkspaceShard>,
+) -> Result<Report> {
+    if let Some(shard) = options.shard
+        && (!options.source_only || shard.index >= shard.count)
+    {
+        bail!("shards require --source-only and a valid shard index");
     }
     let mut seen_errors = HashSet::new();
     let mut error_values = vec![];
@@ -2568,6 +2791,16 @@ fn run_package(options: &Options, workspace_work: Option<&Path>) -> Result<Repor
         }
     }
     let selection = &options.test_selection;
+    if options.nextest.is_some() {
+        if !cfg!(unix) {
+            bail!("the nextest runner is available on Unix");
+        }
+        if !options.source_only || options.doc || selection.enabled() {
+            bail!(
+                "--test-tool nextest requires --source-only; select tests through the nextest profile"
+            );
+        }
+    }
     if options.doc && selection.enabled() {
         bail!("--doc cannot be combined with isolated test selection");
     }
@@ -2633,7 +2866,12 @@ fn run_package(options: &Options, workspace_work: Option<&Path>) -> Result<Repor
     let root_target = package
         .targets
         .iter()
-        .find(|t| is_kind(t, &["lib", "rlib", "cdylib", "staticlib", "dylib"]))
+        .find(|t| {
+            is_kind(
+                t,
+                &["lib", "rlib", "cdylib", "staticlib", "dylib", "proc-macro"],
+            )
+        })
         .or_else(|| package.targets.iter().find(|t| is_kind(t, &["bin"])))
         .ok_or_else(|| anyhow!("package `{}` has no lib or bin target", package.name))?;
 
@@ -2936,12 +3174,15 @@ fn run_package(options: &Options, workspace_work: Option<&Path>) -> Result<Repor
         }
     }
 
-    let source_mutants = |file: &SourceFile, site: &Site| {
-        if options.literal_operators {
-            instrument::literal_operator_mutants(&file.original, site)
-        } else {
-            instrument::source_mutants(site)
+    let source_mutants = |file: &SourceFile, site: &Site, include_boundary: bool| {
+        let mut mutants = instrument::source_mutants(site);
+        if include_boundary {
+            mutants.extend(instrument::source_boundary_mutant(site));
         }
+        if options.literal_operators {
+            instrument::literal_operator_mutants(&file.original, site, &mut mutants);
+        }
+        mutants
     };
     let counts = options.shard.map(|_| {
         let regular: usize = files
@@ -2949,10 +3190,7 @@ fn run_package(options: &Options, workspace_work: Option<&Path>) -> Result<Repor
             .map(|file| {
                 file.rebuild_sites
                     .iter()
-                    .map(|site| {
-                        source_mutants(file, site).len()
-                            + usize::from(instrument::source_boundary_mutant(site).is_some())
-                    })
+                    .map(|site| source_mutants(file, site, true).len())
                     .sum::<usize>()
             })
             .sum();
@@ -2963,8 +3201,14 @@ fn run_package(options: &Options, workspace_work: Option<&Path>) -> Result<Repor
                 .count();
         (regular, total)
     });
-    let in_shard = |index| match (options.shard, counts) {
-        (Some(shard), Some((_, total))) => shard.contains(index, total),
+    if let (Some(range), Some((_, local_total))) = (workspace_shard, counts)
+        && range.member_total != local_total
+    {
+        bail!("package catalogue changed while preparing its workspace shard");
+    }
+    let in_shard = |index| match (options.shard, counts, workspace_shard) {
+        (Some(shard), _, Some(range)) => shard.contains(range.offset + index, range.total),
+        (Some(shard), Some((_, total)), _) => shard.contains(index, total),
         _ => true,
     };
     if let Some((mut index, _)) = counts {
@@ -2979,13 +3223,20 @@ fn run_package(options: &Options, workspace_work: Option<&Path>) -> Result<Repor
     }
     let empty_shard = counts.is_some_and(|(_, total)| !(0..total).any(in_shard));
 
+    let package_path = package.manifest_path.parent().unwrap_or(Path::new("."));
+    let mut report_path = repository_prefix(package_path);
+    if report_path.is_empty()
+        && workspace_work.is_some()
+        && let Ok(relative) = package_path.strip_prefix(&workspace)
+        && !relative.as_os_str().is_empty()
+    {
+        report_path = format!("{}/", relative.to_string_lossy().replace('\\', "/"));
+    }
     let mut report = Report {
         package: package.name.clone(),
         sites: if empty_shard { 0 } else { total_sites },
         analysis: report::Analysis {
-            package_path: repository_prefix(
-                package.manifest_path.parent().unwrap_or(Path::new(".")),
-            ),
+            package_path: report_path,
             since: options.since.clone(),
             lines: options.lines.clone(),
             tests_of: test_packages.iter().map(|p| p.name.clone()).collect(),
@@ -2997,6 +3248,7 @@ fn run_package(options: &Options, workspace_work: Option<&Path>) -> Result<Repor
             source_only: options.source_only,
             literal_operators: options.literal_operators,
             shard: options.shard,
+            nextest: options.nextest.clone(),
             error_values: error_values
                 .iter()
                 .map(|value| (*value).to_owned())
@@ -3018,9 +3270,8 @@ fn run_package(options: &Options, workspace_work: Option<&Path>) -> Result<Repor
                     .map(|site| (site, false))
                     .chain(file.rebuild_sites.iter().map(|site| (site, true)))
                     .flat_map(move |(site, requires_rebuild)| {
-                        source_mutants(file, site)
+                        source_mutants(file, site, true)
                             .into_iter()
-                            .chain(instrument::source_boundary_mutant(site))
                             .map(move |mutant| report::Candidate {
                                 what: mutant.what,
                                 into: mutant.into,
@@ -3065,16 +3316,6 @@ fn run_package(options: &Options, workspace_work: Option<&Path>) -> Result<Repor
                     }),
             );
         }
-        candidates.sort_by(|a, b| {
-            let a_edit = &a.edits[0];
-            let b_edit = &b.edits[0];
-            (&a_edit.file, a_edit.start, a_edit.end, &a.into).cmp(&(
-                &b_edit.file,
-                b_edit.start,
-                b_edit.end,
-                &b.into,
-            ))
-        });
         report.mutants = Some(candidates);
         return Ok(report);
     }
@@ -3272,51 +3513,70 @@ fn run_package(options: &Options, workspace_work: Option<&Path>) -> Result<Repor
     let root_exe = (!witness_candidates.is_empty())
         .then(|| root_test_exe(&build))
         .flatten();
-    for (name, exe, owner, kind) in build.test_binaries {
-        if !selection.targets.is_empty() && !selection.targets.contains(&name) {
-            continue;
-        }
-        let owner_package = test_packages
+    if let Some(nextest) = &options.nextest {
+        let mut flags: Vec<_> = test_packages
             .iter()
-            .find(|p| p.name == owner)
-            .expect("binaries are filtered by these packages");
-        let cwd = in_copy(
-            owner_package
-                .manifest_path
-                .parent()
-                .expect("manifest has a parent"),
-        )?;
-        if selection.enabled() {
-            let all = list_tests(&exe, &cwd, &work, false, true)?;
-            let ignored = list_tests(&exe, &cwd, &work, true, true)?;
-            for test in all {
-                let was_ignored = ignored.contains(&test);
-                if (was_ignored && !selection.include_ignored)
-                    || (!selection.include.is_empty() && !selection.include.contains(&test))
-                    || selection.exclude.contains(&test)
-                {
-                    continue;
-                }
-                runners.push((
-                    format!("{owner}::{}::{name}::{test}", kind.join("+")),
-                    Runner::Isolated {
-                        exe: exe.clone(),
-                        test,
-                        ignored: was_ignored,
-                        wrapper: wrapper.clone(),
-                    },
-                    cwd.clone(),
-                ));
+            .flat_map(|p| ["-p".to_owned(), p.name.clone()])
+            .collect();
+        flags.extend(options.cargo.flags());
+        runners.push((
+            "nextest".to_owned(),
+            Runner::Nextest {
+                copy: copy.clone(),
+                target_dir: build_target.clone(),
+                profile: nextest.profile.clone(),
+                opt_level: options.opt_level,
+                flags,
+            },
+            session.package_dir.clone(),
+        ));
+    } else {
+        for (name, exe, owner, kind) in build.test_binaries {
+            if !selection.targets.is_empty() && !selection.targets.contains(&name) {
+                continue;
             }
-            continue;
+            let owner_package = test_packages
+                .iter()
+                .find(|p| p.name == owner)
+                .expect("binaries are filtered by these packages");
+            let cwd = in_copy(
+                owner_package
+                    .manifest_path
+                    .parent()
+                    .expect("manifest has a parent"),
+            )?;
+            if selection.enabled() {
+                let all = list_tests(&exe, &cwd, &work, false, true)?;
+                let ignored = list_tests(&exe, &cwd, &work, true, true)?;
+                for test in all {
+                    let was_ignored = ignored.contains(&test);
+                    if (was_ignored && !selection.include_ignored)
+                        || (!selection.include.is_empty() && !selection.include.contains(&test))
+                        || selection.exclude.contains(&test)
+                    {
+                        continue;
+                    }
+                    runners.push((
+                        format!("{owner}::{}::{name}::{test}", kind.join("+")),
+                        Runner::Isolated {
+                            exe: exe.clone(),
+                            test,
+                            ignored: was_ignored,
+                            wrapper: wrapper.clone(),
+                        },
+                        cwd.clone(),
+                    ));
+                }
+                continue;
+            }
+            // Tests of other packages are named after their package.
+            let name = if owner == package.name {
+                name
+            } else {
+                format!("{owner}::{name}")
+            };
+            runners.push((name, Runner::Exe(exe), cwd));
         }
-        // Tests of other packages are named after their package.
-        let name = if owner == package.name {
-            name
-        } else {
-            format!("{owner}::{name}")
-        };
-        runners.push((name, Runner::Exe(exe), cwd));
     }
     if selection.enabled() && runners.is_empty() {
         bail!("{build_note}no tests matched the requested selection");
@@ -3724,14 +3984,8 @@ fn run_package(options: &Options, workspace_work: Option<&Path>) -> Result<Repor
         });
         for site in file.rebuild_sites.iter().chain(retried) {
             built.extend(
-                source_mutants(file, site)
+                source_mutants(file, site, options.source_only)
                     .into_iter()
-                    .chain(
-                        options
-                            .source_only
-                            .then(|| instrument::source_boundary_mutant(site))
-                            .flatten(),
-                    )
                     .map(|mutant| (file, site, mutant, None)),
             );
         }
@@ -3941,7 +4195,7 @@ fn run_package(options: &Options, workspace_work: Option<&Path>) -> Result<Repor
                             bin.tests.contains(required) && !ignored.contains(required)
                         }
                         Runner::Isolated { test, .. } => test == required,
-                        Runner::Doc { .. } => false,
+                        Runner::Doc { .. } | Runner::Nextest { .. } => false,
                     })
             })
         };
@@ -5001,6 +5255,34 @@ serde = { path = "../../serde-fork" }
             mutant_timeout(Duration::from_secs(2)),
             Duration::from_secs(15)
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stopping_nextest_reaps_a_runner_that_ignores_termination() {
+        use std::io::Read as _;
+        use std::os::unix::process::CommandExt as _;
+
+        let mut child = Command::new("sh")
+            .args(["-c", "trap '' TERM; printf X; while :; do sleep 1; done"])
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdout.take().unwrap().read_exact(&mut [0]).unwrap();
+
+        stop_nextest(&mut child, Duration::from_millis(10));
+        let status = child.try_wait().unwrap().expect("runner was reaped");
+        assert!(!status.success());
+    }
+
+    #[test]
+    fn nextest_counts_only_a_test_failure_as_a_kill() {
+        assert_eq!(nextest_outcome(Some(0)).unwrap(), Outcome::Pass);
+        assert_eq!(nextest_outcome(Some(100)).unwrap(), Outcome::Fail);
+        for code in [Some(4), Some(101), Some(102), Some(105), None] {
+            assert!(nextest_outcome(code).is_err(), "{code:?}");
+        }
     }
 
     #[test]

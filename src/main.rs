@@ -10,6 +10,13 @@ enum Sharding {
     RoundRobin,
 }
 
+#[derive(Clone, Copy, Default, clap::ValueEnum)]
+enum TestTool {
+    #[default]
+    Cargo,
+    Nextest,
+}
+
 /// Targeted mutation testing: finds the wrong implementations your tests would let
 /// through, and says which input or assertion would catch them.
 #[derive(Parser)]
@@ -93,12 +100,18 @@ struct Cli {
     /// Replace just the operator token, using Rust precedence for the new spelling.
     #[arg(long, requires = "source_only")]
     literal_operators: bool,
-    /// Select a zero-based source-only shard K/N within each package.
+    /// Select a zero-based source-only shard K/N.
     #[arg(long, requires = "source_only", value_name = "K/N")]
     shard: Option<report::Shard>,
     /// Method for distributing candidates across shards (default: slice).
     #[arg(long, requires = "shard", value_enum)]
     sharding: Option<Sharding>,
+    /// Select the runner (nextest requires --source-only).
+    #[arg(long, value_enum, default_value = "cargo")]
+    test_tool: TestTool,
+    /// Nextest profile to use with --test-tool nextest.
+    #[arg(long, value_name = "PROFILE")]
+    nextest_profile: Option<String>,
     /// Run one selected libtest test per process, including its child threads.
     #[arg(long)]
     isolate_tests: bool,
@@ -154,6 +167,11 @@ struct Cli {
 /// Exit codes: 0 no gaps, 1 analysis failed, 2 gaps found, 3 no mutations executed.
 fn main() -> ExitCode {
     let cli = Cli::parse_from(arguments(std::env::args_os()));
+    let nextest = matches!(cli.test_tool, TestTool::Nextest);
+    if !nextest && cli.nextest_profile.is_some() {
+        eprintln!("tmt: --nextest-profile requires --test-tool nextest");
+        return ExitCode::FAILURE;
+    }
     let options = driver::Options {
         dir: cli.directory.unwrap_or(cli.dir),
         package: cli.package.first().cloned(),
@@ -176,6 +194,9 @@ fn main() -> ExitCode {
         shard: cli.shard.map(|mut shard| {
             shard.round_robin = matches!(cli.sharding, Some(Sharding::RoundRobin));
             shard
+        }),
+        nextest: nextest.then_some(report::Nextest {
+            profile: cli.nextest_profile,
         }),
         test_selection: driver::TestSelection {
             isolate: cli.isolate_tests,
@@ -303,6 +324,7 @@ fn show_workspace(
             .map(|result| {
                 let mut sarif: serde_json::Value =
                     serde_json::from_str(&report::render_sarif(result)).expect("SARIF serialises");
+                sarif["runs"][0]["properties"]["package"] = result.package.clone().into();
                 sarif["runs"][0].take()
             })
             .collect();

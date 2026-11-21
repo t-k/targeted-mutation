@@ -226,6 +226,9 @@ pub(crate) fn discover(source: &str) -> Vec<Candidate> {
     let Ok(file) = syn::parse_file(source) else {
         return vec![];
     };
+    if crate::instrument::is_test_only(&file.attrs) || crate::instrument::is_skipped(&file.attrs) {
+        return vec![];
+    }
     let mut candidates = position_searches(source, &file)
         .into_iter()
         .map(|search| {
@@ -440,6 +443,14 @@ pub(crate) fn parse_observation(output: &str) -> Option<String> {
 mod tests {
     use super::*;
     use quote::ToTokens;
+
+    #[test]
+    fn test_only_library_does_not_propose_source_witnesses() {
+        let code = "pub fn chars(text: &str) -> usize { text.chars().count() }";
+        assert!(!discover(code).is_empty());
+        assert!(discover(&format!("#![cfg(test)]\n{code}")).is_empty());
+        assert!(discover(&format!("#![mutants::skip]\n{code}")).is_empty());
+    }
 
     #[test]
     fn witness_test_edits_keep_names_and_placement_for_each_input() {
