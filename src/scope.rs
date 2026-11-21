@@ -131,6 +131,11 @@ impl LineIndex {
     }
 
     pub(crate) fn position(&self, source: &str, offset: usize) -> (usize, usize) {
+        let offset = if source.is_char_boundary(offset) {
+            offset
+        } else {
+            source.len()
+        };
         let line = self.line_of(offset);
         let column = source[self.0[line - 1]..offset].chars().count() + 1;
         (line, column)
@@ -311,15 +316,13 @@ new file mode 100644
             let lines = LineIndex::new(&source);
             for offset in 0..=source.len() + 1 {
                 assert_eq!(lines.line_of(offset), line_of(&source, offset), "{row}");
-                if offset <= source.len() && source.is_char_boundary(offset) {
-                    let prefix = &source[..offset];
-                    let column = prefix.rsplit('\n').next().unwrap().chars().count() + 1;
-                    assert_eq!(
-                        lines.position(&source, offset),
-                        (line_of(&source, offset), column),
-                        "{row}"
-                    );
-                }
+                let prefix = source.get(..offset).unwrap_or(&source);
+                let column = prefix.rsplit('\n').next().unwrap().chars().count() + 1;
+                assert_eq!(
+                    lines.position(&source, offset),
+                    (line_of(prefix, prefix.len()), column),
+                    "{row}"
+                );
             }
             let (line, column) = match *query {
                 "first" => (1, 1),

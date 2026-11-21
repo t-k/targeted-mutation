@@ -3711,8 +3711,7 @@ fn run_package(
                             column: 1,
                             ..Default::default()
                         },
-                        &original,
-                        original.len(),
+                        scope::LineIndex::new(&original).position(&original, original.len()),
                         report::SkipReason::UnparseableSource,
                         Some(diagnostic),
                     ));
@@ -4440,8 +4439,7 @@ fn run_package(
                 }
                 report.skipped.push(report::SkippedSite::new(
                     report::location(&file.display, site),
-                    &file.original,
-                    site.end,
+                    file.lines.position(&file.original, site.end),
                     if fallback {
                         report::SkipReason::ProbeReplacedBySourceRebuild
                     } else {
@@ -4455,8 +4453,7 @@ fn run_package(
             report.skipped.extend(file.rebuild_sites.iter().map(|site| {
                 report::SkippedSite::new(
                     report::location(&file.display, site),
-                    &file.original,
-                    site.end,
+                    file.lines.position(&file.original, site.end),
                     report::SkipReason::RequiresSourceRebuild,
                     None,
                 )
@@ -4930,8 +4927,7 @@ fn run_package(
                             if skipped_targets.insert((&file.path, site.start, site.end)) {
                                 report.skipped.push(report::SkippedSite::new(
                                     report::location(&file.display, site),
-                                    &file.original,
-                                    site.end,
+                                    file.lines.position(&file.original, site.end),
                                     report::SkipReason::SourceNotBuilt,
                                     None,
                                 ));

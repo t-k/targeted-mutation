@@ -260,14 +260,10 @@ pub struct SkippedSite {
 impl SkippedSite {
     pub(crate) fn new(
         at: Location,
-        source: &str,
-        end: usize,
+        (end_line, end_column): (usize, usize),
         reason: SkipReason,
         diagnostic: Option<String>,
     ) -> Self {
-        let before = source.get(..end).unwrap_or(source);
-        let end_line = crate::scope::line_of(before, before.len());
-        let end_column = before.rsplit('\n').next().unwrap_or("").chars().count() + 1;
         Self {
             at,
             end_line,
