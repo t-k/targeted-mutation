@@ -1,10 +1,13 @@
 //! Targeted mutation testing: find the wrong implementations your tests would let through.
 
 pub mod baseline;
+mod campaign_identity;
+mod checkpoint;
 pub mod driver;
 mod git_index;
 pub mod instrument;
 mod modules;
+pub mod output_fixture;
 pub mod plan;
 mod progress;
 pub mod propagation;
@@ -12,6 +15,7 @@ pub mod report;
 pub mod scope;
 pub mod trace;
 mod witness;
+mod work_lock;
 
 /// The runtime injected into the crate under test, compiled here so that its logic can be
 /// checked against the planner.

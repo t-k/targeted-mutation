@@ -1,0 +1,660 @@
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Output};
+
+use serde_json::Value;
+
+fn package(name: &str) -> PathBuf {
+    let path = Path::new(env!("CARGO_TARGET_TMPDIR")).join(name);
+    if path.exists() {
+        fs::remove_dir_all(&path).unwrap();
+    }
+    fs::create_dir_all(path.join("src")).unwrap();
+    write(
+        &path,
+        "Cargo.toml",
+        "[package]\nname = \"campaign-example\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[workspace]\n",
+    );
+    write(
+        &path,
+        "src/lib.rs",
+        "pub fn value() -> u32 { 9 }\n#[test] fn exact_value() { assert_eq!(value(), 9); }\n",
+    );
+    path
+}
+
+fn write(path: &Path, relative: &str, content: &str) {
+    let path = path.join(relative);
+    fs::create_dir_all(path.parent().unwrap()).unwrap();
+    fs::write(path, content).unwrap();
+}
+
+fn command(path: &Path, args: &[&str]) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cargo-tmt"));
+    command
+        .arg(path)
+        .args(args)
+        .env_remove("TMT_MUTANT")
+        .env_remove("TMT_TRACE");
+    command
+}
+
+fn json(run: &Output, code: i32) -> Value {
+    assert_eq!(
+        run.status.code(),
+        Some(code),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    serde_json::from_slice(&run.stdout).unwrap()
+}
+
+#[cfg(unix)]
+fn wrapper(path: &Path, contents: &str) {
+    use std::os::unix::fs::PermissionsExt;
+    write(path, "wrap", contents);
+    fs::set_permissions(path.join("wrap"), fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+#[test]
+fn checkpoint_reuses_only_the_same_campaign_context() {
+    let path = package("checkpoint-cli");
+    let args = [
+        "--source-only",
+        "--lines",
+        "src/lib.rs:1",
+        "--checkpoint",
+        "--quiet",
+        "--json",
+    ];
+    let run = || command(&path, &args).output().unwrap();
+    let first = json(&run(), 0);
+    let checkpoint_path = first["analysis"]["checkpoint"].as_str().unwrap();
+    let events = || {
+        fs::read_to_string(checkpoint_path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .collect::<Vec<_>>()
+    };
+    let recorded = events();
+    assert_eq!(recorded.last().unwrap()["event"], "campaign_completed");
+    assert!(
+        recorded
+            .iter()
+            .any(|row| row["event"] == "outcome" && row["phase"] == "source")
+    );
+
+    // Simulate interruption after candidate outcomes but before the final campaign marker.
+    let mut incomplete = fs::read_to_string(checkpoint_path).unwrap();
+    let last = incomplete.trim_end().rfind('\n').unwrap() + 1;
+    incomplete.truncate(last);
+    incomplete.push_str("{\"event\":\"campaign_com");
+    fs::write(checkpoint_path, incomplete).unwrap();
+    assert_eq!(json(&run(), 0), first);
+    assert!(events().iter().any(|row| row["event"] == "phase_resumed"
+        && row["phase"] == "source"
+        && row["reused"].as_u64().unwrap() == 2));
+
+    let before = events().len();
+    write(
+        &path,
+        "src/lib.rs",
+        "pub fn value() -> u32 { 8 }\n#[test] fn exact_value() { assert_eq!(value(), 8); }\n",
+    );
+    assert_eq!(json(&run(), 0)["mutants_killed"], 2);
+    let changed = events();
+    assert!(
+        changed[before..]
+            .iter()
+            .any(|row| row["event"] == "phase_started" && row["phase"] == "source")
+    );
+    assert!(
+        !changed[before..]
+            .iter()
+            .any(|row| row["event"] == "phase_resumed")
+    );
+}
+
+#[test]
+fn cargo_output_assets_work_in_a_child_with_a_cleared_environment() {
+    let path = package("output-fixture-cli");
+    write(&path, "assets/message.txt", "isolated asset");
+    write(
+        &path,
+        "src/bin/helper.rs",
+        r#"
+fn main() {
+    let exe = std::env::current_exe().unwrap();
+    print!("{}", std::fs::read_to_string(exe.parent().unwrap().join("runtime/message.txt")).unwrap());
+}
+"#,
+    );
+    write(
+        &path,
+        "tests/child.rs",
+        r#"
+#[test]
+fn child_reads_asset() {
+    let child = std::process::Command::new(env!("CARGO_BIN_EXE_helper")).env_clear().output().unwrap();
+    assert!(child.status.success(), "{:?}", child.stderr);
+    assert_eq!(child.stdout, b"isolated asset");
+    assert_eq!(campaign_example::value(), 9);
+}
+"#,
+    );
+    let mut args = vec![
+        "--source-only",
+        "--test-target",
+        "child",
+        "--lines",
+        "src/lib.rs:1",
+        "--quiet",
+        "--json",
+    ];
+    let missing = command(&path, &args).output().unwrap();
+    assert_eq!(missing.status.code(), Some(1));
+    args.extend(["--copy-output-fixture", "assets=debug/runtime"]);
+    let report = json(&command(&path, &args).output().unwrap(), 0);
+    assert_eq!(report["mutants_killed"], 2);
+    assert_eq!(
+        report["analysis"]["output_fixtures"][0]["to"],
+        "debug/runtime"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn explicit_fixture_exclusion_only_omits_a_confined_entry() {
+    let path = package("dangling-fixture-cli");
+    write(&path, "vendor/module.txt", "sdk");
+    fs::create_dir_all(path.join("vendor/.bin")).unwrap();
+    std::os::unix::fs::symlink("../missing", path.join("vendor/.bin/glob")).unwrap();
+    let mut args = vec!["--list", "--quiet", "--json", "--copy-fixture", "vendor"];
+    let strict = command(&path, &args).output().unwrap();
+    assert_eq!(strict.status.code(), Some(1));
+    args.extend(["--copy-fixture-exclude", "vendor/.bin/glob"]);
+    let report = json(&command(&path, &args).output().unwrap(), 0);
+    assert_eq!(
+        report["analysis"]["copy_fixture_excludes"][0],
+        "vendor/.bin/glob"
+    );
+    assert_eq!(
+        fs::read_to_string(path.join("target/tmt/src/vendor/module.txt")).unwrap(),
+        "sdk"
+    );
+    assert!(!path.join("target/tmt/src/vendor/.bin/glob").exists());
+    fs::remove_file(path.join("vendor/.bin/glob")).unwrap();
+    std::os::unix::fs::symlink("../../../missing", path.join("vendor/.bin/glob")).unwrap();
+    let outside = command(&path, &args).output().unwrap();
+    assert_eq!(outside.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&outside.stderr).contains("outside the workspace"));
+}
+
+#[cfg(unix)]
+#[test]
+fn wrapper_can_clean_up_after_mutant_timeout_or_use_force_only() {
+    let path = package("wrapper-grace-cli");
+    write(
+        &path,
+        "src/lib.rs",
+        r#"pub fn value() -> bool { true }
+#[test]
+fn running() {
+    if !value() { std::thread::sleep(std::time::Duration::from_secs(10)); }
+}
+"#,
+    );
+    wrapper(
+        &path,
+        r#"#!/bin/sh
+set -eu
+entry=$(mktemp -d "$FIXTURE_SCRATCH/wrapper.XXXXXX")
+trap 'rmdir "$entry"' EXIT
+trap 'exit 143' TERM
+"$@" &
+wait "$!"
+"#,
+    );
+    let scratch = path.join("target/cleanup");
+    fs::create_dir_all(&scratch).unwrap();
+    for (grace, entries) in [("2", 0), ("0", 1)] {
+        let args = [
+            "--source-only",
+            "--lines",
+            "src/lib.rs:1",
+            "--test-wrapper",
+            "wrap",
+            "--wrapper-grace",
+            grace,
+            "--timeout",
+            "1",
+            "--quiet",
+            "--json",
+        ];
+        let run = command(&path, &args)
+            .env("FIXTURE_SCRATCH", &scratch)
+            .output()
+            .unwrap();
+        let report = json(&run, 3);
+        assert_eq!(report["mutants_timed_out"], 1);
+        assert_eq!(fs::read_dir(&scratch).unwrap().count(), entries);
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn isolated_baselines_use_the_opt_in_worker_count_and_keep_order() {
+    let path = package("baseline-jobs-cli");
+    write(
+        &path,
+        "src/lib.rs",
+        r#"pub fn value() -> u32 { 9 }
+#[test] fn aa() { assert_eq!(value(), 9); }
+#[test] fn bb() { assert_eq!(value(), 9); }
+"#,
+    );
+    wrapper(
+        &path,
+        r#"#!/bin/sh
+set -eu
+if [ -n "${TMT_TRACE:-}" ]; then
+    touch "$FIXTURE_SCRATCH/$TMT_TEST"
+    attempts=0
+    until [ -f "$FIXTURE_SCRATCH/aa" ] && [ -f "$FIXTURE_SCRATCH/bb" ]; do
+        attempts=$((attempts + 1))
+        [ "$attempts" -lt 100 ] || exit 91
+        sleep 0.02
+    done
+fi
+exec "$@"
+"#,
+    );
+    let scratch = path.join("target/baselines");
+    fs::create_dir_all(&scratch).unwrap();
+    let args = [
+        "--json",
+        "--lines",
+        "src/lib.rs:1",
+        "--test-wrapper",
+        "wrap",
+        "--baseline-jobs",
+        "2",
+    ];
+    let run = command(&path, &args)
+        .env("FIXTURE_SCRATCH", &scratch)
+        .output()
+        .unwrap();
+    let report = json(&run, 0);
+    let tests = report["analysis"]["test_selection"]["tests"]
+        .as_array()
+        .unwrap();
+    assert!(tests[0].as_str().unwrap().ends_with("::aa"));
+    assert!(tests[1].as_str().unwrap().ends_with("::bb"));
+    assert!(String::from_utf8_lossy(&run.stderr).contains("baselines: 2/2 completed"));
+}
+
+#[test]
+fn workspace_catalogue_has_one_snapshot_and_streamed_reports() {
+    let path = package("catalogue-stream");
+    write(
+        &path,
+        "Cargo.toml",
+        "[workspace]\nmembers = [\"a\", \"b\"]\nresolver = \"2\"\n",
+    );
+    for name in ["a", "b"] {
+        write(
+            &path,
+            &format!("{name}/Cargo.toml"),
+            &format!("[package]\nname = \"{name}\"\nversion = \"0.0.0\"\nedition = \"2021\"\n"),
+        );
+        write(
+            &path,
+            &format!("{name}/src/lib.rs"),
+            "pub fn value() -> u32 { 9 }\n#[test] fn checks() { assert_eq!(value(), 9); }\n",
+        );
+    }
+    let run = command(&path, &["--workspace", "--list", "--jsonl"])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "{}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+    let lines = String::from_utf8(run.stdout).unwrap();
+    let records: Vec<Value> = lines
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.len(), 2);
+    for (record, name) in records.iter().zip(["a", "b"]) {
+        assert_eq!(record["package"], name);
+        assert_eq!(
+            record["report"]["mutants"][0]["edits"][0]["file"],
+            "src/lib.rs"
+        );
+    }
+    let work = path.join("target/tmt-workspace");
+    assert!(work.join(".catalogue/src/a/src/lib.rs").exists());
+    assert!(!work.join("a").exists() && !work.join("b").exists());
+
+    write(
+        &path,
+        "b/src/lib.rs",
+        "compile_error!(\"second member failed\");\n",
+    );
+    let run = command(&path, &["--workspace", "--jsonl", "--quiet"])
+        .output()
+        .unwrap();
+    assert_eq!(run.status.code(), Some(1));
+    let output = String::from_utf8(run.stdout).unwrap();
+    let records: Vec<Value> = output
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(records.len(), 2);
+    assert_eq!(records[0]["report"]["package"], "a");
+    assert!(
+        records[1]["error"]
+            .as_str()
+            .unwrap()
+            .contains("second member failed")
+    );
+}
+
+#[test]
+fn checkpoint_cannot_reuse_a_different_test_selection_and_completes_an_empty_scope() {
+    let path = package("checkpoint-selection");
+    write(
+        &path,
+        "src/lib.rs",
+        "pub fn value() -> u32 { 9 }\n#[test] fn detects() { assert_eq!(value(), 9); }\n#[test] fn accepts() { assert!(value() < 10); }\n",
+    );
+    let args = [
+        "--source-only",
+        "--checkpoint",
+        "--quiet",
+        "--json",
+        "--include-test",
+    ];
+    let detected = json(
+        &command(
+            &path,
+            &[&args[..], &["detects", "--lines", "src/lib.rs:1"]].concat(),
+        )
+        .output()
+        .unwrap(),
+        0,
+    );
+    let survived = json(
+        &command(
+            &path,
+            &[&args[..], &["accepts", "--lines", "src/lib.rs:1"]].concat(),
+        )
+        .output()
+        .unwrap(),
+        2,
+    );
+    assert_eq!(detected["mutants_killed"], 2);
+    assert_eq!(survived["mutants_killed"], 0);
+    let empty = json(
+        &command(
+            &path,
+            &[&args[..], &["accepts", "--lines", "src/lib.rs:99"]].concat(),
+        )
+        .output()
+        .unwrap(),
+        0,
+    );
+    assert_eq!(empty["evaluation"], "no_sites");
+    let log = fs::read_to_string(empty["analysis"]["checkpoint"].as_str().unwrap()).unwrap();
+    let events: Vec<Value> = log
+        .lines()
+        .map(|line| serde_json::from_str(line).unwrap())
+        .collect();
+    assert_eq!(events[events.len() - 2]["event"], "campaign_started");
+    assert_eq!(events.last().unwrap()["event"], "campaign_completed");
+    assert!(!events.iter().any(|row| row["event"] == "phase_resumed"));
+}
+
+#[cfg(unix)]
+#[test]
+fn failed_serial_baseline_stops_before_the_next_test() {
+    let path = package("baseline-failure-cli");
+    write(
+        &path,
+        "src/lib.rs",
+        r#"pub fn value() -> u32 { 9 }
+#[test] fn first() { assert_eq!(value(), 9); }
+#[test] fn second() { assert_eq!(value(), 9); }
+"#,
+    );
+    wrapper(
+        &path,
+        r#"#!/bin/sh
+touch "$FIXTURE_SCRATCH/$TMT_TEST"
+exit 91
+"#,
+    );
+    let scratch = path.join("target/fail-fast");
+    fs::create_dir_all(&scratch).unwrap();
+    let output = command(&path, &["--json", "--test-wrapper", "wrap"])
+        .env("FIXTURE_SCRATCH", &scratch)
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    assert!(scratch.join("first").exists());
+    assert!(!scratch.join("second").exists());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("::first"));
+}
+
+#[cfg(unix)]
+#[test]
+fn spanless_cargo_linker_error_survives_the_cli_failure() {
+    let path = package("linker-diagnostic-cli");
+    let tool = path.join("target/tools");
+    fs::create_dir_all(&tool).unwrap();
+    wrapper(
+        &tool,
+        r#"#!/bin/sh
+if [ "$1" = test ]; then
+    printf '%s\n' '{"reason":"compiler-message","message":{"level":"error","message":"linking with cc failed","rendered":"ld: library not found for -liconv","spans":[]}}'
+    printf '%s\n' 'error: could not compile campaign-example' >&2
+    exit 101
+fi
+exec "$FIXTURE_CARGO" "$@"
+"#,
+    );
+    fs::rename(tool.join("wrap"), tool.join("cargo")).unwrap();
+    let path_var = std::env::join_paths(
+        std::iter::once(tool).chain(std::env::split_paths(&std::env::var_os("PATH").unwrap())),
+    )
+    .unwrap();
+    let run = command(&path, &["--quiet", "--json"])
+        .env("FIXTURE_CARGO", env!("CARGO"))
+        .env("PATH", path_var)
+        .output()
+        .unwrap();
+    assert_eq!(run.status.code(), Some(1));
+    assert!(run.stdout.is_empty());
+    let diagnostic = String::from_utf8_lossy(&run.stderr);
+    assert!(
+        diagnostic.contains("ld: library not found for -liconv"),
+        "{diagnostic}"
+    );
+    assert!(
+        diagnostic.contains("could not compile campaign-example"),
+        "{diagnostic}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn active_test_child_protects_work_copy_after_tmt_parent_exits() {
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    struct Release(PathBuf);
+    impl Drop for Release {
+        fn drop(&mut self) {
+            let _ = fs::write(&self.0, b"");
+        }
+    }
+
+    let path = package("interrupted-parent-cli");
+    let gate = path.join("target/gate");
+    fs::create_dir_all(&gate).unwrap();
+    let release = Release(gate.join("release"));
+    wrapper(
+        &path,
+        r#"#!/bin/sh
+set -eu
+touch "$FIXTURE_SCRATCH/ready"
+left=300
+until [ -f "$FIXTURE_SCRATCH/release" ]; do
+    left=$((left - 1))
+    [ "$left" -gt 0 ] || exit 91
+    sleep 0.02
+done
+exec "$@"
+"#,
+    );
+    let mut child = command(&path, &["--quiet", "--test-wrapper", "wrap"])
+        .env("FIXTURE_SCRATCH", &gate)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let began = Instant::now();
+    while !gate.join("ready").exists() && began.elapsed() < Duration::from_secs(5) {
+        if let Some(status) = child.try_wait().unwrap() {
+            panic!("tmt exited before the test started: {status}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    assert!(!child.wait().unwrap().success());
+    assert!(gate.join("ready").exists());
+    let list = || command(&path, &["--quiet", "--list"]).output().unwrap();
+    let blocked = list();
+    assert_eq!(
+        blocked.status.code(),
+        Some(1),
+        "{}",
+        String::from_utf8_lossy(&blocked.stderr)
+    );
+    assert!(String::from_utf8_lossy(&blocked.stderr).contains("another tmt run"));
+    drop(release);
+    let deadline = Instant::now() + Duration::from_secs(4);
+    loop {
+        let result = list();
+        if result.status.success() {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+#[test]
+fn timeout_recheck_policy_distinguishes_parallel_and_serial_verdicts() {
+    let path = package("timeout-recheck-cli");
+    write(
+        &path,
+        "src/lib.rs",
+        r#"pub fn value() -> bool { true }
+#[test]
+fn hangs_on_false() {
+    if !value() { std::thread::sleep(std::time::Duration::from_secs(10)); }
+}
+"#,
+    );
+    let args = [
+        "--json",
+        "--lines",
+        "src/lib.rs:1",
+        "--jobs",
+        "2",
+        "--timeout",
+        "1",
+        "--timeout-recheck",
+    ];
+    let none = command(&path, &[&args[..], &["none"]].concat())
+        .output()
+        .unwrap();
+    let unconfirmed = json(&none, 3);
+    let count = unconfirmed["timeout_rechecks"]["first_pass"]
+        .as_u64()
+        .unwrap();
+    assert!(count > 0, "{unconfirmed:#}");
+    assert_eq!(unconfirmed["timeout_rechecks"]["unconfirmed"], count);
+    assert_eq!(unconfirmed["mutants_killed"], 0);
+
+    let serial = command(&path, &[&args[..], &["serial"]].concat())
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&serial.stderr).contains("serial timeout rechecks"),
+        "{}",
+        String::from_utf8_lossy(&serial.stderr)
+    );
+    let confirmed: Value = serde_json::from_slice(&serial.stdout).unwrap();
+    assert_eq!(confirmed["timeout_rechecks"]["confirmed"], count);
+    assert_eq!(confirmed["timeout_rechecks"]["unconfirmed"], 0);
+    assert_eq!(confirmed["mutants_killed"], count);
+}
+
+#[test]
+fn checkpoint_accounts_for_effective_build_script_environment() {
+    let path = package("checkpoint-build-script");
+    write(
+        &path,
+        "build.rs",
+        r#"
+fn main() {
+    let mode = std::env::var("FIXTURE_MODE_FILE").unwrap();
+    println!("cargo:rerun-if-changed={mode}");
+    println!("cargo:rustc-env=FIXTURE_MODE={}", std::fs::read_to_string(mode).unwrap());
+}
+"#,
+    );
+    write(
+        &path,
+        "src/lib.rs",
+        r#"pub fn value() -> u32 { 9 }
+#[test] fn verifies() {
+    if env!("FIXTURE_MODE") == "strict" { assert_eq!(value(), 9); }
+    else { assert!(value() < 10); }
+}
+"#,
+    );
+    write(&path, "target/mode", "strict");
+    let args = [
+        "--source-only",
+        "--checkpoint",
+        "--lines",
+        "src/lib.rs:1",
+        "--quiet",
+        "--json",
+    ];
+    let run = || {
+        command(&path, &args)
+            .env("FIXTURE_MODE_FILE", path.join("target/mode"))
+            .output()
+            .unwrap()
+    };
+    assert_eq!(json(&run(), 0)["mutants_killed"], 2);
+    write(&path, "target/mode", "loose");
+    assert_eq!(json(&run(), 2)["mutants_killed"], 0);
+}

@@ -9,17 +9,21 @@ use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
+use crate::checkpoint::{Checkpoint, Phase};
 use crate::instrument::{self, LiteralSide, RUNTIME_MOD, Rendered, Site, SiteKind};
+use crate::output_fixture::{self, Fixture};
 use crate::plan::{self, Mutation, Obs};
 use crate::propagation::{self, Change};
 use crate::report::{self, Finding, Report};
 use crate::scope::{self, Scope};
 use crate::trace::Trace;
+use crate::work_lock::WorkLock;
 use crate::{git_index, progress, witness};
 
 #[derive(Clone)]
@@ -77,6 +81,9 @@ pub struct Options {
     pub all_files: bool,
     pub git_index: bool,
     pub copy_fixtures: Vec<PathBuf>,
+    pub copy_fixture_excludes: Vec<PathBuf>,
+    pub output_fixtures: Vec<Fixture>,
+    pub checkpoint: bool,
     /// Also run the doc tests (slow: rustdoc recompiles them for every mutant they reach).
     pub doc: bool,
 }
@@ -307,6 +314,7 @@ struct Diagnostic {
     level: String,
     rendered: Option<String>,
     message: Option<String>,
+    #[serde(default)]
     spans: Vec<DiagnosticSpan>,
 }
 
@@ -340,6 +348,7 @@ struct BuildOutput {
     test_binaries: Vec<(String, PathBuf, String, Vec<String>)>,
     errors: Vec<CompileError>,
     diagnostics: Vec<String>,
+    build_scripts: Vec<serde_json::Value>,
     artifacts: Vec<(PathBuf, Vec<PathBuf>)>,
 }
 
@@ -392,6 +401,11 @@ fn parse_build_output(stdout: &str, packages: &[&str]) -> BuildOutput {
                         .push((target.name, exe, package.to_string(), target.kind));
                 }
             }
+            "build-script-executed" => {
+                if let Ok(script) = serde_json::from_str(line) {
+                    out.build_scripts.push(script);
+                }
+            }
             "compiler-message" => {
                 let Some(diag) = msg.message else { continue };
                 if diag.level != "error" {
@@ -430,6 +444,9 @@ fn parse_build_output(stdout: &str, packages: &[&str]) -> BuildOutput {
             _ => {}
         }
     }
+    out.test_binaries.sort_by(|left, right| {
+        (&left.2, &left.3, &left.0, &left.1).cmp(&(&right.2, &right.3, &right.0, &right.1))
+    });
     out
 }
 
@@ -452,7 +469,6 @@ fn dep_inputs(text: &str, copy: &Path) -> BTreeSet<PathBuf> {
         .filter_map(|line| line.strip_suffix(':'))
         .map(|name| name.replace("\\ ", " ").replace("\\#", "#"))
         .map(|name| normalize(&copy.join(name)))
-        .filter(|path| path.starts_with(copy))
         .collect()
 }
 
@@ -631,6 +647,7 @@ struct TestBinary {
     /// Where the marks of its runs are made: a directory of this analysis alone.
     marks: PathBuf,
     git_ceiling: PathBuf,
+    work_lock: Option<Arc<WorkLock>>,
     /// The tests the binary contains, by the name libtest selects them with.
     tests: BTreeSet<String>,
     runner: Runner,
@@ -686,7 +703,8 @@ impl TestBinary {
     }
 }
 
-#[derive(Debug, PartialEq, Clone, Copy)]
+#[derive(Debug, PartialEq, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum Outcome {
     Pass,
     Fail,
@@ -709,34 +727,6 @@ impl From<Outcome> for progress::Outcome {
 fn isolate_copy_command(command: &mut Command, work: &Path) {
     git_index::remove_git_overrides(command);
     command.env("GIT_CEILING_DIRECTORIES", work);
-}
-
-/// Keeps two runs from rebuilding the same working copy under each other.
-struct WorkLock(PathBuf);
-
-impl WorkLock {
-    fn take(work: &Path) -> Result<WorkLock> {
-        let path = work.join(".tmt-lock");
-        match fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(_) => Ok(WorkLock(path)),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => bail!(
-                "another tmt run is using {}. If none is running, delete {}.",
-                work.display(),
-                path.display()
-            ),
-            Err(err) => Err(err).with_context(|| format!("creating {}", path.display())),
-        }
-    }
-}
-
-impl Drop for WorkLock {
-    fn drop(&mut self) {
-        let _ = fs::remove_file(&self.0);
-    }
 }
 
 /// Name of the log of written files, beside the working copy.
@@ -1045,6 +1035,107 @@ fn copy_tree(
     Ok(())
 }
 
+fn fixture_relative(path: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+    let relative = path
+        .components()
+        .filter(|part| *part != Component::CurDir)
+        .collect::<PathBuf>();
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        bail!(
+            "fixture path must be inside the workspace: {}",
+            path.display()
+        );
+    }
+    Ok(relative)
+}
+
+fn fixture_exclusions(
+    workspace: &Path,
+    roots: &[PathBuf],
+    excluded: &[PathBuf],
+) -> Result<BTreeSet<PathBuf>> {
+    excluded
+        .iter()
+        .map(|path| {
+            let relative = fixture_relative(path)?;
+            if !roots
+                .iter()
+                .any(|root| relative != *root && relative.starts_with(root))
+            {
+                bail!(
+                    "--copy-fixture-exclude must name an entry under a --copy-fixture: {}",
+                    path.display()
+                );
+            }
+            let path = workspace.join(relative);
+            fs::symlink_metadata(&path)
+                .with_context(|| format!("excluding fixture {}", path.display()))?;
+            confined_fixture_path(workspace, &path)?;
+            Ok(path)
+        })
+        .collect()
+}
+
+fn confined_fixture_path(workspace: &Path, path: &Path) -> Result<()> {
+    use std::collections::VecDeque;
+    use std::path::Component;
+
+    let parts = |relative: &Path| {
+        relative
+            .components()
+            .map(|part| part.as_os_str().to_owned())
+            .collect::<Vec<_>>()
+    };
+    let mut pending = VecDeque::from(parts(path.strip_prefix(workspace)?));
+    let mut resolved = workspace.to_path_buf();
+    let mut hops = 0;
+    while let Some(part) = pending.pop_front() {
+        match Path::new(&part).components().next() {
+            Some(Component::ParentDir) if resolved != workspace => {
+                resolved.pop();
+            }
+            Some(Component::CurDir) => {}
+            Some(Component::Normal(_)) => {
+                resolved.push(part);
+                match fs::symlink_metadata(&resolved) {
+                    Ok(metadata) if metadata.is_symlink() => {
+                        hops += 1;
+                        if hops > 40 {
+                            bail!("fixture {} contains a symbolic link cycle", path.display());
+                        }
+                        let target = fs::read_link(&resolved)?;
+                        resolved.pop();
+                        let target = if target.is_absolute() {
+                            resolved = workspace.to_path_buf();
+                            target.strip_prefix(workspace).with_context(|| {
+                                format!("fixture {} points outside the workspace", path.display())
+                            })?
+                        } else {
+                            &target
+                        };
+                        for component in parts(target).into_iter().rev() {
+                            pending.push_front(component);
+                        }
+                    }
+                    Ok(_) => {}
+                    Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(err) => {
+                        return Err(err)
+                            .with_context(|| format!("checking fixture {}", path.display()));
+                    }
+                }
+            }
+            _ => bail!("fixture {} points outside the workspace", path.display()),
+        }
+    }
+    Ok(())
+}
+
 /// An explicitly selected fixture may include ignored directories. Resolve links to
 /// their contents inside the workspace, without following them into a parent cycle.
 fn copy_fixture_entry(
@@ -1089,15 +1180,14 @@ fn copy_fixture_entry(
     for entry in fs::read_dir(&resolved)? {
         let entry = entry?;
         let path = entry.path();
-        if !forbidden(&path) {
-            copy_fixture_entry(
-                &path,
-                &to.join(entry.file_name()),
-                workspace,
-                forbidden,
-                state,
-                visiting,
-            )?;
+        let destination = to.join(entry.file_name());
+        let projected = workspace.join(
+            destination
+                .strip_prefix(&state.root)
+                .expect("fixture under copy"),
+        );
+        if !forbidden(&path) && !forbidden(&projected) {
+            copy_fixture_entry(&path, &destination, workspace, forbidden, state, visiting)?;
         }
     }
     visiting.remove(&resolved);
@@ -1362,9 +1452,13 @@ fn list_tests(
     work: &Path,
     ignored: bool,
     strict: bool,
+    lock: Option<&WorkLock>,
 ) -> Result<BTreeSet<String>> {
     let mut command = Command::new(exe);
     isolate_copy_command(&mut command, work);
+    if let Some(lock) = lock {
+        lock.retain_for(&mut command);
+    }
     command.args(["--list", "--format", "terse"]);
     if ignored {
         command.arg("--ignored");
@@ -1521,6 +1615,9 @@ fn run_binary(
         }
     };
     isolate_copy_command(&mut cmd, &bin.git_ceiling);
+    if let Some(lock) = &bin.work_lock {
+        lock.retain_for(&mut cmd);
+    }
     cmd.env_remove("TMT_TRACE")
         .env_remove("TMT_MUTANT")
         .env_remove("TMT_TEST")
@@ -1981,6 +2078,7 @@ fn observe_witness(
         cwd: baseline.cwd.clone(),
         marks: baseline.marks.clone(),
         git_ceiling: baseline.git_ceiling.clone(),
+        work_lock: baseline.work_lock.clone(),
         tests: BTreeSet::new(),
         runner: Runner::Isolated {
             exe,
@@ -2057,6 +2155,8 @@ fn witness_location(source: &SourceFile, candidate: &witness::Candidate) -> repo
     }
 }
 
+#[derive(Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum WitnessTrial {
     Inapplicable,
     Unviable,
@@ -2319,7 +2419,7 @@ struct Job {
     tests: Vec<(usize, Option<Vec<String>>)>,
 }
 
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 struct JobResult {
     first_pass_timeout: bool,
     unconfirmed_timeout: bool,
@@ -2854,7 +2954,13 @@ impl Session {
     /// Runs the mutants, `workers` at a time. A mutant that ran out of time while others
     /// were running may only have been slowed down by them: it gets a second run on its
     /// own, and that one counts.
-    fn run_jobs(&self, jobs: &[Job], workers: usize, label: &str) -> Result<Vec<JobResult>> {
+    fn run_jobs(
+        &self,
+        jobs: &[Job],
+        workers: usize,
+        label: &str,
+        checkpoint: Option<&Phase<'_>>,
+    ) -> Result<Vec<JobResult>> {
         let run = |index: usize, sharing| self.run_job(&jobs[index], sharing);
         evaluate_jobs(
             jobs.len(),
@@ -2862,6 +2968,7 @@ impl Session {
             self.serial_timeout_rechecks,
             self.progress,
             label,
+            checkpoint,
             &run,
         )
     }
@@ -2873,26 +2980,39 @@ fn evaluate_jobs(
     serial_rechecks: bool,
     progress_enabled: bool,
     label: &str,
+    checkpoint: Option<&Phase<'_>>,
     run: &(impl Fn(usize, usize) -> Result<JobResult> + Sync),
 ) -> Result<Vec<JobResult>> {
     let sharing = workers.clamp(1, count.max(1));
     let mut results = progress::track(progress_enabled, label, count, |progress| {
         run_pool(count, workers, |index| {
+            if let Some(cached) = checkpoint
+                .map(|phase| phase.get::<JobResult>(index))
+                .transpose()?
+                .flatten()
+            {
+                progress.complete(cached.progress_outcome());
+                return Ok((cached, false));
+            }
             let mut result = run(index, sharing)?;
             if sharing > 1 && result.timed_out {
                 result.first_pass_timeout = true;
                 result.unconfirmed_timeout = true;
             }
-            if !result.unconfirmed_timeout || !serial_rechecks {
+            let pending = result.unconfirmed_timeout && serial_rechecks;
+            if !pending {
+                if let Some(phase) = checkpoint {
+                    phase.record(index, &result)?;
+                }
                 progress.complete(result.progress_outcome());
             }
-            Ok(result)
+            Ok((result, pending))
         })
     })?;
     let pending: Vec<_> = results
         .iter()
         .enumerate()
-        .filter_map(|(index, result)| result.unconfirmed_timeout.then_some(index))
+        .filter_map(|(index, (_, pending))| pending.then_some(index))
         .collect();
     if !pending.is_empty() && progress_enabled {
         eprintln!(
@@ -2913,13 +3033,19 @@ fn evaluate_jobs(
                 } else {
                     progress::Outcome::Survived
                 };
-                results[index] = confirmed;
+                if let Some(phase) = checkpoint {
+                    phase.record(index, &confirmed)?;
+                }
+                results[index] = (confirmed, false);
                 progress.complete(outcome);
             }
             Ok::<_, anyhow::Error>(())
         })?;
     }
-    Ok(results)
+    if let Some(phase) = checkpoint {
+        phase.finish()?;
+    }
+    Ok(results.into_iter().map(|(result, _)| result).collect())
 }
 
 /// Calls `work(i)` once for every `i < count`, on up to `workers` threads, and returns the
@@ -2929,36 +3055,39 @@ fn run_pool<T: Send>(
     workers: usize,
     work: impl Fn(usize) -> Result<T> + Sync,
 ) -> Result<Vec<T>> {
-    let next = std::sync::atomic::AtomicUsize::new(0);
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    let next = AtomicUsize::new(0);
+    let stop = AtomicBool::new(false);
     let done: Vec<Vec<(usize, Result<T>)>> = std::thread::scope(|scope| {
         let handles: Vec<_> = (0..workers.clamp(1, count.max(1)))
             .map(|_| {
                 scope.spawn(|| {
                     let mut mine = vec![];
-                    loop {
-                        // Claiming is one atomic step: no two workers get the same index.
-                        let index = next.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    while !stop.load(Ordering::Acquire) {
+                        let index = next.fetch_add(1, Ordering::Relaxed);
                         if index >= count {
-                            return mine;
+                            break;
                         }
-                        mine.push((index, work(index)));
+                        let result = work(index);
+                        if result.is_err() {
+                            stop.store(true, Ordering::Release);
+                        }
+                        mine.push((index, result));
                     }
+                    mine
                 })
             })
             .collect();
         handles
             .into_iter()
-            .map(|h| h.join().expect("worker panicked"))
+            .map(|handle| handle.join().expect("worker panicked"))
             .collect()
     });
-    let mut slots: Vec<Option<T>> = (0..count).map(|_| None).collect();
+    let mut ordered: Vec<Option<Result<T>>> = (0..count).map(|_| None).collect();
     for (index, result) in done.into_iter().flatten() {
-        slots[index] = Some(result?);
+        ordered[index] = Some(result);
     }
-    Ok(slots
-        .into_iter()
-        .map(|slot| slot.expect("every job ran"))
-        .collect())
+    ordered.into_iter().flatten().collect()
 }
 
 impl std::str::FromStr for report::Shard {
@@ -3294,8 +3423,8 @@ fn run_package(
     }
     fs::create_dir_all(&work).with_context(|| format!("creating {}", work.display()))?;
     let work = work.canonicalize()?;
-    let _lock = if catalogue.is_none() {
-        Some(WorkLock::take(&work)?)
+    let work_lock = if catalogue.is_none() {
+        Some(Arc::new(WorkLock::take(&work)?))
     } else {
         None
     };
@@ -3321,9 +3450,25 @@ fn run_package(
             || (path.parent() == Some(workspace.as_path())
                 && path.file_name().is_some_and(|n| n == "target"))
     };
-    let skip =
-        |path: &Path| forbidden(path) || path.file_name().is_some_and(|n| n == "node_modules");
     let state = WorkCopy::open(&work, &copy);
+    let fixtures = options
+        .copy_fixtures
+        .iter()
+        .map(|path| fixture_relative(path))
+        .collect::<Result<Vec<_>>>()?;
+    let excluded = fixture_exclusions(&workspace, &fixtures, &options.copy_fixture_excludes)?;
+    let fixture_forbidden = |path: &Path| forbidden(path) || excluded.contains(path);
+    let skip = |path: &Path| {
+        fixture_forbidden(path) || path.file_name().is_some_and(|n| n == "node_modules")
+    };
+    if options.progress && !options.list {
+        for path in &excluded {
+            note(&format!(
+                "excluded fixture {}",
+                path.strip_prefix(&workspace).unwrap_or(path).display()
+            ));
+        }
+    }
     if catalogue.is_none_or(|catalogue| !catalogue.ready.get()) {
         work_directory(&work, "src")?;
         let visible = if options.all_files {
@@ -3342,27 +3487,12 @@ fn run_package(
             }
             None => copy_tree(&workspace, &copy, &workspace, &skip, &state)?,
         }
-        for relative in &options.copy_fixtures {
-            use std::path::Component;
-            let relative = relative
-                .components()
-                .filter(|c| *c != Component::CurDir)
-                .collect::<PathBuf>();
-            if relative.as_os_str().is_empty()
-                || relative
-                    .components()
-                    .any(|c| !matches!(c, Component::Normal(_)))
-            {
-                bail!(
-                    "--copy-fixture must name a file or directory inside the workspace: {}",
-                    relative.display()
-                );
-            }
+        for relative in &fixtures {
             copy_fixture_entry(
-                &workspace.join(&relative),
-                &copy.join(&relative),
+                &workspace.join(relative),
+                &copy.join(relative),
                 &workspace,
-                &forbidden,
+                &fixture_forbidden,
                 &state,
                 &mut BTreeSet::new(),
             )?;
@@ -3371,32 +3501,34 @@ fn run_package(
         if options.git_index {
             git_index::snapshot(&workspace, &copy)?;
         }
-        // Relative path dependencies that leave the workspace would point nowhere from the copy.
-        let mut manifests: Vec<&Path> = metadata
-            .packages
-            .iter()
-            .map(|p| p.manifest_path.as_path())
-            .collect();
-        let root_manifest = metadata.workspace_root.join("Cargo.toml");
-        manifests.push(&root_manifest);
-        for manifest in manifests {
-            let Ok(canonical) = manifest.canonicalize() else {
-                continue;
-            };
-            let (Some(manifest_dir), Ok(relative)) =
-                (canonical.parent(), canonical.strip_prefix(&workspace))
-            else {
-                continue;
-            };
-            let text = fs::read_to_string(&canonical)?;
-            if let Some(rewritten) =
-                absolutize_path_dependencies(&text, manifest_dir, &workspace, &copy)?
-            {
-                state.write(&copy.join(relative), &rewritten)?;
+        if !options.list {
+            // Relative path dependencies that leave the workspace would point nowhere from the copy.
+            let mut manifests: Vec<&Path> = metadata
+                .packages
+                .iter()
+                .map(|p| p.manifest_path.as_path())
+                .collect();
+            let root_manifest = metadata.workspace_root.join("Cargo.toml");
+            manifests.push(&root_manifest);
+            for manifest in manifests {
+                let Ok(canonical) = manifest.canonicalize() else {
+                    continue;
+                };
+                let (Some(manifest_dir), Ok(relative)) =
+                    (canonical.parent(), canonical.strip_prefix(&workspace))
+                else {
+                    continue;
+                };
+                let text = fs::read_to_string(&canonical)?;
+                if let Some(rewritten) =
+                    absolutize_path_dependencies(&text, manifest_dir, &workspace, &copy)?
+                {
+                    state.write(&copy.join(relative), &rewritten)?;
+                }
             }
         }
-
         if let Some(catalogue) = catalogue {
+            state.settle(&workspace)?;
             catalogue.ready.set(true);
         }
     }
@@ -3664,12 +3796,18 @@ fn run_package(
             test_selection: None,
             git_index: options.git_index,
             copy_fixtures: options.copy_fixtures.clone(),
+            copy_fixture_excludes: options.copy_fixture_excludes.clone(),
+            output_fixtures: options.output_fixtures.clone(),
+            checkpoint: (options.checkpoint && !options.list)
+                .then(|| work.join("checkpoint.jsonl")),
         },
         skipped,
         ..Report::default()
     };
     if options.list {
-        state.settle(&workspace)?;
+        if catalogue.is_none() {
+            state.settle(&workspace)?;
+        }
         let mut candidates: Vec<_> = files
             .iter()
             .flat_map(|file| {
@@ -3737,6 +3875,14 @@ fn run_package(
             crate::baseline::write(path, &[])?;
         }
         report.record_evaluation();
+        if let Some(path) = report.analysis.checkpoint.as_deref() {
+            let checkpoint = Checkpoint::open(path)?;
+            let settings =
+                serde_json::json!({"analysis": &report.analysis, "package": &package.name});
+            let identity = crate::campaign_identity::compute(&copy, &settings, [], false)?;
+            checkpoint.start(&identity, settings)?;
+            checkpoint.finish()?;
+        }
         return Ok(report);
     }
 
@@ -3792,6 +3938,9 @@ fn run_package(
     let build_test_binaries = |observer: bool| {
         let mut command = Command::new("cargo");
         isolate_copy_command(&mut command, &work);
+        if let Some(lock) = &work_lock {
+            lock.retain_for(&mut command);
+        }
         command
             .args(["test", "--no-run", "--message-format=json"])
             .args(test_packages.iter().flat_map(|p| ["-p", p.name.as_str()]))
@@ -3874,6 +4023,9 @@ fn run_package(
         }
     };
     let built_sources = BuiltSources::from_artifacts(&build.artifacts, &copy);
+    output_fixture::stage(&workspace, &work, &build_target, &options.output_fixtures)?;
+    let checkpoint_path = report.analysis.checkpoint.as_deref();
+    let checkpoint = checkpoint_path.map(Checkpoint::open).transpose()?;
     let doc_packages = test_packages
         .iter()
         .filter(|p| options.doc && p.targets.iter().any(|target| target.doctest));
@@ -3958,8 +4110,8 @@ fn run_package(
                     .expect("manifest has a parent"),
             )?;
             if selection.enabled() {
-                let all = list_tests(&exe, &cwd, &work, false, true)?;
-                let ignored = list_tests(&exe, &cwd, &work, true, true)?;
+                let all = list_tests(&exe, &cwd, &work, false, true, work_lock.as_deref())?;
+                let ignored = list_tests(&exe, &cwd, &work, true, true, work_lock.as_deref())?;
                 for test in all {
                     let was_ignored = ignored.contains(&test);
                     if (was_ignored && !selection.include_ignored)
@@ -4017,6 +4169,62 @@ fn run_package(
         let cwd = in_copy(owner.manifest_path.parent().expect("manifest has a parent"))?;
         runners.push((name, doc, cwd));
     }
+    report.analysis.test_selection = selected_tests;
+    let identity = if checkpoint.is_some() {
+        let mut build_inputs: Vec<_> = build
+            .build_scripts
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect();
+        build_inputs.sort();
+        // Build script outputs can contain secrets. Only their digest enters
+        // the checkpoint, never the Cargo event payload.
+        let settings = serde_json::json!({
+            "build_scripts": build_inputs,
+            "analysis": &report.analysis, "package": &package.name, "jobs": options.jobs,
+            "verify": options.verify, "audit": options.audit, "effects": options.effects,
+            "all_files": options.all_files, "build_scope": build_scope,
+            "runners": runners.iter().map(|(name, runner, cwd)| (name, runner.executable(), cwd)).collect::<Vec<_>>()
+        });
+        let mut inputs = BTreeSet::new();
+        for (root, artifacts) in &build.artifacts {
+            inputs.insert(root.clone());
+            if let Some(dependencies) = artifacts
+                .iter()
+                .map(|artifact| artifact_inputs(artifact, root, &copy))
+                .find(|deps| !deps.is_empty())
+            {
+                inputs.extend(dependencies);
+            } else {
+                // An unfamiliar Cargo output layout cannot hide changed
+                // compilation inputs behind a stable artifact name.
+                inputs.extend(artifacts.iter().cloned());
+            }
+        }
+        inputs.extend(
+            build
+                .build_scripts
+                .iter()
+                .filter_map(|script| script.get("out_dir")?.as_str().map(PathBuf::from)),
+        );
+        // The snapshot is already included. The paths outside it include
+        // dependency sources, generated build inputs, and staged fixtures.
+        inputs.retain(|path| !path.starts_with(&copy));
+        inputs.extend(
+            options
+                .output_fixtures
+                .iter()
+                .map(|fixture| build_target.join(&fixture.to)),
+        );
+        Some(crate::campaign_identity::compute(
+            &copy,
+            &settings,
+            inputs,
+            options.nextest.is_some(),
+        )?)
+    } else {
+        None
+    };
     // The marks by which a run says that it gave up are made where nothing else makes
     // files: the working directory is this analysis's alone while it is locked. A
     // directory shared with others (the temporary one, between containers that count
@@ -4047,6 +4255,7 @@ fn run_package(
                     cwd,
                     marks: marks.clone(),
                     git_ceiling: work.clone(),
+                    work_lock: work_lock.clone(),
                     tests: BTreeSet::new(),
                     runner,
                     baseline: Duration::ZERO,
@@ -4100,7 +4309,8 @@ fn run_package(
                     );
                 }
                 if let Runner::Exe(exe) = &bin.runner {
-                    bin.tests = list_tests(exe, &bin.cwd, &work, false, false)?;
+                    bin.tests =
+                        list_tests(exe, &bin.cwd, &work, false, false, work_lock.as_deref())?;
                 }
                 Ok(bin)
             })();
@@ -4114,7 +4324,6 @@ fn run_package(
     })?;
 
     // 6. Plan every site, run the mutants, and put the findings together.
-    report.analysis.test_selection = selected_tests;
     for file in &files {
         for site in &file.sites {
             if disabled.contains(&site.id) {
@@ -4151,6 +4360,48 @@ fn run_package(
             }));
         }
     }
+    if let (Some(checkpoint), Some(identity)) = (&checkpoint, &identity) {
+        checkpoint.start(
+            identity,
+            serde_json::json!({
+                "package": &package.name, "analysis": &report.analysis,
+                "runners": session.binaries.iter().map(|bin| &bin.name).collect::<Vec<_>>(),
+                "jobs": options.jobs, "tool_version": env!("CARGO_PKG_VERSION")
+            }),
+        )?;
+    }
+    let phase = |name: &str, keys: Vec<String>| {
+        checkpoint
+            .as_ref()
+            .zip(identity.as_deref())
+            .map(|(checkpoint, identity)| checkpoint.begin(name, identity, keys))
+            .transpose()
+    };
+    let probe_phase = |name: &str, jobs: &[Job]| -> Result<Option<Phase<'_>>> {
+        if checkpoint.is_none() {
+            return Ok(None);
+        }
+        let locations: BTreeMap<_, _> = files
+            .iter()
+            .flat_map(|file| {
+                file.sites
+                    .iter()
+                    .map(|site| (site.id, (&file.display, site.line, site.column, &site.text)))
+            })
+            .collect();
+        let keys = jobs
+            .iter()
+            .map(|job| {
+                let tests = job
+                    .tests
+                    .iter()
+                    .map(|(bin, selected)| (&session.binaries[*bin].name, selected))
+                    .collect::<Vec<_>>();
+                serde_json::to_string(&(locations.get(&job.site), job.mutation.encode(), tests))
+            })
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        phase(name, keys)
+    };
     let scratch = work.clone();
     let mut jobs: Vec<Job> = vec![];
     // Sites whose mutant could not be run as a probe for what it is. With `--rebuild`
@@ -4226,7 +4477,9 @@ fn run_package(
         jobs.len(),
         options.jobs.max(1)
     ));
-    let mut results = session.run_jobs(&jobs, options.jobs, "mutants")?;
+    let probe_checkpoint = probe_phase("probe", &jobs)?;
+    let mut results =
+        session.run_jobs(&jobs, options.jobs, "mutants", probe_checkpoint.as_ref())?;
     for result in &results {
         report.timeout_rechecks.include(result);
     }
@@ -4259,11 +4512,13 @@ fn run_package(
             survivors: survivors.len(),
             ..report::Audit::default()
         };
-        for (job, again) in
-            chosen
-                .iter()
-                .zip(session.run_jobs(&against_all, options.jobs, "audit mutants")?)
-        {
+        let audit_checkpoint = probe_phase("audit", &against_all)?;
+        for (job, again) in chosen.iter().zip(session.run_jobs(
+            &against_all,
+            options.jobs,
+            "audit mutants",
+            audit_checkpoint.as_ref(),
+        )?) {
             report.timeout_rechecks.include(&again);
             if again.survived.is_none() {
                 // The verdict of all tests is the one that counts.
@@ -4304,11 +4559,14 @@ fn run_package(
         }
         report.audit = Some(audit);
     }
-    let unable = results.iter().filter(|r| r.unable).count();
+    let unable = results
+        .iter()
+        .filter(|r| r.unable || r.unconfirmed_timeout)
+        .count();
     not_evaluated.extend(
         jobs.iter()
             .zip(&results)
-            .filter(|(_, result)| result.unable)
+            .filter(|(_, result)| result.unable || result.unconfirmed_timeout)
             .map(|(job, _)| job.site),
     );
     if !options.rebuild {
@@ -4316,7 +4574,10 @@ fn run_package(
     }
     report.mutants_run = results.len() - unable;
     report.mutants_killed = results.iter().filter(|r| r.survived.is_none()).count() - unable;
-    report.mutants_timed_out = results.iter().filter(|r| r.timed_out).count();
+    report.mutants_timed_out = results
+        .iter()
+        .filter(|r| r.timed_out && !r.unconfirmed_timeout)
+        .count();
 
     // Expressions known to be constant in the tests: comparisons with a confirmed
     // one-sided gap or that cannot differ at all, and `&&` / `||` with a single value.
@@ -4504,6 +4765,23 @@ fn run_package(
     let mut by_speed: Vec<&TestBinary> = session.binaries.iter().collect();
     by_speed.sort_by_key(|bin| bin.baseline);
     if !built.is_empty() {
+        let source_checkpoint = if checkpoint.is_some() {
+            let keys = built
+                .iter()
+                .map(|(file, _, mutation, twin)| {
+                    serde_json::to_string(&(
+                        &file.display,
+                        mutation.start,
+                        mutation.end,
+                        &mutation.replacement,
+                        twin,
+                    ))
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            phase("source", keys)?
+        } else {
+            None
+        };
         session.note(&format!(
             "building {} mutants one by one (code a probe cannot be put in, or to compare with the probe)",
             built.len()
@@ -4524,8 +4802,17 @@ fn run_package(
             "source mutants",
             built.len(),
             |progress| -> Result<()> {
-                for (file, site, mutant, twin) in &built {
+                for (index, (file, site, mutant, twin)) in built.iter().enumerate() {
+                    let cached = source_checkpoint
+                        .as_ref()
+                        .map(|phase| phase.get::<Option<Outcome>>(index))
+                        .transpose()?
+                        .flatten();
                     if !built_sources.contains(file) {
+                        if let Some(phase) = source_checkpoint.as_ref().filter(|_| cached.is_none())
+                        {
+                            phase.record(index, &Some(Outcome::Unable))?;
+                        }
                         if twin.is_none() {
                             report.mutants_not_evaluated += 1;
                             if skipped_targets.insert((&file.path, site.start, site.end)) {
@@ -4543,25 +4830,33 @@ fn run_package(
                         progress.complete(progress::Outcome::Unable);
                         continue;
                     }
-                    let mutated = format!(
-                        "{}{}{}",
-                        &file.original[..mutant.start],
-                        mutant.replacement,
-                        &file.original[mutant.end..]
-                    );
-                    // `None`: it does not build. Otherwise what stopped it, if anything did.
-                    let attempt = || -> Result<Option<Outcome>> {
-                        state.write(&file.path, &instrumented(file, &mutated))?;
-                        if !cargo_build()?.status.success() {
-                            return Ok(None);
+                    let outcome = if let Some(cached) = cached {
+                        cached
+                    } else {
+                        let mutated = format!(
+                            "{}{}{}",
+                            &file.original[..mutant.start],
+                            mutant.replacement,
+                            &file.original[mutant.end..]
+                        );
+                        // `None`: it does not build. Otherwise what stopped it, if anything did.
+                        let attempt = || -> Result<Option<Outcome>> {
+                            state.write(&file.path, &instrumented(file, &mutated))?;
+                            if !cargo_build()?.status.success() {
+                                return Ok(None);
+                            }
+                            run_source_tests(&by_speed).map(Some)
+                        };
+                        let attempted = attempt();
+                        // The file as it was, before another one is changed and whatever went wrong.
+                        let rendered = file.rendered.as_ref().expect("rendered before building");
+                        state.write(&file.path, &instrumented(file, &rendered.text))?;
+                        let outcome = attempted?;
+                        if let Some(phase) = &source_checkpoint {
+                            phase.record(index, &outcome)?;
                         }
-                        run_source_tests(&by_speed).map(Some)
+                        outcome
                     };
-                    let attempted = attempt();
-                    // The file as it was, before another one is changed and whatever went wrong.
-                    let rendered = file.rendered.as_ref().expect("rendered before building");
-                    state.write(&file.path, &instrumented(file, &rendered.text))?;
-                    let outcome = attempted?;
                     progress.complete(outcome.map_or(progress::Outcome::Unable, Into::into));
                     if let Some(job) = twin {
                         // Only compared: the probe's run is the one that is counted and reported.
@@ -4613,6 +4908,9 @@ fn run_package(
                 Ok(())
             },
         )?;
+        if let Some(phase) = &source_checkpoint {
+            phase.finish()?;
+        }
         report.findings.extend(
             survivors
                 .into_iter()
@@ -4656,7 +4954,14 @@ fn run_package(
         let ignored = library_runners
             .iter()
             .find_map(|bin| match &bin.runner {
-                Runner::Exe(exe) => Some(list_tests(exe, &bin.cwd, &bin.git_ceiling, true, false)),
+                Runner::Exe(exe) => Some(list_tests(
+                    exe,
+                    &bin.cwd,
+                    &bin.git_ceiling,
+                    true,
+                    false,
+                    bin.work_lock.as_deref(),
+                )),
                 _ => None,
             })
             .transpose()?
@@ -4721,13 +5026,34 @@ fn run_package(
                 expected.is_some(),
             )
         };
+        let witness_checkpoint = if checkpoint.is_some() {
+            let keys = witness_candidates
+                .iter()
+                .map(|candidate| {
+                    let edits = candidate
+                        .edits
+                        .iter()
+                        .map(|edit| (&edit.span, &edit.replacement))
+                        .collect::<Vec<_>>();
+                    serde_json::to_string(&(&candidate.description, edits))
+                })
+                .collect::<std::result::Result<Vec<_>, _>>()?;
+            phase("witness", keys)?
+        } else {
+            None
+        };
         let mut survivors = vec![];
         progress::track(
             options.progress,
             "source witness mutants",
             witness_candidates.len(),
             |progress| -> Result<()> {
-                for candidate in &witness_candidates {
+                for (index, candidate) in witness_candidates.iter().enumerate() {
+                    let cached = witness_checkpoint
+                        .as_ref()
+                        .map(|phase| phase.get::<WitnessTrial>(index))
+                        .transpose()?
+                        .flatten();
                     let at = witness_location(file, candidate);
                     let existing = candidate
                         .existing
@@ -4753,24 +5079,38 @@ fn run_package(
                     if (candidate.existing && (existing.is_none() || scenarios.is_empty()))
                         || (paired && scenarios.is_empty())
                     {
+                        if let Some(phase) =
+                            witness_checkpoint.as_ref().filter(|_| cached.is_none())
+                        {
+                            phase.record(index, &WitnessTrial::Inapplicable)?;
+                        }
                         progress.complete(progress::Outcome::Unable);
                         continue;
                     }
                     // A compound survivor is interesting only if each component fails on
                     // its own. Test the source edits without any generated witness tests.
-                    let attempted = (|| -> Result<WitnessTrial> {
-                        if paired {
-                            for edit in &candidate.edits {
-                                if suite(std::slice::from_ref(edit))? != Some(Outcome::Fail) {
-                                    return Ok(WitnessTrial::Inapplicable);
+                    let trial = if let Some(cached) = cached {
+                        cached
+                    } else {
+                        let attempted = (|| -> Result<WitnessTrial> {
+                            if paired {
+                                for edit in &candidate.edits {
+                                    if suite(std::slice::from_ref(edit))? != Some(Outcome::Fail) {
+                                        return Ok(WitnessTrial::Inapplicable);
+                                    }
                                 }
                             }
+                            Ok(suite(&candidate.edits)?
+                                .map_or(WitnessTrial::Unviable, WitnessTrial::Evaluated))
+                        })();
+                        state.write(&root_file, &restore)?;
+                        let trial = attempted?;
+                        if let Some(phase) = &witness_checkpoint {
+                            phase.record(index, &trial)?;
                         }
-                        Ok(suite(&candidate.edits)?
-                            .map_or(WitnessTrial::Unviable, WitnessTrial::Evaluated))
-                    })();
-                    state.write(&root_file, &restore)?;
-                    let outcome = match attempted? {
+                        trial
+                    };
+                    let outcome = match trial {
                         WitnessTrial::Inapplicable => {
                             progress.complete(progress::Outcome::Unable);
                             continue;
@@ -4801,6 +5141,9 @@ fn run_package(
             },
         )?;
 
+        if let Some(phase) = &witness_checkpoint {
+            phase.finish()?;
+        }
         let originals = shared_witnesses(
             &file.original,
             &survivors,
@@ -4955,6 +5298,9 @@ fn run_package(
         .findings
         .retain(|finding| !known.as_ref().is_some_and(|known| known.knows(finding)));
     report.suppressed = before - report.findings.len();
+    if let Some(checkpoint) = &checkpoint {
+        checkpoint.finish()?;
+    }
     Ok(report)
 }
 
@@ -5132,6 +5478,114 @@ fn describe_effects(
 mod tests {
     use super::*;
     use crate::trace::UNKNOWN_TEST;
+
+    #[test]
+    fn campaign_phase_combinations() {
+        let rows = include_str!("../tests/data/campaign-phases.pict.tsv");
+        for line in rows.lines().skip(1) {
+            let columns: Vec<_> = line.split('\t').collect();
+            let &[baselines, workers, policy, verdict] = columns.as_slice() else {
+                panic!("invalid PICT row: {line}");
+            };
+            let count = |value| if value == "one" { 1 } else { 2 };
+            let ready = std::sync::Barrier::new(count(baselines));
+            let baselines = run_pool(2, count(baselines), |index| {
+                ready.wait();
+                Ok(index)
+            })
+            .unwrap();
+            assert_eq!(baselines, [0, 1]);
+
+            let serial = policy == "serial";
+            let workers = count(workers);
+            let results = evaluate_jobs(
+                2,
+                workers,
+                serial,
+                false,
+                "test",
+                None,
+                &|index, sharing| {
+                    let time_out =
+                        index == 0 && verdict != "pass" && (sharing > 1 || verdict == "timeout");
+                    let unable = index == 0 && verdict == "unable" && sharing == 1;
+                    Ok(JobResult {
+                        first_pass_timeout: false,
+                        unconfirmed_timeout: false,
+                        survived: (!time_out && !unable).then(|| vec![index.to_string()]),
+                        timed_out: time_out,
+                        unable,
+                    })
+                },
+            )
+            .unwrap();
+            assert_eq!(results[1].survived.as_deref(), Some(&["1".to_owned()][..]));
+            let mut stats = report::TimeoutRechecks::default();
+            stats.include(&results[0]);
+            let first_pass = usize::from(workers == 2 && verdict != "pass");
+            assert_eq!(stats.first_pass, first_pass, "{line}");
+            assert_eq!(
+                stats.confirmed,
+                usize::from(first_pass == 1 && serial && verdict == "timeout"),
+                "{line}"
+            );
+            assert_eq!(
+                stats.recovered,
+                usize::from(first_pass == 1 && serial && verdict == "recovered"),
+                "{line}"
+            );
+            assert_eq!(
+                stats.unconfirmed,
+                usize::from(first_pass == 1 && (!serial || verdict == "unable")),
+                "{line}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn mutant_timeout_uses_the_measured_filter_and_an_explicit_override_wins() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = scratch("filtered-timeout");
+        let exe = dir.join("runner");
+        fs::write(
+            &exe,
+            "#!/bin/sh\n[ \"$2\" = --exact ] && [ \"$3\" = fast ]\n",
+        )
+        .unwrap();
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+        let mut bin = TestBinary {
+            name: "tests".into(),
+            cwd: dir.clone(),
+            marks: marks_dir(&dir).unwrap(),
+            git_ceiling: dir.clone(),
+            work_lock: None,
+            tests: ["fast".to_string(), "slow".to_string()]
+                .into_iter()
+                .collect(),
+            runner: Runner::Exe(exe),
+            baseline: Duration::from_secs(70),
+            traced: Duration::from_secs(70),
+            timeout: None,
+            wrapper_grace: Duration::ZERO,
+            report_slow: false,
+            filtered_timings: Default::default(),
+            trace: Trace::default(),
+        };
+        assert!(bin.filtered_limit(Some(&["fast".to_string()]), false) < Duration::from_secs(7));
+        assert_eq!(
+            bin.filtered_limit(Some(&["slow".to_string()]), false),
+            Duration::from_secs(355)
+        );
+        assert_eq!(bin.filtered_limit(None, false), Duration::from_secs(355));
+        assert_eq!(bin.filtered_timings.lock().unwrap().len(), 2);
+        bin.timeout = Some(Duration::from_secs(8));
+        assert_eq!(
+            bin.filtered_limit(Some(&["fast".to_string()]), false),
+            Duration::from_secs(8)
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn failed_build_retains_spanless_and_source_diagnostics() {
@@ -5312,7 +5766,7 @@ mod tests {
         // With several packages each binary is attributed to its own.
         let both = parse_build_output(stdout, &["dep", "p"]);
         let owners: Vec<&str> = both.test_binaries.iter().map(|b| b.2.as_str()).collect();
-        assert_eq!(owners, ["p", "dep"]);
+        assert_eq!(owners, ["dep", "p"]);
         assert_eq!(
             out.errors,
             [CompileError {
@@ -5796,6 +6250,7 @@ serde = { path = "../../serde-fork" }
             cwd: work.join("src"),
             marks: marks_dir(&work).unwrap(),
             git_ceiling: work,
+            work_lock: None,
             tests: BTreeSet::new(),
             runner: Runner::Exe(exe),
             baseline: Duration::ZERO,
@@ -5860,6 +6315,7 @@ fn main() {
             cwd: work.join("src"),
             marks: marks_dir(&work).unwrap(),
             git_ceiling: work,
+            work_lock: None,
             tests: BTreeSet::new(),
             runner: Runner::Exe(exe),
             baseline: Duration::ZERO,

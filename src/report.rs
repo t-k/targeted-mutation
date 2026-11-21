@@ -192,6 +192,12 @@ pub struct Analysis {
     pub git_index: bool,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub copy_fixtures: Vec<PathBuf>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub copy_fixture_excludes: Vec<PathBuf>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub output_fixtures: Vec<crate::output_fixture::Fixture>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub checkpoint: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]

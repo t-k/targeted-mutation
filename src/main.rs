@@ -71,6 +71,15 @@ struct Cli {
     /// Copy a workspace-relative file or directory even when Git ignores it (repeatable).
     #[arg(long, value_name = "PATH")]
     copy_fixture: Vec<PathBuf>,
+    /// Omit this workspace-relative entry from an explicitly copied fixture (repeatable).
+    #[arg(long, value_name = "PATH", requires = "copy_fixture")]
+    copy_fixture_exclude: Vec<PathBuf>,
+    /// Stage workspace fixture FROM at path TO relative to the isolated Cargo output (repeatable).
+    #[arg(long, value_name = "FROM=TO")]
+    copy_output_fixture: Vec<targeted_mutation::output_fixture::Fixture>,
+    /// Save and reuse completed mutant outcomes in checkpoint.jsonl under the work directory.
+    #[arg(long, conflicts_with = "list")]
+    checkpoint: bool,
     /// Mutants to run at the same time. Only raise it if the tests can run concurrently
     /// with themselves (no fixed ports, no shared files).
     #[arg(short, long, default_value_t = 1, value_name = "N")]
@@ -248,6 +257,9 @@ fn main() -> ExitCode {
         all_files: cli.all_files,
         git_index: cli.git_index,
         copy_fixtures: cli.copy_fixture,
+        copy_fixture_excludes: cli.copy_fixture_exclude,
+        output_fixtures: cli.copy_output_fixture,
+        checkpoint: cli.checkpoint,
         doc: cli.doc,
     };
     if cli.jsonl {
