@@ -66,6 +66,9 @@ struct Cli {
     /// for supported survivors. Slower than probes alone.
     #[arg(long)]
     rebuild: bool,
+    /// Also replace Result returns with Err(EXPR), using this Rust expression (repeatable).
+    #[arg(long = "error", value_name = "EXPR", allow_hyphen_values = true)]
+    error_values: Vec<String>,
     /// Build every supported mutant in the selected source instead of using probes.
     #[arg(long, conflicts_with_all = ["rebuild", "audit", "no_verify"])]
     source_only: bool,
@@ -138,6 +141,7 @@ fn main() -> ExitCode {
         dependents: cli.dependents,
         effects: !cli.no_effects,
         rebuild: cli.rebuild,
+        error_values: cli.error_values,
         source_only: cli.source_only,
         test_selection: driver::TestSelection {
             isolate: cli.isolate_tests,

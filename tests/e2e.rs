@@ -1836,6 +1836,109 @@ fn paired_witnesses_respect_decoder_scope_test_selection_and_skip_attributes() {
 }
 
 #[test]
+fn configured_result_errors_are_mutated_in_every_execution_mode() {
+    let dir = fixture("genres", "configured-errors");
+    let source = dir.join("src/lib.rs");
+    // Pairwise table from errors.pict, including the seeded default and three execution paths.
+    let rows = [
+        ("direct", 0, None),
+        ("direct", 1, None),
+        ("direct", 1, Some("--rebuild")),
+        ("direct", 1, Some("--source-only")),
+        ("nested", 0, Some("--rebuild")),
+        ("direct", 2, Some("--rebuild")),
+        ("other", 2, None),
+        ("other", 1, Some("--source-only")),
+        ("alias", 0, Some("--source-only")),
+        ("alias", 2, Some("--source-only")),
+        ("nested", 1, Some("--source-only")),
+        ("other", 0, Some("--rebuild")),
+        ("alias", 1, None),
+        ("alias", 2, Some("--rebuild")),
+        ("nested", 2, None),
+    ];
+    for (shape, errors, mode) in rows {
+        let (signature, result) = match shape {
+            "direct" => ("core::result::Result<u32, String>", "Ok(n)"),
+            "nested" => ("Option<Result<u32, String>>", "Some(Ok(n))"),
+            "alias" => ("alias::Result", "Ok(())"),
+            "other" => ("u32", "n"),
+            _ => unreachable!(),
+        };
+        let body = if shape == "alias" {
+            "let _ = n; Ok(())"
+        } else {
+            result
+        };
+        fs::write(
+            &source,
+            format!(
+                "mod alias {{ pub type Result = core::result::Result<(), String>; }}\n\
+                 pub fn parse(n: u32) -> {signature} {{ {body} }}\n\
+                 #[test]\nfn accepts_success() {{\n    let n = 5;\n    assert_eq!(parse(n), {expected});\n}}\n",
+                expected = if shape == "alias" { "Ok(())" } else { result },
+            ),
+        )
+        .unwrap();
+        let mut args = vec!["--quiet", "--json", "--lines", "src/lib.rs:2"];
+        args.extend(mode);
+        for expression in [r#""mutated".into()"#, "String::from(7_u32)"]
+            .into_iter()
+            .take(errors)
+        {
+            args.extend(["--error", expression]);
+        }
+        let run = tmt(&dir, &args);
+        let report: Value = serde_json::from_str(&run.stdout)
+            .unwrap_or_else(|err| panic!("{args:?}: {err}: {}", run.stderr));
+        let base = match shape {
+            "nested" if mode == Some("--source-only") => 3,
+            "nested" => 4,
+            "alias" => 1,
+            _ => 2,
+        };
+        let configured = if shape == "other" { 0 } else { errors };
+        assert_eq!(
+            report["mutants_run"],
+            base + configured.min(1),
+            "{shape} {args:?} {report:#}"
+        );
+        assert_eq!(
+            report["unviable_mutants"],
+            configured.saturating_sub(1),
+            "{shape} {args:?} {report:#}"
+        );
+        assert_eq!(
+            report["mutants_killed"],
+            if shape == "alias" {
+                configured.min(1)
+            } else {
+                base + configured.min(1)
+            },
+            "{shape} {args:?} {report:#}"
+        );
+        if errors > 0 {
+            assert_eq!(
+                report["analysis"]["error_values"].as_array().unwrap().len(),
+                errors
+            );
+        } else {
+            assert!(
+                report["analysis"].get("error_values").is_none(),
+                "{report:#}"
+            );
+        }
+    }
+    let invalid = tmt(&dir, &["--error", "broken(", "--quiet"]);
+    assert_eq!(invalid.code, 1);
+    assert!(
+        invalid.stderr.contains("invalid --error expression"),
+        "{}",
+        invalid.stderr
+    );
+}
+
+#[test]
 fn the_mutants_of_cargo_mutants() {
     let dir = fixture("genres", "genres");
     let run = tmt(&dir, &["--json", "--quiet", "--rebuild"]);

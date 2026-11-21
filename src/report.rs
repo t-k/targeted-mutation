@@ -158,6 +158,8 @@ pub struct Analysis {
     pub doc_tests: bool,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub source_only: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub error_values: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub test_selection: Option<TestSelection>,
     #[serde(skip_serializing_if = "std::ops::Not::not")]

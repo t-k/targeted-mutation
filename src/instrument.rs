@@ -320,6 +320,14 @@ pub struct Discovery {
 
 /// Finds the sites in one source file, numbering them from `first_id`.
 pub fn discover(source: &str, first_id: u32) -> Result<Discovery> {
+    discover_with_errors(source, first_id, &[])
+}
+
+pub(crate) fn discover_with_errors(
+    source: &str,
+    first_id: u32,
+    error_values: &[&str],
+) -> Result<Discovery> {
     // The parser drops a byte order mark and a `#!` line before it numbers bytes, so its
     // offsets would not be offsets into `source`.
     if source.starts_with('\u{feff}') || (source.starts_with("#!") && !source.starts_with("#![")) {
@@ -342,6 +350,7 @@ pub fn discover(source: &str, first_id: u32) -> Result<Discovery> {
         found: Discovery::default(),
         local_macros,
         const_depth: 0,
+        error_values,
         for_ranges: std::collections::HashSet::new(),
     };
     finder.visit_file(&file);
@@ -349,6 +358,7 @@ pub fn discover(source: &str, first_id: u32) -> Result<Discovery> {
 }
 
 struct Finder<'s> {
+    error_values: &'s [&'s str],
     /// Names of the macros this file defines at its top level.
     local_macros: Vec<String>,
     source: &'s str,
@@ -435,7 +445,7 @@ impl Finder<'_> {
                 text: text.clone(),
             });
         }
-        for value in body_values(&sig.output) {
+        for value in body_values_with_errors(&sig.output, self.error_values) {
             if written.as_deref() != Some(tokens_of(&value).as_str()) {
                 push(
                     self,
@@ -1039,7 +1049,7 @@ pub fn iterator_values(output: &syn::ReturnType) -> Vec<String> {
     }
     let mut values = vec!["::core::iter::empty()".to_string()];
     values.extend(
-        values_of(item)
+        values_of(item, &[])
             .iter()
             .map(|value| format!("::core::iter::once({value})")),
     );
@@ -1115,6 +1125,10 @@ fn does_nothing_else(expr: &syn::Expr) -> bool {
 /// The values to replace a function's body with, by its return type. The table is that
 /// of cargo-mutants (https://mutants.rs/mutants.html), applied to the type as written.
 pub fn body_values(output: &syn::ReturnType) -> Vec<String> {
+    body_values_with_errors(output, &[])
+}
+
+fn body_values_with_errors(output: &syn::ReturnType, error_values: &[&str]) -> Vec<String> {
     match output {
         syn::ReturnType::Default => vec!["()".to_string()],
         syn::ReturnType::Type(_, ty) => {
@@ -1123,7 +1137,7 @@ pub fn body_values(output: &syn::ReturnType) -> Vec<String> {
             if has_ident(ty.to_token_stream(), "impl") {
                 return vec![];
             }
-            values_of(ty)
+            values_of(ty, error_values)
         }
     }
 }
@@ -1142,17 +1156,24 @@ fn product(parts: &[Vec<String>]) -> Vec<Vec<String>> {
     })
 }
 
-fn values_of(ty: &syn::Type) -> Vec<String> {
+fn values_of(ty: &syn::Type, error_values: &[&str]) -> Vec<String> {
     let each = |inner: &syn::Type, wrap: &dyn Fn(&str) -> String| -> Vec<String> {
-        values_of(inner).iter().map(|v| wrap(v)).collect()
+        values_of(inner, error_values)
+            .iter()
+            .map(|v| wrap(v))
+            .collect()
     };
     match ty {
-        syn::Type::Paren(t) => values_of(&t.elem),
-        syn::Type::Group(t) => values_of(&t.elem),
+        syn::Type::Paren(t) => values_of(&t.elem, error_values),
+        syn::Type::Group(t) => values_of(&t.elem, error_values),
         syn::Type::Never(_) => vec![],
         // Also the empty one: one row of no values, written `()`.
         syn::Type::Tuple(t) => {
-            let parts: Vec<Vec<String>> = t.elems.iter().map(values_of).collect();
+            let parts: Vec<Vec<String>> = t
+                .elems
+                .iter()
+                .map(|ty| values_of(ty, error_values))
+                .collect();
             product(&parts)
                 .into_iter()
                 .map(|row| match &row[..] {
@@ -1224,9 +1245,23 @@ fn values_of(ty: &syn::Type) -> Vec<String> {
                     values
                 }
                 ("String", []) => texts(&["String::new()", "\"xyzzy\".into()"]),
-                ("Result", [ok, ..]) => each(ok, &|v| format!("Ok({v})")),
-                // `fmt::Result`, or an alias of the crate's own.
-                ("Result", []) => vec!["Ok(Default::default())".to_string()],
+                ("Result", arguments) => {
+                    let mut values = match arguments.first() {
+                        Some(ok) => each(ok, &|v| format!("Ok({v})")),
+                        // `fmt::Result`, or an alias of the crate's own.
+                        None => vec!["Ok(Default::default())".to_string()],
+                    };
+                    values.extend(error_values.iter().map(|expression| {
+                        // A trailing line comment must not swallow the closing parenthesis.
+                        let end = if expression.rsplit('\n').next().unwrap_or("").contains("//") {
+                            "\n"
+                        } else {
+                            ""
+                        };
+                        format!("Err({expression}{end})")
+                    }));
+                    values
+                }
                 ("Option", [inner]) => {
                     let mut values = vec!["None".to_string()];
                     values.extend(each(inner, &|v| format!("Some({v})")));
@@ -1248,7 +1283,7 @@ fn values_of(ty: &syn::Type) -> Vec<String> {
                 ("BTreeMap" | "HashMap", [key, value]) => {
                     let mut values = vec![format!("{bare}::new()")];
                     values.extend(
-                        product(&[values_of(key), values_of(value)])
+                        product(&[values_of(key, error_values), values_of(value, error_values)])
                             .into_iter()
                             .map(|row| format!("{bare}::from_iter([({})])", row.join(", "))),
                     );
@@ -1256,7 +1291,7 @@ fn values_of(ty: &syn::Type) -> Vec<String> {
                 }
                 ("Cow", [inner]) => {
                     let borrowed: syn::Type = syn::parse_quote!(&#inner);
-                    values_of(&borrowed)
+                    values_of(&borrowed, error_values)
                         .iter()
                         .flat_map(|v| {
                             [

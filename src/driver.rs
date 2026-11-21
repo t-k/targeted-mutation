@@ -48,6 +48,8 @@ pub struct Options {
     pub effects: bool,
     /// Build and run, one by one, the mutants that cannot be switched at run time.
     pub rebuild: bool,
+    /// Rust expressions used as the payload of a Result error mutation.
+    pub error_values: Vec<String>,
     pub source_only: bool,
     pub test_selection: TestSelection,
     /// Optimisation level to build the tests with, instead of the profile's own.
@@ -2346,6 +2348,16 @@ fn run_pool<T: Send>(
 }
 
 pub fn run(options: &Options) -> Result<Report> {
+    let mut seen_errors = HashSet::new();
+    let mut error_values = vec![];
+    for expression in &options.error_values {
+        let expression = expression.trim();
+        let parsed = syn::parse_str::<syn::Expr>(expression)
+            .with_context(|| format!("invalid --error expression {expression:?}"))?;
+        if seen_errors.insert(quote::ToTokens::to_token_stream(&parsed).to_string()) {
+            error_values.push(expression);
+        }
+    }
     let selection = &options.test_selection;
     if options.doc && selection.enabled() {
         bail!("--doc cannot be combined with isolated test selection");
@@ -2588,7 +2600,7 @@ pub fn run(options: &Options) -> Result<Report> {
             .unwrap_or(&path)
             .display()
             .to_string();
-        match instrument::discover(&original, next_id) {
+        match instrument::discover_with_errors(&original, next_id, &error_values) {
             Ok(found) => {
                 next_id += found.sites.len() as u32;
                 for module in &found.test_modules {
@@ -2731,6 +2743,10 @@ pub fn run(options: &Options) -> Result<Report> {
             verified: options.verify && !options.source_only,
             doc_tests: options.doc,
             source_only: options.source_only,
+            error_values: error_values
+                .iter()
+                .map(|value| (*value).to_owned())
+                .collect(),
             test_selection: None,
             git_index: options.git_index,
             copy_fixtures: options.copy_fixtures.clone(),
