@@ -17,7 +17,7 @@ mod simple;
 pub(crate) const TEST_NAME: &str = "__tmt_witness";
 pub(crate) const OUTPUT_ENV: &str = "TMT_WITNESS_OUTPUT";
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Edit {
     pub span: Range<usize>,
     pub replacement: String,
@@ -58,19 +58,22 @@ pub(crate) struct Observation {
 }
 
 impl Scenario {
-    pub fn test_name(&self) -> String {
+    pub fn test_name(&self, name: &str) -> String {
         self.placement.as_ref().map_or_else(
-            || TEST_NAME.to_owned(),
-            |placement| format!("{}::{TEST_NAME}", placement.module),
+            || name.to_owned(),
+            |placement| format!("{}::{name}", placement.module),
         )
     }
 
-    pub fn render(&self, source: &str, edits: &[Edit], expected: Option<&str>) -> Option<String> {
+    pub fn test_edit(&self, source: &str, name: &str, expected: Option<&str>) -> Edit {
         let offset = self.placement.as_ref().map_or(source.len(), |p| p.offset);
-        render_edits(source, edits, Some((offset, &self.test_source(expected))))
+        Edit {
+            span: offset..offset,
+            replacement: self.test_source(name, expected),
+        }
     }
 
-    fn test_source(&self, expected: Option<&str>) -> String {
+    fn test_source(&self, name: &str, expected: Option<&str>) -> String {
         let result_type = if self.position {
             ": __tmt_witness_std::option::Option<__tmt_witness_std::primitive::usize>"
         } else {
@@ -85,7 +88,7 @@ impl Scenario {
         format!(
             r#"
 #[test]
-fn {TEST_NAME}() {{
+fn {name}() {{
     extern crate std as __tmt_witness_std;
     {setup}
     let result{result_type} = {expression};
@@ -436,6 +439,58 @@ pub(crate) fn parse_observation(output: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use quote::ToTokens;
+
+    #[test]
+    fn witness_test_edits_keep_names_and_placement_for_each_input() {
+        // Full 3-way table from witness.pict.
+        for nested in [false, true] {
+            for expected in [None, Some("7")] {
+                for count in [1, 2] {
+                    let source = "mod tests { fn helper() {} }";
+                    let scenario = Scenario {
+                        expression: "7".into(),
+                        placement: nested.then(|| Placement {
+                            module: "tests".into(),
+                            offset: source.len() - 1,
+                        }),
+                        ..Scenario::default()
+                    };
+                    let edits: Vec<_> = (0..count)
+                        .map(|index| scenario.test_edit(source, &format!("case_{index}"), expected))
+                        .collect();
+                    let rendered = render_edits(source, &edits, None).unwrap();
+                    let parsed = syn::parse_file(&rendered).unwrap();
+                    let syn::Item::Mod(module) = &parsed.items[0] else {
+                        panic!("{rendered}");
+                    };
+                    let functions = if nested {
+                        &module.content.as_ref().unwrap().1[1..]
+                    } else {
+                        &parsed.items[1..]
+                    };
+                    assert_eq!(functions.len(), count);
+                    for (index, item) in functions.iter().enumerate() {
+                        let syn::Item::Fn(item) = item else {
+                            panic!("{rendered}");
+                        };
+                        let name = format!("case_{index}");
+                        assert_eq!(item.sig.ident, name);
+                        let expected_name = if nested {
+                            format!("tests::{name}")
+                        } else {
+                            name.clone()
+                        };
+                        assert_eq!(scenario.test_name(&name), expected_name);
+                        assert_eq!(
+                            item.block.to_token_stream().to_string().contains("=="),
+                            expected.is_some()
+                        );
+                    }
+                }
+            }
+        }
+    }
 
     #[test]
     fn witness_edits_compose_and_keep_insertion_offsets_in_the_original_source() {

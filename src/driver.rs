@@ -1538,10 +1538,11 @@ fn observe_witness(
     exe: PathBuf,
     wrapper: Option<&Path>,
     scenario: &witness::Scenario,
+    name: &str,
     compares: bool,
 ) -> Result<Option<witness::Observation>> {
     use std::io::Read as _;
-    let test_name = scenario.test_name();
+    let test_name = scenario.test_name(name);
     let test = TestBinary {
         name: test_name.clone(),
         cwd: baseline.cwd.clone(),
@@ -1602,9 +1603,100 @@ fn witness_location(source: &SourceFile, candidate: &witness::Candidate) -> repo
 }
 
 enum WitnessTrial {
-    NotApplicable,
-    BuildFailed,
-    Evaluated(Outcome, Option<report::VerifiedWitness>),
+    Inapplicable,
+    Unviable,
+    Evaluated(Outcome),
+}
+
+struct WitnessSurvivor<'a> {
+    candidate: &'a witness::Candidate,
+    at: report::Location,
+    existing: Option<usize>,
+    scenarios: Vec<(&'a witness::Scenario, &'a TestBinary)>,
+}
+
+struct SharedWitness {
+    value: String,
+    name: String,
+    tests: std::rc::Rc<[witness::Edit]>,
+}
+
+fn shared_witnesses(
+    source: &str,
+    survivors: &[WitnessSurvivor<'_>],
+    wrapper: Option<&Path>,
+    compile: impl Fn(&[witness::Edit]) -> Result<Option<PathBuf>>,
+    note: impl Fn(&str),
+) -> Result<Vec<Option<SharedWitness>>> {
+    let mut originals: Vec<_> = (0..survivors.len()).map(|_| None).collect();
+    // A custom wrapper may recognize the individual witness test name.
+    if wrapper.is_some() {
+        return Ok(originals);
+    }
+    // Compile the first selected input of each survivor together, then compile the
+    // typed checks of their values together. No later input is run speculatively.
+    let inputs: Vec<_> = survivors
+        .iter()
+        .enumerate()
+        .filter_map(|(index, survivor)| {
+            let (scenario, runner) = *survivor.scenarios.first()?;
+            Some((
+                index,
+                scenario,
+                runner,
+                format!("{}_{index}", witness::TEST_NAME),
+            ))
+        })
+        .collect();
+    for batch in inputs.chunks(32).filter(|batch| batch.len() > 1) {
+        note(&format!(
+            "sharing a build for {} original witness inputs",
+            batch.len()
+        ));
+        let tests: Vec<_> = batch
+            .iter()
+            .map(|(_, scenario, _, name)| scenario.test_edit(source, name, None))
+            .collect();
+        let Some(exe) = compile(&tests)? else {
+            note("shared witness build failed, trying inputs individually");
+            continue;
+        };
+        let observed: Vec<_> = batch
+            .iter()
+            .filter_map(|(index, scenario, runner, name)| {
+                let value = observe_witness(runner, exe.clone(), wrapper, scenario, name, false)
+                    .ok()??
+                    .value;
+                witness::is_expected_literal(&value)
+                    .then_some((*index, *scenario, *runner, name, value))
+            })
+            .collect();
+        if observed.is_empty() {
+            continue;
+        }
+        let tests: std::rc::Rc<[_]> = observed
+            .iter()
+            .map(|(_, scenario, _, name, value)| scenario.test_edit(source, name, Some(value)))
+            .collect();
+        let Some(exe) = compile(&tests)? else {
+            note("shared witness build failed, trying inputs individually");
+            continue;
+        };
+        for (index, scenario, runner, name, value) in observed {
+            let checked = observe_witness(runner, exe.clone(), wrapper, scenario, name, true);
+            if checked.is_ok_and(|value_read| {
+                value_read
+                    .is_some_and(|read| read.equals_expected == Some(true) && read.value == value)
+            }) {
+                originals[index] = Some(SharedWitness {
+                    value,
+                    name: name.clone(),
+                    tests: tests.clone(),
+                });
+            }
+        }
+    }
+    Ok(originals)
 }
 
 /// Takes the mark away after the run and says whether the run had given up (the mark
@@ -2808,13 +2900,22 @@ pub fn run(options: &Options) -> Result<Report> {
     if !build_note.is_empty() {
         note(build_note.trim_end());
     }
-    let cargo_build = || {
+    // An observation uses only the library's unit-test artifact. The baseline and
+    // source mutants still need the normal library build to check cfg(not(test)).
+    let can_build_only_observer = !options.doc
+        && target_flags.is_none()
+        && test_packages.len() == 1
+        && package.targets.len() == 1
+        && root_target.test
+        && root_target.test_build_arg() == Some(("--lib", None));
+    let build_test_binaries = |observer: bool| {
         let mut command = Command::new("cargo");
         isolate_copy_command(&mut command, &work);
         command
             .args(["test", "--no-run", "--message-format=json"])
             .args(test_packages.iter().flat_map(|p| ["-p", p.name.as_str()]))
             .args(target_flags.as_deref().unwrap_or_default())
+            .args((observer && can_build_only_observer).then_some("--lib"))
             .args(options.cargo.flags())
             .current_dir(&copy)
             .env("CARGO_TARGET_DIR", &build_target)
@@ -2824,6 +2925,7 @@ pub fn run(options: &Options) -> Result<Report> {
             .output()
             .context("running cargo test --no-run")
     };
+    let cargo_build = || build_test_binaries(false);
     let mut rounds = 0;
     let build = loop {
         for file in &mut files {
@@ -3559,6 +3661,19 @@ pub fn run(options: &Options) -> Result<Report> {
             .expect("witness candidates in the root file");
         let rendered = file.rendered.as_ref().expect("rendered before building");
         let restore = format!("{}{root_suffix}", rendered.text);
+        // These builds replace every probe in the library root with the source.
+        // Keep the runtime only if another file in this build still contains probes.
+        let witness_suffix = if files.iter().any(|other| {
+            other.path != root_file
+                && other
+                    .rendered
+                    .as_ref()
+                    .is_some_and(|r| r.text != other.original)
+        }) {
+            root_suffix.as_str()
+        } else {
+            ""
+        };
         let library_runners: Vec<_> = session
             .binaries
             .iter()
@@ -3590,26 +3705,24 @@ pub fn run(options: &Options) -> Result<Report> {
                     })
             })
         };
-        let suite = |edits: &[witness::Edit]| -> Result<Option<Outcome>> {
+        let write_edits = |edits: &[witness::Edit]| -> Result<bool> {
             let Some(source) = witness::render_edits(&file.original, edits, None) else {
-                return Ok(None);
+                return Ok(false);
             };
-            state.write(&root_file, &format!("{source}{root_suffix}"))?;
-            if !cargo_build()?.status.success() {
+            state.write(&root_file, &format!("{source}{witness_suffix}"))?;
+            Ok(true)
+        };
+        let suite = |edits: &[witness::Edit]| -> Result<Option<Outcome>> {
+            if !write_edits(edits)? || !cargo_build()?.status.success() {
                 return Ok(None);
             }
             run_source_tests(&by_speed).map(Some)
         };
-        let observe = |scenario: &witness::Scenario,
-                       baseline: &TestBinary,
-                       edits: &[witness::Edit],
-                       expected: Option<&str>|
-         -> Result<Option<witness::Observation>> {
-            let Some(source) = scenario.render(&file.original, edits, expected) else {
+        let compile_observer = |edits: &[witness::Edit]| -> Result<Option<PathBuf>> {
+            if !write_edits(edits)? {
                 return Ok(None);
-            };
-            state.write(&root_file, &format!("{source}{root_suffix}"))?;
-            let build = cargo_build()?;
+            }
+            let build = build_test_binaries(true)?;
             if !build.status.success() {
                 return Ok(None);
             }
@@ -3617,7 +3730,16 @@ pub fn run(options: &Options) -> Result<Report> {
                 &String::from_utf8_lossy(&build.stdout),
                 &[package.name.as_str()],
             );
-            let Some(exe) = root_test_exe(&artifacts) else {
+            Ok(root_test_exe(&artifacts))
+        };
+        let observe = |scenario: &witness::Scenario,
+                       baseline: &TestBinary,
+                       edits: &[witness::Edit],
+                       expected: Option<&str>|
+         -> Result<Option<witness::Observation>> {
+            let test = scenario.test_edit(&file.original, witness::TEST_NAME, expected);
+            let edits: Vec<_> = edits.iter().cloned().chain([test]).collect();
+            let Some(exe) = compile_observer(&edits)? else {
                 return Ok(None);
             };
             observe_witness(
@@ -3625,12 +3747,14 @@ pub fn run(options: &Options) -> Result<Report> {
                 exe,
                 wrapper.as_deref(),
                 scenario,
+                witness::TEST_NAME,
                 expected.is_some(),
             )
         };
+        let mut survivors = vec![];
         progress::track(
             options.progress,
-            "distinguishing tests",
+            "source witness mutants",
             witness_candidates.len(),
             |progress| -> Result<()> {
                 for candidate in &witness_candidates {
@@ -3662,97 +3786,157 @@ pub fn run(options: &Options) -> Result<Report> {
                         progress.complete(progress::Outcome::Unable);
                         continue;
                     }
-                    // A compound survivor is interesting only if both component mutations fail
-                    // the same selected suite by themselves.
-                    let attempted = (|| -> Result<_> {
+                    // A compound survivor is interesting only if each component fails on
+                    // its own. Test the source edits without any generated witness tests.
+                    let attempted = (|| -> Result<WitnessTrial> {
                         if paired {
                             for edit in &candidate.edits {
                                 if suite(std::slice::from_ref(edit))? != Some(Outcome::Fail) {
-                                    return Ok(WitnessTrial::NotApplicable);
+                                    return Ok(WitnessTrial::Inapplicable);
                                 }
                             }
                         }
-                        let Some(outcome) = suite(&candidate.edits)? else {
-                            return Ok(WitnessTrial::BuildFailed);
-                        };
-                        let mut evidence = None;
-                        if outcome == Outcome::Pass {
-                            for (scenario, baseline) in scenarios {
-                                let distinction = (|| -> Result<_> {
-                                    let Some(original) = observe(scenario, baseline, &[], None)?
-                                    else {
-                                        return Ok(None);
-                                    };
-                                    if !witness::is_expected_literal(&original.value) {
-                                        return Ok(None);
-                                    }
-                                    let Some(mutant) = observe(
-                                        scenario,
-                                        baseline,
-                                        &candidate.edits,
-                                        Some(&original.value),
-                                    )?
-                                    else {
-                                        return Ok(None);
-                                    };
-                                    if mutant.equals_expected != Some(false)
-                                        || original.value == mutant.value
-                                    {
-                                        return Ok(None);
-                                    }
-                                    let Some(checked) =
-                                        observe(scenario, baseline, &[], Some(&original.value))?
-                                    else {
-                                        return Ok(None);
-                                    };
-                                    Ok((checked.equals_expected == Some(true)
-                                        && checked.value == original.value)
-                                        .then(|| scenario.verified(original.value, mutant.value))
-                                        .flatten())
-                                })();
-                                match distinction {
-                                    Ok(Some(mut verified)) => {
-                                        verified.individually_killed =
-                                            paired.then_some(candidate.edits.len());
-                                        evidence = Some(verified);
-                                        break;
-                                    }
-                                    Ok(None) => {}
-                                    Err(err) => note(&format!(
-                                        "could not check a distinguishing test for {}: {err:#}",
-                                        scenario.expression,
-                                    )),
-                                }
-                            }
-                        }
-                        Ok(WitnessTrial::Evaluated(outcome, evidence))
+                        Ok(suite(&candidate.edits)?
+                            .map_or(WitnessTrial::Unviable, WitnessTrial::Evaluated))
                     })();
                     state.write(&root_file, &restore)?;
-                    match attempted? {
-                        WitnessTrial::NotApplicable => progress.complete(progress::Outcome::Unable),
-                        WitnessTrial::BuildFailed => {
+                    let outcome = match attempted? {
+                        WitnessTrial::Inapplicable => {
+                            progress.complete(progress::Outcome::Unable);
+                            continue;
+                        }
+                        WitnessTrial::Unviable => {
                             progress.complete(progress::Outcome::Unable);
                             report.unviable_mutants += usize::from(!candidate.existing);
+                            continue;
                         }
-                        WitnessTrial::Evaluated(outcome, evidence) => {
-                            progress.complete(outcome.into());
-                            if let Some(index) = existing {
-                                if let Some(evidence) = evidence {
-                                    report.findings[index].set_witness(evidence);
+                        WitnessTrial::Evaluated(outcome) => outcome,
+                    };
+                    progress.complete(outcome.into());
+                    if !candidate.existing {
+                        report.mutants_run += 1;
+                        report.mutants_killed += usize::from(outcome != Outcome::Pass);
+                        report.mutants_timed_out += usize::from(outcome == Outcome::Timeout);
+                    }
+                    if outcome == Outcome::Pass {
+                        survivors.push(WitnessSurvivor {
+                            candidate,
+                            at,
+                            existing,
+                            scenarios,
+                        });
+                    }
+                }
+                Ok(())
+            },
+        )?;
+
+        let originals = shared_witnesses(
+            &file.original,
+            &survivors,
+            wrapper.as_deref(),
+            compile_observer,
+            note,
+        );
+        if !survivors.is_empty() {
+            state.write(&root_file, &restore)?;
+        }
+        let originals = originals?;
+
+        progress::track(
+            options.progress,
+            "distinguishing tests",
+            survivors.len(),
+            |progress| -> Result<()> {
+                for (survivor, original) in survivors.into_iter().zip(originals) {
+                    let mut evidence = None;
+                    let mut original = original;
+                    for (scenario, baseline) in survivor.scenarios {
+                        let shared = original.take();
+                        let distinction = (|| -> Result<_> {
+                            if let Some(shared) = shared {
+                                // Keep the harness and test name identical on both sides.
+                                let edits: Vec<_> = survivor
+                                    .candidate
+                                    .edits
+                                    .iter()
+                                    .chain(shared.tests.iter())
+                                    .cloned()
+                                    .collect();
+                                if let Some(exe) = compile_observer(&edits)?
+                                    && let Some(mutant) = observe_witness(
+                                        baseline,
+                                        exe,
+                                        wrapper.as_deref(),
+                                        scenario,
+                                        &shared.name,
+                                        true,
+                                    )
+                                    .ok()
+                                    .flatten()
+                                    && mutant.equals_expected == Some(false)
+                                    && let Some(verified) =
+                                        scenario.verified(shared.value, mutant.value)
+                                {
+                                    return Ok(Some(verified));
                                 }
-                                continue;
+                                // A combined build can fail or the code can depend on
+                                // the harness. Retry the original input in isolation.
                             }
-                            report.mutants_run += 1;
-                            report.mutants_killed += usize::from(outcome != Outcome::Pass);
-                            report.mutants_timed_out += usize::from(outcome == Outcome::Timeout);
-                            if outcome == Outcome::Pass {
-                                report.findings.push(Finding::Survivor {
-                                    at,
-                                    survivors: vec![candidate.description.clone()],
-                                    witness: evidence,
-                                });
+                            let Some(original) = observe(scenario, baseline, &[], None)? else {
+                                return Ok(None);
+                            };
+                            let value = original.value;
+                            if !witness::is_expected_literal(&value) {
+                                return Ok(None);
                             }
+                            let Some(mutant) = observe(
+                                scenario,
+                                baseline,
+                                &survivor.candidate.edits,
+                                Some(&value),
+                            )?
+                            else {
+                                return Ok(None);
+                            };
+                            if mutant.equals_expected != Some(false) || value == mutant.value {
+                                return Ok(None);
+                            }
+                            let Some(checked) = observe(scenario, baseline, &[], Some(&value))?
+                            else {
+                                return Ok(None);
+                            };
+                            if checked.equals_expected != Some(true) || checked.value != value {
+                                return Ok(None);
+                            }
+                            Ok(scenario.verified(value, mutant.value))
+                        })();
+                        match distinction {
+                            Ok(Some(mut verified)) => {
+                                let edits = survivor.candidate.edits.len();
+                                verified.individually_killed = (edits > 1).then_some(edits);
+                                evidence = Some(verified);
+                                break;
+                            }
+                            Ok(None) => {}
+                            Err(err) => note(&format!(
+                                "could not check a distinguishing test for {}: {err:#}",
+                                scenario.expression,
+                            )),
                         }
+                    }
+                    state.write(&root_file, &restore)?;
+                    progress.complete(Outcome::Pass.into());
+                    if let Some(index) = survivor.existing {
+                        if let Some(evidence) = evidence {
+                            report.findings[index].set_witness(evidence);
+                        }
+                    } else {
+                        report.findings.push(Finding::Survivor {
+                            at: survivor.at,
+                            survivors: vec![survivor.candidate.description.clone()],
+                            witness: evidence,
+                        });
                     }
                 }
                 Ok(())

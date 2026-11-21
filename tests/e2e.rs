@@ -1836,6 +1836,94 @@ fn paired_witnesses_respect_decoder_scope_test_selection_and_skip_attributes() {
 }
 
 #[test]
+fn shared_witness_builds_fall_back_to_individual_inputs_on_a_name_conflict() {
+    let dir = fixture("distinguishing", "witness-batch-fallback");
+    append(
+        &dir.join("src/lib.rs"),
+        "\nmod helper;\n#[test] fn uses_other_module() { assert!(helper::is_large(2)); }\n",
+    );
+    fs::write(
+        dir.join("src/helper.rs"),
+        "pub fn is_large(value: u8) -> bool { value > 1 }\n",
+    )
+    .unwrap();
+    let args = [
+        "--rebuild",
+        "--json",
+        "--lines",
+        "src/lib.rs:5",
+        "--lines",
+        "src/lib.rs:9",
+        "--lines",
+        "src/helper.rs",
+    ];
+    let run = tmt(&dir, &args);
+    assert_eq!(run.code, 2, "{}", run.stderr);
+    assert!(
+        run.stderr
+            .contains("sharing a build for 2 original witness inputs"),
+        "{}",
+        run.stderr
+    );
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f.get("witness").is_some())
+            .count(),
+        2
+    );
+
+    append(
+        &dir.join("src/lib.rs"),
+        "\n#[cfg(test)]\nfn __tmt_witness_0() {}\n",
+    );
+    let run = tmt(&dir, &args);
+    assert_eq!(run.code, 2, "{}", run.stderr);
+    assert!(
+        run.stderr.contains("shared witness build failed"),
+        "{}",
+        run.stderr
+    );
+    let fallback: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(fallback, report);
+}
+
+#[test]
+fn an_inconclusive_shared_witness_retries_the_original_test_name() {
+    let dir = fixture("shapes", "witness-batch-test-name");
+    let source = dir.join("src/lib.rs");
+    let old = fs::read_to_string(&source).unwrap();
+    let body = old.find("pub fn sum_first").unwrap();
+    let brace = body + old[body..].find('{').unwrap() + 1;
+    let text = format!(
+        r#"{} if std::env::args().any(|arg| arg.starts_with("__tmt_witness_")) {{ return 0; }} {}"#,
+        &old[..brace],
+        &old[brace..]
+    );
+    fs::write(source, text).unwrap();
+    let run = tmt(&dir, &["--json", "--rebuild"]);
+    assert_eq!(run.code, 2, "{}", run.stderr);
+    assert!(
+        run.stderr
+            .contains("sharing a build for 2 original witness inputs"),
+        "{}",
+        run.stderr
+    );
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    let range = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|finding| finding["code"] == "0..n")
+        .unwrap();
+    assert_eq!(range["witness"]["original"], "3", "{range:#}");
+    assert_eq!(range["witness"]["mutant"], "4", "{range:#}");
+}
+
+#[test]
 fn configured_result_errors_are_mutated_in_every_execution_mode() {
     let dir = fixture("genres", "configured-errors");
     let source = dir.join("src/lib.rs");
@@ -1845,23 +1933,31 @@ fn configured_result_errors_are_mutated_in_every_execution_mode() {
         ("direct", 1, None),
         ("direct", 1, Some("--rebuild")),
         ("direct", 1, Some("--source-only")),
+        ("iterator", 1, Some("--rebuild")),
+        ("iterator", 1, Some("--source-only")),
+        ("other", 1, None),
+        ("alias", 1, Some("--source-only")),
         ("nested", 0, Some("--rebuild")),
-        ("direct", 2, Some("--rebuild")),
-        ("other", 2, None),
-        ("other", 1, Some("--source-only")),
-        ("alias", 0, Some("--source-only")),
-        ("alias", 2, Some("--source-only")),
+        ("iterator", 0, None),
+        ("other", 2, Some("--source-only")),
         ("nested", 1, Some("--source-only")),
-        ("other", 0, Some("--rebuild")),
-        ("alias", 1, None),
-        ("alias", 2, Some("--rebuild")),
+        ("alias", 0, Some("--rebuild")),
+        ("iterator", 2, Some("--rebuild")),
         ("nested", 2, None),
+        ("direct", 2, Some("--source-only")),
+        ("alias", 2, None),
+        ("other", 0, Some("--source-only")),
+        ("other", 1, Some("--rebuild")),
     ];
     for (shape, errors, mode) in rows {
         let (signature, result) = match shape {
             "direct" => ("core::result::Result<u32, String>", "Ok(n)"),
             "nested" => ("Option<Result<u32, String>>", "Some(Ok(n))"),
             "alias" => ("alias::Result", "Ok(())"),
+            "iterator" => (
+                "impl Iterator<Item = Result<u32, String>>",
+                "core::iter::once(Ok(n))",
+            ),
             "other" => ("u32", "n"),
             _ => unreachable!(),
         };
@@ -1870,13 +1966,17 @@ fn configured_result_errors_are_mutated_in_every_execution_mode() {
         } else {
             result
         };
+        let (call, expected) = if shape == "iterator" {
+            ("parse(n).collect::<Vec<_>>()", "vec![Ok(n)]")
+        } else {
+            ("parse(n)", result)
+        };
         fs::write(
             &source,
             format!(
                 "mod alias {{ pub type Result = core::result::Result<(), String>; }}\n\
                  pub fn parse(n: u32) -> {signature} {{ {body} }}\n\
-                 #[test]\nfn accepts_success() {{\n    let n = 5;\n    assert_eq!(parse(n), {expected});\n}}\n",
-                expected = if shape == "alias" { "Ok(())" } else { result },
+                 #[test]\nfn accepts_success() {{\n    let n = 5;\n    assert_eq!({call}, {expected});\n}}\n",
             ),
         )
         .unwrap();
@@ -1895,8 +1995,13 @@ fn configured_result_errors_are_mutated_in_every_execution_mode() {
             "nested" if mode == Some("--source-only") => 3,
             "nested" => 4,
             "alias" => 1,
+            "iterator" => 3,
             _ => 2,
         };
+        if shape == "iterator" && mode.is_none() {
+            assert_eq!(report["mutants_not_built"], base + errors, "{report:#}");
+            continue;
+        }
         let configured = if shape == "other" { 0 } else { errors };
         assert_eq!(
             report["mutants_run"],
@@ -1936,6 +2041,32 @@ fn configured_result_errors_are_mutated_in_every_execution_mode() {
         "{}",
         invalid.stderr
     );
+}
+
+#[test]
+fn source_mutant_must_still_build_the_production_library() {
+    let dir = fixture("eligibility", "source-mutant-production-lib");
+    fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+        #[cfg(test)]
+        pub type Code = u8;
+        #[cfg(not(test))]
+        pub struct Code;
+        pub fn check() -> Result<(), Code> { Ok(()) }
+        #[test]
+        fn succeeds() { assert!(check().is_ok()); }
+        "#,
+    )
+    .unwrap();
+    let run = tmt(
+        &dir,
+        &["--quiet", "--json", "--source-only", "--error", "7"],
+    );
+    let report: Value =
+        serde_json::from_str(&run.stdout).unwrap_or_else(|err| panic!("{err}: {}", run.stderr));
+    assert_eq!(report["unviable_mutants"], 1, "{report:#}");
+    assert_eq!(report["mutants_run"], 0, "{report:#}");
 }
 
 #[test]

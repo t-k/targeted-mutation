@@ -430,7 +430,7 @@ impl Finder<'_> {
         }
         let written = sole_expr.map(|(from, to)| tokens_of(&self.source[from..to]));
         // An iterator of another type cannot be returned beside the body's own.
-        for value in iterator_values(&sig.output) {
+        for value in iterator_values_with_errors(&sig.output, self.error_values) {
             self.found.rebuild_sites.push(Site {
                 id: NO_ID,
                 kind: SiteKind::Body {
@@ -1021,6 +1021,10 @@ pub fn source_mutants(site: &Site) -> Vec<SourceMutant> {
 /// The iterators to return in place of the body of a function that returns
 /// `impl Iterator<Item = T>`: an empty one, and one of each value of `T`.
 pub fn iterator_values(output: &syn::ReturnType) -> Vec<String> {
+    iterator_values_with_errors(output, &[])
+}
+
+fn iterator_values_with_errors(output: &syn::ReturnType, error_values: &[&str]) -> Vec<String> {
     let syn::ReturnType::Type(_, ty) = output else {
         return vec![];
     };
@@ -1049,7 +1053,7 @@ pub fn iterator_values(output: &syn::ReturnType) -> Vec<String> {
     }
     let mut values = vec!["::core::iter::empty()".to_string()];
     values.extend(
-        values_of(item, &[])
+        values_of(item, error_values)
             .iter()
             .map(|value| format!("::core::iter::once({value})")),
     );
