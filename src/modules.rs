@@ -269,6 +269,15 @@ fn attributes_decide_which_files_a_module_has_and_which_are_production() {
             r#"#[cfg_attr(unix, path = "u.rs")] mod child;"#,
             &[(&["src/u.rs"], true), (&default, true)],
         ),
+        // A condition inside another holds only where both do.
+        (
+            r#"#[cfg_attr(test, cfg_attr(unix, path = "n.rs"))] mod child;"#,
+            &[(&["src/n.rs"], false), (&default, true)],
+        ),
+        (
+            r#"#[cfg_attr(unix, cfg_attr(not(test), path = "m.rs"))] mod child;"#,
+            &[(&["src/m.rs"], true), (&default, true)],
+        ),
         // Each directory of an inline module is followed with its own condition.
         (
             r#"#[cfg_attr(test, path = "t")] mod outer { mod child; }"#,
