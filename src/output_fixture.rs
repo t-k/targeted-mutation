@@ -190,7 +190,9 @@ pub(crate) fn stage(
     // path in a later build, and tests may create files of their own.
     let mut previous = Ownership::new();
     for (path, receipt) in &recorded {
-        if let Some(metadata) = output_metadata(&target, path)?
+        // What is no longer a file or a directory of ours, or is now behind something
+        // that is not a directory, was replaced by somebody else: it is theirs.
+        if let Place::Found(metadata) = output_place(&target, path)?
             && let Some(current) = receipt.check(&metadata)?
         {
             previous.insert(path.clone(), current);
@@ -333,25 +335,43 @@ fn plan_source(
     Ok(())
 }
 
-fn output_metadata(target: &Path, relative: &Path) -> Result<Option<fs::Metadata>> {
+/// What is at a path below the target directory, looked at without following links.
+enum Place {
+    Found(fs::Metadata),
+    Missing,
+    /// The path itself, or a part of it, is neither a file nor a directory where it has
+    /// to be one (a symbolic link, for example).
+    Unsafe(PathBuf),
+}
+
+fn output_place(target: &Path, relative: &Path) -> Result<Place> {
     let mut parts = relative.components().peekable();
     let mut current = target.to_path_buf();
     while let Some(part) = parts.next() {
         current.push(part);
         let Some(metadata) = inspect(&current)? else {
-            return Ok(None);
+            return Ok(Place::Missing);
         };
         if parts.peek().is_none() && (metadata.is_dir() || metadata.is_file()) {
-            return Ok(Some(metadata));
+            return Ok(Place::Found(metadata));
         }
         if !metadata.is_dir() {
-            bail!(
-                "output fixture destination crosses an unsafe path: {}",
-                current.display()
-            );
+            return Ok(Place::Unsafe(current));
         }
     }
     unreachable!("relative output fixture paths are nonempty")
+}
+
+/// A destination that is about to be written: nothing is written through an unsafe path.
+fn output_metadata(target: &Path, relative: &Path) -> Result<Option<fs::Metadata>> {
+    match output_place(target, relative)? {
+        Place::Found(metadata) => Ok(Some(metadata)),
+        Place::Missing => Ok(None),
+        Place::Unsafe(path) => bail!(
+            "output fixture destination crosses an unsafe path: {}",
+            path.display()
+        ),
+    }
 }
 
 fn inspect(path: &Path) -> Result<Option<fs::Metadata>> {
@@ -836,6 +856,47 @@ mod tests {
             "an artifact Cargo just created"
         );
         assert!(tree.stage(&[mapping("empty", "debug/dir")]).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn forgets_what_was_replaced_by_something_that_is_not_ours() {
+        // A file of ours replaced by a link: the link stays and nothing is written through it.
+        let tree = Tree::new();
+        fs::write(tree.workspace.join("asset"), "value").unwrap();
+        let asset = mapping("asset", "debug/asset");
+        tree.stage(std::slice::from_ref(&asset)).unwrap();
+        let output = tree.target.join("debug/asset");
+        fs::remove_file(&output).unwrap();
+        let elsewhere = tree.workspace.join("elsewhere");
+        fs::write(&elsewhere, "not ours").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, &output).unwrap();
+
+        tree.stage(&[]).unwrap();
+        assert!(fs::symlink_metadata(&output).unwrap().is_symlink());
+        let error = tree.stage(std::slice::from_ref(&asset)).unwrap_err();
+        assert!(
+            error.to_string().contains("crosses an unsafe path"),
+            "{error:#}"
+        );
+        assert_eq!(fs::read_to_string(&elsewhere).unwrap(), "not ours");
+
+        // A directory of ours replaced by a file: what was in the directory is behind it.
+        let tree = Tree::new();
+        let input = tree.workspace.join("asset");
+        fs::create_dir(&input).unwrap();
+        fs::write(input.join("entry"), "value").unwrap();
+        tree.stage(std::slice::from_ref(&asset)).unwrap();
+        let output = tree.target.join("debug/asset");
+        fs::remove_dir_all(&output).unwrap();
+        fs::write(&output, "an artifact Cargo just created").unwrap();
+
+        tree.stage(&[]).unwrap();
+        assert_eq!(
+            fs::read_to_string(&output).unwrap(),
+            "an artifact Cargo just created"
+        );
+        assert!(tree.stage(std::slice::from_ref(&asset)).is_err());
     }
 
     #[test]
