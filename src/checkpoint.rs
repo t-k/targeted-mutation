@@ -95,6 +95,7 @@ impl State {
     }
 
     fn phase_mut(&mut self, name: &str) -> Result<&mut PhaseState> {
+        // tmt:ignore refused below as well: before a campaign starts no phase is active, and a completed campaign has only completed phases; this names the campaign as the cause
         self.running()?;
         ensure!(
             self.active.contains(name),
@@ -239,6 +240,7 @@ impl Checkpoint {
         let load = || -> Result<Self> {
             match fs::symlink_metadata(path) {
                 Ok(metadata) => check_file(&metadata)?,
+                // tmt:ignore whatever else keeps the path from being inspected keeps it from being opened below
                 Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
                 Err(err) => return Err(err.into()),
             }
@@ -248,7 +250,9 @@ impl Checkpoint {
                 .create(true)
                 .truncate(false)
                 .open(path)?;
+            // tmt:ignore the check before the open refuses the same file; this one closes the race with a replacement of the path, which a test cannot provoke
             check_file(&file.metadata()?)?;
+            // tmt:ignore as above: differs from the first check only if the path is replaced while it is opened
             check_file(&fs::symlink_metadata(path)?)?;
             let state = recover(&file)?;
             Ok(Self(Mutex::new(Log {
@@ -361,9 +365,9 @@ fn check_file(metadata: &fs::Metadata) -> Result<()> {
     Ok(())
 }
 
+/// Reads a file that was just opened, so reading starts at its beginning.
 fn recover(mut file: &File) -> Result<State> {
     let mut state = State::default();
-    file.rewind()?;
     let mut reader = BufReader::new(file);
     let mut line = Vec::new();
     let mut offset = 0;
@@ -380,6 +384,7 @@ fn recover(mut file: &File) -> Result<State> {
                 "file is not a TMT checkpoint"
             );
             file.set_len(offset)?;
+            // tmt:ignore durability across a power loss, which a test cannot observe
             file.sync_data()?;
             break;
         }
@@ -398,10 +403,10 @@ fn recover(mut file: &File) -> Result<State> {
         offset += bytes as u64;
         row += 1;
     }
-    drop(reader);
     file.seek(SeekFrom::End(0))?;
     if offset == 0 {
         file.write_all(HEADER)?;
+        // tmt:ignore durability across a power loss, which a test cannot observe
         file.sync_data()?;
     }
     Ok(state)
@@ -662,5 +667,145 @@ mod tests {
         fs::hard_link(&outside, &path).unwrap();
         assert!(Checkpoint::open(&path).is_err());
         assert_eq!(fs::read(&outside).unwrap(), b"unchanged");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn checkpoint_rejects_links_to_a_file_that_would_open_as_a_checkpoint() {
+        let dir = Scratch::new();
+        let path = dir.path();
+        let outside = dir.0.join("other.jsonl");
+        // The other file is a checkpoint of its own: only the link is wrong.
+        Checkpoint::open(&outside)
+            .unwrap()
+            .start("settings", Value::Null)
+            .unwrap();
+        let before = fs::read(&outside).unwrap();
+        let refused = |reason: &str| {
+            let error = Checkpoint::open(&path).err().expect("opened a link");
+            assert!(format!("{error:#}").contains(reason), "{error:#}");
+            assert_eq!(fs::read(&outside).unwrap(), before);
+        };
+
+        std::os::unix::fs::symlink(&outside, &path).unwrap();
+        refused("not a symbolic link");
+        fs::remove_file(&path).unwrap();
+
+        fs::hard_link(&outside, &path).unwrap();
+        refused("must not have hard links");
+        fs::remove_file(&path).unwrap();
+
+        // A link to nothing must not create the file it names.
+        let missing = dir.0.join("missing.jsonl");
+        std::os::unix::fs::symlink(&missing, &path).unwrap();
+        refused("not a symbolic link");
+        assert!(fs::symlink_metadata(&missing).is_err());
+        fs::remove_file(&path).unwrap();
+
+        fs::create_dir(&path).unwrap();
+        refused("must be a regular file");
+        assert!(path.is_dir());
+    }
+
+    #[test]
+    fn checkpoint_completes_only_a_running_campaign_and_only_once() {
+        let dir = Scratch::new();
+        let path = dir.path();
+        let log = Checkpoint::open(&path).unwrap();
+        assert!(log.finish().is_err());
+        assert_eq!(events(&path).len(), 1, "only the format record");
+
+        log.start("settings", Value::Null).unwrap();
+        log.finish().unwrap();
+        assert!(log.finish().is_err());
+        // A completed campaign takes no further phase, in this run or the next.
+        assert!(log.begin("probe", "trace", keys(&["a"])).is_err());
+        drop(log);
+        let log = Checkpoint::open(&path).unwrap();
+        assert!(log.begin("probe", "trace", keys(&["a"])).is_err());
+        assert!(log.finish().is_err());
+        let recorded: Vec<_> = events(&path)
+            .iter()
+            .map(|event| event["event"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            recorded,
+            ["format", "campaign_started", "campaign_completed"]
+        );
+    }
+
+    #[test]
+    fn checkpoint_reports_a_candidate_it_does_not_have() {
+        let dir = Scratch::new();
+        let log = Checkpoint::open(&dir.path()).unwrap();
+        log.start("settings", Value::Null).unwrap();
+        let phase = log.begin("probe", "trace", keys(&["a"])).unwrap();
+        phase.record(0, &7).unwrap();
+        let error = phase.get::<u8>(1).unwrap_err();
+        assert!(error.to_string().contains("no candidate 1"), "{error:#}");
+        assert_eq!(phase.get::<u8>(0).unwrap(), Some(7));
+    }
+
+    #[test]
+    fn checkpoint_is_unusable_after_a_record_could_not_be_written() {
+        let dir = Scratch::new();
+        let path = dir.path();
+        let log = Checkpoint::open(&path).unwrap();
+        log.start("settings", Value::Null).unwrap();
+        let phase = log.begin("probe", "trace", keys(&["a", "b"])).unwrap();
+        phase.record(0, &1).unwrap();
+        let persisted = fs::read(&path).unwrap();
+
+        // A handle that cannot write stands in for a full disk.
+        log.0.lock().unwrap().file = File::open(&path).unwrap();
+        let error = phase.record(1, &2).unwrap_err();
+        assert!(
+            error.to_string().contains("persisting checkpoint record"),
+            "{error:#}"
+        );
+        // The outcome that is not on disk must not be handed out as recorded.
+        for error in [
+            phase.get::<u8>(1).map(drop).unwrap_err(),
+            phase.get::<u8>(0).map(drop).unwrap_err(),
+            phase.finish().unwrap_err(),
+            log.finish().unwrap_err(),
+        ] {
+            assert!(
+                error
+                    .to_string()
+                    .contains("previous checkpoint write failed"),
+                "{error:#}"
+            );
+        }
+        assert_eq!(fs::read(&path).unwrap(), persisted);
+    }
+
+    #[test]
+    fn checkpoint_names_the_record_that_cannot_be_read_or_replayed() {
+        let dir = Scratch::new();
+        let path = dir.path();
+        let started = r#"{"event":"campaign_started","context":"settings","metadata":null}"#;
+        let completed = r#"{"event":"campaign_completed"}"#;
+        let header = std::str::from_utf8(HEADER).unwrap();
+        for (rows, expected) in [
+            (format!("{header}invalid\n"), "reading checkpoint record 2"),
+            (
+                format!("{header}{started}\ninvalid\n"),
+                "reading checkpoint record 3",
+            ),
+            (
+                format!("{header}{started}\n{started}\n{header}"),
+                "replaying checkpoint record 4",
+            ),
+            (
+                format!("{header}{completed}\n"),
+                "replaying checkpoint record 2",
+            ),
+        ] {
+            fs::write(&path, &rows).unwrap();
+            let error = Checkpoint::open(&path).err().expect("opened invalid rows");
+            assert!(format!("{error:#}").contains(expected), "{error:#}");
+            assert_eq!(fs::read_to_string(&path).unwrap(), rows);
+        }
     }
 }
