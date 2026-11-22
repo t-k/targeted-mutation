@@ -212,4 +212,30 @@ mod tests {
         assert!(snapshot(&source.0, &copy.0).is_err());
         assert_eq!(fs::read_to_string(metadata).unwrap(), "leave this alone");
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_index_snapshot_reports_a_destination_it_cannot_inspect() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let source = TestDirectory::new("index-unreadable-source");
+        let copy = TestDirectory::new("index-unreadable-copy");
+        git(&source.0, &["init", "--quiet"]);
+        let metadata = copy.0.join(".git");
+        fs::set_permissions(&copy.0, fs::Permissions::from_mode(0o000)).unwrap();
+        let inspected = fs::symlink_metadata(&metadata).map(|_| ());
+        let result = snapshot(&source.0, &copy.0);
+        fs::set_permissions(&copy.0, fs::Permissions::from_mode(0o700)).unwrap();
+
+        // Whoever may search every directory (root) sees that there is no metadata.
+        if inspected.is_err_and(|err| err.kind() == ErrorKind::PermissionDenied) {
+            // Only a missing `.git` says that the destination is free.
+            let message = format!("{:#}", result.unwrap_err());
+            assert!(
+                message.starts_with(&format!("inspecting {}", metadata.display())),
+                "{message}"
+            );
+            assert!(!metadata.exists());
+        }
+    }
 }

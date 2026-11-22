@@ -415,6 +415,7 @@ pub(crate) fn one_line(code: &str) -> String {
     const PREFIX: usize = LIMIT - ELLIPSIS.len();
 
     // A code preview can contain four bytes per displayed character.
+    // tmt:ignore performance only: the loop below gives the same text for code of any length
     if code.len() <= 4 * LIMIT {
         let mut words = code.split_whitespace();
         let Some(first) = words.next() else {
@@ -426,6 +427,7 @@ pub(crate) fn one_line(code: &str) -> String {
             output.push(' ');
             output.push_str(word);
         }
+        // tmt:ignore performance only: text of more than LIMIT characters has more than LIMIT bytes, the first test only saves counting
         if output.len() > LIMIT && output.chars().count() > LIMIT {
             let cut = output.char_indices().nth(PREFIX).unwrap().0;
             output.truncate(cut);
@@ -2037,6 +2039,25 @@ mod tests {
         let shortened = one_line(&"x".repeat(101));
         assert_eq!(shortened, format!("{}...", "x".repeat(97)));
         assert_eq!(one_line("a\n   b"), "a b");
+    }
+
+    #[test]
+    fn timeout_rechecks_are_in_the_json_only_when_there_were_any() {
+        let none = serde_json::to_value(Report::default()).unwrap();
+        assert!(none.get("timeout_rechecks").is_none(), "{none}");
+        let report = Report {
+            timeout_rechecks: TimeoutRechecks {
+                first_pass: 3,
+                confirmed: 1,
+                recovered: 2,
+                unconfirmed: 0,
+            },
+            ..Report::default()
+        };
+        assert_eq!(
+            serde_json::to_value(&report).unwrap()["timeout_rechecks"],
+            serde_json::json!({"first_pass": 3, "confirmed": 1, "recovered": 2, "unconfirmed": 0})
+        );
     }
 
     #[test]

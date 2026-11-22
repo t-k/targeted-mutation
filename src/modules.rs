@@ -241,3 +241,65 @@ fn module_edges_match_the_coverage_table() {
         assert_eq!(edges[0].production, *visible == "production", "{row}");
     }
 }
+
+#[cfg(test)]
+#[test]
+fn attributes_decide_which_files_a_module_has_and_which_are_production() {
+    // The candidate files of one module, and whether a non-test build can have it.
+    type Edge<'a> = (&'a [&'a str], bool);
+    let default = ["src/nested/child.rs", "src/nested/child/mod.rs"];
+    let rows: &[(&str, &[Edge])] = &[
+        // What is marked as not to be mutated is not production code.
+        ("#[mutants::skip] mod child;", &[(&default, false)]),
+        ("#![mutants::skip]\nmod child;", &[(&default, false)]),
+        // A test-only item does not hide the modules declared after it.
+        ("#[cfg(test)] fn only() {} mod child;", &[(&default, true)]),
+        // A path given only to the test build leaves the default one to production.
+        (
+            r#"#[cfg_attr(test, path = "t.rs")] mod child;"#,
+            &[(&["src/t.rs"], false), (&default, true)],
+        ),
+        // One that every non-test build has takes the default one from production.
+        (
+            r#"#[cfg_attr(not(test), path = "p.rs")] mod child;"#,
+            &[(&["src/p.rs"], true), (&default, false)],
+        ),
+        // One that some build may have leaves both.
+        (
+            r#"#[cfg_attr(unix, path = "u.rs")] mod child;"#,
+            &[(&["src/u.rs"], true), (&default, true)],
+        ),
+        // Each directory of an inline module is followed with its own condition.
+        (
+            r#"#[cfg_attr(test, path = "t")] mod outer { mod child; }"#,
+            &[
+                (
+                    &["src/nested/t/child.rs", "src/nested/t/child/mod.rs"],
+                    false,
+                ),
+                (
+                    &["src/nested/outer/child.rs", "src/nested/outer/child/mod.rs"],
+                    true,
+                ),
+            ],
+        ),
+        // Only `path` names a file, and only as an attribute of its own or of `cfg_attr`.
+        (r#"#[doc = "x.rs"] mod child;"#, &[(&default, true)]),
+        (
+            r#"#[serde(rename = "a", path = "x.rs")] mod child;"#,
+            &[(&default, true)],
+        ),
+    ];
+    for (source, expected) in rows {
+        let edges: Vec<(Vec<PathBuf>, bool)> =
+            external(source, Path::new("src/nested.rs"), Path::new("src/nested"))
+                .into_iter()
+                .map(|module| (module.paths, module.production))
+                .collect();
+        let expected: Vec<(Vec<PathBuf>, bool)> = expected
+            .iter()
+            .map(|(paths, production)| (paths.iter().map(PathBuf::from).collect(), *production))
+            .collect();
+        assert_eq!(edges, expected, "{source}");
+    }
+}
