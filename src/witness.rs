@@ -197,7 +197,9 @@ pub(crate) fn render_edits(
     let mut end = 0;
     for (range, replacement) in &replacements {
         source.get(end..range.start)?;
+        // tmt:ignore the capacity is a hint: any number gives the same text
         capacity -= source.get(range.clone())?.len();
+        // tmt:ignore the capacity is a hint: any number gives the same text
         capacity = capacity.checked_add(replacement.len())?;
         end = range.end;
     }
@@ -344,6 +346,7 @@ fn position_method(function: &ItemFn) -> Option<&syn::ExprMethodCall> {
         return None;
     };
     let integer = element.path.get_ident()?;
+    // tmt:ignore the two `qself` checks are defensive: a parsed qualified path is never a lone identifier, so `get_ident` has refused it already
     if reference.mutability.is_some()
         || element.qself.is_some()
         || needle_type.qself.is_some()
@@ -669,6 +672,113 @@ mod tests {
         assert_eq!(witness.original, "Some(0)");
         assert_eq!(witness.mutant, "Some(1)");
         assert_eq!(witness.assertion, "assert_eq!(f(&[0, 0], 0), Some(0));");
+    }
+
+    #[test]
+    fn every_rule_family_contributes_candidates_for_one_file() {
+        let source = r#"
+            pub fn find(xs: &[u8], key: u8) -> Option<usize> { xs.iter().position(|x| *x == key) }
+            pub fn chars(text: &str) -> usize { text.chars().count() }
+            pub fn expiry(created: u64, updated: u64, expires: u64) -> bool { created < expires }
+            pub fn encode(word: u16) -> [u8; 2] { word.to_le_bytes() }
+            pub fn decode(bytes: [u8; 2]) -> u16 { u16::from_le_bytes(bytes) }
+            #[cfg(test)]
+            mod tests {
+                use super::*;
+                #[test]
+                fn round_trip() {
+                    let word = 0x1234;
+                    assert_eq!(word, decode(encode(word)));
+                }
+            }
+        "#;
+        let found = discover_parsed(source, &syn::parse_file(source).unwrap(), true);
+        let has = |description: &str| found.iter().any(|entry| entry.description == description);
+        assert!(has("replace `position` with `rposition`"), "{found:?}");
+        assert!(
+            has("replace `text.chars().count()` with `text.len()`"),
+            "{found:?}"
+        );
+        assert!(has("replace `created` with `updated`"), "{found:?}");
+        let round_trip = found
+            .iter()
+            .find(|entry| entry.edits.len() == 2)
+            .unwrap_or_else(|| panic!("{found:?}"));
+        assert_eq!(round_trip.edits[0].replacement, "to_be_bytes");
+        assert_eq!(round_trip.edits[1].replacement, "from_be_bytes");
+    }
+
+    #[test]
+    fn a_position_scenario_declares_and_requires_an_optional_index() {
+        let search = PositionSearch {
+            method: 0..0,
+            lines: 1..=1,
+            signature_line: 1,
+            call: "f(&[0, 0], 0)".into(),
+        };
+        let scenario = search.scenario();
+        assert_eq!(scenario.expression, "self::f(&[0, 0], 0)");
+        let test = scenario.test_edit("", "case", None).replacement;
+        assert!(
+            test.contains(
+                "let result: __tmt_witness_std::option::Option<__tmt_witness_std::primitive::usize> = self::f(&[0, 0], 0);"
+            ),
+            "{test}"
+        );
+        assert_eq!(
+            scenario.observation("Some(1)\n", false).unwrap().value,
+            "Some(1)"
+        );
+        // Another scenario takes any printed value; a position has to be an index or `None`.
+        for invalid in ["Some(01)\n", "7\n", "panic\n"] {
+            assert!(
+                scenario.observation(invalid, false).is_none(),
+                "{invalid:?}"
+            );
+            assert!(
+                Scenario::default().observation(invalid, false).is_some(),
+                "{invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn only_the_text_position_in_the_given_source_is_replaced() {
+        let source = "fn f(xs: &[u8], x: u8) -> Option<usize> { xs.iter().position(|v| *v == x) }";
+        let parsed = syn::parse_file(source).unwrap();
+        assert_eq!(position_searches(source, &parsed).len(), 1);
+        // The edit is a byte range of the source: text that does not hold the method there must stay as it is.
+        let other = source.replace("position", "pos1tion");
+        assert!(position_searches(&other, &parsed).is_empty());
+    }
+
+    #[test]
+    fn the_search_method_itself_has_to_be_position() {
+        let method = |source: &str| {
+            let function: ItemFn = syn::parse_str(source).unwrap();
+            position_method(&function).map(|search| search.method.to_string())
+        };
+        assert_eq!(
+            method("fn f(xs: &[u8], x: u8) -> Option<usize> { xs.iter().position(|v| *v == x) }")
+                .as_deref(),
+            Some("position")
+        );
+        assert_eq!(
+            method("fn f(xs: &[u8], x: u8) -> Option<usize> { xs.iter().rposition(|v| *v == x) }"),
+            None
+        );
+    }
+
+    #[test]
+    fn syn_qualified_paths_are_never_a_lone_identifier() {
+        // `position_method` and the rules below rely on this to refuse `<T>::u8` and `<T as A>::u8`.
+        for qualified in ["<T>::u8", "<T as A>::u8"] {
+            let Type::Path(path) = syn::parse_str::<Type>(qualified).unwrap() else {
+                panic!("{qualified}");
+            };
+            assert!(path.qself.is_some(), "{qualified}");
+            assert!(path.path.get_ident().is_none(), "{qualified}");
+        }
     }
 
     #[test]

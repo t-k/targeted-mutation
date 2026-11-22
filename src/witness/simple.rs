@@ -546,6 +546,313 @@ mod checks {
     }
 
     #[test]
+    fn only_plain_functions_with_harmless_attributes_get_a_witness() {
+        let body = "(bits: u64, active: u64) -> bool { bits & active != 0 }";
+        for prefix in [
+            "fn enabled",
+            "pub fn enabled",
+            "/// Any bit.\nfn enabled",
+            "#[inline]\nfn enabled",
+            "#[must_use]\nfn enabled",
+            "/// Any bit.\n#[inline]\n#[must_use]\nfn enabled",
+        ] {
+            let source = format!("{prefix}{body}");
+            assert_eq!(candidates(&source).len(), 1, "{source}");
+        }
+        // The witness calls the function as `enabled(0b01, 0b11)` from a plain test.
+        for prefix in [
+            "fn enabled<T>",
+            "async fn enabled",
+            "unsafe fn enabled",
+            "extern \"C\" fn enabled",
+            "#[cfg(feature = \"masks\")]\nfn enabled",
+            "#[inline]\n#[test]\nfn enabled",
+        ] {
+            let source = format!("{prefix}{body}");
+            assert!(candidates(&source).is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn parameters_have_to_be_plain_bindings() {
+        for parameters in [
+            "ref bits: u64, active: u64",
+            "bits @ _: u64, active: u64",
+            "bits: u64, ref active: u64",
+        ] {
+            let source = format!("fn enabled({parameters}) -> bool {{ bits & active != 0 }}");
+            assert!(candidates(&source).is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn a_bit_mask_needs_two_integers_of_one_type_and_a_bool() {
+        for signature in [
+            "(bits: u64, active: u64) -> u64",
+            "(bits: u64, active: u64)",
+            "(bits: u64, active: u64, extra: u64) -> bool",
+            "(bits: u64, active: u64, extra: u64) -> u64",
+            "(bits: u64, active: u32) -> bool",
+            "(bits: Flags, active: Flags) -> bool",
+            "(bits: Flags, active: u64) -> bool",
+            "(bits: bool, active: bool) -> bool",
+        ] {
+            let source = format!("fn enabled{signature} {{ bits & active != 0 }}");
+            assert!(candidates(&source).is_empty(), "{source}");
+        }
+        for integer in [
+            "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize",
+        ] {
+            let source = format!(
+                "fn enabled(bits: {integer}, active: {integer}) -> bool {{ bits & active != 0 }}"
+            );
+            assert_eq!(candidates(&source).len(), 1, "{source}");
+        }
+    }
+
+    #[test]
+    fn a_bit_mask_compares_the_two_parameters_with_zero() {
+        // The all-bit test keeps the operands in their order and compares with the mask.
+        for (body, replacement) in [
+            ("active & bits != 0", "active & bits == active"),
+            ("0 != bits & active", "bits & active == active"),
+            ("(bits & (active)) != (0)", "bits & active == active"),
+        ] {
+            let source = format!("fn enabled(bits: u64, active: u64) -> bool {{ {body} }}");
+            let found = candidates(&source);
+            assert_eq!(found.len(), 1, "{source}");
+            assert_eq!(&source[found[0].edits[0].span.clone()], body);
+            assert_eq!(found[0].edits[0].replacement, replacement);
+            assert_eq!(
+                found[0].description,
+                format!("replace any-bit test `{body}` with all-bit test `{replacement}`")
+            );
+        }
+        for body in [
+            "bits & active != 1",
+            "1 != bits & active",
+            "bits & active == 0",
+            "bits | active != 0",
+            "bits & bits != 0",
+            "active & active != 0",
+            "bits & OTHER != 0",
+            "OTHER & active != 0",
+        ] {
+            let source = format!("fn enabled(bits: u64, active: u64) -> bool {{ {body} }}");
+            assert!(candidates(&source).is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn a_string_length_is_a_plain_count_of_the_one_shared_str() {
+        let found = candidates("fn bytes(label: &str) -> usize { label.len() }");
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].description,
+            "replace `label.len()` with `label.chars().count()`"
+        );
+        assert!(!found[0].existing);
+        // The input is the tool's own, so the report says when it applies.
+        assert_eq!(
+            found[0].scenarios[0].guidance.as_deref(),
+            Some("Use this input if the API accepts text outside ASCII.")
+        );
+        for function in [
+            "fn bytes(label: &str) -> u64 { label.len() }",
+            "fn bytes(label: &str) { label.len() }",
+            "fn bytes(label: &str, extra: u8) -> usize { label.len() }",
+            "fn bytes(label: &str, extra: u8) -> u64 { label.len() }",
+            "fn bytes(label: &mut str) -> usize { label.len() }",
+            "fn bytes(label: &String) -> usize { label.len() }",
+            "fn bytes(label: &str) -> usize { OTHER.len() }",
+            "fn bytes(label: &str) -> usize { label.count() }",
+            "fn bytes(label: &str) -> usize { label.len(1) }",
+            "fn bytes(label: &str) -> usize { label.len::<u8>() }",
+            "fn chars(label: &str) -> usize { label.chars().last() }",
+            "fn chars(label: &str) -> usize { label.bytes().count() }",
+            "fn chars(label: &str) -> usize { OTHER.chars().count() }",
+            "fn chars(label: &str) -> usize { label.chars(1).count() }",
+            "fn chars(label: &str) -> usize { label.chars::<u8>().count() }",
+            "fn chars(label: &str) -> usize { label.chars().count(1) }",
+            "fn chars(label: &str) -> usize { label.chars().count::<u8>() }",
+        ] {
+            assert!(candidates(function).is_empty(), "{function}");
+        }
+    }
+
+    const TOTAL: &str = "fn total_of(items: &[u32], bound: usize) -> u32 { let mut total = 0; for i in 0..bound { total += items[i]; } total }";
+
+    /// The range rule only speaks when an existing test gives it an input to change.
+    fn with_range_test(function: &str, assertion: &str) -> String {
+        format!("{function}\n#[test]\nfn sums() {{ {assertion} }}\n")
+    }
+
+    fn range_inputs(source: &str) -> Vec<(String, String)> {
+        candidates(source)
+            .iter()
+            .flat_map(|candidate| &candidate.scenarios)
+            .map(|scenario| {
+                (
+                    scenario.source_test.clone().unwrap(),
+                    scenario.expression.clone(),
+                )
+            })
+            .collect()
+    }
+
+    fn pairs(inputs: &[(String, String)]) -> Vec<(&str, &str)> {
+        inputs
+            .iter()
+            .map(|(test, expression)| (test.as_str(), expression.as_str()))
+            .collect()
+    }
+
+    #[test]
+    fn a_range_mutation_needs_a_counted_sum_over_a_shared_integer_slice() {
+        let assertion = "assert_eq!(total_of(&[4, 5, 0], 2), 9);";
+        let found = candidates(&with_range_test(TOTAL, assertion));
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].scenarios.len(), 1);
+        let scenario = &found[0].scenarios[0];
+        assert_eq!(scenario.expression, "total_of(&[4, 5, 1], 2)");
+        assert_eq!(scenario.fixture_expectation.as_deref(), Some("9"));
+        assert_eq!(scenario.source_test.as_deref(), Some("sums"));
+
+        for (from, to) in [
+            ("bound: usize)", "bound: usize, extra: u8)"),
+            ("bound: usize", "bound: u32"),
+            ("&[u32]", "&mut [u32]"),
+            (
+                "items: &[u32], bound: usize) -> u32",
+                "items: &[f32], bound: usize) -> f32",
+            ),
+            ("-> u32", "-> u64"),
+            ("-> u32", ""),
+            ("0..bound", "1..bound"),
+            ("0..bound", "0..=bound"),
+            ("0..bound", "0..OTHER"),
+            ("total += items[i]", "total -= items[i]"),
+            ("total += items[i]", "totals[0] += items[i]"),
+            ("total += items[i]", "total += OTHER[i]"),
+            ("total += items[i]", "total += items[j]"),
+        ] {
+            assert!(TOTAL.contains(from), "{from}");
+            let source = with_range_test(&TOTAL.replacen(from, to, 1), assertion);
+            assert!(candidates(&source).is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn a_range_input_comes_from_a_direct_call_with_a_literal_shared_array() {
+        for (assertion, expression) in [
+            (
+                "assert_eq!(crate::total_of(&[4, 5, 0], 2), 9);",
+                "total_of(&[4, 5, 1], 2)",
+            ),
+            (
+                "assert_eq!(total_of(&[-4, 5, 0], 2), 1);",
+                "total_of(&[-4, 5, 1], 2)",
+            ),
+            // Only the last zero digit changes: radix, separators and suffix stay.
+            (
+                "assert_eq!(total_of(&[4, 5, 0x0], 2), 9);",
+                "total_of(&[4, 5, 0x1], 2)",
+            ),
+            (
+                "assert_eq!(total_of(&[4, 5, 0x0_0u32], 2), 9);",
+                "total_of(&[4, 5, 0x0_1u32], 2)",
+            ),
+        ] {
+            let source = with_range_test(TOTAL, assertion);
+            assert_eq!(
+                pairs(&range_inputs(&source)),
+                [("sums", expression)],
+                "{source}"
+            );
+        }
+        for assertion in [
+            "assert_eq!(<Sums as crate>::total_of(&[4, 5, 0], 2), 9);",
+            "assert_eq!(other::total_of(&[4, 5, 0], 2), 9);",
+            "assert_eq!(crate::other::total_of(&[4, 5, 0], 2), 9);",
+            // `super` of a test at the root of the file is not this file.
+            "assert_eq!(super::total_of(&[4, 5, 0], 2), 9);",
+            "assert_eq!(total_of(&mut [4, 5, 0], 2), 9);",
+            "assert_eq!(total_of(&[4, FIVE, 0], 2), 9);",
+            "assert_eq!(total_of(&[4, !5, 0], 2), 9);",
+            // The element just past the bound has to be a zero the test does not use yet.
+            "assert_eq!(total_of(&[4, 5, 10], 2), 9);",
+            "assert_eq!(total_of(&[4, 5, 6], 2), 9);",
+        ] {
+            let source = with_range_test(TOTAL, assertion);
+            assert!(candidates(&source).is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn range_inputs_are_named_after_the_test_that_holds_them() {
+        let source = format!(
+            r#"{TOTAL}
+mod first {{
+    #[test]
+    fn one() {{ assert_eq!(super::total_of(&[1, 0], 1), 1); }}
+    #[test]
+    fn two() {{ assert_eq!(total_of(&[2, 0], 1), 2); }}
+    mod deeper {{
+        #[test]
+        fn far() {{ assert_eq!(super::total_of(&[9, 0], 1), 9); }}
+    }}
+}}
+mod second {{
+    #[test]
+    fn three() {{ assert_eq!(total_of(&[3, 0], 1), 3); }}
+}}
+#[test]
+fn four() {{ assert_eq!(total_of(&[4, 0], 1), 4); }}
+"#
+        );
+        assert_eq!(
+            pairs(&range_inputs(&source)),
+            [
+                ("first::one", "total_of(&[1, 1], 1)"),
+                ("first::two", "total_of(&[2, 1], 1)"),
+                ("second::three", "total_of(&[3, 1], 1)"),
+                ("four", "total_of(&[4, 1], 1)"),
+            ]
+        );
+    }
+
+    #[test]
+    fn one_test_gives_at_most_four_different_range_inputs() {
+        let source = format!(
+            r#"{TOTAL}
+#[test]
+fn many() {{
+    assert_eq!(total_of(&[1, 0], 1), 1);
+    assert_eq!(total_of(&[1, 0], 1), 1);
+    assert_eq!(total_of(&[2, 0], 1), 2);
+    assert_eq!(total_of(&[3, 0], 1), 3);
+    assert_eq!(total_of(&[4, 0], 1), 4);
+    assert_eq!(total_of(&[5, 0], 1), 5);
+}}
+#[test]
+fn again() {{
+    assert_eq!(total_of(&[1, 0], 1), 1);
+}}
+"#
+        );
+        assert_eq!(
+            pairs(&range_inputs(&source)),
+            [
+                ("many", "total_of(&[1, 1], 1)"),
+                ("many", "total_of(&[2, 1], 1)"),
+                ("many", "total_of(&[3, 1], 1)"),
+                ("many", "total_of(&[4, 1], 1)"),
+                ("again", "total_of(&[1, 1], 1)"),
+            ]
+        );
+    }
+
+    #[test]
     fn fixture_expectations_use_the_same_integer_spelling_as_runtime_values() {
         for (input, expected) in [
             ("-0x9_i32", Some("-9")),
