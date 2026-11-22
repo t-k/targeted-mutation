@@ -2601,6 +2601,32 @@ struct JobResult {
     unable: bool,
 }
 
+/// What the re-runs say of a survivor the trace predicted.
+#[derive(Debug, PartialEq)]
+enum Prediction {
+    /// Every re-run passed all the tests.
+    Confirmed,
+    /// A re-run was found out by the tests: the trace did not see everything.
+    Refuted,
+    /// No re-run was found out, and one could not be run or was only stopped by a time
+    /// limit that was not confirmed: neither a finding nor a contradiction.
+    Unknown,
+}
+
+impl Prediction {
+    fn of<'a>(runs: impl Iterator<Item = &'a JobResult>) -> Prediction {
+        let mut verdict = Prediction::Confirmed;
+        for run in runs {
+            if run.unable || run.unconfirmed_timeout {
+                verdict = Prediction::Unknown;
+            } else if run.survived.is_none() {
+                return Prediction::Refuted;
+            }
+        }
+        verdict
+    }
+}
+
 impl report::TimeoutRechecks {
     fn include(&mut self, result: &JobResult) {
         if result.first_pass_timeout {
@@ -4829,10 +4855,11 @@ fn run_package(
             // cannot differ, not worth saying at all).
             let repeats = constant_expr
                 .is_some_and(|(start, end)| constants.contains(&(item.file, start, end)));
-            if confirm.iter().any(|j| results[*j].survived.is_none()) {
-                report.unstable.push(at.clone());
-            } else if !repeats {
-                report.findings.push(finding.clone());
+            match Prediction::of(confirm.iter().map(|j| &results[*j])) {
+                Prediction::Refuted => report.unstable.push(at.clone()),
+                Prediction::Confirmed if !repeats => report.findings.push(finding.clone()),
+                // Not evaluated (counted above), or said elsewhere.
+                Prediction::Confirmed | Prediction::Unknown => {}
             }
         }
         // A body that is one expression, constant in the tests: replacing the body by
@@ -7604,6 +7631,32 @@ fn main() {
             assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
         }
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_predicted_survivor_is_unstable_only_when_a_re_run_was_found_out() {
+        let run = |survived: bool, unable: bool, unconfirmed_timeout: bool| JobResult {
+            first_pass_timeout: unconfirmed_timeout,
+            unconfirmed_timeout,
+            survived: survived.then(Vec::new),
+            timed_out: unconfirmed_timeout,
+            unable,
+        };
+        let passed = || run(true, false, false);
+        let found_out = || run(false, false, false);
+        let unable = || run(false, true, false);
+        let unconfirmed = || run(false, false, true);
+        let of = |runs: Vec<JobResult>| Prediction::of(runs.iter());
+        assert_eq!(of(vec![]), Prediction::Confirmed);
+        assert_eq!(of(vec![passed(), passed()]), Prediction::Confirmed);
+        assert_eq!(of(vec![passed(), found_out()]), Prediction::Refuted);
+        assert_eq!(of(vec![found_out(), passed()]), Prediction::Refuted);
+        // A run that says nothing does not hide one that was found out, in either order.
+        assert_eq!(of(vec![unable(), found_out()]), Prediction::Refuted);
+        assert_eq!(of(vec![found_out(), unconfirmed()]), Prediction::Refuted);
+        assert_eq!(of(vec![passed(), unable()]), Prediction::Unknown);
+        assert_eq!(of(vec![unable(), passed()]), Prediction::Unknown);
+        assert_eq!(of(vec![unconfirmed()]), Prediction::Unknown);
     }
 
     #[cfg(unix)]
