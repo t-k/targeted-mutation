@@ -140,23 +140,24 @@ pub(crate) fn stage(
     }
     let workspace = workspace.canonicalize()?;
     let mut plan = BTreeMap::new();
-    let mut destinations = BTreeSet::new();
     for fixture in fixtures {
         let from = relative(&fixture.from)?;
         let to = relative(&fixture.to)?;
-        if destinations
-            .iter()
-            .any(|other: &PathBuf| to.starts_with(other) || other.starts_with(&to))
-        {
-            bail!("overlapping output fixture destination: {}", to.display());
-        }
+        // A mapped destination or a shared parent already in the plan overlaps
+        // at this path. Above it, only shared parents can be reused.
+        let mut overlapping = plan.contains_key(&to);
         for parent in to
             .ancestors()
             .skip(1)
             .filter(|parent| !parent.as_os_str().is_empty())
         {
-            plan.entry(parent.to_path_buf())
+            let entry = plan
+                .entry(parent.to_path_buf())
                 .or_insert(Planned::Directory { shared: true });
+            overlapping |= !matches!(entry, Planned::Directory { shared: true });
+        }
+        if overlapping {
+            bail!("overlapping output fixture destination: {}", to.display());
         }
         plan_source(
             &workspace.join(from),
@@ -166,7 +167,6 @@ pub(crate) fn stage(
             &mut plan,
             &mut BTreeSet::new(),
         )?;
-        destinations.insert(to);
     }
 
     // A replaced file is no longer ours. Cargo can choose a different output
@@ -601,6 +601,75 @@ mod tests {
                 .is_err()
         );
         assert!(!tree.target.join("nested").exists());
+    }
+
+    #[test]
+    fn checks_output_destination_relationships() {
+        let data = match std::env::var_os("TMT_OUTPUT_DESTINATIONS_PICT_TABLE") {
+            Some(table) => fs::read_to_string(table).unwrap(),
+            None => [
+                "Relation\tSource\tSpelling",
+                "Same\tFile\tPlain",
+                "Ancestor\tDirectory\tNormalized",
+                "Descendant\tFile\tPlain",
+                "Sibling\tFile\tPlain",
+                "NamePrefix\tFile\tNormalized",
+                "DifferentRoot\tDirectory\tPlain",
+            ]
+            .join("\n"),
+        };
+        for row in data.lines().skip(1) {
+            let values: Vec<_> = row.split_whitespace().collect();
+            let [relation, source, spelling] = values[..] else {
+                panic!("unexpected model row: {row}");
+            };
+            let tree = Tree::new();
+            let first_source = tree.workspace.join("first");
+            if source == "Directory" {
+                fs::create_dir(&first_source).unwrap();
+                fs::write(first_source.join("file"), "first").unwrap();
+            } else {
+                fs::write(first_source, "first").unwrap();
+            }
+            fs::write(tree.workspace.join("second"), "second").unwrap();
+            let first = "debug/nested/model";
+            let second = match relation {
+                "Same" => first,
+                "Ancestor" => "debug/nested",
+                "Descendant" => "debug/nested/model/data",
+                "Sibling" => "debug/nested/other",
+                "NamePrefix" => "debug/nested/models",
+                "DifferentRoot" => "release/nested/model",
+                _ => panic!("unexpected relation: {row}"),
+            };
+            let spelled = if spelling == "Normalized" {
+                format!("./{}", second.replace('/', "//./"))
+            } else {
+                second.to_owned()
+            };
+            let result = tree.stage(&[mapping("first", first), mapping("second", &spelled)]);
+            if matches!(relation, "Same" | "Ancestor" | "Descendant") {
+                assert_eq!(
+                    result.unwrap_err().to_string(),
+                    format!("overlapping output fixture destination: {second}"),
+                    "{row}"
+                );
+                assert!(!tree.target.join("debug").exists(), "{row}");
+                assert!(!tree.work.join(OWNERSHIP).exists(), "{row}");
+            } else {
+                result.unwrap();
+                let mut first_output = tree.target.join(first);
+                if source == "Directory" {
+                    first_output.push("file");
+                }
+                assert_eq!(fs::read_to_string(first_output).unwrap(), "first", "{row}");
+                assert_eq!(
+                    fs::read_to_string(tree.target.join(second)).unwrap(),
+                    "second",
+                    "{row}"
+                );
+            }
+        }
     }
 
     #[cfg(unix)]
