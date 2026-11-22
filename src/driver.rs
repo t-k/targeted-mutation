@@ -1873,8 +1873,10 @@ fn run_binary(
             kill(&mut child);
             return Ok(Outcome::Timeout);
         }
+        // tmt:ignore without the pause the loop only looks more often: the verdict is the same
         std::thread::sleep(next_test_poll(&mut delay, timeout - elapsed));
     })();
+    // tmt:ignore only Windows needs the file closed before the mark is removed, and these tests are for Unix
     drop(output_to_watch);
     if result.is_err() {
         kill(&mut child);
@@ -1936,7 +1938,9 @@ fn stop_nextest(child: &mut std::process::Child, grace: Duration) {
         loop {
             match child.try_wait() {
                 Ok(Some(_)) => return true,
+                // tmt:ignore how long a runner that does not end is waited for can only be told by the clock
                 Ok(None) if started.elapsed() < limit => {
+                    // tmt:ignore without the pause the loop only looks more often
                     std::thread::sleep(Duration::from_millis(10));
                 }
                 _ => return false,
@@ -1960,26 +1964,17 @@ fn stop_nextest(child: &mut std::process::Child, grace: Duration) {
     }
     #[cfg(unix)]
     {
+        // tmt:ignore the second look only adds a test started between the two, which no test can place there
         if !reaped {
+            // tmt:ignore as above
             owned.extend(owned_test_processes(group));
         }
-        let current = test_processes();
-        let surviving_groups: BTreeSet<_> = current
-            .iter()
-            .filter(|process| {
-                owned.iter().any(|before| {
-                    process.pid == before.pid
-                        && process.group == before.group
-                        && process.started == before.started
-                })
-            })
-            .map(|process| process.group)
-            .collect();
-        for surviving in surviving_groups {
+        for surviving in surviving_groups(&owned, &test_processes()) {
             kill_test_group(surviving);
         }
     }
     if !reaped {
+        // tmt:ignore the group of a runner that `ps` listed was stopped just above: this is for when `ps` could not be run
         kill_test_group(group);
         let _ = child.kill();
         let _ = child.wait();
@@ -1987,6 +1982,7 @@ fn stop_nextest(child: &mut std::process::Child, grace: Duration) {
 }
 
 #[cfg(unix)]
+#[derive(Debug, PartialEq)]
 struct TestProcess {
     pid: u32,
     parent: u32,
@@ -2018,9 +2014,33 @@ fn test_processes() -> Vec<TestProcess> {
         .collect()
 }
 
+/// The groups of the processes in `owned` that are still among `current`. A process is
+/// the same one only with the same start and still in its group: its number alone may
+/// by now be another's, and it may have moved to a group that was never the runner's.
+#[cfg(unix)]
+fn surviving_groups(owned: &[TestProcess], current: &[TestProcess]) -> BTreeSet<u32> {
+    current
+        .iter()
+        .filter(|process| {
+            owned.iter().any(|before| {
+                process.pid == before.pid
+                    && process.group == before.group
+                    && process.started == before.started
+            })
+        })
+        .map(|process| process.group)
+        .collect()
+}
+
 #[cfg(unix)]
 fn owned_test_processes(root: u32) -> Vec<TestProcess> {
-    let data = test_processes();
+    owned_among(test_processes(), root)
+}
+
+/// Of the processes in `data`, those `root` started, directly or through others, that
+/// are in a group one of them leads.
+#[cfg(unix)]
+fn owned_among(data: Vec<TestProcess>, root: u32) -> Vec<TestProcess> {
     let mut owned = HashSet::from([root]);
     loop {
         let before = owned.len();
@@ -3223,19 +3243,11 @@ fn run_pool<T: Send>(
     if count == 0 {
         return Ok(vec![]);
     }
-    if workers <= 1 || count == 1 {
-        return std::thread::scope(|scope| {
-            scope
-                .spawn(|| (0..count).map(&work).collect())
-                .join()
-                .expect("worker panicked")
-        });
-    }
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     let next = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
     let done: Vec<Vec<(usize, Result<T>)>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..workers.min(count))
+        let handles: Vec<_> = (0..workers.clamp(1, count))
             .map(|_| {
                 scope.spawn(|| {
                     let mut mine = vec![];
@@ -6661,7 +6673,11 @@ serde = { path = "../../serde-fork" }
         use std::os::unix::process::CommandExt as _;
 
         let mut child = Command::new("sh")
-            .args(["-c", "trap '' TERM; printf X; while :; do sleep 1; done"])
+            // Ends by itself after a minute, should a test run that is cut short leave it.
+            .args([
+                "-c",
+                "trap '' TERM; printf X; n=0; while [ $n -lt 60 ]; do sleep 1; n=$((n+1)); done",
+            ])
             .process_group(0)
             .stdout(Stdio::piped())
             .spawn()
@@ -7712,5 +7728,593 @@ fn main() {
                 "the guard `n > 1` replaced by `false`"
             ]
         );
+    }
+
+    #[test]
+    fn dependents_are_found_once_through_a_cycle_that_leaves_the_package_out() {
+        let package = |name: &str, deps: &[&str]| Package {
+            name: name.to_string(),
+            features: BTreeMap::new(),
+            dependencies: deps
+                .iter()
+                .map(|d| Dependency {
+                    name: d.to_string(),
+                })
+                .collect(),
+            manifest_path: PathBuf::new(),
+            targets: vec![],
+        };
+        // `x` and `y` depend on each other: the search has to end although each of them
+        // is reached again from the other.
+        let packages = [
+            package("z", &[]),
+            package("x", &["y", "z"]),
+            package("y", &["x"]),
+        ];
+        assert_eq!(dependents_of("z", &packages), ["x", "y"]);
+    }
+
+    #[test]
+    fn an_error_is_said_once_and_only_when_it_says_something() {
+        let stdout = r#"
+{"reason":"compiler-message","message":{"level":"error","spans":[]}}
+{"reason":"compiler-message","message":{"level":"error","message":"","rendered":null,"spans":[]}}
+{"reason":"compiler-message","message":{"level":"error","rendered":"aborting","spans":[]}}
+{"reason":"compiler-message","message":{"level":"error","rendered":"aborting","spans":[]}}
+"#;
+        assert_eq!(parse_build_output(stdout, &["p"]).diagnostics, ["aborting"]);
+    }
+
+    /// A test binary in `dir` whose tests are the shell script `body`.
+    #[cfg(unix)]
+    fn script_binary(dir: &Path, body: &str) -> TestBinary {
+        use std::os::unix::fs::PermissionsExt as _;
+        let work = dir.join("work");
+        let exe = work.join("runner");
+        fs::write(&exe, format!("#!/bin/sh\n{body}\n")).unwrap();
+        fs::set_permissions(&exe, fs::Permissions::from_mode(0o755)).unwrap();
+        TestBinary {
+            name: "runner".into(),
+            cwd: work.join("src"),
+            marks: marks_dir(&work).unwrap(),
+            git_ceiling: work,
+            work_lock: None,
+            tests: BTreeSet::new(),
+            runner: Runner::Exe(exe),
+            baseline: Duration::ZERO,
+            untraced_baseline: None,
+            timeout_diagnostic: std::sync::Once::new(),
+            traced: Duration::ZERO,
+            timeout: None,
+            wrapper_grace: Duration::ZERO,
+            report_slow: false,
+            filtered_timings: Default::default(),
+            trace: Trace::default(),
+            effects_baseline: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// The same binary, run one test to a process.
+    #[cfg(unix)]
+    fn isolated(mut bin: TestBinary) -> TestBinary {
+        let exe = bin.runner.executable().unwrap().to_path_buf();
+        bin.runner = Runner::Isolated {
+            exe,
+            test: "t".to_string(),
+            ignored: false,
+            wrapper: None,
+        };
+        bin
+    }
+
+    /// Whether the process `pid` ends within a generous time. One that was stopped is
+    /// gone or, until its parent takes notice, only waits to be collected.
+    #[cfg(unix)]
+    fn ends(pid: u32) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let state = Command::new("ps")
+                .args(["-o", "stat=", "-p", &pid.to_string()])
+                .output()
+                .unwrap();
+            let state = String::from_utf8_lossy(&state.stdout);
+            if state.trim().is_empty() || state.trim().starts_with('Z') {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                // Not left behind by a test that fails.
+                let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_filter_is_timed_only_for_a_slow_libtest_binary_without_a_given_limit() {
+        let dir = scratch("unmeasured-filters");
+        let slow = Duration::from_secs(70);
+        let fast = ["fast".to_string()];
+        let all = ["fast".to_string(), "slow".to_string()];
+        let binary = |baseline, timeout| {
+            let mut bin = script_binary(&dir, "exit 0");
+            bin.tests = all.iter().cloned().collect();
+            bin.baseline = baseline;
+            bin.timeout = timeout;
+            bin
+        };
+        let timed = |bin: &TestBinary| bin.filtered_timings.lock().unwrap().len();
+
+        // A limit that was given is the limit: nothing is run to find one.
+        let given = binary(slow, Some(Duration::from_secs(8)));
+        assert_eq!(
+            given.filtered_limit(Some(&fast), false),
+            Duration::from_secs(8)
+        );
+        assert_eq!(timed(&given), 0);
+        // Tests that are fast as a whole are not timed again in parts.
+        let quick = binary(Duration::from_secs(1), None);
+        assert_eq!(
+            quick.filtered_limit(Some(&fast), false),
+            Duration::from_secs(10)
+        );
+        assert_eq!(timed(&quick), 0);
+        // From two seconds on they are.
+        let at_the_threshold = binary(SLOW_TRACE, None);
+        at_the_threshold.filtered_limit(Some(&fast), false);
+        assert_eq!(timed(&at_the_threshold), 1);
+        // A runner that is not the libtest binary itself cannot be asked for a part.
+        let one_by_one = isolated(binary(slow, None));
+        assert_eq!(
+            one_by_one.filtered_limit(Some(&fast), false),
+            Duration::from_secs(355)
+        );
+        assert_eq!(timed(&one_by_one), 0);
+        // No names and all the names are the whole binary, which has its timing.
+        let whole = binary(slow, None);
+        for filter in [&[][..], &all[..]] {
+            assert_eq!(
+                whole.filtered_limit(Some(filter), false),
+                Duration::from_secs(355),
+                "{filter:?}"
+            );
+        }
+        assert_eq!(timed(&whole), 0);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn a_command_in_the_copy_cannot_reach_the_repository_around_it() {
+        use std::ffi::OsStr;
+        let mut command = Command::new("git");
+        isolate_copy_command(&mut command, Path::new("/work"));
+        let set: Vec<_> = command.get_envs().collect();
+        for removed in ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE"] {
+            assert!(set.contains(&(OsStr::new(removed), None)), "{removed}");
+        }
+        assert!(set.contains(&(
+            OsStr::new("GIT_CEILING_DIRECTORIES"),
+            Some(OsStr::new("/work"))
+        )));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_tests_are_given_the_mark_the_mutant_and_the_fence_for_git() {
+        let dir = scratch("run-environment");
+        let work = dir.join("work");
+        let bin = script_binary(
+            &dir,
+            &format!(
+                "[ -f \"$TMT_UNABLE\" ] && [ \"$TMT_MUTANT\" = 7 ] \
+                 && [ \"$GIT_CEILING_DIRECTORIES\" = '{}' ]",
+                work.display()
+            ),
+        );
+        assert_eq!(
+            run_binary(
+                &bin,
+                None,
+                &[("TMT_MUTANT", "7")],
+                Duration::from_secs(60),
+                RunOutput::Quiet,
+                1
+            )
+            .unwrap(),
+            Outcome::Pass
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_failure_line_ends_the_run_before_the_tests_do() {
+        let dir = scratch("first-failure");
+        // The tests go on for longer than the run is given: only the line can end it as
+        // a failure.
+        let bin = script_binary(&dir, "echo 'test tests::a ... FAILED'\nexec sleep 30");
+        assert_eq!(
+            run_binary(
+                &bin,
+                None,
+                &[],
+                Duration::from_secs(20),
+                RunOutput::FirstFailure,
+                1
+            )
+            .unwrap(),
+            Outcome::Fail
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_nobody_reads_is_discarded() {
+        let dir = scratch("discarded-output");
+        let nowhere = "[ /dev/stdout -ef /dev/null ] && [ /dev/stderr -ef /dev/null ]";
+        let run = |bin: &TestBinary, output| {
+            run_binary(bin, None, &[], Duration::from_secs(60), output, 1).unwrap()
+        };
+        // A quiet run is not watched at all.
+        let quiet = script_binary(&dir, nowhere);
+        assert_eq!(run(&quiet, RunOutput::Quiet), Outcome::Pass);
+        // A test in a process of its own is judged by how the process ends, also when
+        // the first failure is asked for.
+        let one_by_one = isolated(script_binary(&dir, nowhere));
+        assert_eq!(run(&one_by_one, RunOutput::FirstFailure), Outcome::Pass);
+        // Only the standard output of a watched run is kept.
+        let watched = script_binary(
+            &dir,
+            "[ ! /dev/stdout -ef /dev/null ] && [ /dev/stderr -ef /dev/null ]",
+        );
+        assert_eq!(run(&watched, RunOutput::FirstFailure), Outcome::Pass);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn what_a_finished_run_left_running_is_stopped() {
+        let left_running = "sleep 30 &\necho $! > child.pid";
+        let check = |name: &str, one_by_one: bool, output| {
+            let dir = scratch(name);
+            let mut bin = script_binary(&dir, left_running);
+            if one_by_one {
+                bin = isolated(bin);
+            }
+            let outcome = run_binary(&bin, None, &[], Duration::from_secs(60), output, 1);
+            let pid = fs::read_to_string(bin.cwd.join("child.pid"))
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            let stopped = ends(pid);
+            fs::remove_dir_all(dir).unwrap();
+            assert_eq!(outcome.unwrap(), Outcome::Pass, "{name}");
+            assert!(stopped, "{name}: the run left a process behind");
+        };
+        check("left-running-watched", false, RunOutput::FirstFailure);
+        check("left-running-isolated", true, RunOutput::Quiet);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tests_that_do_not_end_in_time_are_stopped_as_a_timeout() {
+        let dir = scratch("run-timeout");
+        let bin = script_binary(&dir, "exec sleep 20");
+        assert_eq!(
+            run_binary(
+                &bin,
+                None,
+                &[],
+                Duration::from_millis(100),
+                RunOutput::Quiet,
+                1
+            )
+            .unwrap(),
+            Outcome::Timeout
+        );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stopping_nextest_asks_first_and_takes_the_answer() {
+        use std::io::Read as _;
+        use std::os::unix::process::CommandExt as _;
+
+        // Ends by itself after a minute, should a test leave it behind.
+        let mut child = Command::new("sh")
+            .args(["-c", "trap 'exit 7' TERM; printf X; sleep 60; exit 3"])
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        child.stdout.take().unwrap().read_exact(&mut [0]).unwrap();
+
+        let grace = Duration::from_secs(30);
+        let started = Instant::now();
+        stop_nextest(&mut child, grace);
+        let status = child.try_wait().unwrap().expect("runner was reaped");
+        // It ended the way it chose to when asked, and at once: nothing waited for the
+        // grace to run out before asking.
+        assert_eq!(status.code(), Some(7));
+        assert!(started.elapsed() < grace);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stopping_nextest_stops_the_groups_its_tests_run_in() {
+        use std::io::BufRead as _;
+        use std::os::unix::process::CommandExt as _;
+
+        // Stands for nextest with one test: the test runs in a group of its own, and
+        // neither of the two ends when asked to. Both end by themselves after a minute.
+        let dir = scratch("nextest-groups");
+        let source = dir.join("runner.rs");
+        let exe = dir.join("runner");
+        fs::write(
+            &source,
+            r#"
+use std::os::unix::process::CommandExt;
+extern "C" {
+    fn signal(signal: i32, handler: usize) -> usize;
+}
+fn main() {
+    // Ignored (SIG_IGN), which what is started from here inherits.
+    unsafe { signal(15, 1) };
+    let test = std::process::Command::new("sleep").arg("60").process_group(0).spawn().unwrap();
+    println!("{}", test.id());
+    std::thread::sleep(std::time::Duration::from_secs(60));
+}
+"#,
+        )
+        .unwrap();
+        let output = Command::new("rustc")
+            .arg(&source)
+            .arg("-o")
+            .arg(&exe)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let mut child = Command::new(&exe)
+            .process_group(0)
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut line = String::new();
+        std::io::BufReader::new(child.stdout.take().unwrap())
+            .read_line(&mut line)
+            .unwrap();
+        let test: u32 = line.trim().parse().unwrap();
+
+        stop_nextest(&mut child, Duration::from_millis(10));
+        let reaped = child.try_wait().unwrap();
+        let stopped = ends(test);
+        fs::remove_dir_all(dir).unwrap();
+        assert!(reaped.is_some(), "runner was not reaped");
+        assert!(stopped, "the group of the test was left running");
+    }
+
+    #[cfg(unix)]
+    fn process(pid: u32, parent: u32, group: u32, started: &str) -> TestProcess {
+        TestProcess {
+            pid,
+            parent,
+            group,
+            started: started.to_string(),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_processes_of_a_runner_are_its_descendants_in_groups_they_lead() {
+        let table = || {
+            vec![
+                // Listed before its parent: one pass over the table does not find it.
+                process(30, 20, 30, "t"),
+                process(20, 10, 10, "t"),
+                process(10, 1, 10, "t"),
+                // A child that joined a group of somebody else.
+                process(40, 10, 77, "t"),
+                process(77, 1, 77, "t"),
+                // Somebody else's process that joined the group of the runner.
+                process(50, 1, 10, "t"),
+                process(60, 1, 60, "t"),
+            ]
+        };
+        assert_eq!(
+            owned_among(table(), 10),
+            [
+                process(30, 20, 30, "t"),
+                process(20, 10, 10, "t"),
+                process(10, 1, 10, "t")
+            ]
+        );
+        // A runner that is gone has nothing.
+        assert!(owned_among(table(), 11).is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_group_survives_only_through_the_very_process_seen_in_it() {
+        let owned = [process(10, 1, 10, "a"), process(30, 10, 30, "b")];
+        let surviving = |current: &[TestProcess]| surviving_groups(&owned, current);
+        assert_eq!(
+            surviving(&[
+                process(10, 1, 10, "a"),
+                process(30, 1, 30, "b"),
+                process(60, 1, 60, "a")
+            ]),
+            BTreeSet::from([10, 30])
+        );
+        // The number of a process that ended, given to a later one.
+        assert_eq!(surviving(&[process(10, 1, 10, "later")]), BTreeSet::new());
+        // A process that left for a group which was never the runner's.
+        assert_eq!(surviving(&[process(30, 1, 99, "b")]), BTreeSet::new());
+        // Another process of the same second in the group, which nobody saw there.
+        assert_eq!(surviving(&[process(31, 1, 30, "b")]), BTreeSet::new());
+    }
+
+    #[test]
+    fn a_working_directory_that_cannot_be_inspected_is_not_created_over() {
+        let dir = scratch("marks-below-a-file");
+        let file = dir.join("file");
+        fs::write(&file, "").unwrap();
+        let error = work_directory(&file, "marks").unwrap_err();
+        assert!(error.to_string().starts_with("inspecting "), "{error:#}");
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn an_error_is_blamed_on_the_file_it_names() {
+        let copy = Path::new("/work");
+        let make = |name: &str, source: &str, first_id| {
+            let sites = instrument::discover(source, first_id).unwrap().sites;
+            let rendered = instrument::render(source, &sites, &|_| true);
+            SourceFile {
+                display: name.to_string(),
+                path: copy.join(name),
+                owners: BTreeSet::new(),
+                lines: scope::LineIndex::new(source),
+                original: source.to_string(),
+                places: vec![],
+                sites,
+                rebuild_sites: vec![],
+                rendered: Some(rendered),
+            }
+        };
+        let files = [
+            make("first.rs", "pub fn f(n: u32) -> bool { n >= 4 }", 0),
+            make("second.rs", "pub fn g(a: u8, b: u8) -> bool { a < b }", 100),
+        ];
+        let rendered = files[1].rendered.as_ref().unwrap();
+        let probe = rendered.text.find("__tmt_rt::").unwrap();
+        let blamed = rendered.inserted_by(probe).unwrap();
+        assert!(blamed >= 100, "{blamed}");
+        let error = CompileError {
+            primary: vec![ErrorSpan {
+                file: "second.rs".to_string(),
+                byte_start: probe,
+                line: 1,
+            }],
+            secondary: vec![],
+            rendered: String::new(),
+        };
+        assert_eq!(blame_error(&error, &files, copy, &HashSet::new()), [blamed]);
+    }
+
+    #[test]
+    fn modules_are_followed_to_files_that_exist_in_the_copy() {
+        let scratch = scratch("module-files");
+        let copy = scratch.join("work/src");
+        let library = copy.join("lib.rs");
+        let directory_module = copy.join("nested/mod.rs");
+        let outside = scratch.join("work/outside.rs");
+        let sources = BTreeMap::from([
+            (
+                library.clone(),
+                r#"mod nested; #[path = "../outside.rs"] mod outside;"#,
+            ),
+            (directory_module.clone(), "fn nested() {}"),
+            (outside.clone(), "fn outside() {}"),
+        ]);
+        for path in sources.keys() {
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::File::create(path).unwrap();
+        }
+        let graph = source_graph([(library.clone(), true)], &copy, |path| {
+            Ok(sources.get(path).map(|source| (*source).to_string()))
+        })
+        .unwrap();
+        fs::remove_dir_all(scratch).unwrap();
+        // `nested.rs` comes first among the places of `mod nested;` and is not there;
+        // `outside.rs` is there, but is not a file of the copy.
+        assert_eq!(
+            graph.keys().collect::<Vec<_>>(),
+            [&library, &directory_module]
+        );
+    }
+
+    #[test]
+    fn an_empty_directory_the_run_asked_for_is_not_pruned() {
+        let dir = scratch("prune-kept-directory");
+        let (workspace, copy) = (dir.join("ws"), dir.join("work/src"));
+        fs::create_dir(workspace.join("fixture")).unwrap();
+        fs::create_dir(copy.join("stale")).unwrap();
+        let state = WorkCopy::open(&dir.join("work"), &copy);
+        copy_fixture_entry(
+            &workspace.join("fixture"),
+            &copy.join("fixture"),
+            &workspace,
+            &|_| false,
+            &state,
+            &mut BTreeSet::new(),
+        )
+        .unwrap();
+        prune(&copy, &state).unwrap();
+        assert!(copy.join("fixture").is_dir());
+        assert!(!copy.join("stale").exists());
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn pool_with_one_worker_runs_nothing_after_the_first_error() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let calls = AtomicUsize::new(0);
+        let failed = run_pool(3, 1, |index| {
+            calls.fetch_add(1, Ordering::SeqCst);
+            if index == 0 {
+                Err(anyhow!("job {index} broke"))
+            } else {
+                Ok(index)
+            }
+        });
+        assert_eq!(failed.unwrap_err().to_string(), "job 0 broke");
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_checkpoint_gets_every_verdict_once_it_is_final() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = scratch("checkpointed-verdicts");
+        let keys = || vec!["first".to_string(), "second".to_string()];
+        for serial in [false, true] {
+            let checkpoint = Checkpoint::open(&dir.join(format!("checkpoint-{serial}"))).unwrap();
+            let runs = AtomicUsize::new(0);
+            // The first mutant runs out of time next to the other and passes alone.
+            let run = |index: usize, sharing: usize| {
+                runs.fetch_add(1, Ordering::SeqCst);
+                let timed_out = index == 0 && sharing > 1;
+                Ok(JobResult {
+                    first_pass_timeout: false,
+                    unconfirmed_timeout: false,
+                    survived: (!timed_out).then(|| vec![index.to_string()]),
+                    timed_out,
+                    unable: false,
+                })
+            };
+            checkpoint.start("campaign", serde_json::json!({})).unwrap();
+            let phase = checkpoint.begin("mutants", "context", keys()).unwrap();
+            // Finishing the phase fails when a verdict was not recorded, and recording
+            // fails when one was recorded twice.
+            let results = evaluate_jobs(2, 2, serial, false, "test", Some(&phase), &run).unwrap();
+            assert_eq!(runs.load(Ordering::SeqCst), if serial { 3 } else { 2 });
+            assert_eq!(results[0].unconfirmed_timeout, !serial);
+            assert_eq!(results[0].survived.is_some(), serial);
+
+            // The campaign started again has nothing left to run.
+            checkpoint.start("campaign", serde_json::json!({})).unwrap();
+            let phase = checkpoint.begin("mutants", "context", keys()).unwrap();
+            let again = evaluate_jobs(2, 2, serial, false, "test", Some(&phase), &run).unwrap();
+            assert_eq!(again, results);
+            assert_eq!(runs.load(Ordering::SeqCst), if serial { 3 } else { 2 });
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 }
