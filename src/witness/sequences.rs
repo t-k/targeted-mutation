@@ -813,6 +813,27 @@ mod tests {
     }
 
     #[test]
+    fn words_of_every_width_with_a_byte_order_are_codecs() {
+        for (word, width, expected) in [
+            ("u16", 2, 1),
+            ("i16", 2, 1),
+            ("u32", 4, 1),
+            ("i32", 4, 1),
+            ("u64", 8, 1),
+            ("i64", 8, 1),
+            ("u128", 16, 1),
+            ("i128", 16, 1),
+            // One byte has no order.
+            ("u8", 1, 0),
+        ] {
+            let source = CODEC
+                .replace("u16", word)
+                .replace("[u8; 2]", &format!("[u8; {width}]"));
+            assert_eq!(candidates(&source).len(), expected, "{word}");
+        }
+    }
+
+    #[test]
     fn a_codec_converts_its_one_plain_parameter_and_nothing_else() {
         for source in [
             // Not a plain binding.

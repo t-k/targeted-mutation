@@ -781,6 +781,7 @@ fn wrong_key(rows: &mut [Entry]) { rows.sort_by_key(|row| row.created_at + 1); }
             let source = format!("fn f(a: u8, b: u8) -> bool {{ {comparison} }}");
             assert!(witnesses(&source).is_empty(), "{comparison}");
         }
+        assert!(witnesses("fn f(a: u128, b: u128) -> bool { a > -1 }").is_empty());
         assert!(witnesses("fn f(a: u8, b: u8) -> u8 { a & 5 }").is_empty());
     }
 
