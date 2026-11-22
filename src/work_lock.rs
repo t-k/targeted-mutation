@@ -75,7 +75,7 @@ fn lock_directory(work: &Path) -> Result<PathBuf> {
 }
 
 #[cfg(unix)]
-fn inherit_lock(fd: std::os::fd::RawFd) -> io::Result<()> {
+pub(crate) fn inherit_lock(fd: std::os::fd::RawFd) -> io::Result<()> {
     use std::os::raw::c_int;
 
     unsafe extern "C" {
@@ -166,7 +166,7 @@ fn is_link(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
 }
 
-fn contended(error: &io::Error) -> bool {
+pub(crate) fn contended(error: &io::Error) -> bool {
     #[cfg(windows)]
     if error.raw_os_error() == Some(32) {
         // ERROR_SHARING_VIOLATION
@@ -176,7 +176,7 @@ fn contended(error: &io::Error) -> bool {
 }
 
 #[cfg(unix)]
-fn lock_open_file(file: &File) -> io::Result<()> {
+pub(crate) fn lock_open_file(file: &File) -> io::Result<()> {
     use std::os::fd::AsRawFd;
     use std::os::raw::c_int;
 
@@ -202,13 +202,13 @@ fn lock_open_file(file: &File) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn lock_open_file(_: &File) -> io::Result<()> {
+pub(crate) fn lock_open_file(_: &File) -> io::Result<()> {
     // The exclusive open acquired the lock.
     Ok(())
 }
 
 #[cfg(not(any(unix, windows)))]
-fn lock_open_file(_: &File) -> io::Result<()> {
+pub(crate) fn lock_open_file(_: &File) -> io::Result<()> {
     Err(io::Error::new(
         io::ErrorKind::Unsupported,
         "work directory locking is unavailable on this platform",

@@ -24,7 +24,7 @@ use crate::report::{self, Finding, Report};
 use crate::scope::{self, Scope};
 use crate::trace::Trace;
 use crate::work_lock::WorkLock;
-use crate::{git_index, progress, witness};
+use crate::{git_index, leftovers, progress, witness};
 
 #[derive(Clone)]
 pub struct Options {
@@ -1791,9 +1791,16 @@ fn run_binary(
     // Its own process group, so that a timeout can stop whatever the tests started too.
     #[cfg(unix)]
     std::os::unix::process::CommandExt::process_group(&mut cmd, 0);
-    let mut child = cmd
-        .spawn()
-        .with_context(|| format!("starting the tests of `{}`", bin.name))?;
+    // What the tests leave running outside their group is found by a file they pass on.
+    let mut watch = leftovers::Watch::new(reserve_file(&bin.marks, "held", &RUNS)?);
+    let mut child = match watch.spawn(&mut cmd) {
+        Ok(child) => child,
+        Err(error) => {
+            watch.finish(true);
+            let _ = release_mark(&unable_mark);
+            return Err(error).with_context(|| format!("starting the tests of `{}`", bin.name));
+        }
+    };
     let group = child.id();
     let kill = |child: &mut std::process::Child| {
         if nextest {
@@ -1879,6 +1886,8 @@ fn run_binary(
     })();
     // tmt:ignore only Windows needs the file closed before the mark is removed, and these tests are for Unix
     drop(output_to_watch);
+    // The run is over, whichever way: what it started and did not stop is stopped now.
+    leftovers::count(&watch.finish(leftovers::leave()));
     if result.is_err() {
         kill(&mut child);
         let _ = release_mark(&unable_mark);

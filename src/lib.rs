@@ -6,6 +6,7 @@ mod checkpoint;
 pub mod driver;
 mod git_index;
 pub mod instrument;
+mod leftovers;
 mod modules;
 pub mod output_fixture;
 pub mod plan;
