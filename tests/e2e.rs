@@ -4099,3 +4099,60 @@ fn code_between_fork_and_exec_is_not_traced() {
         "{report:#}"
     );
 }
+
+/// A mutant makes a test fail before it stops the helper it started in a process group
+/// of its own. The run passes a locked file on to whatever it starts, and whoever still
+/// has it after the run is stopped.
+#[cfg(unix)]
+#[test]
+fn what_a_failed_test_left_running_in_another_group_is_stopped() {
+    let dir = fixture("leaving", "leaving");
+    let list = dir.join("helpers.txt");
+    let output = fixture_command(env!("CARGO_BIN_EXE_cargo-tmt"))
+        .arg(&dir)
+        .arg("--json")
+        .env("LEAVING_PIDS", &list)
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(output.status.code(), Some(0), "{report:#}\n{stderr}");
+    let killed = report["mutants_killed"].as_u64().unwrap();
+    assert!(killed > 0, "{report:#}");
+    assert_eq!(report["mutants_run"], killed, "{report:#}");
+
+    let helpers: Vec<String> = fs::read_to_string(&list)
+        .unwrap()
+        .lines()
+        .map(str::to_owned)
+        .collect();
+    // The unmutated runs stop their helper themselves; every mutant leaves one.
+    assert!(helpers.len() as u64 > killed, "{helpers:?}");
+    let running: Vec<&String> = helpers
+        .iter()
+        .filter(|pid| {
+            let listed = std::process::Command::new("ps")
+                .args(["-o", "stat=", "-p", pid.as_str()])
+                .output()
+                .unwrap();
+            let state = String::from_utf8_lossy(&listed.stdout);
+            !state.trim().is_empty() && !state.trim().starts_with('Z')
+        })
+        .collect();
+    for pid in &running {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", pid.as_str()])
+            .status();
+    }
+    assert!(running.is_empty(), "left running: {running:?}\n{stderr}");
+    let note = stderr
+        .lines()
+        .find(|line| line.starts_with("tmt: stopped "))
+        .unwrap_or_else(|| panic!("{stderr}"));
+    assert!(
+        note.ends_with(" processes that the tests had left running after their run"),
+        "{note}"
+    );
+    let stopped: u64 = note.split(' ').nth(2).unwrap().parse().unwrap();
+    assert!(stopped >= killed, "{note}");
+}

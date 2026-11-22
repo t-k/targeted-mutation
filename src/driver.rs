@@ -3505,6 +3505,39 @@ pub fn run_packages_each(
     Ok(())
 }
 
+/// Says at the end of a package, however it ends, what its runs left behind.
+struct LeftoverNote(bool);
+
+impl Drop for LeftoverNote {
+    fn drop(&mut self) {
+        use std::sync::atomic::Ordering;
+        let stopped = leftovers::STOPPED.swap(0, Ordering::Relaxed);
+        let not_stopped = leftovers::NOT_STOPPED.swap(0, Ordering::Relaxed);
+        if let Some(text) = leftover_note(stopped, not_stopped)
+            && self.0
+        {
+            eprintln!("tmt: {text}");
+        }
+    }
+}
+
+fn leftover_note(stopped: usize, not_stopped: usize) -> Option<String> {
+    let stopped = (stopped > 0).then(|| {
+        format!("stopped {stopped} processes that the tests had left running after their run")
+    });
+    let not_stopped = (not_stopped > 0).then(|| {
+        format!(
+            "after {not_stopped} runs something the tests started may still be running \
+             (it could not be found or stopped)"
+        )
+    });
+    match (stopped, not_stopped) {
+        (None, None) => None,
+        (Some(one), None) | (None, Some(one)) => Some(one),
+        (Some(stopped), Some(not_stopped)) => Some(format!("{stopped}; {not_stopped}")),
+    }
+}
+
 pub fn run(options: &Options) -> Result<Report> {
     run_package(options, None, None)
 }
@@ -3514,6 +3547,7 @@ fn run_package(
     batch: Option<&WorkspaceBatch<'_>>,
     workspace_shard: Option<WorkspaceShard>,
 ) -> Result<Report> {
+    let _leftovers = LeftoverNote(options.progress);
     if let Some(shard) = options.shard
         && (!options.source_only || shard.index >= shard.count)
     {
@@ -7640,6 +7674,22 @@ fn main() {
             assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
         }
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn what_the_runs_left_is_said_only_when_there_was_something() {
+        assert_eq!(leftover_note(0, 0), None);
+        assert_eq!(
+            leftover_note(3, 0).unwrap(),
+            "stopped 3 processes that the tests had left running after their run"
+        );
+        assert_eq!(
+            leftover_note(0, 2).unwrap(),
+            "after 2 runs something the tests started may still be running (it could not be \
+             found or stopped)"
+        );
+        let both = leftover_note(1, 1).unwrap();
+        assert!(both.starts_with("stopped 1 processes") && both.contains("; after 1 runs"));
     }
 
     #[test]
