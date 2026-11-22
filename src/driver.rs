@@ -8004,11 +8004,34 @@ fn main() {
         assert!(!next(&long));
         assert!(!next("test tests::c ... ok\n"));
         assert!(next("test tests::d ... FAILED\n"));
-        // One byte over, in two pieces.
-        assert!(!next("t"));
-        let rest = format!("est {} ... FAILED\n", "x".repeat(8 * 1024 - 16));
-        assert_eq!(rest.len(), 8 * 1024);
-        assert!(!next(&rest));
+        // Every line of a piece is looked at, not only its last.
+        assert!(next(
+            "noise\ntest tests::e ... FAILED\ntest tests::f ... ok\n"
+        ));
+
+        // The longest line that is kept, and one byte more in two pieces.
+        let longest = format!("test {} ... FAILED\n", "x".repeat(8 * 1024 - 17));
+        assert_eq!(longest.len(), 8 * 1024);
+        for (pieces, found) in [(vec![&longest[..]], true), (vec!["t", &longest[1..]], true)] {
+            let path = dir.join("longest");
+            let mut written = fs::File::create(&path).unwrap();
+            let mut output = FailureOutput::new(fs::File::open(&path).unwrap());
+            let mut last = false;
+            for piece in pieces {
+                written.write_all(piece.as_bytes()).unwrap();
+                last = output.failed().unwrap();
+            }
+            assert_eq!(last, found);
+        }
+        let over = format!("test {} ... FAILED\n", "x".repeat(8 * 1024 - 16));
+        assert_eq!(over.len(), 8 * 1024 + 1);
+        let path = dir.join("over");
+        let mut written = fs::File::create(&path).unwrap();
+        let mut output = FailureOutput::new(fs::File::open(&path).unwrap());
+        written.write_all(b"t").unwrap();
+        assert!(!output.failed().unwrap());
+        written.write_all(&over.as_bytes()[1..]).unwrap();
+        assert!(!output.failed().unwrap());
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -8313,19 +8336,12 @@ fn main() {
     #[test]
     fn an_empty_directory_the_run_asked_for_is_not_pruned() {
         let dir = scratch("prune-kept-directory");
-        let (workspace, copy) = (dir.join("ws"), dir.join("work/src"));
-        fs::create_dir(workspace.join("fixture")).unwrap();
+        let copy = dir.join("work/src");
+        fs::create_dir(copy.join("fixture")).unwrap();
         fs::create_dir(copy.join("stale")).unwrap();
         let state = WorkCopy::open(&dir.join("work"), &copy);
-        copy_fixture_entry(
-            &workspace.join("fixture"),
-            &copy.join("fixture"),
-            &workspace,
-            &|_| false,
-            &state,
-            &mut BTreeSet::new(),
-        )
-        .unwrap();
+        // As the copy of a fixture directory without files leaves it.
+        state.kept.borrow_mut().insert(copy.join("fixture"));
         prune(&copy, &state).unwrap();
         assert!(copy.join("fixture").is_dir());
         assert!(!copy.join("stale").exists());
