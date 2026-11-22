@@ -768,8 +768,7 @@ pub fn diff(av: Val, bv: Val, equal: bool) -> Diff {
     }
 }
 
-fn finish(site: u32, op: u8, orig: bool, rel: u8, av: Val, bv: Val) -> bool {
-    let d = diff(av, bv, rel == REL_EQ);
+fn finish(site: u32, op: u8, orig: bool, rel: u8, av: Val, bv: Val, d: Diff) -> bool {
     let st = state();
     // The mutated site does not record while its mutant is active. Every other site
     // does, so that a trace taken with a mutant shows what the mutant changes elsewhere.
@@ -823,7 +822,8 @@ fn ord_busy<A: ?Sized + PartialOrd<B>, B: ?Sized>(
         Some(Ordering::Greater) => REL_GT,
         None => REL_UN,
     };
-    finish(site, op, eval_rel(op, rel), rel, av, bv)
+    let d = diff(av, bv, rel == REL_EQ);
+    finish(site, op, eval_rel(op, rel), rel, av, bv, d)
 }
 
 /// `a == b`, `a != b`.
@@ -846,12 +846,13 @@ pub fn eq<A: ?Sized + PartialEq<B>, B: ?Sized>(
 #[inline(never)]
 fn eq_busy(site: u32, op: u8, orig: bool, av: Val, bv: Val) -> bool {
     let equal = orig == (op == EQ);
-    let rel = match (equal, diff(av, bv, equal)) {
+    let d = diff(av, bv, equal);
+    let rel = match (equal, d) {
         (true, _) => REL_EQ,
         (false, Diff::Int(d)) if d != 0 => rel_of_d(d),
         (false, _) => REL_UN,
     };
-    finish(site, op, orig, rel, av, bv)
+    finish(site, op, orig, rel, av, bv, d)
 }
 
 /// Guards a statement: false when the active mutant deletes it.
