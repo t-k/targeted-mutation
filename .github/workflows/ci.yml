@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6.1.0
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
       # The runner comes with rustup; no action is needed to get a toolchain.
@@ -53,7 +53,7 @@ jobs:
       matrix:
         part: [1, 2, 3, 4, 5, 6]
     steps:
-      - uses: actions/checkout@v6.1.0
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
       - name: Install the stable toolchain
@@ -87,7 +87,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:
-      - uses: actions/checkout@v6.1.0
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
       - name: Check with Rust 1.88
@@ -100,7 +100,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 10
     steps:
-      - uses: actions/checkout@v6.1.0
+      - uses: actions/checkout@v7.0.1
         with:
           persist-credentials: false
       - name: Verify .github/workflows/actions.lock
