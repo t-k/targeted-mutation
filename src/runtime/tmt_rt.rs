@@ -416,6 +416,22 @@ struct Tracer {
 struct State {
     mutant: Option<(u32, Mutant)>,
     tracer: Option<Mutex<Tracer>>,
+    /// The process that read the settings and opened the trace.
+    home: u32,
+}
+
+/// The tracer, for the process that opened it.
+///
+/// A child made by `fork` has every lock of this module as it was at that instant,
+/// perhaps held by a thread the child does not have: it would wait for ever, and so would
+/// the parent that waits for its `exec`. The code a child runs before `exec` (a
+/// `pre_exec` hook) therefore records nothing and takes no lock here.
+fn tracer() -> Option<&'static Mutex<Tracer>> {
+    let state = state();
+    match &state.tracer {
+        Some(tracer) if std::process::id() == state.home => Some(tracer),
+        _ => None,
+    }
 }
 
 /// What the probes have to do in this process, kept where a probe can read it without a
@@ -479,7 +495,11 @@ fn state() -> &'static State {
                 typed: HashSet::new(),
             })
         });
-        let state = State { mutant, tracer };
+        let state = State {
+            mutant,
+            tracer,
+            home: std::process::id(),
+        };
         if let Some((site, _)) = state.mutant {
             TARGET.store(site, Atomic::Relaxed);
         }
@@ -595,7 +615,7 @@ fn locked<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 /// Writes what the threads have kept back; `leaving` is the backlog of a thread that ends.
 /// Locks are taken in one order everywhere: the tracer, then a backlog.
 fn flush_backlogs(leaving: Option<&Arc<Mutex<Backlog>>>) {
-    let Some(tracer) = &state().tracer else {
+    let Some(tracer) = tracer() else {
         return;
     };
     let mut tracer = locked(tracer);
@@ -652,7 +672,7 @@ thread_local! {
 }
 
 fn with_tracer(f: impl FnOnce(&mut Tracer, u32)) {
-    let Some(tracer) = &state().tracer else {
+    let Some(tracer) = tracer() else {
         return;
     };
     let mut tracer = locked(tracer);
@@ -679,7 +699,7 @@ fn with_tracer(f: impl FnOnce(&mut Tracer, u32)) {
 
 /// Records observation bits of a statement (`R`), logic (`L`) or arithmetic (`A`) site.
 fn record_bits(kind: u8, site: u32, bits: u8) {
-    if state().tracer.is_none() || !bits_are_news(kind, site, bits) {
+    if state().tracer.is_none() || !bits_are_news(kind, site, bits) || tracer().is_none() {
         return;
     }
     // A thread that records has a keeper, so that its end writes every backlog.
@@ -710,6 +730,8 @@ fn record_cmp(site: u32, rel: u8, d: Diff, av: Val, bv: Val) {
     });
     let summary = match seen {
         Ok((News::Nothing, _)) => return,
+        // Before any lock, that of this thread's backlog included.
+        _ if tracer().is_none() => return,
         Ok((News::Closer, summary)) => {
             // Not worth a line each time: kept for later where there is a later.
             let kept = KEEPER.try_with(|keeper| match &keeper.0 {

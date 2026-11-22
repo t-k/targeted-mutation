@@ -4075,3 +4075,27 @@ fn an_unparseable_selection_is_not_a_successful_empty_selection() {
     assert_eq!(report["evaluation"], "no_mutants_executed");
     assert_eq!(report["skipped"][0]["reason"], "unparseable_source");
 }
+
+/// A child made by `fork` has the locks of the runtime as they were at that instant,
+/// perhaps held by a thread it does not have. What it runs before `exec` records nothing
+/// (and waits for nothing): it is reported as not reached, while a mutant still acts there.
+#[cfg(unix)]
+#[test]
+fn code_between_fork_and_exec_is_not_traced() {
+    let dir = fixture("forking", "forking");
+    let (code, report) = json(&dir);
+    assert_eq!(code, 0, "{report:#}");
+    assert_eq!(report["skipped_sites"], 0, "{report:#}");
+    assert_eq!(findings(&report, "survivor").len(), 0, "{report:#}");
+    let unreached: Vec<&str> = report["unreached"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|u| u["code"].as_str().unwrap())
+        .collect();
+    assert_eq!(unreached, ["level > HIGHEST"], "{report:#}");
+    assert_eq!(
+        report["mutants_run"], report["mutants_killed"],
+        "{report:#}"
+    );
+}
