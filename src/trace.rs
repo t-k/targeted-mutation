@@ -56,48 +56,58 @@ fn optional<T: std::str::FromStr>(text: &str) -> Option<Option<T>> {
     }
 }
 
-/// How many keys of two maps of maps have another value in one than in the other.
-fn differing<T: PartialEq>(
-    a: &BTreeMap<u32, BTreeMap<String, T>>,
-    b: &BTreeMap<u32, BTreeMap<String, T>>,
+/// Counts differing records from two streams ordered by the same key.
+fn differing<K: Ord, V: PartialEq>(
+    a: impl Iterator<Item = (K, V)>,
+    b: impl Iterator<Item = (K, V)>,
 ) -> usize {
-    let one_way = |from: &BTreeMap<u32, BTreeMap<String, T>>,
-                   to: &BTreeMap<u32, BTreeMap<String, T>>,
-                   both: bool| {
-        from.iter()
-            .flat_map(|(site, tests)| tests.iter().map(move |(test, seen)| (site, test, seen)))
-            .filter(
-                |(site, test, seen)| match to.get(site).and_then(|tests| tests.get(*test)) {
-                    Some(other) => both && other != *seen,
-                    None => true,
-                },
-            )
-            .count()
-    };
-    one_way(a, b, true) + one_way(b, a, false)
+    let mut a = a.peekable();
+    let mut b = b.peekable();
+    let mut count = 0;
+    while let (Some((left, _)), Some((right, _))) = (a.peek(), b.peek()) {
+        match left.cmp(right) {
+            std::cmp::Ordering::Less => {
+                a.next();
+                count += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                b.next();
+                count += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                let left = a.next().unwrap().1;
+                let right = b.next().unwrap().1;
+                count += usize::from(left != right);
+            }
+        }
+    }
+    count + a.count() + b.count()
+}
+
+fn records<T>(map: &BTreeMap<u32, BTreeMap<String, T>>) -> impl Iterator<Item = ((u32, &str), &T)> {
+    map.iter().flat_map(|(&site, tests)| {
+        tests
+            .iter()
+            .map(move |(test, seen)| ((site, test.as_str()), seen))
+    })
+}
+
+fn reached_records(
+    map: &BTreeMap<u32, BTreeSet<String>>,
+) -> impl Iterator<Item = ((u32, &str), ())> {
+    map.iter()
+        .flat_map(|(&site, tests)| tests.iter().map(move |test| ((site, test.as_str()), ())))
 }
 
 impl Trace {
     /// How many records (what one test saw at one site) are not the same in two traces
     /// of the same tests. Tests that always do the same give none.
     pub fn differences(&self, other: &Trace) -> usize {
-        let reach = |from: &Trace, to: &Trace| {
-            from.reach
-                .iter()
-                .flat_map(|(site, tests)| tests.iter().map(move |test| (site, test)))
-                .filter(|(site, test)| {
-                    !to.reach
-                        .get(site)
-                        .is_some_and(|tests| tests.contains(*test))
-                })
-                .count()
-        };
-        differing(&self.cmp, &other.cmp)
-            + differing(&self.logic, &other.logic)
-            + differing(&self.arith, &other.arith)
-            + differing(&self.returns, &other.returns)
-            + reach(self, other)
-            + reach(other, self)
+        differing(records(&self.cmp), records(&other.cmp))
+            + differing(records(&self.logic), records(&other.logic))
+            + differing(records(&self.arith), records(&other.arith))
+            + differing(records(&self.returns), records(&other.returns))
+            + differing(reached_records(&self.reach), reached_records(&other.reach))
     }
 
     pub fn parse(text: &str) -> Trace {
@@ -1020,6 +1030,16 @@ mod tests {
         }
         assert_eq!(base.differences(&Trace::default()), 5);
         assert_eq!(Trace::default().differences(&base), 5);
+    }
+
+    #[test]
+    fn sorted_audit_counts_changes_once_across_interleaved_keys() {
+        let before = [((0, "a"), 1), ((1, "a"), 2), ((1, "ba"), 3), ((7, "u"), 4)];
+        let after = [((1, "a"), 2), ((1, "b"), 3), ((1, "ba"), 7), ((8, "u"), 4)];
+        assert_eq!(differing(before.into_iter(), after.into_iter()), 5);
+        assert_eq!(differing(after.into_iter(), before.into_iter()), 5);
+        assert_eq!(differing(before.into_iter(), before.into_iter()), 0);
+        assert_eq!(differing(before.into_iter(), [].into_iter()), 4);
     }
 
     #[test]
