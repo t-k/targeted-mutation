@@ -421,20 +421,7 @@ fn show_workspace(
             serde_json::json!({"packages": packages, "errors": errors})
         );
     } else if sarif {
-        let mut combined: serde_json::Value =
-            serde_json::from_str(&report::render_sarif(&report::Report::default()))
-                .expect("SARIF serialises");
-        let runs: Vec<_> = reports
-            .iter()
-            .map(|result| {
-                let mut sarif: serde_json::Value =
-                    serde_json::from_str(&report::render_sarif(result)).expect("SARIF serialises");
-                sarif["runs"][0]["properties"]["package"] = result.package.clone().into();
-                sarif["runs"][0].take()
-            })
-            .collect();
-        combined["runs"] = serde_json::Value::Array(runs);
-        println!("{combined:#}");
+        println!("{}", report::render_workspace_sarif(&reports));
     } else {
         for result in &reports {
             show_report(result, false, false, show_unreached);

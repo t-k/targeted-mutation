@@ -387,11 +387,8 @@ impl Report {
     /// a statement is discovered before the expressions of the statements above it.
     pub fn sort_findings(&mut self) {
         self.findings.sort_by(|a, b| {
-            let key = |finding: &Finding| {
-                let at = finding.at();
-                (at.file.clone(), at.line, at.column)
-            };
-            key(a).cmp(&key(b))
+            let (a, b) = (a.at(), b.at());
+            (&a.file, a.line, a.column).cmp(&(&b.file, b.line, b.column))
         });
     }
 
@@ -850,10 +847,35 @@ pub fn arith_gap_finding(
     })
 }
 
-/// The report as SARIF 2.1.0, for code scanning UIs. `prefix` is put in front of the file
-/// names (the package's path inside the repository).
-/// SARIF with the files named from the top of the repository.
+/// The report as SARIF 2.1.0, with file names relative to the repository root.
 pub fn render_sarif(report: &Report) -> String {
+    sarif_document(vec![sarif_run(report)])
+}
+
+/// The CLI's workspace SARIF has one run per successful member, in report order.
+#[doc(hidden)]
+pub fn render_workspace_sarif(reports: &[Report]) -> String {
+    let runs = reports
+        .iter()
+        .map(|report| {
+            let mut run = sarif_run(report);
+            run["properties"]["package"] = serde_json::json!(report.package);
+            run
+        })
+        .collect();
+    sarif_document(runs)
+}
+
+fn sarif_document(runs: Vec<serde_json::Value>) -> String {
+    let mut document = serde_json::json!({
+        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+        "version": "2.1.0",
+    });
+    document["runs"] = serde_json::Value::Array(runs);
+    serde_json::to_string_pretty(&document).expect("JSON values serialise")
+}
+
+fn sarif_run(report: &Report) -> serde_json::Value {
     let prefix = report.analysis.package_path.as_str();
     let results: Vec<serde_json::Value> = report
         .findings
@@ -881,24 +903,20 @@ pub fn render_sarif(report: &Report) -> String {
             })
         })
         .collect();
-    let sarif = serde_json::json!({
-        "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
-        "version": "2.1.0",
-        "runs": [{
-            "tool": { "driver": {
-                "name": "tmt",
-                "rules": [
-                    { "id": "input-gap", "shortDescription": { "text": "No test input tells this mutant from the original" } },
-                    { "id": "assertion-gap", "shortDescription": { "text": "Tests run the mutated code and still pass" } },
-                    { "id": "survivor", "shortDescription": { "text": "A mutant built on its own passes every test; why is not known" } }
-                ]
-            } },
-            // What was looked at: a run of a part says nothing about the rest.
-            "properties": { "analysis": report.analysis, "evaluation": report.evaluation, "skipped": report.skipped },
-            "results": results
-        }]
+    let mut run = serde_json::json!({
+        "tool": { "driver": {
+            "name": "tmt",
+            "rules": [
+                { "id": "input-gap", "shortDescription": { "text": "No test input tells this mutant from the original" } },
+                { "id": "assertion-gap", "shortDescription": { "text": "Tests run the mutated code and still pass" } },
+                { "id": "survivor", "shortDescription": { "text": "A mutant built on its own passes every test; why is not known" } }
+            ]
+        } },
+        // What was looked at: a run of a part says nothing about the rest.
+        "properties": { "analysis": report.analysis, "evaluation": report.evaluation, "skipped": report.skipped },
     });
-    serde_json::to_string_pretty(&sarif).expect("JSON values serialise")
+    run["results"] = serde_json::Value::Array(results);
+    run
 }
 
 fn list(items: &[String], limit: usize) -> String {
@@ -1710,6 +1728,92 @@ mod tests {
             logic_gap_finding("f.rs", &add, LogicGap::RhsNeverDecides, true),
             None
         );
+    }
+
+    #[test]
+    fn workspace_sarif_matches_the_individual_runs() {
+        use serde_json::{Value, json};
+
+        let report = Report {
+            package: "zebra".into(),
+            analysis: Analysis {
+                package_path: "crates/zebra/".into(),
+                ..Analysis::default()
+            },
+            findings: vec![Finding::Survivor {
+                at: Location {
+                    file: r#"src/"é".rs"#.into(),
+                    line: 4,
+                    column: 1,
+                    id: "zebra|4".into(),
+                    ..Location::default()
+                },
+                survivors: vec!["delete".into()],
+                witness: None,
+            }],
+            ..Report::default()
+        };
+        let empty = Report {
+            package: "ant".into(),
+            ..Report::default()
+        };
+        for reports in [
+            &[][..],
+            std::slice::from_ref(&report),
+            &[report.clone(), empty],
+        ] {
+            let runs: Vec<_> = reports
+                .iter()
+                .map(|report| {
+                    let mut single: Value = serde_json::from_str(&render_sarif(report)).unwrap();
+                    let mut run = single["runs"][0].take();
+                    assert!(run["properties"].get("package").is_none());
+                    run["properties"]["package"] = json!(report.package);
+                    run
+                })
+                .collect();
+            let old = json!({
+                "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
+                "version": "2.1.0",
+                "runs": runs,
+            });
+            assert_eq!(render_workspace_sarif(reports), format!("{old:#}"));
+        }
+    }
+
+    #[test]
+    fn findings_sort_by_path_and_position_in_input_order_for_ties() {
+        let mut report = Report {
+            findings: [
+                ("z.rs", 1, 1, "1"),
+                ("é.rs", 1, 1, "2"),
+                ("a.rs", 2, 1, "3"),
+                ("a.rs", 1, 3, "4"),
+                ("a.rs", 1, 3, "5"),
+                ("a.rs", 1, 1, "6"),
+            ]
+            .into_iter()
+            .map(|(file, line, column, id)| Finding::Survivor {
+                at: Location {
+                    file: file.into(),
+                    line,
+                    column,
+                    id: id.into(),
+                    ..Location::default()
+                },
+                survivors: vec![],
+                witness: None,
+            })
+            .collect(),
+            ..Report::default()
+        };
+        report.sort_findings();
+        let ids: Vec<_> = report
+            .findings
+            .iter()
+            .map(|finding| finding.at().id.as_str())
+            .collect();
+        assert_eq!(ids, ["6", "4", "5", "3", "1", "2"]);
     }
 
     #[test]
