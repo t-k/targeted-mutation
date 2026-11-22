@@ -52,9 +52,11 @@ fn lock_directory(work: &Path) -> Result<PathBuf> {
     let path = work.join(".tmt-lock");
     match fs::create_dir(&path) {
         Ok(()) => {}
+        // tmt:ignore any other failure to create the directory is a failure all the same: there is then no lock directory to inspect or to open the owner file in
         Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
             let existing = fs::symlink_metadata(&path)
                 .with_context(|| format!("inspecting {}", path.display()))?;
+            // tmt:ignore on Unix a link is never reported as a file; the test for a link is for Windows reparse points
             if !is_link(&existing) && existing.is_file() {
                 bail!(
                     "{} is a legacy TMT lock file. Choose a fresh --work-dir, or remove \
@@ -62,6 +64,7 @@ fn lock_directory(work: &Path) -> Result<PathBuf> {
                     path.display()
                 );
             }
+            // tmt:ignore on Unix a link is never reported as a directory (the test for a link is for Windows reparse points), and what is not a directory cannot hold the owner file, so taking the lock fails without this too; this says why
             if is_link(&existing) || !existing.is_dir() {
                 bail!("{} must be a real lock directory", path.display());
             }
@@ -110,23 +113,28 @@ fn acquire(path: &Path) -> io::Result<File> {
 
     let file = match options.create_new(true).open(path) {
         Ok(file) => file,
+        // tmt:ignore after any other failure to create the file there is nothing to open: inspecting the path fails as well
         Err(err) if err.kind() == io::ErrorKind::AlreadyExists => {
+            // tmt:ignore refuses a link before its target is opened; the checks after the open refuse the same paths
             require_regular(&fs::symlink_metadata(path)?)?;
             options.create_new(false).open(path)?
         }
         Err(err) => return Err(err),
     };
     let opened = file.metadata()?;
+    // tmt:ignore differs from the check before the open only if the path is replaced in between, which a test cannot provoke
     require_regular(&opened)?;
     lock_open_file(&file)?;
 
     // Do not unlink this path on release: another contender may already have
     // opened this inode. Also check that it wasn't replaced during acquisition.
     let named = fs::symlink_metadata(path)?;
+    // tmt:ignore differs from the checks above only if the path is replaced during acquisition, which a test cannot provoke
     require_regular(&named)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
+        // tmt:ignore true only if the path is replaced during acquisition, which a test cannot provoke
         if (opened.dev(), opened.ino()) != (named.dev(), named.ino()) {
             return Err(io::Error::other(
                 "lock file was replaced during acquisition",
@@ -137,6 +145,7 @@ fn acquire(path: &Path) -> io::Result<File> {
 }
 
 fn require_regular(metadata: &fs::Metadata) -> io::Result<()> {
+    // tmt:ignore on Unix a link is never reported as a file; the test for a link is for Windows reparse points
     if metadata.is_file() && !is_link(metadata) {
         Ok(())
     } else {
@@ -144,6 +153,7 @@ fn require_regular(metadata: &fs::Metadata) -> io::Result<()> {
     }
 }
 
+// tmt:ignore on Unix every caller also requires a file or a directory, which a link is not; this matters for Windows reparse points
 fn is_link(metadata: &fs::Metadata) -> bool {
     #[cfg(windows)]
     {
@@ -179,10 +189,12 @@ fn lock_open_file(file: &File) -> io::Result<()> {
     loop {
         // SAFETY: the File owns this descriptor throughout the call, and the
         // two flags request a nonblocking exclusive lock.
+        // tmt:ignore the bits do not overlap, so `^` joins them just as well
         if unsafe { flock(file.as_raw_fd(), LOCK_EX | LOCK_NB) } == 0 {
             return Ok(());
         }
         let error = io::Error::last_os_error();
+        // tmt:ignore a nonblocking flock is interrupted only by a signal at the right instant, which a test cannot provoke
         if error.kind() != io::ErrorKind::Interrupted {
             return Err(error);
         }
@@ -422,6 +434,39 @@ mod tests {
         fs::write(&marker, "keep this content").unwrap();
         drop(WorkLock::take(&work.0).unwrap());
         assert_eq!(fs::read_to_string(&marker).unwrap(), "keep this content");
+    }
+
+    #[test]
+    fn an_unusable_owner_path_is_not_reported_as_another_run() {
+        let work = Scratch::new();
+        let marker = work.0.join(".tmt-lock/owner");
+        fs::create_dir_all(&marker).unwrap();
+        let error = WorkLock::take(&work.0).err().expect("locked a directory");
+        let text = format!("{error:#}");
+        // Waiting for the other run to end would never help here.
+        assert!(!text.contains("another tmt run"), "{text}");
+        assert!(text.contains("locking"), "{text}");
+        assert!(text.contains(&marker.display().to_string()), "{text}");
+        assert!(text.contains("must be a regular file"), "{text}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejects_an_owner_that_is_neither_a_file_nor_a_link() {
+        let work = Scratch::new();
+        let marker = work.0.join(".tmt-lock/owner");
+        fs::create_dir(marker.parent().unwrap()).unwrap();
+        let made = Command::new("mkfifo").arg(&marker).status().unwrap();
+        assert!(made.success());
+        // A FIFO can be opened for reading and writing, and some systems lock one.
+        for _ in 0..2 {
+            let error = WorkLock::take(&work.0).err().expect("locked a FIFO");
+            let text = format!("{error:#}");
+            assert!(text.contains("must be a regular file"), "{text}");
+            assert!(!text.contains("another tmt run"), "{text}");
+        }
+        use std::os::unix::fs::FileTypeExt;
+        assert!(fs::symlink_metadata(&marker).unwrap().file_type().is_fifo());
     }
 
     #[test]
