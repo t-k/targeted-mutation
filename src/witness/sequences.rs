@@ -331,6 +331,7 @@ fn round_trip_candidates(
             codecs.insert(function.sig.ident.to_string(), codec);
         }
     }
+    // tmt:ignore performance only: without a codec of each kind no round trip below finds its pair
     if encoders.is_empty() || decoders.is_empty() {
         return;
     }
@@ -596,6 +597,7 @@ fn batch_candidates(
             let sibling_queries: BTreeSet<_> = tests
                 .iter()
                 .filter(|other| {
+                    // tmt:ignore leaving out the test itself states the intent: a test `failed_batch` accepts has no read
                     other.module == test.module
                         && other.function.sig.ident != test.function.sig.ident
                 })
@@ -739,5 +741,311 @@ mod tests {
         ] {
             assert!(candidates(&source).is_empty(), "{source}");
         }
+    }
+
+    fn codec_with(from: &str, to: &str) -> String {
+        assert!(CODEC.contains(from), "{from}");
+        CODEC.replace(from, to)
+    }
+
+    #[test]
+    fn the_pair_says_where_it_is_and_what_to_check() {
+        let found = candidates(CODEC);
+        assert_eq!(found.len(), 1);
+        // `encode` is on the second line of the text, `decode` on the third.
+        assert_eq!(found[0].scope, 2..=3);
+        assert_eq!(found[0].signature_lines, [2, 3]);
+        assert_eq!(
+            found[0].scenarios[0].guidance.as_deref(),
+            Some("Check the encoded bytes against the format contract.")
+        );
+    }
+
+    #[test]
+    fn the_edits_are_in_source_order_when_the_decoder_comes_first() {
+        let source = r#"
+        pub fn decode(bytes: [u8; 2]) -> u16 { u16::from_le_bytes(bytes) }
+        pub fn encode(word: u16) -> [u8; 2] { word.to_le_bytes() }
+        #[test]
+        fn round_trip() {
+            assert_eq!(decode(encode(7)), 7);
+        }
+        "#;
+        let found = candidates(source);
+        assert_eq!(found.len(), 1);
+        let actual: Vec<_> = found[0]
+            .edits
+            .iter()
+            .map(|edit| (&source[edit.span.clone()], edit.replacement.as_str()))
+            .collect();
+        assert_eq!(
+            actual,
+            [
+                ("from_le_bytes", "from_be_bytes"),
+                ("to_le_bytes", "to_be_bytes")
+            ]
+        );
+        assert_eq!(found[0].scope, 2..=3);
+        assert_eq!(found[0].signature_lines, [3, 2]);
+        assert_eq!(
+            found[0].scenarios[0].source_test.as_deref(),
+            Some("round_trip")
+        );
+    }
+
+    #[test]
+    fn a_big_endian_pair_is_reversed_to_little_endian() {
+        let source = CODEC.replace("_le_", "_be_");
+        let found = candidates(&source);
+        assert_eq!(found.len(), 1);
+        let actual: Vec<_> = found[0]
+            .edits
+            .iter()
+            .map(|edit| (&source[edit.span.clone()], edit.replacement.as_str()))
+            .collect();
+        assert_eq!(
+            actual,
+            [
+                ("to_be_bytes", "to_le_bytes"),
+                ("from_be_bytes", "from_le_bytes")
+            ]
+        );
+    }
+
+    #[test]
+    fn a_codec_converts_its_one_plain_parameter_and_nothing_else() {
+        for source in [
+            // Not a plain binding.
+            codec_with("encode(word: u16)", "encode(ref word: u16)"),
+            codec_with("encode(word: u16)", "encode(word @ _: u16)"),
+            // A second parameter.
+            codec_with("encode(word: u16)", "encode(word: u16, pad: u8)")
+                .replace("decode(encode(word))", "decode(encode(word, 0))"),
+            // Code the tool does not mutate.
+            codec_with("pub fn encode", "#[cfg(test)] pub fn encode"),
+            codec_with("pub fn encode", "#[mutants::skip] pub fn encode"),
+            // Not a conversion of the parameter.
+            codec_with("word.to_le_bytes()", "word.to_le_bytes(1)"),
+            codec_with("word.to_le_bytes()", "MAGIC.to_le_bytes()"),
+            codec_with("from_le_bytes(bytes)", "from_le_bytes(MAGIC)"),
+            // Not the bytes of the word.
+            codec_with("-> [u8; 2] { word", "-> [u8; 4] { word"),
+            codec_with("decode(bytes: [u8; 2])", "decode(bytes: [u8; 4])"),
+            codec_with("u16::from_le_bytes", "Word::from_le_bytes"),
+            // Two codecs of different words.
+            codec_with(
+                "decode(bytes: [u8; 2]) -> u16 { u16::",
+                "decode(bytes: [u8; 4]) -> u32 { u32::",
+            ),
+        ] {
+            assert!(candidates(&source).is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn a_round_trip_is_asserted_by_a_test_against_its_own_input() {
+        for source in [
+            codec_with("#[test]", ""),
+            codec_with(
+                "assert_eq!(word, decode(encode(word)));",
+                "assert_eq!(0x1234, decode(encode(word)));",
+            ),
+        ] {
+            assert!(candidates(&source).is_empty(), "{source}");
+        }
+    }
+
+    const READS: &str = r#"
+            #[test]
+            fn reads() {
+                let mut store = Store::default();
+                assert_eq!(store.get("a"), None);
+            }
+"#;
+
+    const STORE: &str = r#"
+        pub struct Store;
+        impl Store {
+            pub fn get(&self, key: &str) -> Option<&str> { None }
+            pub fn has(&self, key: &str) -> bool { false }
+            pub fn commit(&mut self, batch: &[Write]) -> Result<(), CommitError> {
+                self.check(batch)?;
+                Ok(())
+            }
+        }
+        #[cfg(test)]
+        mod tests {
+            use super::*;
+
+            #[test]
+            fn reads() {
+                let mut store = Store::default();
+                assert_eq!(store.get("a"), None);
+            }
+
+            #[test]
+            fn fails() {
+                let mut store = Store::default();
+                let result = store.commit(&[set("a", "1"), update("b", "2")]);
+                assert_eq!(result, Err(CommitError::NotFound("b".into())));
+            }
+        }
+    "#;
+
+    fn store_with(from: &str, to: &str) -> String {
+        assert!(STORE.contains(from), "{from}");
+        STORE.replace(from, to)
+    }
+
+    fn observations(source: &str) -> Vec<String> {
+        candidates(source)
+            .iter()
+            .flat_map(|candidate| &candidate.scenarios)
+            .map(|scenario| scenario.expression.clone())
+            .collect()
+    }
+
+    #[test]
+    fn each_key_of_the_rejected_batch_is_read_after_the_error_check() {
+        let found = candidates(STORE);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].description, "delete `self.check(batch)?;`");
+        assert_eq!(
+            observations(STORE),
+            ["store.get(\"a\")", "store.get(\"b\")"]
+        );
+        for scenario in &found[0].scenarios {
+            assert_eq!(
+                scenario.guidance.as_deref(),
+                Some("Add this assertion after the error check in `tests::fails`.")
+            );
+            assert_eq!(scenario.source_test.as_deref(), Some("tests::fails"));
+        }
+    }
+
+    #[test]
+    fn the_error_may_be_on_either_side_of_the_assertion() {
+        let source = store_with(
+            "assert_eq!(result, Err(CommitError::NotFound(\"b\".into())));",
+            "assert_eq!(Err(CommitError::NotFound(\"b\".into())), result);",
+        );
+        assert_eq!(
+            observations(&source),
+            ["store.get(\"a\")", "store.get(\"b\")"]
+        );
+    }
+
+    #[test]
+    fn a_read_is_a_public_method_of_the_shared_store_with_a_string_key() {
+        let get = "pub fn get(&self, key: &str)";
+        for replacement in [
+            "fn get(&self, key: &str)",
+            "pub fn get(&mut self, key: &str)",
+            "pub fn get(self, key: &str)",
+            "pub fn get(&self, key: &mut str)",
+            "pub fn get(&self, key: &String)",
+            "pub fn get(&self, key: u32)",
+            "pub fn get(&self, key: &str, default: &str)",
+            "pub fn get(key: &str)",
+        ] {
+            let source = store_with(get, replacement);
+            assert!(candidates(&source).is_empty(), "{replacement}");
+        }
+    }
+
+    #[test]
+    fn a_guard_is_the_first_statement_of_a_method_that_changes_the_store_with_a_slice() {
+        let commit = "pub fn commit(&mut self, batch: &[Write])";
+        for replacement in [
+            "pub fn commit(&self, batch: &[Write])",
+            "pub fn commit(mut self, batch: &[Write])",
+            "pub fn commit(&mut self, batch: &Vec<Write>)",
+            "pub fn commit(&mut self, batch: Vec<Write>)",
+            "pub fn commit(&mut self, batch: &[Write], force: bool)",
+        ] {
+            let source = store_with(commit, replacement);
+            assert!(candidates(&source).is_empty(), "{replacement}");
+        }
+        let guard = "self.check(batch)?;";
+        for replacement in [
+            "self.check(other)?;",
+            "CHECKER.check(batch)?;",
+            "self.inner.check(batch)?;",
+        ] {
+            let source = store_with(guard, replacement);
+            assert!(candidates(&source).is_empty(), "{replacement}");
+        }
+    }
+
+    #[test]
+    fn a_guard_longer_than_a_line_of_the_report_is_not_proposed() {
+        // `self.` and `(batch)?;` are 14 characters.
+        let fits = store_with(
+            "self.check(batch)?;",
+            &format!("self.{}(batch)?;", "c".repeat(86)),
+        );
+        let found = candidates(&fits);
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].description.chars().count(),
+            "delete ``".len() + 100
+        );
+        let long = store_with(
+            "self.check(batch)?;",
+            &format!("self.{}(batch)?;", "c".repeat(87)),
+        );
+        assert!(candidates(&long).is_empty());
+    }
+
+    #[test]
+    fn the_tests_must_use_a_fresh_store_of_the_type_and_the_guarded_method() {
+        for source in [
+            STORE.replace("Store::default()", "Store::with_capacity(4)"),
+            STORE.replace("Store::default()", "Other::default()"),
+            store_with(
+                "assert_eq!(store.get(\"a\"), None);",
+                "assert_eq!(other.get(\"a\"), None);",
+            ),
+            store_with("store.commit(&[", "store.apply(&["),
+            store_with("store.commit(&[", "OTHER.commit(&["),
+            store_with(
+                "assert_eq!(result, Err(CommitError::NotFound(\"b\".into())));",
+                "assert_eq!(result, Ok(()));",
+            ),
+            store_with("assert_eq!(result, Err(", "assert_eq!(LAST, Err("),
+        ] {
+            assert!(candidates(&source).is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn a_read_from_a_test_of_another_module_is_not_borrowed() {
+        let source = format!(
+            "{}\n#[cfg(test)]\nmod other {{\n{READS}}}\n",
+            store_with(READS.trim(), "")
+        );
+        assert!(source.contains("fn reads()"));
+        assert!(candidates(&source).is_empty(), "{source}");
+    }
+
+    #[test]
+    fn one_failing_test_gets_a_bounded_number_of_observations() {
+        let source = store_with(
+            "assert_eq!(store.get(\"a\"), None);",
+            "assert_eq!(store.get(\"a\"), None);\nassert_eq!(store.has(\"a\"), false);",
+        )
+        .replace(
+            "update(\"b\", \"2\")]",
+            "update(\"b\", \"2\"), update(\"c\", \"3\")]",
+        );
+        assert_eq!(
+            observations(&source),
+            [
+                "store.get(\"a\")",
+                "store.get(\"b\")",
+                "store.get(\"c\")",
+                "store.has(\"a\")"
+            ]
+        );
     }
 }

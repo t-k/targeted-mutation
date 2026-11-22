@@ -352,11 +352,17 @@ fn alternative_name(value: Value, params: &[Parameter<'_>]) -> String {
 
 fn compare(op: &BinOp, lhs: i128, rhs: i128) -> Option<bool> {
     Some(match op {
+        // tmt:ignore the negation is the same: `across` only asks whether two outcomes differ
         BinOp::Eq(_) => lhs == rhs,
+        // tmt:ignore the negation is the same: `across` only asks whether two outcomes differ
         BinOp::Ne(_) => lhs != rhs,
+        // tmt:ignore the negation is the same: `across` only asks whether two outcomes differ
         BinOp::Lt(_) => lhs < rhs,
+        // tmt:ignore the negation is the same: `across` only asks whether two outcomes differ
         BinOp::Le(_) => lhs <= rhs,
+        // tmt:ignore the negation is the same: `across` only asks whether two outcomes differ
         BinOp::Gt(_) => lhs > rhs,
+        // tmt:ignore the negation is the same: `across` only asks whether two outcomes differ
         BinOp::Ge(_) => lhs >= rhs,
         _ => return None,
     })
@@ -376,15 +382,16 @@ fn across(pivot: i128, primitive: Integer, op: &BinOp, change_lhs: bool) -> Opti
         }
     };
     for (index, &first) in values.iter().enumerate() {
+        // tmt:ignore a value paired with itself never differs, so starting at `index` finds the same pair
         for &second in &values[index + 1..] {
             if evaluate(first)? != evaluate(second)? {
-                return Some(
-                    if matches!(op, BinOp::Eq(_) | BinOp::Ne(_)) && second == pivot {
-                        (second, first)
-                    } else {
-                        (first, second)
-                    },
-                );
+                // Equality tells the pivot from the rest, and the pivot is the last value:
+                // it is `second` here. The original of an equality is the equal case.
+                return Some(if matches!(op, BinOp::Eq(_) | BinOp::Ne(_)) {
+                    (second, first)
+                } else {
+                    (first, second)
+                });
             }
         }
     }
@@ -411,7 +418,9 @@ fn compare_candidates(
         };
         let integer = integer_type(chosen, params);
         let pivot = match opposite {
-            Operand::Literal(value) if integer.contains(value) => value,
+            // A literal outside the type needs no check: `across` then has at most one
+            // value in range and finds no pair.
+            Operand::Literal(value) => value,
             Operand::Place(value) if value != chosen && integer_type(value, params) == integer => 1,
             _ => continue,
         };
@@ -715,5 +724,299 @@ fn hidden(a: u64, alternate: u64, limit: u64) -> bool { let a = limit; a < limit
 fn wrong_key(rows: &mut [Entry]) { rows.sort_by_key(|row| row.created_at + 1); }
 "#;
         assert!(candidates(source).is_empty());
+    }
+
+    fn witnesses(source: &str) -> Vec<String> {
+        candidates(source)
+            .iter()
+            .map(|entry| entry.scenarios[0].expression.clone())
+            .collect()
+    }
+
+    const ENTRY: &str = "struct Entry { created_at: u64, updated_at: u64, id: u8 }\n";
+
+    fn with_entry(function: &str) -> String {
+        format!("{ENTRY}{function}")
+    }
+
+    #[test]
+    fn every_primitive_integer_type_is_compared() {
+        for ty in [
+            "i8", "i16", "i32", "i64", "i128", "isize", "u8", "u16", "u32", "u64", "u128", "usize",
+        ] {
+            let source = format!("fn below(a: {ty}, b: {ty}) -> bool {{ a < 5 }}");
+            assert_eq!(witnesses(&source), ["below(4, 6)"], "{ty}");
+        }
+        assert!(witnesses("fn below(a: f64, b: f64) -> bool { a < 5 }").is_empty());
+    }
+
+    #[test]
+    fn each_comparison_gets_arguments_on_both_sides_of_its_boundary() {
+        for (comparison, expected) in [
+            ("a < 5", "f(4, 6)"),
+            ("a <= 5", "f(4, 6)"),
+            ("a > 5", "f(4, 6)"),
+            ("a >= 5", "f(4, 6)"),
+            ("5 > a", "f(4, 6)"),
+            ("a == 5", "f(5, 4)"),
+            ("a != 5", "f(5, 4)"),
+            // Nothing lies below 0: the pair is the boundary and the value above it.
+            ("a > 0", "f(1, 0)"),
+            ("a <= 0", "f(1, 0)"),
+            ("a != 0", "f(0, 1)"),
+            // Nothing lies above 255.
+            ("a < 255", "f(254, 255)"),
+            ("a >= 255", "f(254, 255)"),
+        ] {
+            let source = format!("fn f(a: u8, b: u8) -> bool {{ {comparison} }}");
+            assert_eq!(witnesses(&source), [expected], "{comparison}");
+        }
+    }
+
+    #[test]
+    fn a_comparison_no_value_of_the_type_can_change_has_no_witness() {
+        for comparison in [
+            "a < 0", "a >= 0", "a > 255", "a <= 255", "a < 256", "a < 300", "a > -1", "a == 256",
+        ] {
+            let source = format!("fn f(a: u8, b: u8) -> bool {{ {comparison} }}");
+            assert!(witnesses(&source).is_empty(), "{comparison}");
+        }
+        assert!(witnesses("fn f(a: u8, b: u8) -> u8 { a & 5 }").is_empty());
+    }
+
+    #[test]
+    fn literals_may_be_negative_or_parenthesized_but_not_otherwise_computed() {
+        for (comparison, expected) in [
+            ("a < -5", "f(-6, -4)"),
+            ("a < -(5)", "f(-6, -4)"),
+            ("(a) < (5)", "f(4, 6)"),
+            (
+                "a > -170141183460469231731687303715884105728",
+                "f(-170141183460469231731687303715884105727, -170141183460469231731687303715884105728)",
+            ),
+        ] {
+            let source = format!("fn f(a: i128, b: i128) -> bool {{ {comparison} }}");
+            assert_eq!(witnesses(&source), [expected], "{comparison}");
+        }
+        for comparison in [
+            "a < !5",
+            "a < 5 + 1",
+            // One more than the largest i128.
+            "a > 170141183460469231731687303715884105728",
+        ] {
+            let source = format!("fn f(a: i128, b: i128) -> bool {{ {comparison} }}");
+            assert!(witnesses(&source).is_empty(), "{comparison}");
+        }
+    }
+
+    #[test]
+    fn only_plain_functions_are_proposed() {
+        let rest = "(a: u64, b: u64, c: u64) -> bool { a < c }";
+        for start in [
+            "fn f",
+            "#[inline] fn f",
+            "/// Says whether `a` is below `c`.\n#[must_use] pub fn f",
+        ] {
+            assert_eq!(
+                witnesses(&format!("{start}{rest}")),
+                ["f(0, 2, 1)", "f(1, 2, 0)"],
+                "{start}"
+            );
+        }
+        for start in [
+            "fn f<T>",
+            "async fn f",
+            "unsafe fn f",
+            "const fn f",
+            "extern \"C\" fn f",
+            "#[cfg(unix)] fn f",
+        ] {
+            assert!(witnesses(&format!("{start}{rest}")).is_empty(), "{start}");
+        }
+        // A statement, not the value of the function.
+        assert!(witnesses("fn f(a: u64, b: u64, c: u64) { a < c; }").is_empty());
+    }
+
+    #[test]
+    fn parameters_must_be_plain_bindings() {
+        assert_eq!(
+            witnesses("fn f(mut a: u64, b: u64, c: u64) -> bool { b < c }"),
+            ["f(2, 0, 1)", "f(2, 1, 0)"]
+        );
+        for parameter in ["ref a: u64", "a @ _: u64", "(a, _): (u64, u64)"] {
+            let source = format!("fn f({parameter}, b: u64, c: u64) -> bool {{ b < c }}");
+            assert!(witnesses(&source).is_empty(), "{parameter}");
+        }
+    }
+
+    fn many_parameters(count: usize) -> String {
+        let parameters: Vec<_> = (0..count).map(|index| format!("p{index}: u64")).collect();
+        format!("fn f({}) -> bool {{ p0 < 5 }}", parameters.join(", "))
+    }
+
+    fn wide(fields: usize) -> String {
+        let fields: Vec<_> = (0..fields).map(|index| format!("f{index}: u64")).collect();
+        format!("struct Wide {{ {} }}\n", fields.join(", "))
+    }
+
+    const COMPARE_WIDE: &str = "fn first(row: Wide) -> bool { row.f0 < 5 }\n";
+    const SORT_WIDE: &str = "fn sort_wide(rows: &mut [Wide]) { rows.sort_by_key(|row| row.f0); }\n";
+
+    #[test]
+    fn long_parameter_lists_and_large_records_are_left_alone() {
+        assert_eq!(witnesses(&many_parameters(MAX_PARAMETERS)).len(), 7);
+        assert!(witnesses(&many_parameters(MAX_PARAMETERS + 1)).is_empty());
+        for function in [COMPARE_WIDE, SORT_WIDE] {
+            let source = format!("{}{function}", wide(MAX_FIELDS + 1));
+            assert!(witnesses(&source).is_empty(), "{function}");
+        }
+    }
+
+    #[test]
+    fn each_function_is_given_a_bounded_number_of_candidates() {
+        // 15 other fields could replace `f0`.
+        for function in [COMPARE_WIDE, SORT_WIDE] {
+            let source = format!("{}{function}", wide(MAX_FIELDS));
+            assert_eq!(
+                witnesses(&source).len(),
+                MAX_CANDIDATES_PER_FUNCTION,
+                "{function}"
+            );
+        }
+        let source = format!("{}{COMPARE_WIDE}{SORT_WIDE}", wide(MAX_FIELDS));
+        assert_eq!(witnesses(&source).len(), 2 * MAX_CANDIDATES_PER_FUNCTION);
+    }
+
+    #[test]
+    fn a_field_is_found_by_its_parameter_and_its_name() {
+        let source =
+            with_entry("fn late(limit: u64, row: &Entry) -> bool { row.updated_at < limit }");
+        let all = candidates(&source);
+        assert_eq!(all.len(), 1);
+        let candidate = &all[0];
+        assert_eq!(
+            candidate.description,
+            "replace `row.updated_at` with `row.created_at`"
+        );
+        assert_eq!(&source[candidate.edits[0].span.clone()], "updated_at");
+        assert_eq!(candidate.edits[0].replacement, "created_at");
+        let scenario = &candidate.scenarios[0];
+        assert_eq!(
+            scenario.expression,
+            "late(1, &Entry { created_at: 2, updated_at: 0, id: 0 })"
+        );
+        assert_eq!(
+            scenario.guidance.as_deref(),
+            Some("Use these arguments if the API accepts them together.")
+        );
+    }
+
+    #[test]
+    fn records_are_compared_by_their_integer_fields_only() {
+        for function in [
+            // Whole records: there is no integer to move across a boundary.
+            "fn same(row: Entry, other: Entry) -> bool { row == other }",
+            "fn below(row: Entry, limit: u64) -> bool { row < limit }",
+            // The suggested call passes a record by value or behind `&`.
+            "fn late(row: &mut Entry, limit: u64) -> bool { row.created_at < limit }",
+        ] {
+            assert!(witnesses(&with_entry(function)).is_empty(), "{function}");
+        }
+        // No call can name the parameter of a generic record.
+        let source = "struct Entry<const N: usize = 0> { created_at: u64, updated_at: u64 }
+fn late(row: Entry, limit: u64) -> bool { row.created_at < limit }";
+        assert!(witnesses(source).is_empty());
+    }
+
+    #[test]
+    fn the_other_operand_is_another_value_of_the_same_type() {
+        for function in [
+            "fn f(a: u64, b: u64) -> bool { a < a }",
+            "fn f(a: u64, b: u64, c: u32) -> bool { a < c }",
+        ] {
+            assert!(witnesses(function).is_empty(), "{function}");
+        }
+    }
+
+    #[test]
+    fn either_sort_by_key_method_is_a_sort_key() {
+        for (method, expected) in [
+            ("sort_by_key", 1),
+            ("sort_unstable_by_key", 1),
+            ("dedup_by_key", 0),
+        ] {
+            let source = with_entry(&format!(
+                "fn sort_entries(rows: &mut [Entry]) {{ rows.{method}(|row| row.created_at); }}"
+            ));
+            assert_eq!(candidates(&source).len(), expected, "{method}");
+        }
+    }
+
+    #[test]
+    fn the_sort_key_is_replaced_whichever_field_it_is() {
+        let source = with_entry(
+            "fn sort_entries(rows: &mut [Entry]) { rows.sort_by_key(|row| row.updated_at); }",
+        );
+        let all = candidates(&source);
+        assert_eq!(all.len(), 1);
+        assert_eq!(
+            all[0].description,
+            "replace sort key `updated_at` with `created_at`"
+        );
+        assert_eq!(&source[all[0].edits[0].span.clone()], "updated_at");
+        assert_eq!(all[0].edits[0].replacement, "created_at");
+        let scenario = &all[0].scenarios[0];
+        assert_eq!(
+            scenario.setup,
+            "let mut rows = [Entry { created_at: 40, updated_at: 10, id: 0 }, Entry { created_at: 30, updated_at: 20, id: 0 }]; sort_entries(&mut rows);"
+        );
+        assert_eq!(
+            scenario.expression,
+            "[rows[0].updated_at, rows[1].updated_at]"
+        );
+        assert_eq!(
+            scenario.guidance.as_deref(),
+            Some("Use these rows if the API accepts such values.")
+        );
+    }
+
+    #[test]
+    fn the_rows_of_a_function_named_rows_get_another_name() {
+        let source =
+            with_entry("fn rows(rows: &mut [Entry]) { rows.sort_by_key(|row| row.created_at); }");
+        let all = candidates(&source);
+        assert_eq!(all.len(), 1);
+        let scenario = &all[0].scenarios[0];
+        assert!(scenario.setup.starts_with("let mut tmt_rows = [Entry {"));
+        assert!(scenario.setup.ends_with("; rows(&mut tmt_rows);"));
+        assert_eq!(
+            scenario.expression,
+            "[tmt_rows[0].created_at, tmt_rows[1].created_at]"
+        );
+    }
+
+    #[test]
+    fn a_sort_must_be_of_the_mutable_slice_parameter_by_a_field_of_the_closure_parameter() {
+        for function in [
+            "fn sort_entries(rows: &[Entry]) { rows.sort_by_key(|row| row.created_at); }",
+            "fn sort_entries(rows: &mut [Entry]) { rows.sort_by_key::<u64, _>(|row| row.created_at); }",
+            "fn sort_entries(rows: &mut [Entry]) { OTHER.sort_by_key(|row| row.created_at); }",
+            "fn sort_entries(_: &mut [Entry]) { other().sort_by_key(|row| row.created_at); }",
+            "fn sort_entries(rows: &mut [Entry]) { rows.sort_by_key(|row| FIRST.created_at); }",
+        ] {
+            assert!(witnesses(&with_entry(function)).is_empty(), "{function}");
+        }
+    }
+
+    #[test]
+    fn nothing_is_proposed_for_a_text_the_file_was_not_parsed_from() {
+        let source =
+            "fn expiry(created: u64, updated: u64, expires: u64) -> bool { created < expires }";
+        let file = syn::parse_file(source).unwrap();
+        for other in [format!(" {source}"), String::new()] {
+            let mut out = Vec::new();
+            discover(&other, &file, &mut out);
+            assert!(out.is_empty(), "{other}");
+        }
     }
 }
