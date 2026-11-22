@@ -455,6 +455,7 @@ impl Finder<'_> {
                 .is_some_and(|text| text == tokens_of(value))
         };
         let probe_values = body_values_with_errors(&sig.output, self.error_values, false);
+        // tmt:ignore performance only: the set answers what `probe_values.contains` answers
         let probe_index = (probe_values.len() > 32).then(|| {
             probe_values
                 .iter()
@@ -904,7 +905,6 @@ impl<'a> ItemIndex<'a> {
             .flat_map(|item| [item.start, item.end])
             .collect();
         boundaries.sort_unstable();
-        boundaries.dedup();
 
         let mut starts = starts.into_iter().peekable();
         let mut active = BinaryHeap::new();
@@ -1909,14 +1909,12 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             .iter()
             .any(|arm| matches!(arm.pat, syn::Pat::Wild(_)));
         let final_catches_all = node.arms.last().is_some_and(catches_all);
-        for (index, arm) in node.arms.iter().enumerate() {
+        for arm in &node.arms {
             if is_test_only(&arm.attrs) || is_skipped(&arm.attrs) {
                 continue;
             }
-            let probe = index + 1 < node.arms.len()
-                && final_catches_all
-                && arm.attrs.is_empty()
-                && !catches_all(arm);
+            // The last arm is not probed: where it takes everything, it is a catch-all.
+            let probe = final_catches_all && arm.attrs.is_empty() && !catches_all(arm);
             let literal =
                 has_wildcard && !matches!(arm.pat, syn::Pat::Wild(_)) && arm.guard.is_none();
             if !probe && !literal {
@@ -4749,5 +4747,196 @@ mod tests {
             })
             .collect();
         assert_eq!(bodies, ["f 0", "f 1", "two ()", "value 0", "value 1"]);
+    }
+    #[test]
+    fn an_attribute_excludes_the_compile_time_expressions_of_what_it_is_on() {
+        // `@` is where the attribute goes: without one the length is a mutant to build.
+        for context in [
+            "fn f() { @let _ = [0u8; 6 * 7]; }",
+            "fn f() { let _ = @const { 6 * 7 }; }",
+            "struct Items<@const N: usize = { 6 * 7 }>;",
+            "@enum E { A = 6 * 7 }",
+            "enum E { @A = 6 * 7 }",
+            "enum E { @A([u8; 6 * 7]) }",
+            "@struct S { a: [u8; 6 * 7] }",
+            "struct S { @a: [u8; 6 * 7] }",
+            "@union U { a: [u8; 6 * 7] }",
+            "@trait T { const D: [u8; 6 * 7]; }",
+            "trait T { @type A = [u8; 6 * 7]; }",
+            "@type A = [u8; 6 * 7];",
+            "impl T for S { @type A = [u8; 6 * 7]; }",
+        ] {
+            for attribute in ["", "#[mutants::skip] ", "#[cfg(test)] "] {
+                let source = context.replace('@', attribute);
+                let found = discover(&source, 0).unwrap();
+                let expected: &[&str] = if attribute.is_empty() {
+                    &["6 * 7"]
+                } else {
+                    &[]
+                };
+                assert_eq!(found_arith(&found.rebuild_sites), expected, "{source}");
+                assert!(found_arith(&found.sites).is_empty(), "{source}");
+            }
+        }
+        // On the file itself it excludes everything in it.
+        for attribute in ["#![mutants::skip]", "#![cfg(test)]"] {
+            let source =
+                format!("{attribute}\nconst N: u8 = 6 * 7;\nfn f(a: u8) -> u8 {{ a + 1 }}");
+            let found = discover(&source, 0).unwrap();
+            assert!(found.sites.is_empty(), "{source}");
+            assert!(found.rebuild_sites.is_empty(), "{source}");
+        }
+    }
+
+    #[test]
+    fn compile_time_expressions_are_found_inside_types() {
+        let built = |source: &str| -> Vec<String> {
+            let found = discover(source, 0).unwrap();
+            assert!(found_arith(&found.sites).is_empty(), "{source}");
+            found_arith(&found.rebuild_sites)
+                .into_iter()
+                .map(str::to_string)
+                .collect()
+        };
+        // The element of an array is a type with lengths of its own.
+        assert_eq!(
+            built("fn f() { let _: [[u8; 1 + 2]; 3 + 4]; }"),
+            ["1 + 2", "3 + 4"]
+        );
+        // So is the type of a const parameter.
+        assert_eq!(built("struct S<const N: [u8; 2 + 3]>;"), ["2 + 3"]);
+        // A const argument is computed by the compiler whatever it consists of: it is
+        // never probed.
+        assert_eq!(built("fn f() { let _: Items<{ N + 1 }>; }"), ["N + 1"]);
+    }
+
+    #[test]
+    fn only_the_skip_mark_and_a_cfg_that_needs_test_exclude_code() {
+        let src = "#[mutants] fn bare(a: u8) -> u8 { a + 1 }\n\
+                   #[mutants::skip::deeper] fn longer(a: u8) -> u8 { a + 2 }\n\
+                   #[cfg(all(test))] fn all_of_one(a: u8) -> u8 { a + 3 }\n\
+                   #[cfg(not(not(test)))] fn twice_not(a: u8) -> u8 { a + 4 }\n\
+                   #[cfg(not())] fn malformed(a: u8) -> u8 { a + 5 }\n\
+                   #[labels(test)] fn labelled(a: u8) -> u8 { a + 6 }\n";
+        let found = discover(src, 0).unwrap();
+        assert_eq!(
+            found_arith(&found.sites),
+            ["a + 1", "a + 2", "a + 5", "a + 6"]
+        );
+    }
+
+    #[test]
+    fn which_arms_are_probed_built_or_left_alone() {
+        let src = "fn f(x: u8, k: Kind, c: bool, a: u8) -> u8 {\n\
+                   \x20   let p = match x { 0 => 4, #[allow(unused)] 1 => 5, #[allow(unused)] 2 if c => 6, _ => 7 };\n\
+                   \x20   let q = match k { Kind::A => 1, Kind::B => 2 };\n\
+                   \x20   let r = match x { #[mutants::skip] 3 => a + 1, #[cfg(test)] 4 => a + 2, 5 => a + 3, _ => a + 4 };\n\
+                   \x20   p + q + r\n\
+                   }\n";
+        let found = discover(src, 0).unwrap();
+        let arms = |sites: &[Site]| -> Vec<String> {
+            sites
+                .iter()
+                .filter(|site| matches!(site.kind, SiteKind::Arm { .. }))
+                .map(|site| site.text.clone())
+                .collect()
+        };
+        // Probed: an arm without attributes above a last arm that takes everything.
+        assert_eq!(arms(&found.sites), ["0 => ..", "5 => .."]);
+        // Built: an unguarded arm with an attribute, where a `_` arm keeps the match
+        // exhaustive. Neither a guarded one, nor the `_` arm, nor an arm of a match
+        // without `_`, nor one that is marked or only for tests.
+        assert_eq!(arms(&found.rebuild_sites), ["1 => .."]);
+        // What a marked or test-only arm does is not mutated either.
+        let in_arms: Vec<&str> = found_arith(&found.sites)
+            .into_iter()
+            .filter(|text| text.starts_with("a + "))
+            .collect();
+        assert_eq!(in_arms, ["a + 3", "a + 4"]);
+    }
+
+    #[test]
+    fn which_fields_of_a_struct_update_are_probed_built_or_left_alone() {
+        let src = "fn f(a: u8, base: S) {\n\
+                   \x20   let _ = S { #[mutants::skip] v: a + 1, #[cfg(test)] w: a + 2, x: a + 3, ..base };\n\
+                   \x20   g(#[mutants::skip] S { v: a + 4, ..base });\n\
+                   \x20   g(#[cfg(test)] S { v: a + 5, ..base });\n\
+                   \x20   g(#[allow(unused)] S { v: a + 6, ..base });\n\
+                   \x20   g(<S as Tr>::Out { v: a + 7, ..base });\n\
+                   }\n";
+        let found = discover(src, 0).unwrap();
+        let fields = |sites: &[Site]| -> Vec<String> {
+            sites
+                .iter()
+                .filter_map(|site| match &site.kind {
+                    SiteKind::Field { from_base, .. } => Some(format!(
+                        "{} | {}",
+                        site.text,
+                        from_base.as_deref().unwrap_or("-")
+                    )),
+                    _ => None,
+                })
+                .collect()
+        };
+        // Probed: the field is read from the base instead.
+        assert_eq!(fields(&found.sites), ["x: a + 3 | (base).x"]);
+        // Built: an expression with an attribute or a qualified path is not written a
+        // second time. Marked and test-only fields and expressions have no mutants.
+        assert_eq!(
+            fields(&found.rebuild_sites),
+            ["v: a + 6 | -", "v: a + 7 | -"]
+        );
+        assert_eq!(found_arith(&found.sites), ["a + 3", "a + 6", "a + 7"]);
+    }
+
+    #[test]
+    fn body_values_that_are_only_built() {
+        let bodies = |sites: &[Site]| -> Vec<String> {
+            sites
+                .iter()
+                .filter_map(|site| match &site.kind {
+                    SiteKind::Body { value, .. } => Some(value.clone()),
+                    _ => None,
+                })
+                .collect()
+        };
+        // An unknown wrapper is probed with its default alone; its constructors are
+        // guesses that have to compile, except the one the body already is.
+        let found = discover("fn f() -> Wrapper<bool> { Wrapper::new() }", 0).unwrap();
+        assert_eq!(bodies(&found.sites), ["Default::default()"]);
+        assert_eq!(values("Wrapper<bool>"), ["Default::default()"]);
+        assert_eq!(
+            bodies(&found.rebuild_sites),
+            [
+                "Wrapper::from_iter([true])",
+                "Wrapper::new(true)",
+                "Wrapper::from(true)",
+                "Wrapper::from_iter([false])",
+                "Wrapper::new(false)",
+                "Wrapper::from(false)",
+            ]
+        );
+        // An opaque type anywhere in the return type leaves nothing to probe.
+        assert!(values("(bool, impl Iterator<Item = u8>)").is_empty());
+        // Iterators of iterators are built, and not offered to who asks for the
+        // iterators to return.
+        let nested = "impl Iterator<Item = impl Iterator<Item = u8>>";
+        let found = discover(&format!("fn f() -> {nested} {{ todo!() }}"), 0).unwrap();
+        assert!(bodies(&found.sites).is_empty());
+        assert_eq!(
+            bodies(&found.rebuild_sites),
+            [
+                "::core::iter::empty()",
+                "::core::iter::once(::core::iter::empty())",
+                "::core::iter::once(::core::iter::once(0))",
+                "::core::iter::once(::core::iter::once(1))",
+            ]
+        );
+        let function: syn::ItemFn =
+            syn::parse_str(&format!("fn f() -> {nested} {{ todo!() }}")).unwrap();
+        assert_eq!(
+            iterator_values(&function.sig.output),
+            ["::core::iter::empty()"]
+        );
     }
 }
