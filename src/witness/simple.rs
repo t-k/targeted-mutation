@@ -797,6 +797,8 @@ mod first {{
     fn one() {{ assert_eq!(super::total_of(&[1, 0], 1), 1); }}
     #[test]
     fn two() {{ assert_eq!(total_of(&[2, 0], 1), 2); }}
+    #[test]
+    fn elsewhere() {{ assert_eq!(other::total_of(&[7, 0], 1), 7); }}
     mod deeper {{
         #[test]
         fn far() {{ assert_eq!(super::total_of(&[9, 0], 1), 9); }}
