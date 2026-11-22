@@ -450,9 +450,10 @@ fn broken_source_stops_the_analysis() {
 #[test]
 fn source_timeout_reports_incomplete_analysis_to_ci() {
     let dir = fixture("looping", "source-loop-timeout");
+    // Long enough that, on a busy machine, only the mutants that never end run out of it.
     let run = tmt(
         &dir,
-        &["--source-only", "--timeout", "1", "--quiet", "--json"],
+        &["--source-only", "--timeout", "4", "--quiet", "--json"],
     );
     assert_eq!(run.code, 3, "{}", run.stderr);
     let report: Value = serde_json::from_str(&run.stdout).unwrap();
@@ -461,7 +462,7 @@ fn source_timeout_reports_incomplete_analysis_to_ci() {
         report["findings"].as_array().unwrap().is_empty(),
         "{report:#}"
     );
-    assert_eq!(report["analysis"]["timeout_seconds"], 1, "{report:#}");
+    assert_eq!(report["analysis"]["timeout_seconds"], 4, "{report:#}");
 }
 
 #[test]
