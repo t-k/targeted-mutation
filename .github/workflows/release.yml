@@ -13,10 +13,32 @@ jobs:
     name: Verify release package
     runs-on: ubuntu-24.04
     timeout-minutes: 15
+    permissions:
+      contents: read
+      actions: read
     steps:
       - uses: actions/checkout@v6.1.0
         with:
           persist-credentials: false
+          fetch-depth: 0
+      # This workflow builds the package and runs no test: what is released is a commit
+      # of main whose tests the CI workflow has run, and passed.
+      - name: Check that the tag is a commit of main that passed CI
+        if: github.ref_type == 'tag'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          git fetch --no-tags origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            printf 'The tagged commit %s is not on main\n' "$GITHUB_SHA" >&2
+            exit 1
+          fi
+          passed="$(gh run list --repo "$GITHUB_REPOSITORY" --workflow CI --commit "$GITHUB_SHA" \
+            --status success --json databaseId --jq length)"
+          if [[ "$passed" -lt 1 ]]; then
+            printf 'No successful CI run for the tagged commit %s\n' "$GITHUB_SHA" >&2
+            exit 1
+          fi
       - name: Verify the Actions lockfile
         env:
           GH_TOKEN: ${{ github.token }}

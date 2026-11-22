@@ -1,0 +1,3 @@
+Relation: Same, Ancestor, Descendant, Sibling, NamePrefix, DifferentRoot
+Source: File, Directory
+Spelling: Plain, Normalized

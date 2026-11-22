@@ -1,0 +1,4 @@
+Source: File, Directory, LocalLink, OutsideLink, DanglingLink
+Destination: Vacant, Occupied, Link
+Parent: Present, Missing
+IF [Parent]="Missing" THEN [Destination]="Vacant";

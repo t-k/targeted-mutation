@@ -1,0 +1,13 @@
+Relation	Source	Spelling
+Same	File	Plain
+Ancestor	Directory	Normalized
+Descendant	File	Plain
+Sibling	File	Plain
+NamePrefix	File	Normalized
+DifferentRoot	Directory	Plain
+Descendant	Directory	Normalized
+DifferentRoot	File	Normalized
+Same	Directory	Normalized
+NamePrefix	Directory	Plain
+Ancestor	File	Plain
+Sibling	Directory	Normalized

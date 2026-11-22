@@ -169,6 +169,22 @@ pub(crate) fn stage(
         )?;
     }
 
+    // Two names that differ only in the case of their letters are one file on a file
+    // system that does not tell case apart (the usual one on macOS and Windows): the
+    // second would replace the first, and both would be taken for ours. They are
+    // refused everywhere, so that a plan means the same wherever it is run.
+    let mut folded: BTreeMap<String, &PathBuf> = BTreeMap::new();
+    for path in plan.keys() {
+        let key = path.to_string_lossy().to_lowercase();
+        if let Some(other) = folded.insert(key, path) {
+            bail!(
+                "output fixture destinations differ only by case: {} and {}",
+                other.display(),
+                path.display()
+            );
+        }
+    }
+
     // A replaced file is no longer ours. Cargo can choose a different output
     // path in a later build, and tests may create files of their own.
     let mut previous = Ownership::new();
@@ -604,20 +620,46 @@ mod tests {
     }
 
     #[test]
+    fn destinations_that_differ_only_by_case_are_one_destination() {
+        let tree = Tree::new();
+        fs::write(tree.workspace.join("asset"), "content").unwrap();
+        fs::write(tree.workspace.join("other"), "other").unwrap();
+        // Where case is not told apart the second would replace the first.
+        for (first, second) in [
+            ("debug/Data", "debug/data"),
+            ("debug/a/file", "debug/A/other"),
+            ("É/x", "é/y"),
+        ] {
+            let error = tree
+                .stage(&[mapping("asset", first), mapping("other", second)])
+                .unwrap_err();
+            assert!(
+                format!("{error:#}").contains("differ only by case"),
+                "{first} and {second}: {error:#}"
+            );
+            assert!(!tree.target.join(first).exists(), "{first}");
+            assert!(!tree.target.join(second).exists(), "{second}");
+        }
+        // Names that differ in more than that are two.
+        tree.stage(&[
+            mapping("asset", "debug/Data"),
+            mapping("other", "debug/data2"),
+        ])
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(tree.target.join("debug/Data")).unwrap(),
+            "content"
+        );
+        assert_eq!(
+            fs::read_to_string(tree.target.join("debug/data2")).unwrap(),
+            "other"
+        );
+    }
+
+    #[test]
     fn checks_output_destination_relationships() {
-        let data = match std::env::var_os("TMT_OUTPUT_DESTINATIONS_PICT_TABLE") {
-            Some(table) => fs::read_to_string(table).unwrap(),
-            None => [
-                "Relation\tSource\tSpelling",
-                "Same\tFile\tPlain",
-                "Ancestor\tDirectory\tNormalized",
-                "Descendant\tFile\tPlain",
-                "Sibling\tFile\tPlain",
-                "NamePrefix\tFile\tNormalized",
-                "DifferentRoot\tDirectory\tPlain",
-            ]
-            .join("\n"),
-        };
+        // formal/pict/output-destinations.pict, with its seed rows.
+        let data = include_str!("../tests/data/output-destinations.pict.tsv");
         for row in data.lines().skip(1) {
             let values: Vec<_> = row.split_whitespace().collect();
             let [relation, source, spelling] = values[..] else {
@@ -676,10 +718,8 @@ mod tests {
     #[test]
     fn output_fixture_replays_pict_table() {
         use std::os::unix::fs::symlink;
-        let Some(table) = std::env::var_os("TMT_FIXTURE_PICT_TABLE") else {
-            return;
-        };
-        let data = fs::read_to_string(table).unwrap();
+        // formal/pict/output-fixture.pict, with its seed rows.
+        let data = include_str!("../tests/data/output-fixture.pict.tsv");
         for row in data.lines().skip(1) {
             let values: Vec<_> = row.trim().split('\t').collect();
             let [source, destination, parent] = values[..] else {

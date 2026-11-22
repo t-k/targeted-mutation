@@ -467,6 +467,9 @@ fn compare_candidates(
                 ),
                 Scenario {
                     expression: format!("{}({args})", function.sig.ident),
+                    // Arguments of this tool's making: together they may be a case
+                    // the function is never given.
+                    guidance: Some("Use these arguments if the API accepts them together.".into()),
                     ..Scenario::default()
                 },
                 out,
@@ -569,6 +572,7 @@ fn sort_candidates(
                 setup: setup.clone(),
                 expression: format!("[{rows}[0].{chosen}, {rows}[1].{chosen}]"),
                 assertion_prefix: setup,
+                guidance: Some("Use these rows if the API accepts such values.".into()),
                 ..Scenario::default()
             },
             out,

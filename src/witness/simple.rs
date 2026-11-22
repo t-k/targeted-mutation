@@ -231,6 +231,9 @@ fn string_length(source: &str, function: &ItemFn) -> Option<Candidate> {
         false,
         vec![Scenario {
             expression: format!("{}(\"é\")", function.sig.ident),
+            // The input is this tool's, not one the tests gave: it may be outside of
+            // what the function is for.
+            guidance: Some("Use this input if the API accepts text outside ASCII.".into()),
             ..Scenario::default()
         }],
     ))

@@ -291,6 +291,28 @@ mod tests {
         child
     }
 
+    /// Takes a lock that this process has just let go of. Tests run on threads of one
+    /// process, and a child that another test starts holds a copy of every open file
+    /// between its fork and its exec, the lock that was just released among them: for
+    /// that moment the lock still looks taken. (A run takes its lock once and keeps it,
+    /// so only tests see this.)
+    fn take_released(work: &Path) -> WorkLock {
+        let patience = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match WorkLock::take(work) {
+                Ok(lock) => return lock,
+                Err(err) if std::time::Instant::now() < patience => {
+                    assert!(
+                        err.to_string().contains("another tmt run is using"),
+                        "{err:#}"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(5));
+                }
+                Err(err) => panic!("the released lock stayed taken: {err:#}"),
+            }
+        }
+    }
+
     fn assert_contended(work: &Path) {
         let err = WorkLock::take(work).err().expect("second owner took lock");
         assert!(
@@ -330,7 +352,7 @@ mod tests {
                 assert_contended(&work.0);
             }
             assert!(marker.is_file(), "release removed the lock file");
-            let _next = WorkLock::take(&work.0).unwrap();
+            let _next = take_released(&work.0);
             assert_contended(&work.0);
         }
     }
@@ -383,7 +405,7 @@ mod tests {
                 assert_contended(&work.0);
             }
             drop(parent);
-            let _next = WorkLock::take(&work.0).unwrap();
+            let _next = take_released(&work.0);
             drop(unrelated);
         }
     }
@@ -442,7 +464,7 @@ mod tests {
         assert!(reserved.join("owner").is_file());
         assert_contended(&work.0);
         drop(current);
-        assert!(WorkLock::take(&work.0).is_ok());
+        drop(take_released(&work.0));
     }
 
     #[cfg(unix)]

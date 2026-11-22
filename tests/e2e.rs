@@ -1192,8 +1192,21 @@ fn workspace_failure_keeps_other_reports_and_has_a_distinct_exit_status() {
             assert_eq!(value["errors"][0]["package"], "ws-app");
             assert_eq!(value["packages"][0]["package"], "ws-core");
         } else {
-            assert_eq!(value["runs"].as_array().unwrap().len(), 1);
-            assert!(!value["runs"][0]["results"].as_array().unwrap().is_empty());
+            // The member that could not be analysed is a run too, and says that it failed:
+            // a document without it would read as a package with nothing to report.
+            let runs = value["runs"].as_array().unwrap();
+            assert_eq!(runs.len(), 2);
+            assert!(!runs[0]["results"].as_array().unwrap().is_empty());
+            assert_eq!(runs[0]["automationDetails"]["id"], "tmt/ws-core/");
+            assert_eq!(runs[0]["invocations"][0]["executionSuccessful"], true);
+            assert_eq!(runs[1]["automationDetails"]["id"], "tmt/ws-app/");
+            assert_eq!(runs[1]["invocations"][0]["executionSuccessful"], false);
+            let said =
+                runs[1]["invocations"][0]["toolExecutionNotifications"][0]["message"]["text"]
+                    .as_str()
+                    .unwrap();
+            assert!(said.contains("broken member"), "{said}");
+            assert!(runs[1]["results"].as_array().unwrap().is_empty());
         }
     }
 }
@@ -2955,6 +2968,16 @@ fn configured_result_errors_are_mutated_in_every_execution_mode() {
                 "{report:#}"
             );
         }
+    }
+    // One line of Rust, with nothing in it that is not to be seen.
+    for unseen in ["E::new(\n1)", "E::new(1)\t// note", "E::new(1)\u{1b}"] {
+        let refused = tmt(&dir, &["--error", unseen, "--quiet"]);
+        assert_eq!(refused.code, 1, "{unseen:?}: {}", refused.stderr);
+        assert!(
+            refused.stderr.contains("without control characters"),
+            "{unseen:?}: {}",
+            refused.stderr
+        );
     }
     let invalid = tmt(&dir, &["--error", "broken(", "--quiet"]);
     assert_eq!(invalid.code, 1);

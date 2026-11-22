@@ -352,6 +352,34 @@ struct BuildOutput {
     artifacts: Vec<(PathBuf, Vec<PathBuf>)>,
 }
 
+/// What a build of changed source came to.
+#[derive(Debug, PartialEq)]
+enum SourceBuild {
+    Built,
+    /// The compiler refused the code: the change is not a program.
+    Refused,
+    /// The build ended badly and the compiler said nothing against the code (it was
+    /// killed, the disk is full, cargo could not get its lock): this says nothing about
+    /// the change. With the end of what was said, for the user.
+    Failed(String),
+}
+
+fn source_build(output: &std::process::Output) -> SourceBuild {
+    if output.status.success() {
+        return SourceBuild::Built;
+    }
+    let refused = !parse_build_output(&String::from_utf8_lossy(&output.stdout), &[])
+        .diagnostics
+        .is_empty();
+    if refused {
+        return SourceBuild::Refused;
+    }
+    let said = String::from_utf8_lossy(&output.stderr);
+    let last: Vec<&str> = said.lines().rev().take(3).collect();
+    let last: Vec<&str> = last.into_iter().rev().collect();
+    SourceBuild::Failed(format!("{} ({})", last.join(" / "), output.status))
+}
+
 /// The workspace packages that depend on `package`, directly or through others.
 fn dependents_of(package: &str, packages: &[Package]) -> Vec<String> {
     let mut reverse = BTreeMap::<&str, Vec<&str>>::new();
@@ -3446,6 +3474,14 @@ fn run_package(
     let mut error_values = vec![];
     for expression in &options.error_values {
         let expression = expression.trim();
+        // The text is written into the code of probes, each on the line of its site: it
+        // is one line, and has nothing in it that is not to be seen.
+        if expression.chars().any(char::is_control) {
+            bail!(
+                "invalid --error expression {expression:?}: it has to be on one line, \
+                 without control characters"
+            );
+        }
         let parsed = syn::parse_str::<syn::Expr>(expression)
             .with_context(|| format!("invalid --error expression {expression:?}"))?;
         if seen_errors.insert(quote::ToTokens::to_token_stream(&parsed).to_string()) {
@@ -5043,10 +5079,18 @@ fn run_package(
                                 &file.path,
                                 &instrumented(file, &mutated, root_mutant_suffix),
                             )?;
-                            if !cargo_build()?.status.success() {
-                                return Ok(None);
+                            match source_build(&cargo_build()?) {
+                                SourceBuild::Built => run_source_tests(&by_speed).map(Some),
+                                SourceBuild::Refused => Ok(None),
+                                // Nothing is known of the mutant: not one that does not
+                                // compile, and not one to remember as such.
+                                SourceBuild::Failed(why) => {
+                                    session.note(&format!(
+                                        "a build failed without the compiler refusing the code; its mutant is not evaluated: {why}"
+                                    ));
+                                    Ok(Some(Outcome::Unable))
+                                }
                             }
-                            run_source_tests(&by_speed).map(Some)
                         };
                         let attempted = attempt();
                         // The file as it was, before another one is changed and whatever went wrong.
@@ -5056,7 +5100,11 @@ fn run_package(
                             &instrumented(file, &rendered.text, &root_suffix),
                         )?;
                         let outcome = attempted?;
-                        if let Some(phase) = &source_checkpoint {
+                        // A run that could not be judged is tried again when the campaign
+                        // is taken up: only what was established is kept.
+                        if let Some(phase) = &source_checkpoint
+                            && outcome != Some(Outcome::Unable)
+                        {
                             phase.record(index, &outcome)?;
                         }
                         outcome
@@ -7536,6 +7584,40 @@ fn main() {
             assert_eq!(fs::read_dir(&elsewhere).unwrap().count(), 0);
         }
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_build_that_failed_is_not_code_the_compiler_refused() {
+        use std::os::unix::process::ExitStatusExt;
+        let output = |status: i32, stdout: &str, stderr: &str| std::process::Output {
+            status: std::process::ExitStatus::from_raw(status),
+            stdout: stdout.as_bytes().to_vec(),
+            stderr: stderr.as_bytes().to_vec(),
+        };
+        let refusal = r#"{"reason":"compiler-message","message":{"level":"error","message":"mismatched types","rendered":"error: mismatched types","spans":[]}}"#;
+        let warning = r#"{"reason":"compiler-message","message":{"level":"warning","message":"unused","rendered":"warning: unused","spans":[]}}"#;
+        // A wait status: exit code 101 is 101 << 8, a signal is its number.
+        assert_eq!(source_build(&output(0, warning, "")), SourceBuild::Built);
+        assert_eq!(
+            source_build(&output(101 << 8, refusal, "error: could not compile")),
+            SourceBuild::Refused
+        );
+        // Ended badly with nothing said against the code: killed, or cargo itself failed.
+        let killed = source_build(&output(9, warning, "Compiling x\nlast words"));
+        assert!(
+            matches!(&killed, SourceBuild::Failed(why) if why.contains("last words")),
+            "{killed:?}"
+        );
+        let cargo = source_build(&output(
+            101 << 8,
+            "",
+            "error: failed to open lock\nno space left on device",
+        ));
+        assert!(
+            matches!(&cargo, SourceBuild::Failed(why) if why.contains("no space left")),
+            "{cargo:?}"
+        );
     }
 
     #[test]

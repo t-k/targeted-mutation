@@ -420,7 +420,14 @@ fn show_workspace(
         combined["errors"] = serde_json::Value::Array(errors);
         println!("{combined:#}");
     } else if sarif {
-        println!("{:#}", report::workspace_sarif(&reports));
+        let failed: Vec<(String, String)> = errors
+            .iter()
+            .map(|error| {
+                let text = |key: &str| error[key].as_str().unwrap_or_default().to_string();
+                (text("package"), text("error"))
+            })
+            .collect();
+        println!("{:#}", report::workspace_sarif(&reports, &failed));
     } else {
         for result in &reports {
             show_report(result, false, false, show_unreached);

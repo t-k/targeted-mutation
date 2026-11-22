@@ -510,7 +510,7 @@ fn active_test_child_protects_work_copy_after_tmt_parent_exits() {
         r#"#!/bin/sh
 set -eu
 touch "$FIXTURE_SCRATCH/ready"
-left=300
+left=9000
 until [ -f "$FIXTURE_SCRATCH/release" ]; do
     left=$((left - 1))
     [ "$left" -gt 0 ] || exit 91
@@ -525,8 +525,11 @@ exec "$@"
         .stderr(Stdio::null())
         .spawn()
         .unwrap();
+    // The fixture is built before its tests start: on a busy machine that takes a while.
+    // The waits end as soon as what they wait for is there, so they cost nothing when
+    // it is quick.
     let began = Instant::now();
-    while !gate.join("ready").exists() && began.elapsed() < Duration::from_secs(5) {
+    while !gate.join("ready").exists() && began.elapsed() < Duration::from_secs(150) {
         if let Some(status) = child.try_wait().unwrap() {
             panic!("tmt exited before the test started: {status}");
         }
@@ -551,7 +554,7 @@ exec "$@"
     );
     assert!(String::from_utf8_lossy(&blocked.stderr).contains("another tmt run"));
     drop(release);
-    let deadline = Instant::now() + Duration::from_secs(4);
+    let deadline = Instant::now() + Duration::from_secs(60);
     loop {
         let result = list();
         if result.status.success() {

@@ -895,18 +895,67 @@ pub fn render_sarif(report: &Report) -> String {
         .expect("JSON values serialise")
 }
 
-/// The CLI's workspace SARIF has one run per successful member, in report order.
+/// The CLI's workspace SARIF has one run per member, the analysed ones in report order
+/// and then those whose analysis could not run (`failed`: package and what went wrong).
+/// A member that failed is a run that says so: a document without it would read as a
+/// package with nothing to report. Each run has an id of its own, by which a service
+/// that takes several runs of one tool keeps them apart.
 #[doc(hidden)]
-pub fn workspace_sarif(reports: &[Report]) -> impl std::fmt::Display {
-    let runs = reports
+pub fn workspace_sarif(reports: &[Report], failed: &[(String, String)]) -> impl std::fmt::Display {
+    let category = |package: &str| serde_json::json!({ "id": format!("tmt/{package}/") });
+    let mut runs: Vec<serde_json::Value> = reports
         .iter()
         .map(|report| {
             let mut run = sarif_run(report);
             run["properties"]["package"] = serde_json::json!(report.package);
+            run["automationDetails"] = category(&report.package);
+            run["invocations"] = serde_json::json!([{ "executionSuccessful": true }]);
             run
         })
         .collect();
+    for (package, error) in failed {
+        runs.push(serde_json::json!({
+            "tool": sarif_tool(),
+            "automationDetails": category(package),
+            "invocations": [{
+                "executionSuccessful": false,
+                "toolExecutionNotifications": [{
+                    "level": "error",
+                    "message": { "text": error },
+                }],
+            }],
+            "properties": { "package": package },
+            "results": [],
+        }));
+    }
     sarif_document(runs)
+}
+
+/// A path as the URI reference SARIF wants: `/` between its parts, and in the parts
+/// every byte that is not plainly allowed in one (a space, `#`, `%`, what is not ASCII)
+/// written as `%XX`.
+fn sarif_uri(prefix: &str, file: &str) -> String {
+    let mut uri = String::new();
+    for byte in prefix.bytes().chain(file.bytes()) {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
+                uri.push(byte as char)
+            }
+            _ => uri.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    uri
+}
+
+fn sarif_tool() -> serde_json::Value {
+    serde_json::json!({ "driver": {
+        "name": "tmt",
+        "rules": [
+            { "id": "input-gap", "shortDescription": { "text": "No test input tells this mutant from the original" } },
+            { "id": "assertion-gap", "shortDescription": { "text": "Tests run the mutated code and still pass" } },
+            { "id": "survivor", "shortDescription": { "text": "A mutant built on its own passes every test; why is not known" } }
+        ]
+    } })
 }
 
 fn sarif_document(runs: Vec<serde_json::Value>) -> serde_json::Value {
@@ -939,7 +988,7 @@ fn sarif_run(report: &Report) -> serde_json::Value {
                 "partialFingerprints": { "tmtFindingId/v2": at.id },
                 "locations": [{
                     "physicalLocation": {
-                        "artifactLocation": { "uri": format!("{prefix}{}", at.file) },
+                        "artifactLocation": { "uri": sarif_uri(prefix, &at.file) },
                         "region": { "startLine": at.line, "startColumn": at.column }
                     }
                 }]
@@ -947,14 +996,7 @@ fn sarif_run(report: &Report) -> serde_json::Value {
         })
         .collect();
     let mut run = serde_json::json!({
-        "tool": { "driver": {
-            "name": "tmt",
-            "rules": [
-                { "id": "input-gap", "shortDescription": { "text": "No test input tells this mutant from the original" } },
-                { "id": "assertion-gap", "shortDescription": { "text": "Tests run the mutated code and still pass" } },
-                { "id": "survivor", "shortDescription": { "text": "A mutant built on its own passes every test; why is not known" } }
-            ]
-        } },
+        "tool": sarif_tool(),
         // What was looked at: a run of a part says nothing about the rest.
         "properties": { "analysis": report.analysis, "evaluation": report.evaluation, "skipped": report.skipped },
     });
@@ -1812,6 +1854,9 @@ mod tests {
                     let mut run = single["runs"][0].take();
                     assert!(run["properties"].get("package").is_none());
                     run["properties"]["package"] = json!(report.package);
+                    // What a run of a workspace has beside that of a package alone.
+                    run["automationDetails"] = json!({ "id": format!("tmt/{}/", report.package) });
+                    run["invocations"] = json!([{ "executionSuccessful": true }]);
                     run
                 })
                 .collect();
@@ -1820,11 +1865,86 @@ mod tests {
                 "version": "2.1.0",
                 "runs": runs,
             });
-            assert_eq!(
-                format!("{:#}", workspace_sarif(reports)),
-                format!("{old:#}")
-            );
+            let workspace: Value =
+                serde_json::from_str(&format!("{:#}", workspace_sarif(reports, &[]))).unwrap();
+            assert_eq!(workspace, old);
         }
+    }
+
+    #[test]
+    fn a_package_that_could_not_be_analysed_is_a_run_that_says_so() {
+        use serde_json::Value;
+
+        let analysed = Report {
+            package: "ant".into(),
+            ..Report::default()
+        };
+        let failed = [(
+            "bee".to_string(),
+            "the tests of `bee` fail: \"quoted\"\n".to_string(),
+        )];
+        let document: Value = serde_json::from_str(&format!(
+            "{:#}",
+            workspace_sarif(std::slice::from_ref(&analysed), &failed)
+        ))
+        .unwrap();
+        let runs = document["runs"].as_array().unwrap();
+        assert_eq!(runs.len(), 2);
+        // Each run is told from the others, and the one that failed is not a clean one.
+        assert_eq!(runs[0]["automationDetails"]["id"], "tmt/ant/");
+        assert_eq!(runs[0]["invocations"][0]["executionSuccessful"], true);
+        assert_eq!(runs[1]["automationDetails"]["id"], "tmt/bee/");
+        assert_eq!(runs[1]["invocations"][0]["executionSuccessful"], false);
+        assert_eq!(
+            runs[1]["invocations"][0]["toolExecutionNotifications"][0]["message"]["text"],
+            failed[0].1
+        );
+        assert_eq!(runs[1]["results"].as_array().unwrap().len(), 0);
+        assert_eq!(runs[1]["tool"], runs[0]["tool"]);
+        assert_eq!(runs[1]["properties"]["package"], "bee");
+        // Only failures: still a document, with nothing passed off as analysed.
+        let document: Value =
+            serde_json::from_str(&format!("{:#}", workspace_sarif(&[], &failed))).unwrap();
+        assert_eq!(document["runs"].as_array().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn a_path_is_written_as_a_uri() {
+        assert_eq!(sarif_uri("", "src/lib.rs"), "src/lib.rs");
+        assert_eq!(
+            sarif_uri("crates/a-b_c/", "src/x~1.rs"),
+            "crates/a-b_c/src/x~1.rs"
+        );
+        // What a URI gives a meaning of its own, or does not allow, is written as bytes.
+        assert_eq!(
+            sarif_uri("my crate/", "a#b%c?.rs"),
+            "my%20crate/a%23b%25c%3F.rs"
+        );
+        assert_eq!(sarif_uri("", "src/é.rs"), "src/%C3%A9.rs");
+        assert_eq!(sarif_uri("", r#"a\b"c.rs"#), "a%5Cb%22c.rs");
+        let report = Report {
+            analysis: Analysis {
+                package_path: "my crate/".into(),
+                ..Analysis::default()
+            },
+            findings: vec![Finding::Survivor {
+                at: Location {
+                    file: "src/a b.rs".into(),
+                    line: 1,
+                    column: 1,
+                    ..Location::default()
+                },
+                survivors: vec![],
+                witness: None,
+            }],
+            ..Report::default()
+        };
+        let sarif: serde_json::Value = serde_json::from_str(&render_sarif(&report)).unwrap();
+        assert_eq!(
+            sarif["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["artifactLocation"]
+                ["uri"],
+            "my%20crate/src/a%20b.rs"
+        );
     }
 
     #[test]
