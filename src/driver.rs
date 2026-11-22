@@ -1850,6 +1850,7 @@ fn run_binary(
             );
             waiting_reported = true;
         }
+        // tmt:ignore at exactly the limit either is right, and no test can stop the clock there
         if elapsed >= timeout {
             if cfg!(unix)
                 && !bin.wrapper_grace.is_zero()
@@ -1937,6 +1938,7 @@ fn stop_nextest(child: &mut std::process::Child, grace: Duration) {
         let started = Instant::now();
         loop {
             match child.try_wait() {
+                // tmt:ignore a runner taken for running is signalled again and collected at the end all the same: what this spares is signals to a group that is gone
                 Ok(Some(_)) => return true,
                 // tmt:ignore how long a runner that does not end is waited for can only be told by the clock
                 Ok(None) if started.elapsed() < limit => {
@@ -7832,6 +7834,27 @@ fn main() {
         }
     }
 
+    /// Whether, within a generous time, no process is left that was started with `path`
+    /// among its arguments.
+    #[cfg(unix)]
+    fn nothing_runs(path: &Path) -> bool {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let processes = Command::new("ps")
+                .args(["-e", "-o", "args="])
+                .output()
+                .unwrap();
+            let processes = String::from_utf8_lossy(&processes.stdout).into_owned();
+            if !processes.contains(&*path.to_string_lossy()) {
+                return true;
+            }
+            if Instant::now() >= deadline {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn a_filter_is_timed_only_for_a_slow_libtest_binary_without_a_given_limit() {
@@ -7934,20 +7957,58 @@ fn main() {
     fn a_failure_line_ends_the_run_before_the_tests_do() {
         let dir = scratch("first-failure");
         // The tests go on for longer than the run is given: only the line can end it as
-        // a failure.
-        let bin = script_binary(&dir, "echo 'test tests::a ... FAILED'\nexec sleep 30");
-        assert_eq!(
-            run_binary(
-                &bin,
-                None,
-                &[],
-                Duration::from_secs(20),
-                RunOutput::FirstFailure,
-                1
-            )
-            .unwrap(),
-            Outcome::Fail
+        // a failure. They and what they started are stopped then.
+        let bin = script_binary(
+            &dir,
+            "sleep 30 &\necho $! > child.pid\necho 'test tests::a ... FAILED'\nwait",
         );
+        let outcome = run_binary(
+            &bin,
+            None,
+            &[],
+            Duration::from_secs(20),
+            RunOutput::FirstFailure,
+            1,
+        );
+        let pid = fs::read_to_string(bin.cwd.join("child.pid"))
+            .unwrap()
+            .trim()
+            .parse()
+            .unwrap();
+        let stopped = ends(pid);
+        fs::remove_dir_all(dir).unwrap();
+        assert_eq!(outcome.unwrap(), Outcome::Fail);
+        assert!(stopped, "the failed run left a process behind");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn failure_lines_are_found_in_output_that_comes_in_pieces() {
+        use std::io::Write as _;
+        let dir = scratch("failure-output");
+        let path = dir.join("output");
+        let mut written = fs::File::create(&path).unwrap();
+        let mut output = FailureOutput::new(fs::File::open(&path).unwrap());
+        let mut next = |text: &str| {
+            written.write_all(text.as_bytes()).unwrap();
+            output.failed().unwrap()
+        };
+        assert!(!next(""));
+        assert!(!next("running 2 tests\ntest tests::a ... ok\n"));
+        // A line counts when its end has come.
+        assert!(!next("test tests::b ... FA"));
+        assert!(next("ILED\n"));
+        // A line longer than is kept is not judged by its end, and the one after it is
+        // a line of its own.
+        let long = format!("test {} ... FAILED\n", "x".repeat(8 * 1024));
+        assert!(!next(&long));
+        assert!(!next("test tests::c ... ok\n"));
+        assert!(next("test tests::d ... FAILED\n"));
+        // One byte over, in two pieces.
+        assert!(!next("t"));
+        let rest = format!("est {} ... FAILED\n", "x".repeat(8 * 1024 - 16));
+        assert_eq!(rest.len(), 8 * 1024);
+        assert!(!next(&rest));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -7964,7 +8025,13 @@ fn main() {
         assert_eq!(run(&quiet, RunOutput::Quiet), Outcome::Pass);
         // A test in a process of its own is judged by how the process ends, also when
         // the first failure is asked for.
-        let one_by_one = isolated(script_binary(&dir, nowhere));
+        // It is told which test it is, as libtest and the runtime want to hear it.
+        let one_by_one = isolated(script_binary(
+            &dir,
+            &format!(
+                "{nowhere} && [ \"$*\" = '--exact --test-threads=1 t' ] && [ \"$TMT_TEST\" = t ]"
+            ),
+        ));
         assert_eq!(run(&one_by_one, RunOutput::FirstFailure), Outcome::Pass);
         // Only the standard output of a watched run is kept.
         let watched = script_binary(
@@ -8004,20 +8071,20 @@ fn main() {
     #[test]
     fn tests_that_do_not_end_in_time_are_stopped_as_a_timeout() {
         let dir = scratch("run-timeout");
-        let bin = script_binary(&dir, "exec sleep 20");
-        assert_eq!(
-            run_binary(
-                &bin,
-                None,
-                &[],
-                Duration::from_millis(100),
-                RunOutput::Quiet,
-                1
-            )
-            .unwrap(),
-            Outcome::Timeout
+        let bin = script_binary(&dir, "sleep 20");
+        let outcome = run_binary(
+            &bin,
+            None,
+            &[],
+            Duration::from_millis(100),
+            RunOutput::Quiet,
+            1,
         );
+        // The shell that ran the script is known by the path of the script.
+        let stopped = nothing_runs(bin.runner.executable().unwrap());
         fs::remove_dir_all(dir).unwrap();
+        assert_eq!(outcome.unwrap(), Outcome::Timeout);
+        assert!(stopped, "the tests went on after the timeout");
     }
 
     #[cfg(unix)]
@@ -8309,6 +8376,8 @@ fn main() {
             assert_eq!(runs.load(Ordering::SeqCst), if serial { 3 } else { 2 });
             assert_eq!(results[0].unconfirmed_timeout, !serial);
             assert_eq!(results[0].survived.is_some(), serial);
+            // The phase was finished, or the campaign could not be.
+            checkpoint.finish().unwrap();
 
             // The campaign started again has nothing left to run.
             checkpoint.start("campaign", serde_json::json!({})).unwrap();
@@ -8316,6 +8385,7 @@ fn main() {
             let again = evaluate_jobs(2, 2, serial, false, "test", Some(&phase), &run).unwrap();
             assert_eq!(again, results);
             assert_eq!(runs.load(Ordering::SeqCst), if serial { 3 } else { 2 });
+            checkpoint.finish().unwrap();
         }
         fs::remove_dir_all(dir).unwrap();
     }
