@@ -98,13 +98,18 @@ impl Scope {
 
     /// Whether lines `first..=last` of `file` touch the scope.
     pub fn touches(&self, file: &str, first: usize, last: usize) -> bool {
-        self.files
-            .get(&file.replace('\\', "/"))
-            .is_some_and(|ranges| {
-                ranges
-                    .iter()
-                    .any(|(from, to)| first <= *to && *from <= last)
-            })
+        let ranges = self.files.get(file).or_else(|| {
+            if file.contains('\\') {
+                self.files.get(&file.replace('\\', "/"))
+            } else {
+                None
+            }
+        });
+        ranges.is_some_and(|ranges| {
+            ranges
+                .iter()
+                .any(|(from, to)| first <= *to && *from <= last)
+        })
     }
 }
 
@@ -148,11 +153,19 @@ impl LineIndex {
             .get(line.checked_sub(1)?)
             .copied()
             .unwrap_or(source.len());
+        let column = column.checked_sub(1)?;
+        if column == 0 {
+            return Some(start);
+        }
         let rest = &source[start..];
-        let within = rest
-            .char_indices()
-            .nth(column.checked_sub(1)?)
-            .map_or(rest.len(), |(offset, _)| offset);
+        let capped = column.min(rest.len());
+        let within = if rest.as_bytes()[..capped].is_ascii() {
+            capped
+        } else {
+            rest.char_indices()
+                .nth(column)
+                .map_or(rest.len(), |(offset, _)| offset)
+        };
         Some(start + within)
     }
 }
@@ -335,6 +348,18 @@ new file mode 100644
                 lines.offset_of(&source, line, column),
                 crate::instrument::offset_of(&source, line, column),
                 "{row}"
+            );
+        }
+    }
+
+    #[test]
+    fn long_ascii_prefix_before_multibyte_columns() {
+        let source = format!("start\r\n{}é🦀\n", "a".repeat(64_000));
+        let lines = LineIndex::new(&source);
+        for column in [0, 1, 64_000, 64_001, 64_002, 64_003, usize::MAX] {
+            assert_eq!(
+                lines.offset_of(&source, 2, column),
+                crate::instrument::offset_of(&source, 2, column)
             );
         }
     }

@@ -365,10 +365,9 @@ fn stream_reports(options: &driver::Options, packages: &[String], workspace: boo
                         _ => 0,
                     }
                 };
-                (
-                    serde_json::json!({"package": result.package, "report": report_json(&result)}),
-                    (priority, code),
-                )
+                let mut record = serde_json::json!({"package": result.package});
+                record["report"] = report_json(&result);
+                (record, (priority, code))
             }
             Err(err) => (
                 serde_json::json!({"package": name, "error": format!("{err:#}")}),
@@ -414,12 +413,12 @@ fn show_workspace(
             }
         }
     }
+    let has_errors = !errors.is_empty();
     if json {
-        let packages: Vec<_> = reports.iter().map(report_json).collect();
-        println!(
-            "{:#}",
-            serde_json::json!({"packages": packages, "errors": errors})
-        );
+        let mut combined = serde_json::json!({});
+        combined["packages"] = serde_json::Value::Array(reports.iter().map(report_json).collect());
+        combined["errors"] = serde_json::Value::Array(errors);
+        println!("{combined:#}");
     } else if sarif {
         println!("{}", report::render_workspace_sarif(&reports));
     } else {
@@ -427,7 +426,7 @@ fn show_workspace(
             show_report(result, false, false, show_unreached);
         }
     }
-    ExitCode::from(if !errors.is_empty() {
+    ExitCode::from(if has_errors {
         1
     } else if reports.iter().any(incomplete_source_run) {
         3

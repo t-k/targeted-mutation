@@ -55,26 +55,32 @@ pub fn load(path: &Path) -> Result<Baseline> {
 }
 
 fn parse(text: &str) -> Result<Baseline> {
-    let strings = |value: &serde_json::Value| -> Result<BTreeSet<String>> {
-        Ok(serde_json::from_value(value.clone())?)
-    };
-    let value: serde_json::Value = serde_json::from_str(text)?;
+    let mut value: serde_json::Value = serde_json::from_str(text)?;
     if value.is_array() {
-        return Ok(Baseline::Fingerprints(strings(&value)?));
+        return Ok(Baseline::Fingerprints(serde_json::from_value(value)?));
     }
     match value["version"].as_u64() {
-        Some(VERSION) => Ok(Baseline::Ids(strings(&value["findings"])?)),
+        Some(VERSION) => Ok(Baseline::Ids(serde_json::from_value(
+            value["findings"].take(),
+        )?)),
         Some(other) => anyhow::bail!("version {other} of the format is not known to this tmt"),
         None => anyhow::bail!("neither a list nor an object with a version"),
     }
 }
 
 pub fn write(path: &Path, findings: &[Finding]) -> Result<()> {
-    let text = render(findings);
-    std::fs::write(path, format!("{text}\n")).with_context(|| format!("writing {}", path.display()))
+    let mut text = render(findings);
+    text.push('\n');
+    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
 }
 
 fn render(findings: &[Finding]) -> String {
+    #[derive(serde::Serialize)]
+    struct BaselineFile<'a> {
+        findings: BTreeSet<&'a str>,
+        version: u64,
+    }
+
     let ids: BTreeSet<&str> = findings
         .iter()
         .map(|finding| {
@@ -82,8 +88,11 @@ fn render(findings: &[Finding]) -> String {
             at.id.as_str()
         })
         .collect();
-    let file = serde_json::json!({ "version": VERSION, "findings": ids });
-    serde_json::to_string_pretty(&file).expect("strings serialise")
+    serde_json::to_string_pretty(&BaselineFile {
+        findings: ids,
+        version: VERSION,
+    })
+    .expect("strings serialise")
 }
 
 /// Lines covered by a `// tmt:ignore` comment, with the reason given after it. The
@@ -171,6 +180,8 @@ mod tests {
         for bad in [
             "{}",
             "3",
+            r#"{"version": 2}"#,
+            r#"{"version": 2, "findings": null}"#,
             r#"{"version": 2, "findings": [1]}"#,
             r#"["a", 1]"#,
         ] {
@@ -213,7 +224,7 @@ mod tests {
     fn baseline_round_trip() {
         let path =
             std::env::temp_dir().join(format!("tmt-baseline-test-{}.json", std::process::id()));
-        let mut findings = [
+        let mut findings = vec![
             gap(1, "a > b", &["`a >= b`"]),
             gap(2, "x();", &["delete `x();`"]),
         ];
@@ -221,11 +232,17 @@ mod tests {
             let Finding::AssertionGap { at, .. } = finding else {
                 unreachable!()
             };
-            at.id = format!("id-{index}");
+            at.id = format!("id-{index}-é\n");
         }
+        findings.reverse();
+        findings.push(findings[0].clone());
         write(&path, &findings).unwrap();
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "{\n  \"findings\": [\n    \"id-0-é\\n\",\n    \"id-1-é\\n\"\n  ],\n  \"version\": 2\n}\n"
+        );
         let loaded = load(&path).unwrap();
-        let ids: BTreeSet<String> = ["id-0", "id-1"].iter().map(|id| id.to_string()).collect();
+        let ids: BTreeSet<String> = ["id-0-é\n", "id-1-é\n"].map(str::to_string).into();
         assert_eq!(loaded, Baseline::Ids(ids));
         assert!(findings.iter().all(|f| loaded.knows(f)));
         std::fs::write(&path, "not json").unwrap();

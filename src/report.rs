@@ -410,12 +410,54 @@ pub fn location(file: &str, site: &Site) -> Location {
 }
 
 pub(crate) fn one_line(code: &str) -> String {
-    let joined = code.split_whitespace().collect::<Vec<_>>().join(" ");
-    if joined.chars().count() > 100 {
-        format!("{}...", joined.chars().take(97).collect::<String>())
-    } else {
-        joined
+    const LIMIT: usize = 100;
+    const ELLIPSIS: &str = "...";
+    const PREFIX: usize = LIMIT - ELLIPSIS.len();
+
+    // A code preview can contain four bytes per displayed character.
+    if code.len() <= 4 * LIMIT {
+        let mut words = code.split_whitespace();
+        let Some(first) = words.next() else {
+            return String::new();
+        };
+        let mut output = String::with_capacity(code.len());
+        output.push_str(first);
+        for word in words {
+            output.push(' ');
+            output.push_str(word);
+        }
+        if output.len() > LIMIT && output.chars().count() > LIMIT {
+            let cut = output.char_indices().nth(PREFIX).unwrap().0;
+            output.truncate(cut);
+            output.push_str(ELLIPSIS);
+        }
+        return output;
     }
+
+    let mut output = String::with_capacity(LIMIT);
+    let mut width = 0;
+    let mut shortened_at = 0;
+    let mut separated = false;
+    for ch in code.chars() {
+        if ch.is_whitespace() {
+            separated = width != 0;
+            continue;
+        }
+        for ch in [separated.then_some(' '), Some(ch)].into_iter().flatten() {
+            if width == LIMIT {
+                output.truncate(shortened_at);
+                output.push_str(ELLIPSIS);
+                return output;
+            }
+            output.push(ch);
+            width += 1;
+            if width == PREFIX {
+                shortened_at = output.len();
+            }
+        }
+        separated = false;
+    }
+    output
 }
 
 /// Value of a float literal such as `30.5`, `1e3` or `2.5_f32`.
@@ -1814,6 +1856,54 @@ mod tests {
             .map(|finding| finding.at().id.as_str())
             .collect();
         assert_eq!(ids, ["6", "4", "5", "3", "1", "2"]);
+    }
+
+    #[test]
+    fn collapsed_code_matches_the_previous_format() {
+        // Pairwise combinations of character set, whitespace and normalized width.
+        for (charset, spacing, width) in [
+            ("ascii", "none", 17),
+            ("ascii", "split", 100),
+            ("ascii", "surrounded", 101),
+            ("multibyte", "split", 101),
+            ("ascii", "none", 4096),
+            ("multibyte", "none", 97),
+            ("multibyte", "surrounded", 0),
+            ("multibyte", "surrounded", 17),
+            ("multibyte", "surrounded", 4096),
+            ("ascii", "split", 17),
+            ("multibyte", "none", 100),
+            ("multibyte", "none", 101),
+            ("ascii", "surrounded", 97),
+            ("ascii", "surrounded", 100),
+            ("multibyte", "split", 97),
+            ("ascii", "none", 0),
+            ("multibyte", "split", 4096),
+        ] {
+            let glyph = if charset == "ascii" { "x" } else { "🦀" };
+            let code = match spacing {
+                "none" => glyph.repeat(width),
+                "surrounded" => format!("\t{}\u{2003}\r\n", glyph.repeat(width)),
+                _ => format!(
+                    "{}\u{2003}\r\n {}",
+                    glyph.repeat(width / 2),
+                    glyph.repeat(width - width / 2 - 1),
+                ),
+            };
+            let normalized = code.split_whitespace().collect::<Vec<_>>().join(" ");
+            let expected = if normalized.chars().count() > 100 {
+                format!("{}...", normalized.chars().take(97).collect::<String>())
+            } else {
+                normalized
+            };
+            assert_eq!(one_line(&code), expected, "{charset} {spacing} {width}");
+        }
+
+        // The last visible character can itself be the space between two words.
+        let code = format!("{}\n{}", "x".repeat(96), "y".repeat(4096));
+        assert_eq!(one_line(&code), format!("{} ...", "x".repeat(96)));
+        let code = format!("{}\n{}", "x".repeat(100), " ".repeat(4096));
+        assert_eq!(one_line(&code), "x".repeat(100));
     }
 
     #[test]
