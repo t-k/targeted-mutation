@@ -102,6 +102,7 @@ enum Owned {
 impl Owned {
     fn check(&self, metadata: &fs::Metadata) -> Result<Option<Self>> {
         Ok(match self {
+            // tmt:ignore the stamp of anything else has another inode and so does not match; the guard is for platforms whose stamp has none
             Self::File(stamps) if metadata.is_file() => {
                 let current = Stamp::from_metadata(metadata)?;
                 stamps.contains(&current).then(|| Self::File(vec![current]))
@@ -211,7 +212,8 @@ pub(crate) fn stage(
                     path.display()
                 );
             }
-            if shared_directory && !previous.contains_key(path) {
+            // Only a shared directory gets here without being ours: it was there before us.
+            if !previous.contains_key(path) {
                 shared.insert(path.clone());
             }
         }
@@ -290,6 +292,7 @@ fn plan_source(
         .with_context(|| format!("resolving output fixture source {}", from.display()))?;
     let allowed = |path: &Path| {
         path.strip_prefix(workspace).is_ok_and(|relative| {
+            // tmt:ignore the tests give every part but the first a case of its own; a link to the workspace root is refused without the first too, as a cycle, because the root contains the link
             !relative.as_os_str().is_empty()
                 && !path.starts_with(work)
                 && !relative.starts_with("target")
@@ -306,6 +309,7 @@ fn plan_source(
     let metadata = fs::metadata(&resolved)?;
     if metadata.is_file() {
         plan.insert(to.to_path_buf(), Planned::File(resolved));
+    // tmt:ignore what is neither a file nor a directory cannot be listed, so it is refused without this test too; this gives the reason
     } else if metadata.is_dir() && visiting.insert(resolved.clone()) {
         plan.insert(to.to_path_buf(), Planned::Directory { shared: false });
         for child in fs::read_dir(&resolved)? {
@@ -365,8 +369,10 @@ fn remove_owned(path: &Path, kind: Kind) -> Result<()> {
     };
     match result {
         Ok(()) => Ok(()),
+        // tmt:ignore only what was just seen in place is removed, so nothing is missing unless it is removed concurrently; the tests pin that other errors are reported
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(()),
         // Tests or Cargo may have created their own files under a former fixture.
+        // tmt:ignore removing a file never reports a directory that is not empty, so the kind only states the intent; the tests pin that other errors of a directory are reported
         Err(error) if kind == Kind::Directory && error.kind() == ErrorKind::DirectoryNotEmpty => {
             Ok(())
         }
@@ -453,7 +459,9 @@ fn write_ownership(work: &Path, owned: &Ownership) -> Result<()> {
         .create_new(true)
         .open(&temporary)?;
     serde_json::to_writer(&file, owned)?;
+    // tmt:ignore durability across a power loss, which a test cannot observe
     file.sync_all()?;
+    // tmt:ignore Windows does not rename a file that is open; elsewhere closing it first changes nothing
     drop(file);
     fs::rename(temporary, work.join(OWNERSHIP)).context("committing output fixture ownership")
 }
@@ -789,5 +797,335 @@ mod tests {
         symlink(&cyclic, cyclic.join("again")).unwrap();
         assert!(tree.stage(&[mapping("cycle", "debug/cycle")]).is_err());
         assert!(!tree.target.join("debug/cycle").exists());
+    }
+
+    #[test]
+    fn the_target_must_be_a_real_directory_inside_the_work_directory() {
+        let tree = Tree::new();
+        let refused = |target: &Path| {
+            let error = stage(&tree.workspace, &tree.work, target, &[]).unwrap_err();
+            assert!(
+                error.to_string().contains("inside the TMT work directory"),
+                "{}: {error:#}",
+                target.display()
+            );
+        };
+        refused(&tree.work);
+        refused(&tree.workspace);
+        #[cfg(unix)]
+        {
+            let link = tree.work.join("link");
+            std::os::unix::fs::symlink(&tree.target, &link).unwrap();
+            refused(&link);
+        }
+        tree.stage(&[]).unwrap();
+    }
+
+    #[test]
+    fn forgets_an_owned_directory_that_became_a_file() {
+        let tree = Tree::new();
+        fs::create_dir(tree.workspace.join("empty")).unwrap();
+        tree.stage(&[mapping("empty", "debug/dir")]).unwrap();
+        let output = tree.target.join("debug/dir");
+        fs::remove_dir(&output).unwrap();
+        fs::write(&output, "an artifact Cargo just created").unwrap();
+
+        tree.stage(&[]).unwrap();
+        assert_eq!(
+            fs::read_to_string(&output).unwrap(),
+            "an artifact Cargo just created"
+        );
+        assert!(tree.stage(&[mapping("empty", "debug/dir")]).is_err());
+    }
+
+    #[test]
+    fn a_destination_of_another_kind_is_refused_before_anything_is_removed() {
+        let tree = Tree::new();
+        let input = tree.workspace.join("asset");
+        fs::create_dir(&input).unwrap();
+        fs::write(input.join("entry"), "value").unwrap();
+        let asset = mapping("asset", "debug/asset");
+        tree.stage(std::slice::from_ref(&asset)).unwrap();
+
+        // The source is now a file, and the directory that is ours is in its place.
+        fs::remove_dir_all(&input).unwrap();
+        fs::write(&input, "a file").unwrap();
+        let error = tree.stage(std::slice::from_ref(&asset)).unwrap_err();
+        assert!(
+            error.to_string().contains("already exists: debug/asset"),
+            "{error:#}"
+        );
+        assert_eq!(
+            fs::read_to_string(tree.target.join("debug/asset/entry")).unwrap(),
+            "value"
+        );
+        // Withdrawing the fixture first makes room for the file.
+        tree.stage(&[]).unwrap();
+        tree.stage(&[asset]).unwrap();
+        assert_eq!(
+            fs::read_to_string(tree.target.join("debug/asset")).unwrap(),
+            "a file"
+        );
+    }
+
+    #[test]
+    fn removes_the_parent_directories_it_created_and_no_others() {
+        for existed in [true, false] {
+            let tree = Tree::new();
+            fs::write(tree.workspace.join("asset"), "value").unwrap();
+            let parent = tree.target.join("debug");
+            if existed {
+                fs::create_dir(&parent).unwrap();
+            }
+            let asset = mapping("asset", "debug/nested/asset");
+            // The second run finds the directories of the first in place.
+            tree.stage(std::slice::from_ref(&asset)).unwrap();
+            tree.stage(std::slice::from_ref(&asset)).unwrap();
+            assert_eq!(
+                fs::read_to_string(parent.join("nested/asset")).unwrap(),
+                "value"
+            );
+            tree.stage(&[]).unwrap();
+            assert!(!parent.join("nested").exists(), "existed: {existed}");
+            assert_eq!(parent.is_dir(), existed);
+        }
+    }
+
+    /// Takes away the right to change the entries of a directory, and gives what
+    /// restores it. Gives `None` where that holds nobody back (a privileged user),
+    /// so that the caller can skip.
+    #[cfg(unix)]
+    fn deny_changes(dir: &Path) -> Option<impl FnOnce() + use<>> {
+        use std::os::unix::fs::PermissionsExt;
+        let set = |dir: &Path, mode| {
+            fs::set_permissions(dir, fs::Permissions::from_mode(mode)).unwrap();
+        };
+        set(dir, 0o555);
+        let probe = dir.join("probe");
+        if fs::write(&probe, "").is_ok() {
+            fs::remove_file(probe).unwrap();
+            set(dir, 0o755);
+            return None;
+        }
+        let dir = dir.to_path_buf();
+        Some(move || set(&dir, 0o755))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_next_run_completes_an_install_that_was_interrupted() {
+        let tree = Tree::new();
+        let input = tree.workspace.join("asset");
+        fs::write(&input, "first").unwrap();
+        tree.stage(&[mapping("asset", "held/kept")]).unwrap();
+
+        // The second run installs one file and is stopped at the next.
+        fs::write(&input, "second").unwrap();
+        let both = [mapping("asset", "early/new"), mapping("asset", "held/kept")];
+        let Some(allow) = deny_changes(&tree.target.join("held")) else {
+            return;
+        };
+        let stopped = tree.stage(&both);
+        allow();
+        let error = stopped.unwrap_err();
+        assert!(
+            error.to_string().contains("installing output fixture"),
+            "{error:#}"
+        );
+        let read = |path: &str| fs::read_to_string(tree.target.join(path)).unwrap();
+        assert_eq!(read("early/new"), "second");
+        assert_eq!(read("held/kept"), "first");
+
+        // Both files are still known as ours: the one installed and the one not yet.
+        tree.stage(&both).unwrap();
+        assert_eq!(read("early/new"), "second");
+        assert_eq!(read("held/kept"), "second");
+        tree.stage(&[]).unwrap();
+        assert!(!tree.target.join("early").exists());
+        assert!(!tree.target.join("held").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn reports_an_old_fixture_that_cannot_be_removed() {
+        for source in ["file", "directory"] {
+            let tree = Tree::new();
+            fs::write(tree.workspace.join("file"), "value").unwrap();
+            fs::create_dir(tree.workspace.join("directory")).unwrap();
+            tree.stage(&[mapping(source, "held/old")]).unwrap();
+            let Some(allow) = deny_changes(&tree.target.join("held")) else {
+                return;
+            };
+            let stopped = tree.stage(&[]);
+            allow();
+            let error = stopped.unwrap_err();
+            assert!(
+                error.to_string().contains("removing old output fixture"),
+                "{source}: {error:#}"
+            );
+            assert!(tree.target.join("held/old").exists(), "{source}");
+            tree.stage(&[]).unwrap();
+            assert!(!tree.target.join("held").exists(), "{source}");
+        }
+    }
+
+    #[test]
+    fn sources_are_not_taken_from_the_work_directory_build_output_or_git_data() {
+        let tree = Tree::new();
+        let write = |path: &str| {
+            let path = tree.workspace.join(path);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "value").unwrap();
+        };
+        let refused = |from: &str| {
+            let error = tree.stage(&[mapping(from, "debug/out")]).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("outside the allowed workspace inputs"),
+                "{from}: {error:#}"
+            );
+            assert!(!tree.target.join("debug").exists(), "{from}");
+        };
+        for path in [
+            "work/secret",
+            "target/built",
+            ".git/config",
+            "sub/.git/config",
+            "sub/data",
+            "plain/data",
+            "targets/data",
+            ".gitignore",
+            "ordinary",
+        ] {
+            write(path);
+        }
+        for from in [
+            "work/secret",
+            "target/built",
+            ".git/config",
+            "sub/.git/config",
+        ] {
+            refused(from);
+        }
+        // A directory is refused for what it contains.
+        refused("sub");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::symlink;
+            // A link is judged by where it is and by what it names.
+            let ordinary = tree.workspace.join("ordinary");
+            symlink(&ordinary, tree.workspace.join("target/link")).unwrap();
+            refused("target/link");
+            for (name, hidden) in [
+                ("to-git", ".git/config"),
+                ("to-target", "target/built"),
+                ("to-work", "work/secret"),
+            ] {
+                symlink(tree.workspace.join(hidden), tree.workspace.join(name)).unwrap();
+                refused(name);
+            }
+        }
+        // Names that only resemble the refused ones are ordinary inputs.
+        for (index, from) in ["plain/data", "targets/data", ".gitignore", "ordinary"]
+            .into_iter()
+            .enumerate()
+        {
+            let to = format!("debug/{index}");
+            tree.stage(&[mapping(from, &to)]).unwrap();
+            assert_eq!(
+                fs::read_to_string(tree.target.join(to)).unwrap(),
+                "value",
+                "{from}"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copies_a_directory_that_two_links_name() {
+        use std::os::unix::fs::symlink;
+        let tree = Tree::new();
+        let common = tree.workspace.join("common");
+        let source = tree.workspace.join("source");
+        fs::create_dir(&common).unwrap();
+        fs::create_dir(&source).unwrap();
+        fs::write(common.join("file"), "value").unwrap();
+        symlink(&common, source.join("one")).unwrap();
+        symlink(&common, source.join("two")).unwrap();
+        // Seen twice, but not inside itself: this is no cycle.
+        tree.stage(&[mapping("source", "debug/source")]).unwrap();
+        for name in ["one", "two"] {
+            assert_eq!(
+                fs::read_to_string(tree.target.join("debug/source").join(name).join("file"))
+                    .unwrap(),
+                "value"
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_destination_that_cannot_be_inspected_is_refused_before_copying() {
+        let tree = Tree::new();
+        fs::write(tree.workspace.join("asset"), "value").unwrap();
+        // Longer than any name a file system holds.
+        let unusable = "z".repeat(300);
+        let error = tree
+            .stage(&[mapping("asset", "first"), mapping("asset", &unusable)])
+            .unwrap_err();
+        assert!(error.to_string().contains("inspecting"), "{error:#}");
+        assert!(!tree.target.join("first").exists());
+        assert!(!tree.work.join(OWNERSHIP).exists());
+    }
+
+    #[test]
+    fn leaves_no_staging_directory_behind() {
+        let tree = Tree::new();
+        fs::write(tree.workspace.join("asset"), "value").unwrap();
+        let staging = tree.work.join(STAGING);
+        // What an interrupted run left is replaced.
+        fs::create_dir(&staging).unwrap();
+        fs::write(staging.join("0"), "stale").unwrap();
+        tree.stage(&[mapping("asset", "debug/asset")]).unwrap();
+        assert_eq!(
+            fs::read_to_string(tree.target.join("debug/asset")).unwrap(),
+            "value"
+        );
+        assert!(!staging.exists());
+        assert!(!tree.work.join(OWNERSHIP_TEMP).exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_staged_file_keeps_the_permissions_of_its_source() {
+        use std::os::unix::fs::PermissionsExt;
+        let tree = Tree::new();
+        // Whatever the umask is, it does not give both of these to a new file.
+        for (name, mode) in [("tool", 0o750), ("data", 0o640)] {
+            let input = tree.workspace.join(name);
+            fs::write(&input, "value").unwrap();
+            fs::set_permissions(&input, fs::Permissions::from_mode(mode)).unwrap();
+        }
+        tree.stage(&[mapping("tool", "debug/tool"), mapping("data", "debug/data")])
+            .unwrap();
+        for (name, mode) in [("tool", 0o750), ("data", 0o640)] {
+            let staged = fs::metadata(tree.target.join("debug").join(name)).unwrap();
+            assert_eq!(staged.permissions().mode() & 0o777, mode, "{name}");
+        }
+    }
+
+    #[test]
+    fn refuses_an_ownership_record_whose_paths_are_not_confined_and_plain() {
+        let tree = Tree::new();
+        let record = tree.work.join(OWNERSHIP);
+        for path in ["./debug/asset", "../outside", "/outside"] {
+            let text = serde_json::json!({ path: "directory" }).to_string();
+            fs::write(&record, &text).unwrap();
+            assert!(tree.stage(&[]).is_err(), "{path}");
+            assert_eq!(fs::read_to_string(&record).unwrap(), text, "{path}");
+        }
+        fs::write(&record, r#"{"debug/asset":"directory"}"#).unwrap();
+        tree.stage(&[]).unwrap();
     }
 }
