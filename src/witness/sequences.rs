@@ -12,10 +12,18 @@ use super::{Candidate, Edit, Placement, Scenario};
 
 const MAX_SCENARIOS: usize = 4;
 
-pub(super) fn discover(source: &str, file: &syn::File, out: &mut Vec<Candidate>) {
+pub(super) fn discover(
+    source: &str,
+    file: &syn::File,
+    out: &mut Vec<Candidate>,
+    include_existing: bool,
+) {
     let mut tests = Vec::new();
     collect_tests(&file.items, "", None, &mut tests);
     round_trip_candidates(source, file, &tests, out);
+    if !include_existing {
+        return;
+    }
     for item in &file.items {
         if let Item::Impl(block) = item
             && block.trait_.is_none()
@@ -644,7 +652,7 @@ mod tests {
 
     fn candidates(source: &str) -> Vec<Candidate> {
         let mut output = Vec::new();
-        discover(source, &syn::parse_file(source).unwrap(), &mut output);
+        discover(source, &syn::parse_file(source).unwrap(), &mut output, true);
         output
     }
 

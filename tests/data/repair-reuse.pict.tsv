@@ -1,0 +1,7 @@
+Cache	Disabled	OnDisk
+missing	none	changed
+present	here	rendered
+present	elsewhere	changed
+present	none	rendered
+missing	elsewhere	rendered
+missing	here	changed

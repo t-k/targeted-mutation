@@ -354,21 +354,27 @@ struct BuildOutput {
 
 /// The workspace packages that depend on `package`, directly or through others.
 fn dependents_of(package: &str, packages: &[Package]) -> Vec<String> {
-    let mut found: Vec<String> = vec![];
-    let mut frontier = vec![package.to_string()];
+    let mut reverse = BTreeMap::<&str, Vec<&str>>::new();
+    for other in packages {
+        for dependency in &other.dependencies {
+            reverse
+                .entry(&dependency.name)
+                .or_default()
+                .push(&other.name);
+        }
+    }
+    let mut found = BTreeSet::new();
+    let mut frontier = vec![package];
     while let Some(current) = frontier.pop() {
-        for other in packages {
-            if other.name != package
-                && !found.contains(&other.name)
-                && other.dependencies.iter().any(|d| d.name == current)
-            {
-                found.push(other.name.clone());
-                frontier.push(other.name.clone());
+        if let Some(next) = reverse.get(current) {
+            for &other in next {
+                if other != package && found.insert(other) {
+                    frontier.push(other);
+                }
             }
         }
     }
-    found.sort();
-    found
+    found.into_iter().map(str::to_owned).collect()
 }
 
 /// Package ids embed the path, and the build runs in a copy, so compare by name.
@@ -615,6 +621,31 @@ struct SourceFile {
     /// leaves out: findings are numbered by these.
     places: Vec<(usize, usize, String)>,
     rendered: Option<Rendered>,
+}
+
+fn write_rendered(
+    file: &mut SourceFile,
+    state: &WorkCopy,
+    suffix: &str,
+    disabled: &HashSet<u32>,
+    newly_disabled: &HashSet<u32>,
+) -> Result<()> {
+    if file.rendered.is_none()
+        || file
+            .sites
+            .iter()
+            .any(|site| newly_disabled.contains(&site.id))
+    {
+        file.rendered = Some(instrument::render(&file.original, &file.sites, &|id| {
+            !disabled.contains(&id)
+        }));
+    }
+    let rendered = file.rendered.as_ref().expect("rendered before writing");
+    if suffix.is_empty() {
+        state.write(&file.path, &rendered.text)
+    } else {
+        state.write(&file.path, &format!("{}{suffix}", rendered.text))
+    }
 }
 
 /// How a group of tests is started.
@@ -2466,16 +2497,12 @@ fn blame_error(
         }
         ids
     };
-    [
-        innermost(&error.primary),
-        innermost(&error.secondary),
-        widen(0),
-        widen(NEARBY_LINES),
-        widen(usize::MAX),
-    ]
-    .into_iter()
-    .find(|ids| !ids.is_empty())
-    .unwrap_or_default()
+    [&error.primary, &error.secondary]
+        .into_iter()
+        .map(|spans| innermost(spans))
+        .chain([0, NEARBY_LINES, usize::MAX].into_iter().map(widen))
+        .find(|ids| !ids.is_empty())
+        .unwrap_or_default()
 }
 
 /// Range of `D = lhs - rhs` that the operand types allow, when one side is a literal.
@@ -2681,19 +2708,17 @@ impl Session {
             infected: Box::new(move |bin, _| bin.trace.reach.get(&id).cloned().unwrap_or_default()),
             reaching: Box::new(move |bin| bin.trace.reach.get(&id).cloned().unwrap_or_default()),
         };
-        let reached = self
-            .binaries
-            .iter()
-            .any(|b| b.trace.reach.contains_key(&id));
-        let opaque = self
-            .merged(|t| t.arith.get(&id), plan::ArithObs::merge)
-            .opaque;
+        let reached = || {
+            self.binaries
+                .iter()
+                .any(|b| b.trace.reach.contains_key(&id))
+        };
         Planned::Plan(match &site.kind {
             SiteKind::Stmt
             | SiteKind::Neg { .. }
             | SiteKind::Field { .. }
             | SiteKind::Body { .. }
-                if reached =>
+                if reached() =>
             {
                 reach_plan(Mutation::Delete)
             }
@@ -2736,25 +2761,32 @@ impl Session {
                     }),
                 }
             }
-            SiteKind::Arm { .. } if reached => reach_plan(Mutation::Delete),
+            SiteKind::Arm { .. } if reached() => reach_plan(Mutation::Delete),
             SiteKind::Arm { .. } => return Planned::Unreached,
-            SiteKind::Not { .. } if reached => reach_plan(Mutation::DropNot),
+            SiteKind::Not { .. } if reached() => reach_plan(Mutation::DropNot),
             // `a..=b` with `b` the largest value of its type is no range the probe could
             // return in place of `a..b`: the mutant would run as the original and pass.
-            SiteKind::Range { .. }
-                if reached
-                    && self
-                        .binaries
-                        .iter()
-                        .any(|b| b.trace.ranges_at_top.contains(&id)) =>
-            {
-                return Planned::NotEvaluated;
+            SiteKind::Range { .. } if reached() => {
+                if self
+                    .binaries
+                    .iter()
+                    .any(|b| b.trace.ranges_at_top.contains(&id))
+                {
+                    return Planned::NotEvaluated;
+                }
+                reach_plan(Mutation::RangeEnd)
             }
-            SiteKind::Range { .. } if reached => reach_plan(Mutation::RangeEnd),
             // `!` on an integer or a user type is not negation of a condition, and a range
             // of something other than integers has no "one more".
-            SiteKind::Not { .. } | SiteKind::Range { .. } if opaque => return Planned::Nothing,
-            SiteKind::Not { .. } | SiteKind::Range { .. } => return Planned::Unreached,
+            SiteKind::Not { .. } | SiteKind::Range { .. } => {
+                if self
+                    .merged(|t| t.arith.get(&id), plan::ArithObs::merge)
+                    .opaque
+                {
+                    return Planned::Nothing;
+                }
+                return Planned::Unreached;
+            }
             SiteKind::Cmp { op, literal, .. } => {
                 let op = *op;
                 let mut merged = Obs::default();
@@ -3160,11 +3192,22 @@ fn run_pool<T: Send>(
     workers: usize,
     work: impl Fn(usize) -> Result<T> + Sync,
 ) -> Result<Vec<T>> {
+    if count == 0 {
+        return Ok(vec![]);
+    }
+    if workers <= 1 || count == 1 {
+        return std::thread::scope(|scope| {
+            scope
+                .spawn(|| (0..count).map(&work).collect())
+                .join()
+                .expect("worker panicked")
+        });
+    }
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     let next = AtomicUsize::new(0);
     let stop = AtomicBool::new(false);
     let done: Vec<Vec<(usize, Result<T>)>> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..workers.clamp(1, count.max(1)))
+        let handles: Vec<_> = (0..workers.min(count))
             .map(|_| {
                 scope.spawn(|| {
                     let mut mine = vec![];
@@ -3696,7 +3739,8 @@ fn run_package(
                 let mut found =
                     instrument::discover_parsed(&original, &parsed, next_id, &error_values);
                 if want_witnesses && selected_file && path == root_file {
-                    witness_candidates = witness::discover_parsed(&original, &parsed);
+                    witness_candidates =
+                        witness::discover_parsed(&original, &parsed, !options.list);
                 }
                 next_id += found.sites.len() as u32;
                 if owners.consumers.len() != 1 || !owners.consumers.contains(&root_file) {
@@ -3925,36 +3969,33 @@ fn run_package(
         if catalogue.is_none() {
             state.settle(&workspace)?;
         }
-        let mut candidates: Vec<_> = files
-            .iter()
-            .flat_map(|file| {
-                file.sites
-                    .iter()
-                    .map(|site| (site, false))
-                    .chain(file.rebuild_sites.iter().map(|site| (site, true)))
-                    .flat_map(move |(site, requires_rebuild)| {
-                        source_mutants(file, site, true)
-                            .into_iter()
-                            .map(move |mutant| report::Candidate {
-                                what: mutant.what,
-                                into: mutant.into,
-                                requires_rebuild,
-                                edits: vec![candidate_edit(
-                                    file,
-                                    mutant.start,
-                                    mutant.end,
-                                    mutant.replacement,
-                                )],
-                            })
-                    })
-            })
-            .collect();
+        let mut candidates = vec![];
         let mut index = 0;
-        candidates.retain(|_| {
-            let selected = in_shard(index);
-            index += 1;
-            selected
-        });
+        for file in &files {
+            let sites = file
+                .sites
+                .iter()
+                .map(|site| (site, false))
+                .chain(file.rebuild_sites.iter().map(|site| (site, true)));
+            for (site, requires_rebuild) in sites {
+                for mutant in source_mutants(file, site, true) {
+                    if in_shard(index) {
+                        candidates.push(report::Candidate {
+                            what: mutant.what,
+                            into: mutant.into,
+                            requires_rebuild,
+                            edits: vec![candidate_edit(
+                                file,
+                                mutant.start,
+                                mutant.end,
+                                mutant.replacement,
+                            )],
+                        });
+                    }
+                    index += 1;
+                }
+            }
+        }
         if let Some(root) = files.iter().find(|file| file.path == root_file) {
             candidates.extend(
                 witness_candidates
@@ -4084,16 +4125,15 @@ fn run_package(
     };
     let cargo_build = || build_test_binaries(false);
     let mut rounds = 0;
+    let mut newly_disabled = HashSet::new();
     let build = loop {
         for file in &mut files {
-            let rendered =
-                instrument::render(&file.original, &file.sites, &|id| !disabled.contains(&id));
-            let mut text = rendered.text.clone();
-            if file.path == root_file {
-                text.push_str(&root_suffix);
-            }
-            state.write(&file.path, &text)?;
-            file.rendered = Some(rendered);
+            let suffix = if file.path == root_file {
+                root_suffix.as_str()
+            } else {
+                ""
+            };
+            write_rendered(file, &state, suffix, &disabled, &newly_disabled)?;
         }
         if !files.iter().any(|f| f.path == root_file) {
             state.write(&root_file, &format!("{root_source}{root_suffix}"))?;
@@ -4140,7 +4180,8 @@ fn run_package(
                 blamed_now.insert(id);
             }
         }
-        disabled.extend(blamed_now);
+        disabled.extend(blamed_now.iter().copied());
+        newly_disabled = blamed_now;
         if disabled.len() == before || rounds > MAX_REPAIR_ROUNDS {
             bail!(
                 "the crate does not build after instrumentation.\n\
@@ -4827,6 +4868,8 @@ fn run_package(
     // a `const fn`, and the sites whose probe did not compile.
     // The last of the four: for an audit, the job that ran the same mutant as a probe.
     let mut built: Vec<(&SourceFile, &Site, instrument::SourceMutant, Option<usize>)> = vec![];
+    let build_regular_mutants = options.rebuild || options.source_only;
+    let mut index = 0;
     for file in &files {
         // Tried again as the source says them: what did not compile as a probe, and
         // what a probe could not be (a range that ends at the top of its type).
@@ -4835,24 +4878,17 @@ fn run_package(
                 || not_evaluated.contains(&site.id)
         });
         for site in file.rebuild_sites.iter().chain(retried) {
-            built.extend(
-                source_mutants(file, site, options.source_only)
-                    .into_iter()
-                    .map(|mutant| (file, site, mutant, None)),
-            );
+            let mutants = source_mutants(file, site, options.source_only);
+            if build_regular_mutants {
+                built.extend(mutants.into_iter().filter_map(|mutant| {
+                    let selected = in_shard(index);
+                    index += 1;
+                    selected.then_some((file, site, mutant, None))
+                }));
+            } else {
+                report.mutants_not_built += mutants.len();
+            }
         }
-    }
-    if options.shard.is_some() {
-        let mut index = 0;
-        built.retain(|_| {
-            let selected = in_shard(index);
-            index += 1;
-            selected
-        });
-    }
-    if !options.rebuild && !options.source_only {
-        report.mutants_not_built = built.len();
-        built.clear();
     }
     // An audit also builds some of the mutants that were run as probes, from the source
     // as a person would write them, to see whether a probe and the real thing agree.
@@ -5426,8 +5462,14 @@ fn run_package(
     name_findings(&mut report.findings, &places);
 
     // 8. Findings the user has already dealt with.
+    let files_with_findings: BTreeSet<&str> = report
+        .findings
+        .iter()
+        .map(|finding| finding.at().file.as_str())
+        .collect();
     let ignored: BTreeMap<&str, BTreeMap<usize, String>> = files
         .iter()
+        .filter(|file| files_with_findings.contains(file.display.as_str()))
         .map(|f| {
             (
                 f.display.as_str(),
@@ -5439,13 +5481,12 @@ fn run_package(
         Some(path) => Some(crate::baseline::load(path)?),
         None => None,
     };
-    let location = |finding: &Finding| (finding.at().file.clone(), finding.at().line);
     let before = report.findings.len();
     report.findings.retain(|finding| {
-        let (file, line) = location(finding);
+        let at = finding.at();
         !ignored
-            .get(file.as_str())
-            .is_some_and(|lines| lines.contains_key(&line))
+            .get(at.file.as_str())
+            .is_some_and(|lines| lines.contains_key(&at.line))
     });
     if let Some(path) = &options.write_baseline {
         crate::baseline::write(path, &report.findings)?;
@@ -6072,6 +6113,118 @@ mod tests {
             None,
             "overflow is not a domain"
         );
+    }
+
+    #[test]
+    fn a_primary_blame_does_not_inspect_later_fallbacks() {
+        let copy = Path::new("/work");
+        let source = "pub fn f(n: u32) -> bool { n >= 4 }";
+        let make = |name: &str, rendered: bool| {
+            let sites = instrument::discover(source, 0).unwrap().sites;
+            let output = rendered.then(|| instrument::render(source, &sites, &|_| true));
+            SourceFile {
+                display: name.to_string(),
+                path: copy.join(name),
+                owners: BTreeSet::new(),
+                lines: scope::LineIndex::new(source),
+                original: source.to_string(),
+                places: vec![],
+                sites,
+                rebuild_sites: vec![],
+                rendered: output,
+            }
+        };
+        let files = [make("primary.rs", true), make("secondary.rs", false)];
+        let rendered = files[0].rendered.as_ref().unwrap();
+        let probe = rendered.text.find("__tmt_rt::").unwrap();
+        let span = |file: &str, byte_start| ErrorSpan {
+            file: file.to_string(),
+            byte_start,
+            line: 1,
+        };
+        let error = CompileError {
+            primary: vec![span("primary.rs", probe)],
+            secondary: vec![span("secondary.rs", 0)],
+            rendered: String::new(),
+        };
+        assert_eq!(
+            blame_error(&error, &files, copy, &HashSet::new()),
+            [rendered.inserted_by(probe).unwrap()]
+        );
+    }
+
+    #[test]
+    fn repair_reuses_a_render_but_still_corrects_the_working_copy() {
+        let dir = scratch("render-repair");
+        let root = dir.join("work/src");
+        let path = root.join("f.rs");
+        let state = WorkCopy::open(&dir.join("work"), &root);
+        let source = "pub fn f(n: u32) -> bool { n >= 4 }";
+        let suffix = "\n// root suffix\n";
+        for row in include_str!("../tests/data/repair-reuse.pict.tsv")
+            .lines()
+            .skip(1)
+        {
+            let columns: Vec<_> = row.split('\t').collect();
+            let [cache, which, disk] = columns.as_slice() else {
+                panic!("{row}")
+            };
+            let sites = instrument::discover(source, 1).unwrap().sites;
+            let id = sites
+                .iter()
+                .find(|site| matches!(site.kind, SiteKind::Cmp { .. }))
+                .unwrap()
+                .id;
+            let disabled = match *which {
+                "here" => HashSet::from([id]),
+                "elsewhere" => HashSet::from([u32::MAX]),
+                _ => HashSet::new(),
+            };
+            let before = instrument::render(source, &sites, &|_| true);
+            let expected = instrument::render(source, &sites, &|id| !disabled.contains(&id));
+            let original_text = format!("{}{suffix}", before.text);
+            fs::write(
+                &path,
+                if *disk == "rendered" {
+                    &original_text
+                } else {
+                    source
+                },
+            )
+            .unwrap();
+            let mut file = SourceFile {
+                display: "f.rs".to_string(),
+                path: path.clone(),
+                owners: BTreeSet::new(),
+                lines: scope::LineIndex::new(source),
+                original: source.to_string(),
+                places: vec![],
+                sites,
+                rebuild_sites: vec![],
+                rendered: (*cache == "present").then_some(before),
+            };
+            write_rendered(&mut file, &state, suffix, &disabled, &disabled).unwrap();
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                format!("{}{suffix}", expected.text),
+                "{row}"
+            );
+            let rendered = file.rendered.unwrap();
+            assert_eq!(rendered.text, expected.text, "{row}");
+            for offset in 0..rendered.text.len() {
+                assert_eq!(
+                    rendered.to_original(offset),
+                    expected.to_original(offset),
+                    "{row}"
+                );
+                assert_eq!(
+                    rendered.inserted_by(offset),
+                    expected.inserted_by(offset),
+                    "{row}"
+                );
+            }
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

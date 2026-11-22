@@ -192,15 +192,24 @@ pub(crate) fn render_edits(
         replacements.push((offset..offset, text));
     }
     replacements.sort_by_key(|(range, _)| (range.start, range.end));
-    let mut result = String::new();
+
+    let mut capacity = source.len();
+    let mut end = 0;
+    for (range, replacement) in &replacements {
+        source.get(end..range.start)?;
+        capacity -= source.get(range.clone())?.len();
+        capacity = capacity.checked_add(replacement.len())?;
+        end = range.end;
+    }
+
+    let mut result = String::with_capacity(capacity);
     let mut end = 0;
     for (range, replacement) in replacements {
-        result.push_str(source.get(end..range.start)?);
-        source.get(range.clone())?;
+        result.push_str(&source[end..range.start]);
         result.push_str(replacement);
         end = range.end;
     }
-    result.push_str(source.get(end..)?);
+    result.push_str(&source[end..]);
     Some(result)
 }
 
@@ -222,7 +231,11 @@ impl PositionSearch {
     }
 }
 
-pub(crate) fn discover_parsed(source: &str, file: &syn::File) -> Vec<Candidate> {
+pub(crate) fn discover_parsed(
+    source: &str,
+    file: &syn::File,
+    include_existing: bool,
+) -> Vec<Candidate> {
     if crate::instrument::is_test_only(&file.attrs) || crate::instrument::is_skipped(&file.attrs) {
         return vec![];
     }
@@ -243,15 +256,14 @@ pub(crate) fn discover_parsed(source: &str, file: &syn::File) -> Vec<Candidate> 
             }
         })
         .collect();
-    simple::discover(source, file, &mut candidates);
+    simple::discover(source, file, &mut candidates, include_existing);
     relations::discover(source, file, &mut candidates);
-    sequences::discover(source, file, &mut candidates);
+    sequences::discover(source, file, &mut candidates, include_existing);
     candidates
 }
 
 fn position_searches(source: &str, file: &syn::File) -> Vec<PositionSearch> {
-    let mut seeds = SearchValues::default();
-    seeds.visit_file(file);
+    let mut seeds = None;
     file.items
         .iter()
         .filter_map(|item| {
@@ -267,6 +279,11 @@ fn position_searches(source: &str, file: &syn::File) -> Vec<PositionSearch> {
             }
             let function_name = &function.sig.ident;
             let needle = seeds
+                .get_or_insert_with(|| {
+                    let mut seeds = SearchValues::default();
+                    seeds.visit_file(file);
+                    seeds
+                })
                 .values
                 .get(&function_name.to_string())
                 .copied()
@@ -443,7 +460,8 @@ mod tests {
 
     #[test]
     fn test_only_library_does_not_propose_source_witnesses() {
-        let discover = |source: &str| discover_parsed(source, &syn::parse_file(source).unwrap());
+        let discover =
+            |source: &str| discover_parsed(source, &syn::parse_file(source).unwrap(), true);
         let code = "pub fn chars(text: &str) -> usize { text.chars().count() }";
         assert!(!discover(code).is_empty());
         assert!(discover(&format!("#![cfg(test)]\n{code}")).is_empty());

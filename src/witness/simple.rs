@@ -9,13 +9,20 @@ use syn::{BinOp, Expr, FnArg, Item, ItemFn, Pat, ReturnType, Stmt, Type};
 
 use super::{Candidate, Edit, Scenario};
 
-pub(super) fn discover(source: &str, file: &syn::File, out: &mut Vec<Candidate>) {
+pub(super) fn discover(
+    source: &str,
+    file: &syn::File,
+    out: &mut Vec<Candidate>,
+    include_existing: bool,
+) {
     let mut fixtures = RangeFixtures {
         source,
         tests: Vec::new(),
         seeds: BTreeMap::new(),
     };
-    fixtures.visit_file(file);
+    if include_existing {
+        fixtures.visit_file(file);
+    }
     for item in &file.items {
         let Item::Fn(function) = item else { continue };
         if !supports(function) {
@@ -23,7 +30,8 @@ pub(super) fn discover(source: &str, file: &syn::File, out: &mut Vec<Candidate>)
         }
         out.extend(bit_mask(source, function));
         out.extend(string_length(source, function));
-        if let Some(seeds) = fixtures.seeds.get(&function.sig.ident.to_string()) {
+        if include_existing && let Some(seeds) = fixtures.seeds.get(&function.sig.ident.to_string())
+        {
             out.extend(range_mutation(source, function, seeds));
         }
     }
@@ -454,7 +462,7 @@ mod tests {
     fn candidates(source: &str) -> Vec<Candidate> {
         let file = syn::parse_file(source).unwrap();
         let mut found = Vec::new();
-        discover(source, &file, &mut found);
+        discover(source, &file, &mut found, true);
         found
     }
 
