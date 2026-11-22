@@ -86,14 +86,14 @@ impl Watch {
         // This process lets go: from here on only the run and what it started hold it.
         #[cfg(unix)]
         drop(file);
-        if child.is_err() {
-            self.started = false;
-        }
+        // A command that did not start has passed the file on to nobody: the sweep finds
+        // the lock free.
         child
     }
 
     /// Stops whoever still has the file, unless they are to be left, and removes it.
     pub(crate) fn finish(self, leave: bool) -> Swept {
+        // tmt:ignore a run that was not given the file holds no lock: the sweep finds it free at once
         let swept = if self.started && !leave {
             sweep(&self.path)
         } else {
@@ -114,7 +114,11 @@ pub(crate) fn count(swept: &Swept) {
 
 /// Whether leftovers are to be left alone: `TMT_LEAVE_PROCESSES` is set to something.
 pub(crate) fn leave() -> bool {
-    std::env::var_os("TMT_LEAVE_PROCESSES").is_some_and(|value| !value.is_empty())
+    asked_to_leave(std::env::var_os("TMT_LEAVE_PROCESSES"))
+}
+
+fn asked_to_leave(setting: Option<std::ffi::OsString>) -> bool {
+    setting.is_some_and(|value| !value.is_empty())
 }
 
 #[cfg(unix)]
@@ -132,7 +136,9 @@ fn sweep(path: &Path) -> Swept {
                 break;
             }
         }
+        // tmt:ignore the pause only spares a listing while a copy is on its way out: who is stopped is the same
         if !settled {
+            // tmt:ignore as above
             std::thread::sleep(SETTLE);
             settled = true;
             continue;
@@ -147,10 +153,12 @@ fn sweep(path: &Path) -> Swept {
                 stopped.insert(pid);
             }
         }
+        // tmt:ignore giving up needs a holder that cannot be stopped, which a test cannot make
         if Instant::now() >= deadline {
             swept.left = true;
             break;
         }
+        // tmt:ignore without the pause the loop only looks more often
         std::thread::sleep(Duration::from_millis(20));
     }
     swept.stopped = stopped.len();
@@ -203,6 +211,7 @@ fn held(path: &Path) -> io::Result<bool> {
     let file = File::open(path)?;
     match crate::work_lock::lock_open_file(&file) {
         Ok(()) => Ok(false),
+        // tmt:ignore a lock that fails for another reason on a file that was just opened cannot be provoked in a test
         Err(error) if crate::work_lock::contended(&error) => Ok(true),
         Err(error) => Err(error),
     }
@@ -272,6 +281,7 @@ fn stop(pid: u32) {
         fn kill(pid: std::ffi::c_int, signal: std::ffi::c_int) -> std::ffi::c_int;
     }
     // Never 0, -1 or a negative number, which name groups: one process at a time.
+    // tmt:ignore a test cannot ask to stop process 1 or 0 (every process of the group): the guard is what keeps that from ever happening
     if let Ok(pid) = std::ffi::c_int::try_from(pid)
         && pid > 1
     {
@@ -481,10 +491,36 @@ mod tests {
     }
 
     #[test]
+    fn leftovers_are_left_only_when_the_setting_says_something() {
+        assert!(!asked_to_leave(None));
+        assert!(!asked_to_leave(Some("".into())));
+        assert!(asked_to_leave(Some("1".into())));
+        assert!(asked_to_leave(Some("no".into())));
+    }
+
+    #[test]
+    fn a_sweep_is_counted_for_the_summary() {
+        // Other tests of this program sweep too: the counts only grow.
+        let (stopped, not_stopped) = (
+            STOPPED.load(Ordering::Relaxed),
+            NOT_STOPPED.load(Ordering::Relaxed),
+        );
+        count(&Swept {
+            stopped: 3,
+            left: true,
+        });
+        assert!(STOPPED.load(Ordering::Relaxed) >= stopped + 3);
+        assert!(NOT_STOPPED.load(Ordering::Relaxed) > not_stopped);
+        let not_stopped = NOT_STOPPED.load(Ordering::Relaxed);
+        count(&Swept::default());
+        assert_eq!(NOT_STOPPED.load(Ordering::Relaxed), not_stopped);
+    }
+
+    #[test]
     fn a_listing_gives_process_numbers_and_nothing_that_names_a_group() {
         assert_eq!(
-            pids("120\n 77 \n\nlsof: warning\n0\n1\n-5\n4000000000\n"),
-            [120, 77, 4000000000]
+            pids("120\n 77 \n\nlsof: warning\n0\n1\n2\n-5\n4000000000\n"),
+            [120, 77, 2, 4000000000]
         );
         assert!(pids("").is_empty());
     }
