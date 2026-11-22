@@ -130,17 +130,16 @@ pub(super) fn discover(source: &str, file: &syn::File, out: &mut Vec<Candidate>)
         let [Stmt::Expr(expression, semicolon)] = &function.block.stmts[..] else {
             continue;
         };
-        let start = out.len();
+        let limit = out.len().saturating_add(MAX_CANDIDATES_PER_FUNCTION);
         match unparen(expression) {
             Expr::Binary(comparison) if semicolon.is_none() => {
                 if let Some(parameters) = parameters(function, &records) {
-                    compare_candidates(source, function, comparison, &parameters, out);
+                    compare_candidates(source, function, comparison, &parameters, out, limit);
                 }
             }
-            Expr::MethodCall(call) => sort_candidates(source, function, call, &records, out),
+            Expr::MethodCall(call) => sort_candidates(source, function, call, &records, out, limit),
             _ => {}
         }
-        out.truncate(start.saturating_add(MAX_CANDIDATES_PER_FUNCTION));
     }
 }
 
@@ -398,6 +397,7 @@ fn compare_candidates(
     expression: &syn::ExprBinary,
     params: &[Parameter<'_>],
     out: &mut Vec<Candidate>,
+    limit: usize,
 ) {
     for (change_lhs, changed, other) in [
         (true, expression.left.as_ref(), expression.right.as_ref()),
@@ -420,6 +420,9 @@ fn compare_candidates(
             continue;
         };
         for new in alternatives(chosen, params) {
+            if out.len() == limit {
+                return;
+            }
             if new == chosen || matches!(opposite, Operand::Place(value) if new == value) {
                 continue;
             }
@@ -478,6 +481,7 @@ fn sort_candidates(
     expression: &syn::ExprMethodCall,
     records: &BTreeMap<&Ident, Record<'_>>,
     out: &mut Vec<Candidate>,
+    limit: usize,
 ) {
     if expression.method != "sort_by_key" && expression.method != "sort_unstable_by_key" {
         return;
@@ -529,6 +533,9 @@ fn sort_candidates(
         "rows"
     };
     for (alternative, (field, ty)) in record.fields.iter().enumerate() {
+        if out.len() == limit {
+            break;
+        }
         if alternative == index || ty != integer {
             continue;
         }

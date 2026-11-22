@@ -7,6 +7,8 @@
 //! The rewrite only inserts text on the line where the site is, so line numbers in compiler
 //! diagnostics still match the original file.
 
+use std::collections::HashSet;
+
 use anyhow::{Context, Result};
 use proc_macro2::{Span, TokenStream, TokenTree};
 use quote::ToTokens;
@@ -447,11 +449,24 @@ impl Finder<'_> {
             return;
         }
         let written = sole_expr.map(|(from, to)| tokens_of(&self.source[from..to]));
+        let is_written = |value: &str| {
+            written
+                .as_deref()
+                .is_some_and(|text| text == tokens_of(value))
+        };
         let probe_values = body_values_with_errors(&sig.output, self.error_values, false);
+        let probe_index = (probe_values.len() > 32).then(|| {
+            probe_values
+                .iter()
+                .map(String::as_str)
+                .collect::<HashSet<_>>()
+        });
         for value in body_values_with_errors(&sig.output, self.error_values, true) {
-            if !probe_values.contains(&value)
-                && written.as_deref() != Some(tokens_of(&value).as_str())
-            {
+            let is_probe = probe_index.as_ref().map_or_else(
+                || probe_values.contains(&value),
+                |index| index.contains(value.as_str()),
+            );
+            if !is_probe && !is_written(&value) {
                 self.add_rebuild(Site {
                     id: NO_ID,
                     kind: SiteKind::Body {
@@ -468,7 +483,7 @@ impl Finder<'_> {
             }
         }
         for value in probe_values {
-            if written.as_deref() != Some(tokens_of(&value).as_str()) {
+            if !is_written(&value) {
                 push(
                     self,
                     SiteKind::Body {
@@ -1313,18 +1328,28 @@ fn body_values_with_errors(
     }
 }
 
-fn product(parts: &[Vec<String>]) -> Vec<Vec<String>> {
-    parts.iter().fold(vec![vec![]], |rows, part| {
-        rows.iter()
-            .flat_map(|row| {
-                part.iter().map(move |value| {
-                    let mut row = row.clone();
-                    row.push(value.clone());
-                    row
-                })
-            })
-            .collect()
-    })
+fn product(parts: &[Vec<String>], format: impl Fn(&[&str]) -> String) -> Vec<String> {
+    if parts.iter().any(Vec::is_empty) {
+        return vec![];
+    }
+    let mut positions = vec![0; parts.len()];
+    let mut row: Vec<_> = parts.iter().map(|part| part[0].as_str()).collect();
+    let mut results = vec![];
+    loop {
+        results.push(format(&row));
+        let Some(next) = (0..parts.len())
+            .rev()
+            .find(|&i| positions[i] + 1 < parts[i].len())
+        else {
+            return results;
+        };
+        positions[next] += 1;
+        row[next] = &parts[next][positions[next]];
+        for i in next + 1..parts.len() {
+            positions[i] = 0;
+            row[i] = &parts[i][0];
+        }
+    }
 }
 
 fn values_of(ty: &syn::Type, error_values: &[&str], extended: bool) -> Vec<String> {
@@ -1346,13 +1371,10 @@ fn values_of(ty: &syn::Type, error_values: &[&str], extended: bool) -> Vec<Strin
                 .iter()
                 .map(|ty| values_of(ty, error_values, extended))
                 .collect();
-            product(&parts)
-                .into_iter()
-                .map(|row| match &row[..] {
-                    [one] => format!("({one},)"),
-                    _ => format!("({})", row.join(", ")),
-                })
-                .collect()
+            product(&parts, |row| match row {
+                [one] => format!("({one},)"),
+                _ => format!("({})", row.join(", ")),
+            })
         }
         syn::Type::Array(t) => {
             let len = t.len.to_token_stream().to_string();
@@ -1454,14 +1476,13 @@ fn values_of(ty: &syn::Type, error_values: &[&str], extended: bool) -> Vec<Strin
                 }
                 ("BTreeMap" | "HashMap", [key, value]) => {
                     let mut values = vec![format!("{bare}::new()")];
-                    values.extend(
-                        product(&[
+                    values.extend(product(
+                        &[
                             values_of(key, error_values, extended),
                             values_of(value, error_values, extended),
-                        ])
-                        .into_iter()
-                        .map(|row| format!("{bare}::from_iter([({})])", row.join(", "))),
-                    );
+                        ],
+                        |row| format!("{bare}::from_iter([({})])", row.join(", ")),
+                    ));
                     values
                 }
                 ("Cow", [inner]) => {
