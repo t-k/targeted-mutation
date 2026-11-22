@@ -420,7 +420,7 @@ fn show_workspace(
         combined["errors"] = serde_json::Value::Array(errors);
         println!("{combined:#}");
     } else if sarif {
-        println!("{}", report::render_workspace_sarif(&reports));
+        println!("{:#}", report::workspace_sarif(&reports));
     } else {
         for result in &reports {
             show_report(result, false, false, show_unreached);

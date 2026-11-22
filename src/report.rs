@@ -891,12 +891,13 @@ pub fn arith_gap_finding(
 
 /// The report as SARIF 2.1.0, with file names relative to the repository root.
 pub fn render_sarif(report: &Report) -> String {
-    sarif_document(vec![sarif_run(report)])
+    serde_json::to_string_pretty(&sarif_document(vec![sarif_run(report)]))
+        .expect("JSON values serialise")
 }
 
 /// The CLI's workspace SARIF has one run per successful member, in report order.
 #[doc(hidden)]
-pub fn render_workspace_sarif(reports: &[Report]) -> String {
+pub fn workspace_sarif(reports: &[Report]) -> impl std::fmt::Display {
     let runs = reports
         .iter()
         .map(|report| {
@@ -908,13 +909,13 @@ pub fn render_workspace_sarif(reports: &[Report]) -> String {
     sarif_document(runs)
 }
 
-fn sarif_document(runs: Vec<serde_json::Value>) -> String {
+fn sarif_document(runs: Vec<serde_json::Value>) -> serde_json::Value {
     let mut document = serde_json::json!({
         "$schema": "https://json.schemastore.org/sarif-2.1.0.json",
         "version": "2.1.0",
     });
     document["runs"] = serde_json::Value::Array(runs);
-    serde_json::to_string_pretty(&document).expect("JSON values serialise")
+    document
 }
 
 fn sarif_run(report: &Report) -> serde_json::Value {
@@ -1819,7 +1820,10 @@ mod tests {
                 "version": "2.1.0",
                 "runs": runs,
             });
-            assert_eq!(render_workspace_sarif(reports), format!("{old:#}"));
+            assert_eq!(
+                format!("{:#}", workspace_sarif(reports)),
+                format!("{old:#}")
+            );
         }
     }
 
