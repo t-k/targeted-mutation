@@ -646,6 +646,15 @@ impl Reach {
         }
     }
 
+    /// The numbers the expression lies between, where it has such bounds.
+    pub fn interval(self) -> Option<(i128, i128)> {
+        match self {
+            Reach::Multiples(_) => None,
+            Reach::Bits(mask) => Some((0, mask)),
+            Reach::Below(limit) => Some((1 - limit, limit - 1)),
+        }
+    }
+
     /// The least value above `value` that the expression can be.
     fn next_above(self, value: i128) -> Option<i128> {
         match self {
@@ -1190,6 +1199,41 @@ mod tests {
             dropped > 100 && kept > 1000,
             "{dropped} dropped, {kept} kept"
         );
+    }
+
+    #[test]
+    fn an_outcome_no_value_gives_is_not_asked_for() {
+        // `n % 10 < 10` is true for whatever `n` is, `flags & 0xF0 > 0xF0` never is.
+        for (reach, literal, op, differs) in [
+            (Reach::Below(10), 10, CmpOp::Lt, false),
+            (Reach::Below(10), 9, CmpOp::Lt, true),
+            (Reach::Below(10), -10, CmpOp::Gt, false),
+            (Reach::Bits(0xF0), 0xF0, CmpOp::Gt, false),
+            (Reach::Bits(0xF0), 0xF0, CmpOp::Ge, true),
+            (Reach::Bits(0xF0), 0, CmpOp::Lt, false),
+        ] {
+            let (lo, hi) = reach.interval().unwrap();
+            assert!((lo..=hi).all(|v| !reach.holds(v) || (lo <= v && v <= hi)));
+            assert!(reach.holds(lo) && reach.holds(hi), "{reach:?}");
+            assert!(!reach.holds(lo - 1) && !reach.holds(hi + 1), "{reach:?}");
+            let can_differ = (lo..=hi)
+                .filter(|v| reach.holds(*v))
+                .map(|v| op.eval_d(v - literal))
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                == 2;
+            assert_eq!(can_differ, differs, "{reach:?} {op:?} {literal}");
+            // One value seen: the plan asks for the other outcome only if there is one.
+            let seen = (lo..=hi).find(|v| reach.holds(*v)).unwrap();
+            let plan = plan_cmp(
+                op,
+                &Obs::of_d(seen - literal),
+                Some((lo - literal, hi - literal)),
+            );
+            assert_eq!(plan.cannot_differ, !differs, "{reach:?} {op:?} {literal}");
+            assert_eq!(plan.gap.is_some(), differs, "{reach:?} {op:?} {literal}");
+        }
+        assert_eq!(Reach::Multiples(8).interval(), None);
     }
 
     #[test]

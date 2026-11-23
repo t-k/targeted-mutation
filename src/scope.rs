@@ -197,25 +197,35 @@ fn new_path(path: &str) -> Option<String> {
     path.strip_prefix("b/").map(str::to_string)
 }
 
+/// Where the new lines of a hunk are in `text`, as a byte range: empty, at the place
+/// the old lines were, when the hunk has no new lines.
+pub fn range_of(text: &str, hunk: &Hunk) -> (usize, usize) {
+    // The offset where line `n` (1-based) starts; past the last line, the end.
+    let start_of = |line: usize| {
+        if line <= 1 {
+            return 0;
+        }
+        text.match_indices('\n')
+            .nth(line - 2)
+            .map_or(text.len(), |(at, _)| at + 1)
+    };
+    if hunk.count == 0 {
+        let at = start_of(hunk.start + 1);
+        (at, at)
+    } else {
+        (start_of(hunk.start), start_of(hunk.start + hunk.count))
+    }
+}
+
 /// `text` with the hunks undone: the old lines where the new ones are. The hunks are of
 /// this text and do not overlap. `None` when one of them does not fit the text.
 pub fn undo(text: &str, hunks: &[&Hunk]) -> Option<String> {
-    let starts: Vec<usize> = std::iter::once(0)
-        .chain(text.match_indices('\n').map(|(at, _)| at + 1))
-        .collect();
-    // The offset where line `n` (1-based) starts; past the last line, the end.
-    let start_of = |line: usize| starts.get(line - 1).copied().unwrap_or(text.len());
     let mut ordered: Vec<&Hunk> = hunks.to_vec();
     ordered.sort_by_key(|hunk| (hunk.start, hunk.count));
     let mut out = String::with_capacity(text.len());
     let mut done = 0;
     for hunk in ordered {
-        let (from, to) = if hunk.count == 0 {
-            let at = start_of(hunk.start + 1);
-            (at, at)
-        } else {
-            (start_of(hunk.start), start_of(hunk.start + hunk.count))
-        };
+        let (from, to) = range_of(text, hunk);
         if from < done || to > text.len() || (hunk.count > 0 && from == to) {
             return None;
         }

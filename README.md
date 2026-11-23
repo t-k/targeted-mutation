@@ -88,7 +88,7 @@ INPUT GAP  src/lib.rs:4:5
 
 The tests saw 17 and 20, so any threshold in 18..=20 behaves the same on every test. The tool derives that range from the two observed values and names the one input that pins the boundary.
 
-A value that no input can give is not asked for. Compared with a number, `blocks * 8` is only ever a multiple of eight, `flags & 0xF0` only has bits of the mask, and `n % 10` is smaller than ten: when no such value lies between the ones the tests gave, nothing is reported, and otherwise the values named are ones the expression can be. This is read from the last operation of the expression, for integers, and only where it also holds when the arithmetic wraps (a product by a power of two, a shift, a mask, a remainder).
+A value that no input can give is not asked for. Compared with a number, `blocks * 8` is only ever a multiple of eight, `flags & 0xF0` only has bits of the mask, and `n % 10` is smaller than ten: when no such value lies between the ones the tests gave, nothing is reported, and otherwise the values named are ones the expression can be. A comparison that such a value cannot make come out the other way (`n % 10 < 10`) is not asked to. This is read from the last operation of the expression, for integers, and only where it also holds when the arithmetic wraps (a product by a power of two, a shift, a mask, a remainder).
 
 The second kind of finding is about assertions rather than inputs. `fixtures/batch-store` has an atomic batch commit and a test that checks a failing batch returns an error, but never looks at the store afterwards:
 
@@ -242,6 +242,25 @@ Here a session's age is now counted from its last use, and every session in the 
 - A change that is a refactoring passes with the old code by design. Silence it with `// tmt:ignore <reason>` on its first line, or keep it in the baseline.
 - Without a rebuild mode the changes are counted among the mutants that need a build of their own. They are not tried with `--shard` or `--list`.
 - In JSON the finding has `kind: "survivor"` and `change_since` with the revision.
+
+### Tests that changed
+
+With `--since REV`, a change to the tests of a file (`#[cfg(test)]` code and `#[test]` functions in it) puts the whole program of that file in scope, not only its changed lines. In the lines that did not change, a mutant that passes is reported only if the tests as they were at `REV` found it out. They are built once more, with the program as it is, and run against those mutants:
+
+```text
+INPUT GAP  src/lib.rs:27:5
+    age >= 18
+  passes every test as: `age >= 19`, `age >= 20`  [re-run: tests pass]
+  nearest values the tests passed: `age` = 17, 20
+  add a test with `age` = 18 (the original gives true)
+  the tests as they were at e76c0bd70fff found this out: a change to the tests lets it through
+```
+
+- This needs no rebuild mode: it costs two more builds, and only when tests changed.
+- Gaps that were there before the change are not reported in such lines; a run of the whole reports them.
+- When the earlier tests do not build with the program as it is, or fail on it (the program changed with them), they cannot say what they found out, and only the changed lines are looked at.
+- Code that a deleted test leaves with no test at all is not reported here (it is unreached: see `--show-unreached` on a run of the whole). Tests in files of their own (`tests/*.rs`) are not followed back to the code they test.
+- In JSON these findings are listed under `weakened`.
 
 Output: text by default, `--json`, or `--sarif` (SARIF 2.1.0 for code scanning: paths from the top of the git repository, the finding's id as `partialFingerprints`, and what the run looked at under the run's `properties`; with `--workspace` there is one run per package, each with an `automationDetails.id` of its own, and a package whose analysis failed is a run with `executionSuccessful: false` and the error). The JSON report has the same under `analysis`: package, `--since` and `--lines`, features, and whether mutants were built and predictions re-run. `--show-unreached` lists sites with no recorded execution. Long campaigns print completed, failed, timed-out, survived and unevaluated counts on stderr. `--quiet` suppresses progress. If a baseline test fails, stderr includes the available diagnostics and the full log path.
 

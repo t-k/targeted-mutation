@@ -2972,16 +2972,33 @@ impl Session {
                     merged.merge(&bin.trace.merged(id));
                 }
                 let bounds = self.binaries.iter().find_map(|b| b.trace.bounds.get(&id));
-                let mut cmp_plan = plan::plan_cmp(op, &merged, domain_of(*literal, bounds));
                 // Compared with a number, what cannot be every number has a gap only
-                // where a value it can be lies between the values the tests gave it.
+                // where a value it can be lies between the values the tests gave it,
+                // and another outcome only if a value it can be gives one.
                 let against = match literal {
                     LiteralSide::Rhs(number) => Some((lhs, *number, true)),
                     LiteralSide::Lhs(number) => Some((rhs, *number, false)),
                     LiteralSide::None => None,
-                };
-                if let Some((expr, number, is_rhs)) = against
-                    && let Some(reach) = instrument::reach(expr)
+                }
+                .and_then(|(expr, number, is_rhs)| {
+                    Some((instrument::reach(expr)?, number, is_rhs))
+                });
+                let mut domain = domain_of(*literal, bounds);
+                if let Some((reach, number, is_rhs)) = against
+                    && let Some((low, high)) = reach.interval()
+                    && let (Some(a), Some(b)) = if is_rhs {
+                        (low.checked_sub(number), high.checked_sub(number))
+                    } else {
+                        (number.checked_sub(high), number.checked_sub(low))
+                    }
+                {
+                    domain = Some(match domain {
+                        Some((lo, hi)) => (lo.max(a), hi.min(b)),
+                        None => (a, b),
+                    });
+                }
+                let mut cmp_plan = plan::plan_cmp(op, &merged, domain);
+                if let Some((reach, number, is_rhs)) = against
                     && let Some(gap) = cmp_plan.gap.take()
                 {
                     cmp_plan.gap = plan::within_reach(gap, op, &merged, reach, number, is_rhs);
@@ -4026,6 +4043,16 @@ fn run_package(
         }
     }
 
+    // Where the tests of a file changed and nothing else says so, the whole program of
+    // the file is looked at: what they found out before and let through now is theirs.
+    let since_hunks = match options.since.as_deref() {
+        Some(revision) if !options.list && options.shard.is_none() => {
+            scope::hunks(&since_diff(&workspace, revision)?)
+        }
+        _ => vec![],
+    };
+    let mut tests_changed: Vec<(PathBuf, Vec<scope::Hunk>)> = vec![];
+    let mut beyond_places: HashSet<(PathBuf, usize, usize)> = HashSet::new();
     // Only the requested lines, if any were requested.
     if let Some(scope) = &scope {
         for file in &mut files {
@@ -4040,7 +4067,23 @@ fn run_package(
                     // A function is in scope by its signature line too.
                     || scope.touches(&relative, site.line, site.line)
             };
-            file.sites.retain(in_scope);
+            let of_file: Vec<scope::Hunk> = since_hunks
+                .iter()
+                .filter(|hunk| hunk.file == relative)
+                .cloned()
+                .collect();
+            let of_tests = reverts::test_hunks(&file.original, &of_file);
+            if of_tests.is_empty() {
+                file.sites.retain(in_scope);
+            } else {
+                beyond_places.extend(
+                    file.sites
+                        .iter()
+                        .filter(|site| !in_scope(site))
+                        .map(|site| (file.path.clone(), site.start, site.end)),
+                );
+                tests_changed.push((file.path.clone(), of_tests));
+            }
             file.rebuild_sites.retain(in_scope);
         }
         files.retain(|f| {
@@ -4291,6 +4334,16 @@ fn run_package(
     {
         site.id = id as u32;
     }
+    // The sites outside of what changed, looked at for the sake of the tests that did.
+    let beyond: HashSet<u32> = files
+        .iter()
+        .flat_map(|file| {
+            file.sites
+                .iter()
+                .filter(|site| beyond_places.contains(&(file.path.clone(), site.start, site.end)))
+                .map(|site| site.id)
+        })
+        .collect();
 
     let root_source = state
         .original(&root_file, &workspace)?
@@ -4832,6 +4885,9 @@ fn run_package(
     for file in &files {
         for site in file.sites.iter().filter(|s| !disabled.contains(&s.id)) {
             let plan = match session.plan(&file.display, site, options.verify) {
+                // Code that did not change is not said to be unreached here: that takes
+                // a run of the whole.
+                Planned::Unreached if beyond.contains(&site.id) => continue,
                 Planned::Unreached => {
                     // A function is one place, however many sites it is.
                     let at = report::location(&file.display, site);
@@ -4978,6 +5034,101 @@ fn run_package(
         }
         report.audit = Some(audit);
     }
+    // 6c. In code that did not change, a mutant that passes says something about this
+    // change only if the tests as they were found it out. They are built once, with
+    // the program as it is, and run against those mutants.
+    let mut found_out_before: HashSet<usize> = HashSet::new();
+    let asked: Vec<usize> = work
+        .iter()
+        .filter(|item| beyond.contains(&item.site.id))
+        .flat_map(|item| {
+            item.gaps
+                .iter()
+                .flat_map(|(_, confirm, _)| confirm.iter().copied())
+                .chain(item.runs.iter().map(|(_, job)| *job))
+        })
+        .filter(|job| results[*job].survived.is_some())
+        .collect();
+    if !asked.is_empty() {
+        let revision = report::short_revision(options.since.as_deref().unwrap_or_default());
+        session.note(&format!(
+            "running {} surviving mutants against the tests as they were at {revision}",
+            asked.len()
+        ));
+        let suffix = |file: &SourceFile| {
+            if file.path == root_file {
+                root_suffix.as_str()
+            } else {
+                ""
+            }
+        };
+        // The instrumented files with the old lines of their tests.
+        let earlier: Vec<(&SourceFile, String)> = tests_changed
+            .iter()
+            .filter_map(|(path, hunks)| {
+                let file = files.iter().find(|file| file.path == *path)?;
+                let rendered = file.rendered.as_ref()?;
+                let mut places = hunks
+                    .iter()
+                    .map(|hunk| {
+                        let (from, to) = scope::range_of(&file.original, hunk);
+                        Some((rendered.copied(from, to)?, hunk.old.as_str()))
+                    })
+                    .collect::<Option<Vec<_>>>()?;
+                places.sort_by_key(|((from, _), _)| std::cmp::Reverse(*from));
+                let mut text = rendered.text.clone();
+                for ((from, to), old) in places {
+                    text.replace_range(from..to, old);
+                }
+                Some((file, text))
+            })
+            .collect();
+        let attempted = (|| -> Result<Option<Vec<JobResult>>> {
+            for (file, text) in &earlier {
+                state.write(&file.path, &format!("{text}{}", suffix(file)))?;
+            }
+            if !cargo_build()?.status.success() {
+                session.note(
+                    "the tests as they were do not build with the code as it is: what they found out is not known",
+                );
+                return Ok(None);
+            }
+            // They have to pass as they are, or a failure says nothing of a mutant.
+            let all: Vec<&TestBinary> = session.binaries.iter().collect();
+            if run_source_tests(&all)? != Outcome::Pass {
+                session.note(
+                    "the tests as they were fail on the code as it is: what they found out is not known",
+                );
+                return Ok(None);
+            }
+            let against_all: Vec<Job> = asked
+                .iter()
+                .map(|job| Job {
+                    site: jobs[*job].site,
+                    mutation: jobs[*job].mutation,
+                    tests: (0..session.binaries.len()).map(|bin| (bin, None)).collect(),
+                })
+                .collect();
+            session
+                .run_jobs(&against_all, options.jobs, "mutants, earlier tests", None)
+                .map(Some)
+        })();
+        // The files and the binaries as they were, whatever went wrong.
+        for (file, _) in &earlier {
+            let rendered = file.rendered.as_ref().expect("rendered before building");
+            state.write(&file.path, &format!("{}{}", rendered.text, suffix(file)))?;
+        }
+        if !cargo_build()?.status.success() {
+            bail!("the crate does not build once its tests are put back as they are");
+        }
+        if let Some(again) = attempted? {
+            for (job, result) in asked.iter().zip(again) {
+                if result.survived.is_none() && !result.unable && !result.unconfirmed_timeout {
+                    found_out_before.insert(*job);
+                }
+            }
+        }
+    }
     let unable = results
         .iter()
         .filter(|r| r.unable || r.unconfirmed_timeout)
@@ -5017,6 +5168,15 @@ fn run_package(
             // cannot differ, not worth saying at all).
             let repeats = constant_expr
                 .is_some_and(|(start, end)| constants.contains(&(item.file, start, end)));
+            if beyond.contains(&item.site.id) {
+                // Said only when the tests found it out before their change.
+                let confirmed = confirm.iter().all(|j| results[*j].survived.is_some());
+                if confirmed && !repeats && confirm.iter().any(|j| found_out_before.contains(j)) {
+                    report.weakened.push(finding.at().clone());
+                    report.findings.push(finding.clone());
+                }
+                continue;
+            }
             match Prediction::of(confirm.iter().map(|j| &results[*j])) {
                 Prediction::Refuted => report.unstable.push(at.clone()),
                 Prediction::Confirmed if !repeats => report.findings.push(finding.clone()),
@@ -5037,6 +5197,9 @@ fn run_package(
         let mut survivors = vec![];
         let mut passing_tests = BTreeSet::new();
         for (mutation, job) in &item.runs {
+            if beyond.contains(&item.site.id) && !found_out_before.contains(job) {
+                continue;
+            }
             if let Some(tests) = &results[*job].survived {
                 survivors.push(report::describe(item.site, *mutation));
                 passing_tests.extend(tests.iter().cloned());
@@ -5044,10 +5207,13 @@ fn run_package(
         }
         if !survivors.is_empty() {
             // The first survivor is traced below to see what it changes.
-            let first = item
-                .runs
-                .iter()
-                .find(|(_, job)| results[*job].survived.is_some());
+            let first = item.runs.iter().find(|(_, job)| {
+                results[*job].survived.is_some()
+                    && (!beyond.contains(&item.site.id) || found_out_before.contains(job))
+            });
+            if beyond.contains(&item.site.id) {
+                report.weakened.push(at.clone());
+            }
             effect_jobs.push((report.findings.len(), first.expect("a survivor").1));
             report.findings.push(Finding::AssertionGap {
                 at,

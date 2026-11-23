@@ -16,6 +16,11 @@ pub fn is_marked(flags: u32) -> bool {
     flags & 0b1100 >= 0b0101
 }
 
+/// The last digit is never ten: there is no other outcome to test.
+pub fn has_a_last_digit(n: u32) -> bool {
+    n % 10 < 10
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -26,6 +31,7 @@ mod tests {
         assert!(is_wide(3));
         assert!(!is_marked(0b0100));
         assert!(is_marked(0b1000));
+        assert!(has_a_last_digit(7));
     }
 
     #[test]

@@ -2298,12 +2298,18 @@ fn a_boundary_value_no_input_gives_is_not_asked_for() {
     let dir = fixture("stepped", "stepped");
     let (code, report) = json(&dir);
     assert_eq!(code, 2, "{report:#}");
-    let findings = report["findings"].as_array().unwrap();
     // 16 and 24 blocks of eight have nothing between them, and neither have the bits
-    // 0100 and 1000 of the mask 1100: only the comparison tested far from its limit
-    // has a gap, and the values to add are ones a count of blocks gives.
+    // 0100 and 1000 of the mask 1100; a last digit is under ten whatever the number
+    // is. Only the comparison tested far from its limit has a gap, and the values to
+    // add are ones a count of blocks gives.
+    let findings: Vec<&Value> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["kind"] == "input_gap")
+        .collect();
     assert_eq!(findings.len(), 1, "{report:#}");
-    let finding = &findings[0];
+    let finding = findings[0];
     assert_eq!(finding["line"], 11, "{finding:#}");
     assert_eq!(
         finding["add_tests"],
@@ -2336,8 +2342,15 @@ fn a_boundary_value_no_input_gives_is_not_asked_for() {
         ),
     )
     .unwrap();
-    let (code, report) = json(&dir);
-    assert_eq!(code, 0, "{report:#}");
+    let (_, report) = json(&dir);
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|f| f["kind"] != "input_gap"),
+        "{report:#}"
+    );
 }
 
 #[test]
@@ -2388,6 +2401,92 @@ fn a_distinguishing_test_is_found_in_a_file_that_is_a_module() {
         let again: Value = serde_json::from_str(&again.stdout).unwrap();
         assert_eq!(again["findings"], report["findings"], "{fixture_name}");
     }
+}
+
+#[test]
+fn what_changed_tests_no_longer_find_out_is_theirs() {
+    let dir = fixture("weakening", "weakening");
+    fs::write(dir.join(".gitignore"), "target/\nCargo.lock\n").unwrap();
+    git_output(&dir, &["init", "-q"]);
+    git_output(&dir, &["add", "-A"]);
+    let base = git_output(&dir, &["write-tree"]);
+    let path = dir.join("src/lib.rs");
+    let original = fs::read_to_string(&path).unwrap();
+    let edit = |from: &str, to: &str| {
+        let source = fs::read_to_string(&path).unwrap();
+        assert!(source.contains(from), "{from}");
+        fs::write(&path, source.replace(from, to)).unwrap();
+    };
+    let run = || {
+        let run = tmt(&dir, &["--json", "--quiet", "--since", &base]);
+        let report: Value = serde_json::from_str(&run.stdout)
+            .unwrap_or_else(|e| panic!("{e}: {}{}", run.stdout, run.stderr));
+        let found: Vec<(u64, String)> = report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| {
+                (
+                    f["line"].as_u64().unwrap(),
+                    f["code"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        let weakened: Vec<u64> = report["weakened"]
+            .as_array()
+            .map(|all| all.iter().map(|at| at["line"].as_u64().unwrap()).collect())
+            .unwrap_or_default();
+        (run.code, found, weakened, report)
+    };
+
+    // An assertion that says less, and one that is gone: no line of the program
+    // changed, and what the tests found out before is found in the whole file. The gap
+    // of `is_senior` was there before and is not this change's.
+    edit(
+        "        assert_eq!(settle(10, true), Status::Cancelled);\n",
+        "        assert!(settle(10, true).is_terminal());\n",
+    );
+    edit("        assert!(is_eligible(18));\n", "");
+    let (code, found, weakened, report) = run();
+    assert_eq!(code, 2, "{report:#}");
+    assert_eq!(
+        found,
+        [
+            (19, "refund || amount == 0".to_string()),
+            (27, "age >= 18".to_string())
+        ],
+        "{report:#}"
+    );
+    assert_eq!(weakened, [19, 27], "{report:#}");
+    assert!(
+        report["unreached"].as_array().unwrap().is_empty(),
+        "{report:#}"
+    );
+    let text = tmt(&dir, &["--quiet", "--since", &base]);
+    let said = format!(
+        "  the tests as they were at {} found this out: a change to the tests lets it through\n",
+        &base[..12]
+    );
+    assert_eq!(text.stdout.matches(&said).count(), 2, "{}", text.stdout);
+
+    // Tests that say the same in other words, or more, let nothing new through.
+    fs::write(&path, &original).unwrap();
+    edit(
+        "        assert_eq!(settle(10, true), Status::Cancelled);\n",
+        "        assert_eq!(Status::Cancelled, settle(10, true));\n        assert!(settle(10, true).is_terminal());\n",
+    );
+    let (code, found, weakened, report) = run();
+    assert_eq!((code, found.len(), weakened.len()), (0, 0, 0), "{report:#}");
+
+    // Tests that fail as they were (the program changed with them) say nothing of what
+    // they found out: only the changed line is looked at.
+    fs::write(&path, &original).unwrap();
+    edit("age >= 18", "age >= 21");
+    edit("assert!(is_eligible(18));", "assert!(!is_eligible(18));");
+    edit("assert!(is_eligible(20));", "assert!(is_eligible(21));");
+    let (_, found, weakened, report) = run();
+    assert!(weakened.is_empty(), "{report:#}");
+    assert!(found.iter().all(|(line, _)| *line == 27), "{report:#}");
 }
 
 #[test]

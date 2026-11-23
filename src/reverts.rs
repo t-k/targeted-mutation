@@ -37,35 +37,37 @@ impl Change {
     }
 }
 
-/// The changes of one file to try undone, in the order of the file. Left out: a hunk that
-/// changes no token (comments, documentation, spacing), and one that only touches code
-/// of the tests. `current` is the file as it is now, and the hunks are of it.
-pub(crate) fn changes(current: &str, hunks: &[Hunk]) -> Vec<Change> {
+/// What a hunk of a file changes.
+enum Kind {
+    /// The program: worth trying undone.
+    Program(Change),
+    /// Code of the tests alone.
+    Tests,
+    /// No token (comments, documentation, spacing), or nothing that fits the text.
+    Nothing,
+}
+
+fn classify(current: &str, hunks: &[Hunk]) -> Vec<(Hunk, Kind)> {
     let Ok(parsed) = instrument::parse_source(current) else {
         return vec![];
     };
     let tests_now = instrument::test_only_ranges(current, &parsed);
-    let starts: Vec<usize> = std::iter::once(0)
-        .chain(current.match_indices('\n').map(|(at, _)| at + 1))
-        .collect();
-    let start_of = |line: usize| starts.get(line - 1).copied().unwrap_or(current.len());
+    let lines = current.matches('\n').count() + 1;
     let mut ordered: Vec<&Hunk> = hunks.iter().collect();
     ordered.sort_by_key(|hunk| (hunk.start, hunk.count));
     let mut found = vec![];
     for hunk in ordered {
+        let mut kind = |kind| found.push((hunk.clone(), kind));
         let Some(undone) = scope::undo(current, &[hunk]) else {
+            kind(Kind::Nothing);
             continue;
         };
         if instrument::same_tokens(current, &undone) == Some(true) {
+            kind(Kind::Nothing);
             continue;
         }
         // Where the new lines are, and where the old ones are in the undone text.
-        let (from, to) = if hunk.count == 0 {
-            let at = start_of(hunk.start + 1);
-            (at, at)
-        } else {
-            (start_of(hunk.start), start_of(hunk.start + hunk.count))
-        };
+        let (from, to) = scope::range_of(current, hunk);
         let inside = |ranges: &[(usize, usize)], from: usize, to: usize| {
             ranges
                 .iter()
@@ -94,27 +96,61 @@ pub(crate) fn changes(current: &str, hunks: &[Hunk]) -> Vec<Change> {
             }
             (None, false) => true,
         };
-        let only_blank = from == to && hunk.old.trim().is_empty();
-        if only_blank || (new_is_tests && old_is_tests) {
+        if from == to && hunk.old.trim().is_empty() {
+            kind(Kind::Nothing);
+            continue;
+        }
+        if new_is_tests && old_is_tests {
+            kind(Kind::Tests);
             continue;
         }
         let line = if hunk.count == 0 {
-            (hunk.start + 1).min(starts.len())
+            (hunk.start + 1).min(lines)
         } else {
             hunk.start
         };
-        let code_line = current[start_of(line)..]
+        let code_line = current[scope::range_of(
+            current,
+            &Hunk {
+                start: line,
+                count: 1,
+                ..hunk.clone()
+            },
+        )
+        .0..]
             .lines()
             .find(|text| !text.trim().is_empty())
             .unwrap_or("");
-        found.push(Change {
+        kind(Kind::Program(Change {
             hunk: hunk.clone(),
             line,
             code: crate::report::one_line(code_line.trim()),
             undone: undone_parsed.map(|_| undone),
-        });
+        }));
     }
     found
+}
+
+/// The changes of one file to try undone, in the order of the file. Left out: a hunk that
+/// changes no token (comments, documentation, spacing), and one that only touches code
+/// of the tests. `current` is the file as it is now, and the hunks are of it.
+pub(crate) fn changes(current: &str, hunks: &[Hunk]) -> Vec<Change> {
+    classify(current, hunks)
+        .into_iter()
+        .filter_map(|(_, kind)| match kind {
+            Kind::Program(change) => Some(change),
+            Kind::Tests | Kind::Nothing => None,
+        })
+        .collect()
+}
+
+/// The hunks of a file that change its tests and nothing else.
+pub(crate) fn test_hunks(current: &str, hunks: &[Hunk]) -> Vec<Hunk> {
+    classify(current, hunks)
+        .into_iter()
+        .filter(|(_, kind)| matches!(kind, Kind::Tests))
+        .map(|(hunk, _)| hunk)
+        .collect()
 }
 
 /// The file with all of these changes undone; `None` when that is not Rust.
@@ -216,6 +252,49 @@ mod tests {
             // The other way round: the same holds for what was there before.
             assert_eq!(between(&new, OLD), [], "backwards: {new}");
         }
+    }
+
+    #[test]
+    fn the_changes_of_the_tests_are_told_from_the_rest() {
+        let weaker = OLD.replace("assert!(valid(0, 0, 10));", "let _ = valid(0, 0, 10);");
+        let both = weaker.replace("now - created < 30", "now - used < 30");
+        let diff = |old: &str, new: &str| {
+            let dir = std::env::temp_dir().join(format!(
+                "tmt-test-hunks-{}-{:?}",
+                std::process::id(),
+                std::thread::current().id()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("old"), old).unwrap();
+            std::fs::write(dir.join("new"), new).unwrap();
+            let output = std::process::Command::new("git")
+                .current_dir(&dir)
+                .args(["diff", "--no-index", "-U0", "--no-color", "--no-ext-diff"])
+                .args(["--src-prefix=a/", "--dst-prefix=b/", "old", "new"])
+                .output()
+                .unwrap();
+            std::fs::remove_dir_all(&dir).unwrap();
+            scope::hunks(&String::from_utf8(output.stdout).unwrap())
+        };
+        let hunks = diff(OLD, &both);
+        assert_eq!(hunks.len(), 2);
+        let of_tests = test_hunks(&both, &hunks);
+        assert_eq!(of_tests.len(), 1, "{of_tests:?}");
+        assert_eq!(of_tests[0].old.trim(), "assert!(valid(0, 0, 10));");
+        assert_eq!(changes(&both, &hunks).len(), 1);
+        // With the tests' change undone the program's change stays.
+        let hunk_refs: Vec<&Hunk> = of_tests.iter().collect();
+        assert_eq!(
+            scope::undo(&both, &hunk_refs).unwrap(),
+            OLD.replace("now - created < 30", "now - used < 30")
+        );
+        // A comment in the tests is no change of them.
+        let commented = OLD.replace(
+            "        assert!(valid",
+            "        // sure\n        assert!(valid",
+        );
+        assert_eq!(test_hunks(&commented, &diff(OLD, &commented)), []);
+        assert_eq!(test_hunks("fn f( {", &hunks), []);
     }
 
     #[test]

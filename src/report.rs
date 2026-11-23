@@ -382,6 +382,10 @@ pub struct Report {
     pub unreached: Vec<Location>,
     /// Survivors predicted from the trace that a re-run killed: the tests are not deterministic.
     pub unstable: Vec<Location>,
+    /// Findings in code that did not change, of a file whose tests did (`--since`): the
+    /// tests as they were at the revision found these mutants out.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub weakened: Vec<Location>,
 }
 
 impl Report {
@@ -1183,6 +1187,15 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
         }
         for line in finding_body(finding) {
             out.push_str(&format!("  {line}\n"));
+        }
+        if report.weakened.iter().any(|before| {
+            (before.file.as_str(), before.line, before.column)
+                == (at.file.as_str(), at.line, at.column)
+        }) {
+            out.push_str(&format!(
+                "  the tests as they were at {} found this out: a change to the tests lets it through\n",
+                short_revision(report.analysis.since.as_deref().unwrap_or("the revision"))
+            ));
         }
         previous = Some((at.file.as_str(), at.line));
     }
@@ -2369,6 +2382,7 @@ mod tests {
             }],
             unreached: vec![at.clone()],
             unstable: vec![at],
+            weakened: vec![],
         };
         let text = render_text(&report, false);
         assert!(

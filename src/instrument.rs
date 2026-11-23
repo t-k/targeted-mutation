@@ -2493,6 +2493,15 @@ pub struct Rendered {
 }
 
 impl Rendered {
+    /// Where a stretch of the original that no probe touches is in the instrumented
+    /// text. `None` when a probe is in it or next to its ends.
+    pub fn copied(&self, from: usize, to: usize) -> Option<(usize, usize)> {
+        self.segments
+            .iter()
+            .find(|(_, start, len)| *start <= from && to <= start + len)
+            .map(|(out, start, _)| (out + from - start, out + to - start))
+    }
+
     /// Maps a byte offset in the instrumented text to the original. Offsets inside inserted
     /// text map to the point of insertion.
     /// The site whose probe text contains the byte at `offset` of the instrumented text.
