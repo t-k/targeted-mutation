@@ -120,4 +120,93 @@ theorem summary_positive (S : Int → Prop) (p b : Int)
   · intro h
     exact ⟨p, hp, by omega, h⟩
 
+/-! ## Values the expression cannot be
+
+Compared with a number, `x * 8`, `x & 0xF0` and `x % 10` are not every number. `R` is
+the set of differences `D` such an expression can make (`within_reach` in `src/plan.rs`),
+and the tests observed some of them.
+
+* `u` and `o` are the nearest values of `R` under and over the original threshold.
+  Every threshold between them answers like the original for all of `R`: it is no
+  mutant (the range `same`). Every threshold outside is told apart by `u` or by `o`,
+  which are the values the report asks a test for.
+* When nothing of `R` lies strictly between the two nearest observations, every
+  threshold the tests let through answers like the original for all of `R`: the gap is
+  not reported.
+-/
+
+theorem up_same (R : Int → Prop) (t0 u o t : Int)
+    (hunder : ∀ D, R D → D < t0 → D ≤ u)
+    (hover : ∀ D, R D → t0 ≤ D → o ≤ D)
+    (h1 : u < t) (h2 : t ≤ o) :
+    ∀ D, R D → (up t0 D ↔ up t D) :=
+  up_survivor R t0 u o t hunder hover h1 h2
+
+theorem up_told_apart (R : Int → Prop) (t0 u o t : Int)
+    (hu : R u) (hu' : u < t0) (ho : R o) (ho' : t0 ≤ o)
+    (h : t ≤ u ∨ o < t) :
+    ∃ D, R D ∧ ¬ (up t0 D ↔ up t D) :=
+  up_infected R t0 u o t hu hu' ho ho' h
+
+theorem down_same (R : Int → Prop) (t0 u o t : Int)
+    (hunder : ∀ D, R D → D ≤ t0 → D ≤ u)
+    (hover : ∀ D, R D → t0 < D → o ≤ D)
+    (h1 : u ≤ t) (h2 : t < o) :
+    ∀ D, R D → (down t0 D ↔ down t D) :=
+  down_survivor R t0 u o t hunder hover h1 h2
+
+theorem down_told_apart (R : Int → Prop) (t0 u o t : Int)
+    (hu : R u) (hu' : u ≤ t0) (ho : R o) (ho' : t0 < o)
+    (h : t < u ∨ o ≤ t) :
+    ∃ D, R D ∧ ¬ (down t0 D ↔ down t D) :=
+  down_infected R t0 u o t hu hu' ho ho' h
+
+/-- The shifts called the same, as `within_reach` computes them from `u` and `o`. -/
+theorem up_same_shifts (t0 u o s : Int) :
+    (u < t0 + s ∧ t0 + s ≤ o) ↔ (u - t0 + 1 ≤ s ∧ s ≤ o - t0) := by omega
+
+theorem down_same_shifts (t0 u o s : Int) :
+    (u ≤ t0 + s ∧ t0 + s < o) ↔ (u - t0 ≤ s ∧ s ≤ o - t0 - 1) := by omega
+
+/-- Nothing the expression can be lies strictly between the nearest observations `lo`
+and `hi`: a threshold the tests let through (`lo < t ≤ hi`) is the original for every
+value it can be. -/
+theorem up_gap_unreachable (R : Int → Prop) (t0 lo hi t : Int)
+    (hlo : lo < t0) (hhi : t0 ≤ hi)
+    (hnone : ∀ D, R D → D ≤ lo ∨ hi ≤ D)
+    (h1 : lo < t) (h2 : t ≤ hi) :
+    ∀ D, R D → (up t0 D ↔ up t D) := by
+  intro D hD
+  unfold up
+  have := hnone D hD
+  omega
+
+theorem down_gap_unreachable (R : Int → Prop) (t0 lo hi t : Int)
+    (hlo : lo ≤ t0) (hhi : t0 < hi)
+    (hnone : ∀ D, R D → D ≤ lo ∨ hi ≤ D)
+    (h1 : lo ≤ t) (h2 : t < hi) :
+    ∀ D, R D → (down t0 D ↔ down t D) := by
+  intro D hD
+  unfold down
+  have := hnone D hD
+  omega
+
+/-! ### What is read from the last operation holds when the arithmetic wraps
+
+An `n`-bit product wraps to its remainder by `2 ^ n`. For a factor `2 ^ k` with
+`k ≤ n` the result is still a multiple of `2 ^ k`; for another factor it need not be
+(`3 * 86 = 258` wraps to `2` in eight bits), which is why only powers of two are read
+as "a multiple". A mask and a remainder never wrap. -/
+
+theorem wrapped_multiple (a k n : Nat) (h : k ≤ n) : (a * 2 ^ k) % 2 ^ n % 2 ^ k = 0 := by
+  rw [Nat.mod_mod_of_dvd _ (Nat.pow_dvd_pow 2 h)]
+  exact Nat.mul_mod_left a (2 ^ k)
+
+theorem other_factor_wraps_off : (86 * 3) % 2 ^ 8 % 3 ≠ 0 := by decide
+
+theorem masked_within (a m : Nat) : a &&& m ≤ m := Nat.and_le_right
+
+theorem remainder_below (a m : Int) (h : 0 < m) : -m < Int.tmod a m ∧ Int.tmod a m < m :=
+  ⟨Int.lt_tmod_of_pos a h, Int.tmod_lt_of_pos a h⟩
+
 end Tmt
