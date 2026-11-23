@@ -1808,16 +1808,23 @@ fn test_only_items(source: &str, item: &syn::Item, found: &mut Vec<(usize, usize
 /// Whether two sources are the same program text: the same tokens, whatever the
 /// comments, the documentation and the spacing are. `None` when one does not lex.
 pub(crate) fn same_tokens(a: &str, b: &str) -> Option<bool> {
-    fn tokens(stream: TokenStream, out: &mut Vec<String>) {
+    // `plain`: outside of what is given to a macro. A macro may tell any token from
+    // another, also documentation (`stringify!`, a rule that matches an attribute).
+    fn tokens(stream: TokenStream, plain: bool, out: &mut Vec<String>) {
         let mut trees = stream.into_iter().peekable();
+        // Whether the last tokens were a name and `!`: what follows is a macro's.
+        let (mut named, mut called) = (false, false);
         while let Some(tree) = trees.next() {
+            let (was_named, was_called) = (named, called);
+            (named, called) = (false, false);
             match tree {
                 // `#[doc = ".."]` and `#![doc = ".."]`: what a doc comment is read as.
                 TokenTree::Punct(hash) if hash.as_char() == '#' => {
                     let bang =
                         matches!(trees.peek(), Some(TokenTree::Punct(p)) if p.as_char() == '!')
                             .then(|| trees.next());
-                    let is_doc = matches!(trees.peek(), Some(TokenTree::Group(group))
+                    let is_doc = plain
+                        && matches!(trees.peek(), Some(TokenTree::Group(group))
                         if group.delimiter() == proc_macro2::Delimiter::Bracket
                             && matches!(group.stream().into_iter().next(),
                                 Some(TokenTree::Ident(name)) if name == "doc"));
@@ -1832,8 +1839,19 @@ pub(crate) fn same_tokens(a: &str, b: &str) -> Option<bool> {
                 }
                 TokenTree::Group(group) => {
                     out.push(format!("{:?}(", group.delimiter()));
-                    tokens(group.stream(), out);
+                    // `name!(..)`, and `macro_rules! name {..}` with its name between.
+                    tokens(group.stream(), plain && !was_called, out);
                     out.push(")".to_string());
+                }
+                TokenTree::Punct(mark) => {
+                    called = was_named && mark.as_char() == '!';
+                    out.push(mark.to_string());
+                }
+                TokenTree::Ident(name) => {
+                    named = true;
+                    // The name of a macro that is being defined.
+                    called = was_called;
+                    out.push(name.to_string());
                 }
                 other => out.push(other.to_string()),
             }
@@ -1841,7 +1859,7 @@ pub(crate) fn same_tokens(a: &str, b: &str) -> Option<bool> {
     }
     let lex = |text: &str| -> Option<Vec<String>> {
         let mut out = vec![];
-        tokens(text.parse::<TokenStream>().ok()?, &mut out);
+        tokens(text.parse::<TokenStream>().ok()?, true, &mut out);
         Some(out)
     };
     Some(lex(a)? == lex(b)?)
@@ -2974,6 +2992,38 @@ mod tests {
         }
         assert_eq!(
             same_tokens("#![doc = \"a\"] fn f() {}", "fn f() {}"),
+            Some(true)
+        );
+        // What is given to a macro is the macro's to read, documentation and all.
+        for (one, other) in [
+            (r#"m!(#[doc = "old"]);"#, r#"m!(#[doc = "new"]);"#),
+            (
+                r#"const T: &str = stringify!(#[doc = "old"]);"#,
+                r#"const T: &str = stringify!(#[doc = "new"]);"#,
+            ),
+            ("m! { /// old\n fn f() {} }", "m! { /// new\n fn f() {} }"),
+            (
+                "macro_rules! m { (#[doc = \"old\"]) => {1}; }",
+                "macro_rules! m { (#[doc = \"new\"]) => {1}; }",
+            ),
+            (
+                "std::vec![#[doc = \"old\"] 1]",
+                "std::vec![#[doc = \"new\"] 1]",
+            ),
+        ] {
+            assert_eq!(same_tokens(one, other), Some(false), "{one}");
+            assert_eq!(same_tokens(one, one), Some(true), "{one}");
+        }
+        // A `!` that is no call, and code after a macro, are plain again.
+        assert_eq!(
+            same_tokens(
+                "fn f(a: bool) -> bool { !{ /** a */ a } }",
+                "fn f(a: bool) -> bool { !{ /** b */ a } }"
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            same_tokens("m!(1); /// a\nfn f() {}", "m!(1); /// b\nfn f() {}"),
             Some(true)
         );
         assert_eq!(same_tokens(code, "fn f( {"), None);

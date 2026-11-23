@@ -3060,6 +3060,12 @@ impl Session {
                 }
                 .and_then(|(expr, (from, to), number, is_rhs)| {
                     let (reach, shift) = instrument::reach(expr)?;
+                    // A number past the values of the type it is compared with is
+                    // another number there: nothing is read from how it is written.
+                    let (low, high) = bounds.map(|b| if is_rhs { b.lhs } else { b.rhs })?;
+                    if number < low || number > high {
+                        return None;
+                    }
                     // A shift by the width of its type or more is a shift by less when
                     // overflow is not checked: the type says by how much.
                     let reach = match shift {
@@ -4608,13 +4614,12 @@ fn run_package(
     let built_sources = if options.rebuild || options.source_only || options.audit.is_some() {
         // A feature can also be turned on behind cargo's back: by compiler flags (in
         // the environment or a configuration file) and by a build script.
+        // Every variable of flags for the compiler: also those of one target
+        // (`CARGO_TARGET_<TRIPLE>_RUSTFLAGS`).
         let behind_cargo = features_from_flags(
-            [
-                "RUSTFLAGS",
-                "CARGO_ENCODED_RUSTFLAGS",
-                "CARGO_BUILD_RUSTFLAGS",
-            ]
-            .map(std::env::var_os),
+            std::env::vars_os()
+                .filter(|(name, _)| name.to_string_lossy().ends_with("RUSTFLAGS"))
+                .map(|(_, value)| Some(value)),
         ) || build.build_scripts.iter().any(|script| {
             script["cfgs"].as_array().is_some_and(|cfgs| {
                 cfgs.iter()
@@ -5927,28 +5932,50 @@ fn run_package(
                 }
                 stuck_files += usize::from(stuck);
             }
-            if stuck_files > 0 && changed.len() > 1 {
+            // All files together: where a file's changes do not build even together,
+            // and where code that is left out changed, which may count only with the
+            // changes of another file undone.
+            let with_left_out = changed
+                .iter()
+                .any(|(_, changes)| changes.iter().any(|change| change.outside));
+            if (stuck_files > 0 || with_left_out) && changed.len() > 1 {
                 let whole: Option<Vec<String>> = changed
                     .iter()
                     .map(|(file, changes)| reverts::all_undone(&file.original, changes))
                     .collect();
-                let outcome = match &whole {
-                    Some(texts) => {
-                        let edits: Vec<(&SourceFile, &str)> = changed
-                            .iter()
-                            .zip(texts)
-                            .map(|((file, _), text)| (*file, text.as_str()))
-                            .collect();
-                        undone(&edits)?
-                    }
-                    None => None,
-                };
-                let (file, changes) = &changed[0];
-                judged(
-                    outcome,
-                    place(file, &changes[0]),
-                    format!("with every change undone, in all {} files", changed.len()),
-                );
+                // Never the program that is there: in some file it has to be another.
+                let another = whole.as_ref().is_none_or(|texts| {
+                    changed.iter().zip(texts).any(|((file, _), text)| {
+                        match (
+                            built_sources.left_out_of(file, text),
+                            built_sources.left_out_of(file, &file.original),
+                        ) {
+                            (Some(then), Some(now)) => {
+                                !reverts::same_build(&file.original, &now, text, &then)
+                            }
+                            _ => true,
+                        }
+                    })
+                });
+                if stuck_files > 0 || another {
+                    let outcome = match &whole {
+                        Some(texts) => {
+                            let edits: Vec<(&SourceFile, &str)> = changed
+                                .iter()
+                                .zip(texts)
+                                .map(|((file, _), text)| (*file, text.as_str()))
+                                .collect();
+                            undone(&edits)?
+                        }
+                        None => None,
+                    };
+                    let (file, changes) = &changed[0];
+                    judged(
+                        outcome,
+                        place(file, &changes[0]),
+                        format!("with every change undone, in all {} files", changed.len()),
+                    );
+                }
             }
         }
     }

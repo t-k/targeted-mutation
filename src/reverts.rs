@@ -64,8 +64,8 @@ impl Change {
 }
 
 /// Whether two texts of a file are the same program for a build that leaves these
-/// ranges of each out: the same tokens in what is left. Lines that come or go move the
-/// lines after them, which code that asks where it is can tell: then they are not.
+/// ranges of each out: the same tokens in what is left. Where what is left asks where
+/// it is in the file, any other text is another program.
 pub(crate) fn same_build(
     now: &str,
     off_now: &[(usize, usize)],
@@ -88,9 +88,9 @@ pub(crate) fn same_build(
         out
     };
     let (built_now, built_then) = (built(now, off_now), built(then, off_then));
-    if now.matches('\n').count() != then.matches('\n').count()
-        && (asks_where_it_is(&built_now) || asks_where_it_is(&built_then))
-    {
+    // Code that asks where it is can tell any other text from this one: a line more
+    // above it, a column more before it on its line.
+    if now != then && (asks_where_it_is(&built_now) || asks_where_it_is(&built_then)) {
         return false;
     }
     instrument::same_tokens(&built_now, &built_then) == Some(true)
@@ -700,9 +700,14 @@ pub fn basic() -> u32 {
             &longer.replace("line!()", "4"),
             &["basic"]
         ));
-        // As many lines as before move nothing.
+        // Not even with as many lines as before: a column may be asked for too.
         let same = longer.replace("let _ = 2;", "let _ = 3;");
-        assert!(outside(&longer, &same, &["basic"]));
+        assert!(!outside(&longer, &same, &["basic"]));
+        assert!(outside(
+            &longer.replace("line!()", "4"),
+            &same.replace("line!()", "4"),
+            &["basic"]
+        ));
     }
 
     #[test]
@@ -743,6 +748,11 @@ pub fn basic() -> u32 {
                 "{asking}"
             );
         }
+        // On one line, what is left out before it moves the column.
+        let base =
+            "#[cfg(feature = \"extra\")] const OFF: u32 = 1; pub const N: u32 = column!();\n";
+        let with = base.replace("= 1;", "= 100;");
+        assert!(!same_build(&with, &off(&with), base, &off(base)));
         // In code that is left out it asks nothing of this build.
         let base = "#[cfg(feature = \"extra\")]\nfn off() -> u32 {\n    line!()\n}\npub fn n() -> u32 { 1 }\n";
         let with = base.replace("    line!()\n", "    let _ = 2;\n    line!()\n");
