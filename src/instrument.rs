@@ -89,6 +89,8 @@ pub enum SiteKind {
         receiver: String,
         /// Byte range of `.first()`.
         call: (usize, usize),
+        /// Byte range of the method's name.
+        method: (usize, usize),
     },
     /// `lhs..rhs` or `lhs..=rhs` on integers: the end moves by one.
     Range {
@@ -835,6 +837,28 @@ fn yields_iterator(receiver: &syn::Expr) -> bool {
     }
 }
 
+/// The name of a receiver that is a variable, with or without parentheses around it.
+/// A name that starts with a capital is taken for a constant, which is a new value each
+/// time it is named.
+fn variable_name(receiver: &str) -> Option<String> {
+    let mut expr = &syn::parse_str::<syn::Expr>(receiver).ok()?;
+    while let syn::Expr::Paren(inner) = expr {
+        if !inner.attrs.is_empty() {
+            return None;
+        }
+        expr = &inner.expr;
+    }
+    let syn::Expr::Path(path) = expr else {
+        return None;
+    };
+    if path.qself.is_some() || !path.attrs.is_empty() {
+        return None;
+    }
+    let name = path.path.get_ident()?.to_string();
+    let first = name.trim_start_matches("r#").chars().next()?;
+    (!first.is_uppercase()).then_some(name)
+}
+
 fn deletable_call(expr: &syn::Expr) -> bool {
     match expr {
         syn::Expr::Call(_) | syn::Expr::MethodCall(_) => true,
@@ -1217,14 +1241,15 @@ pub fn source_mutants(site: &Site) -> Vec<SourceMutant> {
             };
             vec![change(gap.0, gap.1, to.to_string(), from, to)]
         }
-        // The other method, called as the first was.
-        SiteKind::SliceEnd { first, call, .. } => {
+        // The other method's name in place of the first: whatever is written around
+        // it (a line that ends, a comment) stays.
+        SiteKind::SliceEnd { first, method, .. } => {
             let (from, to) = if *first {
                 ("first", "last")
             } else {
                 ("last", "first")
             };
-            vec![change(call.0, call.1, format!(".{to}()"), from, to)]
+            vec![change(method.0, method.1, to.to_string(), from, to)]
         }
         SiteKind::Return { .. } | SiteKind::MinMax { .. } => vec![],
     }
@@ -2436,16 +2461,19 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             && node.turbofish.is_none()
             && node.attrs.is_empty()
             && !(name == "last" && yields_iterator(&node.receiver))
-            && let (Some((start, receiver_end)), Some((_, end))) = (
+            && let (Some((start, receiver_end)), Some(method), Some((_, end))) = (
                 self.range(node.receiver.span()),
+                self.range(node.method.span()),
                 self.range(node.paren_token.span.close()),
             )
-            && in_order(receiver_end, end)
+            && in_order(receiver_end, method.0)
+            && in_order(method.1, end)
         {
             let kind = SiteKind::SliceEnd {
                 first: name == "first",
                 receiver: self.source[start..receiver_end].to_string(),
                 call: (receiver_end, end),
+                method,
             };
             self.push(kind, start, end, node.receiver.span());
         }
@@ -3005,6 +3033,7 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                 first,
                 receiver,
                 call,
+                ..
             } => {
                 // Both calls are made as they are written. Only where the runtime knows
                 // the receiver's type does it ever ask for the other one; of anything else
@@ -3026,21 +3055,29 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                 // what it said.
                 let lines = "\n".repeat(source[call.0..call.1].matches('\n').count());
                 // A variable is the same place each time it is named, so it is named
-                // again for the call: the call then borrows it, or takes it, exactly as
-                // it did (a `&mut` for as long as it is one). Any
-                // other receiver is evaluated once and borrowed for the probe.
-                let variable = syn::parse_str::<syn::Ident>(receiver.trim()).is_ok();
-                let (open, close) = if variable {
+                // again for the call: the call then borrows it exactly as it did (a `&mut`
+                // for as long as it is one). Any other receiver is evaluated once and
+                // borrowed for the probe.
+                let (open, close) = if let Some(name) = variable_name(receiver) {
+                    // The receiver may have the name the probe would give.
+                    let seen = if name == "__tmt_s" {
+                        "__tmt_t"
+                    } else {
+                        "__tmt_s"
+                    };
                     let decide = decide
-                        .replace("__TMT_BORROWED__", &format!("&({receiver})"))
-                        .replace("__TMT_PLACE__", receiver);
-                    ("({ let _ = &(", format!("); {decide} }}){lines}"))
+                        .replace("__tmt_s", seen)
+                        .replace("__TMT_PLACE__", &name);
+                    let (head, tail) = decide
+                        .split_once("__TMT_BORROWED__")
+                        .expect("the receiver is borrowed once");
+                    (format!("({{ {head}&("), format!("){tail} }}){lines}"))
                 } else {
                     let decide = decide
                         .replace("__TMT_BORROWED__", "__tmt_a")
                         .replace("__TMT_PLACE__", "*__tmt_a");
                     (
-                        "(match (&(",
+                        "(match (&(".to_string(),
                         format!(")) {{ __tmt_a => {{ {decide} }} }}){lines}"),
                     )
                 };
@@ -3052,7 +3089,7 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     text: close,
                     site: site.id,
                 });
-                (open.to_string(), String::new())
+                (open, String::new())
             }
             SiteKind::Range { inclusive, gap, .. } => {
                 edits.push(Edit {
@@ -4641,11 +4678,12 @@ mod tests {
         let found = discover(src, 0).unwrap();
         let out = render(src, &found.sites, &|_| true).text;
         // A variable is named again for the call.
-        assert!(out.contains("({ let _ = &(v); #[allow"), "{out}");
+        assert!(out.contains("({ #[allow(unused_imports)] use"), "{out}");
         assert!(
-            out.contains("(&crate::__tmt_rt::Ends(&(v))).tmt_other_end("),
+            out.contains("match (&crate::__tmt_rt::Ends(&(v))).tmt_other_end("),
             "{out}"
         );
+        assert_eq!(out.matches("(v)").count(), 3, "{out}");
         assert!(out.contains(", false) {"), "{out}");
         assert!(
             out.contains("End::Other => (v).first(), crate::__tmt_rt::End::Same(__tmt_s) => { let __tmt_r = (v).last(); __tmt_s.tmt_end_seen("),
@@ -4662,7 +4700,7 @@ mod tests {
         assert_eq!(out.matches('\n').count(), 1, "{out}");
         let src = "fn f(v: &[u8]) -> Option<&u8> { v.last() }";
         let found = discover(src, 0).unwrap();
-        // Written into the source, the other method is called as the first was.
+        // Written into the source, only the name of the method changes.
         let mutants: Vec<_> = found.sites.iter().flat_map(source_mutants).collect();
         let end = mutants.iter().find(|m| m.what == "last").unwrap();
         assert_eq!(
@@ -4671,7 +4709,7 @@ mod tests {
                 end.replacement.as_str(),
                 end.into.as_str()
             ),
-            (".last()", ".first()", "first")
+            ("last", "first", "first")
         );
     }
 

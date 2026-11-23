@@ -2493,20 +2493,24 @@ fn stronger_assertions(
                 .get(site.start..site.end)
                 .map_or(0, |text| text.matches('\n').count());
             for mutant in instrument::source_mutants(site) {
-                candidates.push(witness::Candidate {
-                    description: report::describe(site, mutation_of(site, &mutant)),
-                    edits: vec![witness::Edit {
-                        span: mutant.start..mutant.end,
-                        replacement: mutant.replacement,
-                    }],
-                    scope: site.line..=site.line + lines,
-                    signature_lines: vec![function.signature_line],
-                    existing: true,
-                    advice: None,
-                    file: Default::default(),
-                    scenarios: function.scenarios.clone(),
-                    finding_at: Some((site.line, site.column)),
-                });
+                // A comparison is planned in other words than it is written in: the
+                // finding may name the negation where the source says `!=`.
+                for mutation in mutations_like(site, &mutant, false) {
+                    candidates.push(witness::Candidate {
+                        description: report::describe(site, mutation),
+                        edits: vec![witness::Edit {
+                            span: mutant.start..mutant.end,
+                            replacement: mutant.replacement.clone(),
+                        }],
+                        scope: site.line..=site.line + lines,
+                        signature_lines: vec![function.signature_line],
+                        existing: true,
+                        advice: None,
+                        file: Default::default(),
+                        scenarios: function.scenarios.clone(),
+                        finding_at: Some((site.line, site.column)),
+                    });
+                }
             }
         }
     }
@@ -4198,7 +4202,9 @@ fn run_package(
                                 candidate
                             }),
                     );
-                    if !options.list {
+                    // With `--literal-operators` the mutant that was built is not the
+                    // one these candidates write.
+                    if !options.list && !options.literal_operators {
                         witness_candidates.extend(
                             stronger_assertions(&original, &parsed, &found.sites)
                                 .into_iter()
@@ -6218,6 +6224,7 @@ fn run_package(
             None
         };
         let mut survivors = vec![];
+        let mut claimed = BTreeSet::new();
         progress::track(
             options.progress,
             "source witness mutants",
@@ -6274,6 +6281,10 @@ fn run_package(
                             })
                         })
                         .flatten();
+                    // One look for a stronger assertion is enough for a finding, and none
+                    // is needed where a rule that knows the code has one to try.
+                    let existing = existing
+                        .filter(|index| claimed.insert(*index) || candidate.finding_at.is_none());
                     let scenarios: Vec<_> = candidate
                         .scenarios
                         .iter()

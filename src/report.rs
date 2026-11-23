@@ -1900,6 +1900,7 @@ mod tests {
                 first: false,
                 receiver: "self.items".into(),
                 call: (0, 0),
+                method: (0, 0),
             },
             ..assign.clone()
         };

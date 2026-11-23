@@ -47,14 +47,27 @@ pub(crate) fn unpinned_calls(source: &str, file: &syn::File) -> Vec<CalledFuncti
     let mut tests = Vec::new();
     collect_tests(&file.items, "", None, &mut tests);
     let mut found: BTreeMap<&str, (BTreeSet<String>, Vec<Scenario>)> = BTreeMap::new();
-    for test in &tests {
+    for test in tests.iter().filter(|test| plain(test.function)) {
         let mut calls = Calls {
             source,
             names: &functions,
             found: vec![],
         };
+        let shadowed = bound_names(&test.function.block);
+        if !test
+            .function
+            .block
+            .stmts
+            .iter()
+            .all(|stmt| calls.only_looks(stmt))
+        {
+            continue;
+        }
         calls.visit_block(&test.function.block);
         for (name, call) in calls.found {
+            if shadowed.contains(name) {
+                continue;
+            }
             let (seen, scenarios) = found.entry(name).or_default();
             if scenarios.len() < MAX_CALLS && seen.insert(call.clone()) {
                 scenarios.push(scenario(test, call));
@@ -88,6 +101,34 @@ fn scenario(test: &Test<'_>, call: String) -> Scenario {
         source_test: Some(name),
         ..Scenario::default()
     }
+}
+
+/// A test that runs as it is written and passes by returning: not one that is ignored,
+/// and not one that is meant to panic (a stronger assertion there is one more way to).
+fn plain(test: &ItemFn) -> bool {
+    test.attrs
+        .iter()
+        .all(|attr| attr.path().is_ident("test") || attr.path().is_ident("doc"))
+        && test.sig.inputs.is_empty()
+        && matches!(test.sig.output, ReturnType::Default)
+        && test.sig.asyncness.is_none()
+}
+
+/// The names a test binds itself: a call of such a name is not one of the file's function.
+fn bound_names(block: &syn::Block) -> BTreeSet<String> {
+    struct Bound(BTreeSet<String>);
+    impl<'ast> Visit<'ast> for Bound {
+        fn visit_pat_ident(&mut self, pat: &'ast syn::PatIdent) {
+            self.0.insert(pat.ident.to_string());
+            syn::visit::visit_pat_ident(self, pat);
+        }
+        fn visit_item_fn(&mut self, function: &'ast ItemFn) {
+            self.0.insert(function.sig.ident.to_string());
+        }
+    }
+    let mut bound = Bound(BTreeSet::new());
+    bound.visit_block(block);
+    bound.0
 }
 
 /// A function a test can call by its name alone and whose result can be looked at.
@@ -148,10 +189,45 @@ impl<'a> Calls<'a> {
         if function.sig.inputs.len() != call.args.len() || !call.args.iter().all(literal) {
             return None;
         }
+        // The call as the test has it, to the letter: space inside a text is part of
+        // the argument.
         let text = self.source.get(call.span().byte_range())?;
-        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
-        (text.chars().count() <= 100).then_some((name.as_str(), text))
+        (text.chars().count() <= 100 && !text.contains('\n'))
+            .then(|| (name.as_str(), text.to_owned()))
     }
+
+    /// Whether a statement of a test only looks at results: an assertion, or a variable
+    /// given a literal, another variable or a call that is itself looked at. A test that
+    /// does anything else may prepare what the call depends on, and the call on its own
+    /// would then not be the call of the test.
+    fn only_looks(&self, stmt: &syn::Stmt) -> bool {
+        match stmt {
+            syn::Stmt::Macro(stmt) => assertion(&stmt.mac),
+            syn::Stmt::Expr(Expr::Macro(expr), _) => assertion(&expr.mac),
+            syn::Stmt::Local(local) => local.init.as_ref().is_some_and(|init| {
+                init.diverge.is_none()
+                    && match init.expr.as_ref() {
+                        Expr::Path(path) => path.qself.is_none(),
+                        Expr::Call(call) => self.call(call).is_some(),
+                        other => literal(other),
+                    }
+            }),
+            _ => false,
+        }
+    }
+}
+
+fn assertion(mac: &syn::Macro) -> bool {
+    [
+        "assert",
+        "assert_eq",
+        "assert_ne",
+        "debug_assert",
+        "debug_assert_eq",
+        "debug_assert_ne",
+    ]
+    .iter()
+    .any(|name| mac.path.is_ident(name))
 }
 
 impl<'ast> Visit<'ast> for Calls<'_> {
@@ -162,18 +238,11 @@ impl<'ast> Visit<'ast> for Calls<'_> {
         syn::visit::visit_expr_call(self, call);
     }
 
+    /// What a closure calls is called when the closure is, if ever.
+    fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
+
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
-        let asserts = [
-            "assert",
-            "assert_eq",
-            "assert_ne",
-            "debug_assert",
-            "debug_assert_eq",
-            "debug_assert_ne",
-        ]
-        .iter()
-        .any(|name| mac.path.is_ident(name));
-        if !asserts {
+        if !assertion(mac) {
             return;
         }
         let Ok(args) = syn::punctuated::Punctuated::<Expr, syn::Token![,]>::parse_terminated
@@ -367,6 +436,28 @@ mod tests {
             found("assert_ne!(other((1)), 2); assert_ne!(other(-1i32 as u32), 2);"),
             ["other((1))"]
         );
+    }
+
+    #[test]
+    fn tests_that_are_ignored_or_meant_to_panic_are_not_asked() {
+        for attribute in [
+            "#[ignore]",
+            "#[should_panic]",
+            "#[cfg(unix)]",
+            "#[tokio::test]",
+        ] {
+            let source = format!(
+                "{BUCKET}#[test] {attribute} fn t() {{ assert_ne!(bucket(3), \"none\"); }}"
+            );
+            assert_eq!(calls(&source), [], "{attribute}");
+        }
+        let source = format!(
+            "{BUCKET}#[test] fn t() -> Result<(), String> {{ assert_ne!(bucket(3), \"none\"); Ok(()) }}"
+        );
+        assert_eq!(calls(&source), []);
+        let source =
+            format!("{BUCKET}/// Looks.\n#[test] fn t() {{ assert_ne!(bucket(3), \"none\"); }}");
+        assert_eq!(calls(&source).len(), 1);
     }
 
     #[test]
