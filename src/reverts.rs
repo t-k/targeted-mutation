@@ -73,8 +73,9 @@ pub(crate) fn same_build(
     off_then: &[(usize, usize)],
 ) -> bool {
     let built = |text: &str, off: &[(usize, usize)]| {
+        // The outermost first: an attribute that is on may begin an item that is off.
         let mut ranges = off.to_vec();
-        ranges.sort_unstable();
+        ranges.sort_unstable_by_key(|(from, to)| (*from, std::cmp::Reverse(*to)));
         let mut out = String::with_capacity(text.len());
         let mut at = 0;
         for (from, to) in ranges {
@@ -1014,6 +1015,16 @@ pub fn basic() -> u32 {
             &settled(off_now),
             gated,
             &settled(gated)
+        ));
+        // An attribute that is on at the head of what another turns off: all of it is
+        // left out.
+        let both = "fn f() -> u8 {\n    #[cfg(feature = \"basic\")]\n    #[cfg(feature = \"extra\")]\n    return 1;\n    2\n}\n";
+        let neither = both.replace("basic", "extra");
+        assert!(same_build(
+            both,
+            &settled(both),
+            &neither,
+            &settled(&neither)
         ));
         // One that depends on something else stays a token.
         let target = "#[cfg(unix)]\npub const N: u8 = 1;\n";
