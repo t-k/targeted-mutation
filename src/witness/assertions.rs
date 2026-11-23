@@ -19,6 +19,9 @@ use super::{Placement, Scenario};
 /// At most this many calls are tried for one function.
 const MAX_CALLS: usize = 4;
 
+/// The calls of one function: (call, test) pairs that were taken, and what to run for them.
+type Tried = (BTreeSet<(String, String)>, Vec<Scenario>);
+
 /// A function of the file and the calls its tests make of it.
 #[derive(Debug)]
 pub(crate) struct CalledFunction {
@@ -46,25 +49,18 @@ pub(crate) fn unpinned_calls(source: &str, file: &syn::File) -> Vec<CalledFuncti
     }
     let mut tests = Vec::new();
     collect_tests(&file.items, "", None, &mut tests);
-    let mut found: BTreeMap<&str, (BTreeSet<String>, Vec<Scenario>)> = BTreeMap::new();
+    let mut found: BTreeMap<&str, Tried> = BTreeMap::new();
     for test in tests.iter().filter(|test| plain(test.function)) {
         let shadowed = bound_names(&test.function.block);
         let body = test.function.block.brace_token.span.open().byte_range().end;
-        for stmt in &test.function.block.stmts {
-            // Only what the test itself does, one statement after the other: not what
-            // is in a loop or a branch, which may run never or often.
-            let looks = match stmt {
-                syn::Stmt::Macro(stmt) => assertion(&stmt.mac),
-                syn::Stmt::Expr(Expr::Macro(expr), _) => assertion(&expr.mac),
-                syn::Stmt::Local(local) => local
-                    .init
-                    .as_ref()
-                    .is_some_and(|init| init.diverge.is_none()),
-                _ => false,
-            };
-            if !looks {
-                continue;
-            }
+        let stmts = &test.function.block.stmts;
+        // What comes after the call is not done again: a test that goes on to do more
+        // than look (it removes what it made) is not cut short.
+        let ends_looking = stmts
+            .iter()
+            .rposition(|stmt| !looks(stmt))
+            .map_or(0, |last| last + 1);
+        for stmt in &stmts[ends_looking.min(stmts.len())..] {
             let Some(setup) = source.get(body..stmt.span().byte_range().start) else {
                 continue;
             };
@@ -72,14 +68,23 @@ pub(crate) fn unpinned_calls(source: &str, file: &syn::File) -> Vec<CalledFuncti
                 source,
                 names: &functions,
                 found: vec![],
+                ran: vec![],
             };
             calls.visit_stmt(stmt);
-            for (name, call) in calls.found {
-                if shadowed.contains(name) {
+            let ran = calls.ran;
+            for (name, call, at) in calls.found {
+                // The same call again in the same test is tried once; in another test
+                // it comes after another beginning.
+                // Whatever the statement runs before the call may be what the call
+                // depends on, and is not run before the call on its own.
+                let first = !ran
+                    .iter()
+                    .any(|other| other.start < at.start && other.end <= at.start);
+                if !first || shadowed.contains(name) {
                     continue;
                 }
                 let (seen, scenarios) = found.entry(name).or_default();
-                if scenarios.len() < MAX_CALLS && seen.insert(call.clone()) {
+                if scenarios.len() < MAX_CALLS && seen.insert((call.clone(), test.name())) {
                     scenarios.push(scenario(test, setup, call));
                 }
             }
@@ -114,6 +119,24 @@ fn scenario(test: &Test<'_>, setup: &str, call: String) -> Scenario {
         }),
         source_test: Some(name),
         ..Scenario::default()
+    }
+}
+
+/// A statement of a test that only looks at results: an assertion or a `let`, always
+/// part of the test (no `cfg` on it). Only what the test itself does, one statement after
+/// the other, is taken: not what is in a loop or a branch, which may run never or often.
+fn looks(stmt: &syn::Stmt) -> bool {
+    match stmt {
+        syn::Stmt::Macro(stmt) => stmt.attrs.is_empty() && assertion(&stmt.mac),
+        syn::Stmt::Expr(Expr::Macro(expr), _) => expr.attrs.is_empty() && assertion(&expr.mac),
+        syn::Stmt::Local(local) => {
+            local.attrs.is_empty()
+                && local
+                    .init
+                    .as_ref()
+                    .is_some_and(|init| init.diverge.is_none())
+        }
+        _ => false,
     }
 }
 
@@ -185,7 +208,9 @@ fn literal(expr: &Expr) -> bool {
 struct Calls<'a> {
     source: &'a str,
     names: &'a BTreeMap<String, &'a ItemFn>,
-    found: Vec<(&'a str, String)>,
+    found: Vec<(&'a str, String, Range<usize>)>,
+    /// Where each call of the statement is, a candidate or not.
+    ran: Vec<Range<usize>>,
 }
 
 impl<'a> Calls<'a> {
@@ -226,10 +251,22 @@ fn assertion(mac: &syn::Macro) -> bool {
 
 impl<'ast> Visit<'ast> for Calls<'_> {
     fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
-        if let Some(found) = self.call(call) {
-            self.found.push(found);
+        let at = call.span().byte_range();
+        if let Some((name, text)) = self.call(call) {
+            self.found.push((name, text, at.clone()));
         }
+        self.ran.push(at);
         syn::visit::visit_expr_call(self, call);
+    }
+
+    fn visit_expr_method_call(&mut self, call: &'ast syn::ExprMethodCall) {
+        self.ran.push(call.span().byte_range());
+        syn::visit::visit_expr_method_call(self, call);
+    }
+
+    fn visit_expr_macro(&mut self, mac: &'ast syn::ExprMacro) {
+        self.ran.push(mac.span().byte_range());
+        syn::visit::visit_expr_macro(self, mac);
     }
 
     /// What a closure calls is called when the closure is, if ever.
@@ -408,7 +445,7 @@ mod tests {
         );
         assert_eq!(
             flag("assert!(on(2) && !on(1)); assert_ne!(on(5), false);"),
-            ["on(2)", "on(1)", "on(5)"]
+            ["on(2)", "on(5)"]
         );
         assert_eq!(found("println!(\"{}\", bucket(3));"), [] as [&str; 0]);
         // Arguments that are not the same wherever they are written, or not as many.
@@ -499,6 +536,65 @@ mod tests {
                 ),
             ]
         );
+    }
+
+    #[test]
+    fn only_the_first_thing_a_statement_runs_and_only_before_the_test_is_done_looking() {
+        // What runs before the call in its statement may be what it depends on.
+        for after in [
+            "assert_ne!(size(\"a\"), bucket(3).len());",
+            "assert!(size(\"a\") > 0 && bucket(3) != \"none\");",
+            "assert!(enable() && bucket(3) != \"none\");",
+            "let both = (\"a\".len(), bucket(3));",
+            "assert!(matches!(1, 1) && bucket(3) != \"none\");",
+        ] {
+            let found = found_in(after);
+            assert!(
+                !found.contains(&"bucket(3)".to_string()),
+                "{after}: {found:?}"
+            );
+        }
+        // What is called with its result, or on it, runs after it.
+        assert_eq!(
+            found_in("assert_ne!(Some(bucket(3)).map(str::len), Some(9));"),
+            ["bucket(3)"]
+        );
+        assert_eq!(
+            found_in("assert!(bucket(3).len() > size(\"a\"));"),
+            ["bucket(3)"]
+        );
+        // A statement that is not always part of the test.
+        assert_eq!(
+            found_in("#[cfg(unix)] let got = bucket(3);"),
+            [] as [&str; 0]
+        );
+        // What the test does after the call is not done after the call on its own.
+        assert_eq!(
+            found_in("make(); assert_ne!(bucket(3), \"none\"); remove();"),
+            [] as [&str; 0]
+        );
+        assert_eq!(
+            found_in(
+                "make(); assert_ne!(bucket(3), \"none\"); remove(); assert_ne!(bucket(4), \"none\"); let n = 1;"
+            ),
+            ["bucket(4)"]
+        );
+    }
+
+    #[test]
+    fn the_same_call_after_another_setup_is_another_call() {
+        let source = format!(
+            "{BUCKET}#[test] fn a() {{ set(0); assert_ne!(bucket(3), \"none\"); }}\n\
+             #[test] fn b() {{ set(1); assert_ne!(bucket(3), \"none\"); assert_ne!(bucket(3), \"x\"); }}"
+        );
+        let file = syn::parse_file(&source).unwrap();
+        let found = unpinned_calls(&source, &file);
+        let setups: Vec<&str> = found[0]
+            .scenarios
+            .iter()
+            .map(|s| s.setup.as_str())
+            .collect();
+        assert_eq!(setups, [" set(0); ", " set(1); ",]);
     }
 
     #[test]
