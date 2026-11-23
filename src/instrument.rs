@@ -1883,9 +1883,12 @@ fn same_tokens_of(a: &str, b: &str, holes: bool) -> Option<bool> {
         let (mut named, mut called) = (false, false);
         // Whether the last token was a name that something can be called by.
         let mut callable = false;
+        // Whether the last token was the `'` of a lifetime or a label.
+        let mut ticked = false;
         while let Some(tree) = trees.next() {
             let (was_named, was_called, was_callable) = (named, called, callable);
-            (named, called, callable) = (false, false, false);
+            let was_ticked = ticked;
+            (named, called, callable, ticked) = (false, false, false, false);
             match tree {
                 // `#[doc = ".."]` and `#![doc = ".."]`: what a doc comment is read as.
                 TokenTree::Punct(hash) if hash.as_char() == '#' => {
@@ -1925,6 +1928,7 @@ fn same_tokens_of(a: &str, b: &str, holes: bool) -> Option<bool> {
                 }
                 TokenTree::Punct(mark) => {
                     called = was_named && mark.as_char() == '!';
+                    ticked = mark.as_char() == '\'';
                     out.push(mark.to_string());
                 }
                 TokenTree::Ident(name) => {
@@ -1932,7 +1936,9 @@ fn same_tokens_of(a: &str, b: &str, holes: bool) -> Option<bool> {
                     // The name of a macro that is being defined.
                     called = was_called;
                     let name = name.to_string();
-                    callable = !KEYWORDS.contains(&name.as_str());
+                    // Not a keyword, and not the name of a lifetime or a label
+                    // (`&'a (u8,)`, `break 'outer (1,)`).
+                    callable = !was_ticked && !KEYWORDS.contains(&name.as_str());
                     out.push(name);
                 }
                 other => out.push(other.to_string()),
@@ -1945,29 +1951,25 @@ fn same_tokens_of(a: &str, b: &str, holes: bool) -> Option<bool> {
         // of a list, the one before it), or with the semicolon of a statement that is
         // an expression.
         let mut kept: Vec<String> = Vec::with_capacity(out.len());
-        let mut had_hole = false;
         let mut items = out.into_iter().peekable();
         while let Some(item) = items.next() {
             if !holes || item != LEFT_OUT {
                 kept.push(item);
                 continue;
             }
-            had_hole = true;
             if items.peek().is_some_and(|next| next == "," || next == ";") {
                 items.next();
             } else if items.peek().is_none() && kept.last().is_some_and(|last| last == ",") {
                 kept.pop();
             }
         }
-        // A comma after the last of a list says nothing: of braces and brackets, of
-        // what follows a name that is called (arguments, the fields of a tuple struct),
-        // and of parentheses an element was left out of. Elsewhere `(a,)` is not `(a)`.
+        // A comma after the last of a list says nothing: of braces and brackets, and of
+        // what follows a name that is called (arguments, the fields of a tuple struct).
+        // Elsewhere `(a,)` is not `(a)`.
         if kept.last().is_some_and(|last| last == ",") {
             let says_nothing = match list {
                 Some((proc_macro2::Delimiter::Brace | proc_macro2::Delimiter::Bracket, _)) => true,
-                Some((proc_macro2::Delimiter::Parenthesis, after_a_name)) => {
-                    after_a_name || had_hole
-                }
+                Some((proc_macro2::Delimiter::Parenthesis, after_a_name)) => after_a_name,
                 _ => false,
             };
             if says_nothing {
@@ -3193,6 +3195,12 @@ mod tests {
             (
                 "fn f(x: u8) { for (a,) in [(x,)] {} }",
                 "fn f(x: u8) { for (a) in [(x,)] {} }",
+            ),
+            // After the name of a lifetime or of a label.
+            ("fn f<'a>(x: &'a (u8,)) {}", "fn f<'a>(x: &'a (u8)) {}"),
+            (
+                "fn f() { let v = 'outer: loop { break 'outer (1u8,); }; }",
+                "fn f() { let v = 'outer: loop { break 'outer (1u8); }; }",
             ),
             ("m!(a, b);", "m!(a, b,);"),
             ("enum E { A, B }", "enum E { A, B, C }"),
