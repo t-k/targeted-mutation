@@ -62,6 +62,31 @@ $ echo $?
 0
 ```
 
+Some wrong implementations are only found by building them one by one, which `--rebuild` adds. Put a fee in basis points after the age check and its tests, with tests of round amounts:
+
+```rust
+pub fn fee(cents: u32, bps: u32) -> u64 {
+    u64::from(cents) * u64::from(bps) / 10_000
+}
+
+#[test]
+fn round_amounts() {
+    assert_eq!(fee(10_000, 125), 125);
+    assert_eq!(fee(20_000, 250), 500);
+}
+```
+
+`cargo tmt` finds nothing; `cargo tmt --rebuild` tries dividing before multiplying, runs a test of its own making on both, and gives the line to add:
+
+```text
+SURVIVOR  src/lib.rs:21:5
+    u64::from(cents) * u64::from(bps) / 10_000
+  passes every test as: `u64::from(cents) / 10_000 * u64::from(bps)` (divide before multiplying)
+  verified on `fee(10080, 125)`: original returned 126, mutant returned 125
+  The tests pass with the division by 10000 done first; this `cents` is not a multiple of it.
+  add a test with `assert_eq!(fee(10080, 125), 126);`
+```
+
 `cargo tmt` builds and runs the crate's tests and build scripts, as `cargo test` does: run it on code you trust.
 
 ## What it reports
@@ -88,7 +113,7 @@ INPUT GAP  src/lib.rs:4:5
 
 The tests saw 17 and 20, so any threshold in 18..=20 behaves the same on every test. The tool derives that range from the two observed values and names the one input that pins the boundary.
 
-A value that no input can give is not asked for. Compared with a number, `blocks * 8` is only ever a multiple of eight, `flags & 0xF0` only has bits of the mask, and `n % 10` is smaller than ten: when no such value lies between the ones the tests gave, nothing is reported, and otherwise the values named are ones the expression can be. A comparison that such a value cannot make come out the other way (`n % 10 < 10`) is not asked to. This is read from the last operation of the expression, for integers, and only where it also holds when the arithmetic wraps (a product by a power of two, a shift, a mask, a remainder).
+A value that no input can give is not asked for. Compared with a number, `blocks * 8` is only ever a multiple of eight, `flags & 0xF0` only has bits of the mask, and `n % 10` is smaller than ten: when no such value lies between the ones the tests gave, nothing is reported, and otherwise the values named are ones the expression can be. A comparison that such a value cannot make come out the other way (`n % 10 < 10`) is not asked to. This is read from the last operation of the expression, for integers, where the tests ran that operation on primitive numbers (a type with a `Mul` of its own can give any number), and only where it also holds when the arithmetic wraps (a product by a power of two, a shift, a mask, a remainder).
 
 The second kind of finding is about assertions rather than inputs. `fixtures/batch-store` has an atomic batch commit and a test that checks a failing batch returns an error, but never looks at the store afterwards:
 
@@ -210,7 +235,7 @@ The rules recognize specific Rust patterns in the files of the library (the crat
 - Try a partial multi-bit mask to distinguish any-bit and all-bit checks, and a non-ASCII character to distinguish text character counts and byte lengths.
 - Substitute same-type integer arguments or record fields in comparisons and put the two values on opposite sides of the boundary. For slice sorting by a record field, try two records whose order depends on the choice of key.
 - When a failing batch is only checked for an error, try a read borrowed from a nearby test for a key in the attempted batch.
-- For `a * b / c` on integer arguments with a literal `c`, try dividing first (`a / c * b`), which rounds earlier. Take a call from the tests and change `a` by the smallest remainder that shows the difference; when every `a` in the tests is a multiple of `c`, the report says so. `fixtures/rounding` is an example: all six mutants that are switched while running are found out, and this one passes until an amount that is not round is tested.
+- For `a * b / c` on integer arguments with a literal `c`, try dividing first (`a / c * b`), which rounds earlier. Take a call from the tests and change `a` by the smallest remainder that shows the difference. `fixtures/rounding` is an example: all six mutants that are switched while running are found out, and this one passes until an amount that is not round is tested.
 - For a function that makes one value of several arguments (a `format!` or a tuple of them, such as the key of a map), try the value without each argument. Tests pass it when they never have two values in one place that differ in that argument alone: `fixtures/keyed` keeps texts by language and page, tests both languages with both pages, and still passes with a key that leaves the language out, because no store in the tests holds two languages. Where the tests write and read such values through methods with literal arguments, a value one test writes is read with another test's value for that argument, in one place: two lines that tell the two keys apart. Otherwise the report says what kind of test to add.
 - When a test checks an integer codec by round trip, try changing the byte order on both sides. TMT checks that the selected tests detect each component change alone and pass with both changes. A fixed byte array on the encoding side can distinguish the implementations.
 
@@ -238,6 +263,8 @@ UNTESTED CHANGE  src/lib.rs:9:1
 Here a session's age is now counted from its last use, and every session in the tests was last used when it was made. A test with a session used later fails on the old code and closes the finding.
 
 - Left out: hunks that change no token (comments, documentation, spacing), and hunks that only touch test code.
+- The tests stay as they are: where one hunk changes the program and its tests (lines next to each other), only the program's lines are put back. That takes as many old lines as new ones in the hunk; otherwise the two cannot be told apart, and the change is counted as not evaluated.
+- A change is tried even where nothing else can be mutated (the value of a constant).
 - A hunk that does not build alone counts as a mutant that does not compile. When a file has such a hunk and others, all of the file's changes are also undone together, and after that all changes of all files.
 - A change that is a refactoring passes with the old code by design. Silence it with `// tmt:ignore <reason>` on its first line, or keep it in the baseline.
 - Without a rebuild mode the changes are counted among the mutants that need a build of their own. They are not tried with `--shard` or `--list`.

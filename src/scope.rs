@@ -190,10 +190,9 @@ fn hunk_header(line: &str) -> Option<(usize, usize, usize)> {
 fn new_path(path: &str) -> Option<String> {
     // Git quotes a path with bytes outside printable ASCII, and puts a tab after one
     // with a space.
-    let path = match unquote(path) {
-        Some(path) => path,
-        None => path.strip_suffix('\t').unwrap_or(path).to_string(),
-    };
+    // The tab also comes after the closing quote of a quoted path.
+    let path = path.strip_suffix('\t').unwrap_or(path);
+    let path = unquote(path).unwrap_or_else(|| path.to_string());
     path.strip_prefix("b/").map(str::to_string)
 }
 
@@ -480,6 +479,9 @@ new file mode 100644
 --- \"a/src/gone \\303\\251.rs\"
 +++ /dev/null
 @@ -1 +0,0 @@
+--- \"a/src/\\344\\276\\241\\346\\240\\274 \\350\\241\\250.rs\"\t
++++ \"b/src/\\344\\276\\241\\346\\240\\274 \\350\\241\\250.rs\"\t
+@@ -2 +2 @@
 ";
         let scope = Scope::from_diff(diff);
         assert_eq!(
@@ -488,9 +490,12 @@ new file mode 100644
                 // Stored with `/`, as every path is (a Windows separator).
                 "src/a\"b/c\td e.rs",
                 "src/two words.rs",
+                "src/価格 表.rs",
                 "src/価格.rs"
             ]
         );
+        // Quoted for its bytes and followed by a tab for its space.
+        assert!(scope.touches("src/価格 表.rs", 2, 2));
         assert!(scope.touches("src/two words.rs", 3, 3));
         // Quoted or not (`core.quotePath`), the same file.
         assert!(scope.touches("src/価格.rs", 5, 5));

@@ -250,10 +250,6 @@ pub(super) fn discover(source: &str, file: &syn::File, out: &mut Vec<Candidate>)
                 .filter(|args| args.len() == params.len())
                 .collect::<Vec<_>>();
             let factor = names[scaled.first];
-            let all_multiples = !seeds.is_empty()
-                && seeds
-                    .iter()
-                    .all(|args| args[scaled.first] % scaled.divisor == 0);
             // A call of the tests with one argument changed: first one whose value is a
             // multiple, where the change is the smallest that shows.
             let mut ordered = seeds.clone();
@@ -269,17 +265,10 @@ pub(super) fn discover(source: &str, file: &syn::File, out: &mut Vec<Candidate>)
                 let args: Vec<String> = args.iter().map(u128::to_string).collect();
                 Some(Scenario {
                     expression: format!("{name}({})", args.join(", ")),
-                    guidance: Some(if all_multiples {
-                        format!(
-                            "Every `{factor}` the tests pass is a multiple of {}: for those, dividing before multiplying gives the same.",
-                            scaled.divisor
-                        )
-                    } else {
-                        format!(
-                            "No `{factor}` the tests pass leaves a remainder that shows when it is divided by {} first.",
-                            scaled.divisor
-                        )
-                    }),
+                    guidance: Some(format!(
+                        "The tests pass with the division by {} done first; this `{factor}` is not a multiple of it.",
+                        scaled.divisor
+                    )),
                     ..Scenario::default()
                 })
             });
@@ -347,7 +336,7 @@ mod tests {
         assert_eq!(
             scenario.guidance.as_deref(),
             Some(
-                "Every `cents` the tests pass is a multiple of 10000: for those, dividing before multiplying gives the same."
+                "The tests pass with the division by 10000 done first; this `cents` is not a multiple of it."
             )
         );
     }
@@ -428,8 +417,8 @@ mod tests {
                 .pop()
                 .map(|scenario| (scenario.expression, scenario.guidance.unwrap()))
         };
-        let multiples = "Every `cents` the tests pass is a multiple of 50: for those, dividing before multiplying gives the same.";
-        let none_shows = "No `cents` the tests pass leaves a remainder that shows when it is divided by 50 first.";
+        let multiples = "The tests pass with the division by 50 done first; this `cents` is not a multiple of it.";
+        let none_shows = multiples;
         // The other arguments stay as the test has them.
         assert_eq!(
             with("assert_eq!(fee(100, 5, 7), 17);"),

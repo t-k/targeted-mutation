@@ -1976,14 +1976,17 @@ fn changed_files_are_found_whatever_their_names() {
     // A name git quotes (bytes that are not ASCII), one it follows with a tab (a space).
     fs::write(dir.join("src/価格.rs"), module("priced")).unwrap();
     fs::write(dir.join("src/two words.rs"), module("worded")).unwrap();
+    // Both: quoted, and the tab after the closing quote.
+    fs::write(dir.join("src/価格 表.rs"), module("tabled")).unwrap();
     append(
         &dir.join("src/lib.rs"),
-        "\n#[path = \"価格.rs\"]\npub mod price;\n#[path = \"two words.rs\"]\npub mod words;\n",
+        "\n#[path = \"価格.rs\"]\npub mod price;\n#[path = \"two words.rs\"]\npub mod words;\n\
+         #[path = \"価格 表.rs\"]\npub mod table;\n",
     );
     git_output(&dir, &["init", "-q"]);
     git_output(&dir, &["add", "-A"]);
     let base = git_output(&dir, &["write-tree"]);
-    for file in ["src/価格.rs", "src/two words.rs"] {
+    for file in ["src/価格.rs", "src/two words.rs", "src/価格 表.rs"] {
         let path = dir.join(file);
         let source = fs::read_to_string(&path).unwrap();
         fs::write(&path, source.replace("n >= 100", "n >= 200")).unwrap();
@@ -2001,7 +2004,11 @@ fn changed_files_are_found_whatever_their_names() {
             .map(|f| f["file"].as_str().unwrap())
             .collect();
         files.sort_unstable();
-        assert_eq!(files, ["src/two words.rs", "src/価格.rs"], "{report:#}");
+        assert_eq!(
+            files,
+            ["src/two words.rs", "src/価格 表.rs", "src/価格.rs"],
+            "{report:#}"
+        );
     }
     // Not yet known to git: the whole file.
     fs::write(dir.join("src/新 しい.rs"), module("fresh")).unwrap();
@@ -2176,6 +2183,80 @@ fn a_change_the_tests_do_not_tell_from_the_old_code_is_found() {
         text.stdout
     );
 
+    // A limit and its test changed in lines next to each other are one hunk: the old
+    // limit is tried with the test as it is now, which finds it out. And a constant
+    // that changed where nothing else can be mutated is tried too.
+    append(
+        &dir.join("src/lib.rs"),
+        "\npub const DEFAULT_LIMIT: u32 = 41;\n\npub fn limit() -> u32 { 41 }\n\
+         #[test] fn the_limit() { assert_eq!(limit(), 41); assert!(DEFAULT_LIMIT > 0); }\n",
+    );
+    git_output(&dir, &["add", "-A"]);
+    let with_limit = git_output(&dir, &["write-tree"]);
+    edit(
+        "src/lib.rs",
+        "pub fn limit() -> u32 { 41 }",
+        "pub fn limit() -> u32 { 42 }",
+    );
+    edit(
+        "src/lib.rs",
+        "assert_eq!(limit(), 41);",
+        "assert_eq!(limit(), 42);",
+    );
+    edit(
+        "src/lib.rs",
+        "DEFAULT_LIMIT: u32 = 41;",
+        "DEFAULT_LIMIT: u32 = 42;",
+    );
+    for mode in ["--rebuild", "--source-only"] {
+        let run = tmt(&dir, &["--json", "--quiet", mode, "--since", &with_limit]);
+        let report: Value = serde_json::from_str(&run.stdout)
+            .unwrap_or_else(|e| panic!("{e}: {}{}", run.stdout, run.stderr));
+        let undone: Vec<String> = report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| !f["change_since"].is_null())
+            .map(|f| f["code"].as_str().unwrap().to_string())
+            .collect();
+        // The limit is tested (41 is not 42); the constant is only said to be positive.
+        assert_eq!(
+            undone,
+            ["pub const DEFAULT_LIMIT: u32 = 42;"],
+            "{mode}: {report:#}"
+        );
+        assert_eq!(run.code, 2, "{mode}: {report:#}");
+    }
+    // Only the constant changed, where no site is: its old value is tried all the same.
+    edit(
+        "src/lib.rs",
+        "pub fn limit() -> u32 { 42 }",
+        "pub fn limit() -> u32 { 41 }",
+    );
+    edit(
+        "src/lib.rs",
+        "assert_eq!(limit(), 42);",
+        "assert_eq!(limit(), 41);",
+    );
+    let run = tmt(
+        &dir,
+        &["--json", "--quiet", "--rebuild", "--since", &with_limit],
+    );
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(run.code, 2, "{report:#}");
+    assert!(report["evaluation"].is_null(), "{report:#}");
+    assert_eq!(
+        report["findings"].as_array().unwrap().len(),
+        1,
+        "{report:#}"
+    );
+    assert_eq!(report["findings"][0]["change_since"], with_limit.as_str());
+    edit(
+        "src/lib.rs",
+        "DEFAULT_LIMIT: u32 = 42;",
+        "DEFAULT_LIMIT: u32 = 41;",
+    );
+
     // With a session used after it was made, the change is told from the old code.
     edit(
         "src/lib.rs",
@@ -2221,7 +2302,7 @@ fn rounding_too_early_is_told_by_an_amount_that_is_not_round() {
     assert_eq!(witness["assertion"], "assert_eq!(fee(10080, 125), 126);");
     assert_eq!(
         witness["guidance"],
-        "Every `cents` the tests pass is a multiple of 10000: for those, dividing before multiplying gives the same."
+        "The tests pass with the division by 10000 done first; this `cents` is not a multiple of it."
     );
 
     // With the assertion it asks for, nothing is left.
@@ -2274,7 +2355,7 @@ fn a_key_without_one_of_its_parts_passes_tests_that_never_mix_them() {
     );
     assert_eq!(
         witness["guidance"],
-        "No test has \"ja\" and \"en\" for `language` in one place."
+        "The tests pass without `language` in the value; here \"ja\" and \"en\" meet in one place."
     );
 
     // One language put, the other asked for: the two lines that tell.
@@ -2308,7 +2389,17 @@ fn a_boundary_value_no_input_gives_is_not_asked_for() {
         .iter()
         .filter(|f| f["kind"] == "input_gap")
         .collect();
-    assert_eq!(findings.len(), 1, "{report:#}");
+    // A type with a multiplication of its own is not a count of eights: its gap is
+    // asked for as any other.
+    assert_eq!(findings.len(), 2, "{report:#}");
+    assert_eq!(findings[1]["code"], "rate * 8 > 20", "{report:#}");
+    assert_eq!(
+        findings[1]["add_tests"],
+        serde_json::json!([
+            "`rate * 8` = 20 (the original gives false)",
+            "`rate * 8` = 21 (the original gives true)"
+        ]),
+    );
     let finding = findings[0];
     assert_eq!(finding["line"], 11, "{finding:#}");
     assert_eq!(
@@ -2338,7 +2429,8 @@ fn a_boundary_value_no_input_gives_is_not_asked_for() {
         &path,
         source.replace(
             "assert!(is_long(5));",
-            "assert!(is_long(5));\n        assert!(!is_long(2));\n        assert!(is_long(3));",
+            "assert!(is_long(5));\n        assert!(!is_long(2));\n        assert!(is_long(3));\n        \
+             assert!(!is_rated(Eighths(20)));\n        assert!(is_rated(Eighths(21)));",
         ),
     )
     .unwrap();
@@ -3807,9 +3899,23 @@ fn code_a_feature_leaves_out_is_not_a_survivor_when_built_one_by_one() {
     let run = tmt(&dir, &["--json", "--quiet", "--source-only"]);
     let report: Value = serde_json::from_str(&run.stdout)
         .unwrap_or_else(|e| panic!("{e}: {}{}", run.stdout, run.stderr));
-    // `extra` is off: the mutants of its function change nothing that is built.
+    // `extra` is off: the mutants of its functions change nothing that is built, also
+    // the one that divides first, which is found by another rule.
     let findings = report["findings"].as_array().unwrap();
-    assert!(findings.iter().all(|f| f["code"] != "n > 10"), "{report:#}");
+    assert!(
+        findings
+            .iter()
+            .all(|f| f["code"] != "n > 10" && f["line"] != 16),
+        "{report:#}"
+    );
+    assert!(
+        report["skipped"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["line"] == 16 && s["code"] == "cents * parts / 100"),
+        "{report:#}"
+    );
     let skipped: Vec<&Value> = report["skipped"]
         .as_array()
         .unwrap()
@@ -3818,8 +3924,10 @@ fn code_a_feature_leaves_out_is_not_a_survivor_when_built_one_by_one() {
         .collect();
     assert!(!skipped.is_empty(), "{report:#}");
     assert!(
-        skipped.iter().all(|s| (s["line"] == 9 || s["line"] == 10)
-            && s["diagnostic"] == "under a `cfg` that the features of this build turn off"),
+        skipped
+            .iter()
+            .all(|s| [9, 10, 15, 16].contains(&s["line"].as_u64().unwrap())
+                && s["diagnostic"] == "under a `cfg` that the features of this build turn off"),
         "{report:#}"
     );
     let left_out = report["mutants_not_compiled"].as_u64().unwrap();

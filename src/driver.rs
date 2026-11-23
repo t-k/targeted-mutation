@@ -2870,7 +2870,15 @@ impl Session {
         all
     }
 
-    fn plan<'a>(&'a self, file: &str, site: &'a Site, verify: bool) -> Planned<'a> {
+    /// `primitive` says of a byte range of the file whether it is an arithmetic
+    /// operation that was run on primitive numbers.
+    fn plan<'a>(
+        &'a self,
+        file: &str,
+        site: &'a Site,
+        verify: bool,
+        primitive: &dyn Fn(usize, usize) -> bool,
+    ) -> Planned<'a> {
         let id = site.id;
         let reach_plan = |mutation: Mutation| SitePlan {
             gaps: vec![],
@@ -2964,7 +2972,7 @@ impl Session {
                 literal,
                 lhs,
                 rhs,
-                ..
+                gap: operator,
             } => {
                 let op = *op;
                 let mut merged = Obs::default();
@@ -2975,13 +2983,18 @@ impl Session {
                 // Compared with a number, what cannot be every number has a gap only
                 // where a value it can be lies between the values the tests gave it,
                 // and another outcome only if a value it can be gives one.
+                // Only for an operation of the language: one a type defines for itself
+                // (`impl Mul<u32> for Eighths`) can give any number.
                 let against = match literal {
-                    LiteralSide::Rhs(number) => Some((lhs, *number, true)),
-                    LiteralSide::Lhs(number) => Some((rhs, *number, false)),
+                    LiteralSide::Rhs(number) => {
+                        Some((lhs, (site.start, operator.0), *number, true))
+                    }
+                    LiteralSide::Lhs(number) => Some((rhs, (operator.1, site.end), *number, false)),
                     LiteralSide::None => None,
                 }
-                .and_then(|(expr, number, is_rhs)| {
-                    Some((instrument::reach(expr)?, number, is_rhs))
+                .and_then(|(expr, (from, to), number, is_rhs)| {
+                    let reach = instrument::reach(expr)?;
+                    primitive(from, to).then_some((reach, number, is_rhs))
                 });
                 let mut domain = domain_of(*literal, bounds);
                 if let Some((reach, number, is_rhs)) = against
@@ -4052,6 +4065,8 @@ fn run_package(
         _ => vec![],
     };
     let mut tests_changed: Vec<(PathBuf, Vec<scope::Hunk>)> = vec![];
+    // Files with a change that is tried undone: they are looked at even with no site.
+    let mut undo_paths: HashSet<PathBuf> = HashSet::new();
     let mut beyond_places: HashSet<(PathBuf, usize, usize)> = HashSet::new();
     // Only the requested lines, if any were requested.
     if let Some(scope) = &scope {
@@ -4072,6 +4087,12 @@ fn run_package(
                 .filter(|hunk| hunk.file == relative)
                 .cloned()
                 .collect();
+            if (options.rebuild || options.source_only)
+                && (!reverts::changes(&file.original, &of_file).is_empty()
+                    || reverts::mixed(&file.original, &of_file) > 0)
+            {
+                undo_paths.insert(file.path.clone());
+            }
             let of_tests = reverts::test_hunks(&file.original, &of_file);
             if of_tests.is_empty() {
                 file.sites.retain(in_scope);
@@ -4091,6 +4112,7 @@ fn run_package(
                 || !f.rebuild_sites.is_empty()
                 || f.path == root_file
                 || witness_candidates.iter().any(|c| c.file == f.path)
+                || undo_paths.contains(&f.path)
         });
     }
     if !options.list {
@@ -4304,7 +4326,7 @@ fn run_package(
         report.mutants = Some(candidates);
         return Ok(report);
     }
-    if empty_shard || (scope.is_some() && total_sites == 0) {
+    if empty_shard || (scope.is_some() && total_sites == 0 && undo_paths.is_empty()) {
         // Restore files changed by a previous run before reporting a selection with no work.
         state.settle(&workspace)?;
         if let Some(path) = &options.baseline {
@@ -4884,7 +4906,42 @@ fn run_package(
     let mut effect_jobs: Vec<(usize, usize)> = vec![];
     for file in &files {
         for site in file.sites.iter().filter(|s| !disabled.contains(&s.id)) {
-            let plan = match session.plan(&file.display, site, options.verify) {
+            // An operand of a comparison that is an arithmetic site of its own, run on
+            // primitive numbers in the tests.
+            let primitive = |from: usize, to: usize| {
+                let Some(mut text) = file.original.get(from..to) else {
+                    return false;
+                };
+                let mut start = from;
+                loop {
+                    let trimmed = text.trim_start();
+                    start += text.len() - trimmed.len();
+                    text = trimmed.trim_end();
+                    match text
+                        .strip_prefix('(')
+                        .and_then(|inner| inner.strip_suffix(')'))
+                    {
+                        Some(inner) => {
+                            start += 1;
+                            text = inner;
+                        }
+                        None => break,
+                    }
+                }
+                file.sites.iter().any(|other| {
+                    matches!(other.kind, SiteKind::Arith { .. })
+                        && other.start == start
+                        && other.end == start + text.len()
+                        && !disabled.contains(&other.id)
+                        && {
+                            let seen =
+                                session.merged(|t| t.arith.get(&other.id), plan::ArithObs::merge);
+                            !seen.opaque
+                                && (seen.same || seen.differs || seen.same2 || seen.differs2)
+                        }
+                })
+            };
+            let plan = match session.plan(&file.display, site, options.verify, &primitive) {
                 // Code that did not change is not said to be unreached here: that takes
                 // a run of the whole.
                 Planned::Unreached if beyond.contains(&site.id) => continue,
@@ -5583,6 +5640,31 @@ fn run_package(
             })
             .collect();
         let total: usize = changed.iter().map(|(_, changes)| changes.len()).sum();
+        // A change of the program and its tests in lines that cannot be told apart
+        // would be undone with the tests: nothing is said of it.
+        let mixed: usize = files
+            .iter()
+            .map(|file| {
+                let relative = file
+                    .path
+                    .strip_prefix(&copy)
+                    .unwrap_or(&file.path)
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let of_file: Vec<_> = hunks
+                    .iter()
+                    .filter(|hunk| hunk.file == relative)
+                    .cloned()
+                    .collect();
+                reverts::mixed(&file.original, &of_file)
+            })
+            .sum();
+        if mixed > 0 && (options.rebuild || options.source_only) {
+            report.mutants_not_evaluated += mixed;
+            session.note(&format!(
+                "{mixed} changes are of the program and its tests in the same lines: they are not tried undone"
+            ));
+        }
         if !(options.rebuild || options.source_only) {
             report.mutants_not_built += total;
         } else if total > 0 {
@@ -5718,6 +5800,7 @@ fn run_package(
             .find(|file| file.path == *witness_file)
             .expect("witness candidates are of files that are analysed");
         let rendered = file.rendered.as_ref().expect("rendered before building");
+        let left_out_here = built_sources.left_out(file);
         let restore = if in_root {
             format!("{}{root_suffix}", rendered.text)
         } else {
@@ -5854,6 +5937,36 @@ fn run_package(
                         .transpose()?
                         .flatten();
                     let at = witness_location(file, candidate);
+                    // Code this build leaves out has no mutant to run.
+                    if !built_sources.contains(file)
+                        || candidate.edits.iter().any(|edit| {
+                            left_out_here
+                                .iter()
+                                .any(|(from, to)| *from <= edit.span.start && edit.span.end <= *to)
+                        })
+                    {
+                        if let Some(phase) =
+                            witness_checkpoint.as_ref().filter(|_| cached.is_none())
+                        {
+                            phase.record(index, &WitnessTrial::Inapplicable)?;
+                        }
+                        if !candidate.existing {
+                            report.mutants_not_evaluated += 1;
+                            report.mutants_not_compiled += 1;
+                            let span = &candidate.edits[0].span;
+                            report.skipped.push(report::SkippedSite::new(
+                                at,
+                                file.lines.position(&file.original, span.end),
+                                report::SkipReason::SourceNotBuilt,
+                                Some(
+                                    "under a `cfg` that the features of this build turn off"
+                                        .to_string(),
+                                ),
+                            ));
+                        }
+                        progress.complete(progress::Outcome::Unable);
+                        continue;
+                    }
                     let existing = candidate
                         .existing
                         .then(|| {

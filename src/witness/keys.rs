@@ -287,7 +287,7 @@ fn mixing(
         assertion_prefix: setup.clone(),
         setup,
         guidance: Some(format!(
-            "No test has {} and {other} for `{part_name}` in one place.",
+            "The tests pass without `{part_name}` in the value; here {} and {other} meet in one place.",
             parts[part]
         )),
         ..Scenario::default()
@@ -635,12 +635,16 @@ mod tests {
                 Some((
                     own(setup),
                     own(r#"labels.get("en", "home")"#),
-                    own(r#"No test has "ja" and "en" for `language` in one place."#)
+                    own(
+                        r#"The tests pass without `language` in the value; here "ja" and "en" meet in one place."#
+                    )
                 )),
                 Some((
                     own(setup),
                     own(r#"labels.get("ja", "about")"#),
-                    own(r#"No test has "home" and "about" for `slug` in one place."#)
+                    own(
+                        r#"The tests pass without `slug` in the value; here "home" and "about" meet in one place."#
+                    )
                 )),
             ]
         );

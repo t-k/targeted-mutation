@@ -21,6 +21,23 @@ pub fn has_a_last_digit(n: u32) -> bool {
     n % 10 < 10
 }
 
+/// A rate in eighths, with a multiplication of its own: times eight it is any number.
+pub struct Eighths(pub u32);
+
+impl std::ops::Mul<u32> for Eighths {
+    type Output = u32;
+
+    fn mul(self, by: u32) -> u32 {
+        self.0 + by - 8
+    }
+}
+
+/// Tested with 16 and 24: here every number between them can be, and 20 and 21 are
+/// the ones to test.
+pub fn is_rated(rate: Eighths) -> bool {
+    rate * 8 > 20
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -32,6 +49,8 @@ mod tests {
         assert!(!is_marked(0b0100));
         assert!(is_marked(0b1000));
         assert!(has_a_last_digit(7));
+        assert!(!is_rated(Eighths(16)));
+        assert!(is_rated(Eighths(24)));
     }
 
     #[test]

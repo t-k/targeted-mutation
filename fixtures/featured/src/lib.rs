@@ -10,6 +10,12 @@ pub fn extra(n: u32) -> bool {
     n > 10
 }
 
+/// A candidate of another kind (dividing first) in code the feature leaves out.
+#[cfg(feature = "extra")]
+pub fn share(cents: u32, parts: u32) -> u32 {
+    cents * parts / 100
+}
+
 #[cfg(test)]
 mod tests {
     #[cfg(feature = "basic")]
