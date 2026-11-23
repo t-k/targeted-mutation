@@ -71,6 +71,10 @@ pub enum Finding {
         survivors: Vec<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         witness: Option<VerifiedWitness>,
+        /// Set when the mutant is a change undone (`--since`): the revision whose code
+        /// was put back.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        change_since: Option<String>,
     },
 }
 
@@ -410,6 +414,12 @@ pub fn location(file: &str, site: &Site) -> Location {
         code: one_line(&site.text),
         ..Location::default()
     }
+}
+
+/// A revision as a reader wants it: a full object name cut to its first twelve digits.
+pub(crate) fn short_revision(revision: &str) -> &str {
+    let full = revision.len() >= 40 && revision.bytes().all(|byte| byte.is_ascii_hexdigit());
+    if full { &revision[..12] } else { revision }
 }
 
 pub(crate) fn one_line(code: &str) -> String {
@@ -1083,6 +1093,17 @@ fn finding_body(finding: &Finding) -> Vec<String> {
             }
         }
         Finding::Survivor {
+            survivors,
+            change_since: Some(revision),
+            ..
+        } => {
+            lines.push(format!("passes every test {}", survivors.join(", ")));
+            lines.push(format!(
+                "no test tells this change from the code as it was at {}: add one that fails without it",
+                short_revision(revision)
+            ));
+        }
+        Finding::Survivor {
             survivors, witness, ..
         } => {
             lines.push(format!("passes every test as: {}", survivors.join(", ")));
@@ -1118,6 +1139,11 @@ fn finding_parts(finding: &Finding) -> (&'static str, &Location) {
     match finding {
         Finding::InputGap { at, .. } => ("INPUT GAP", at),
         Finding::AssertionGap { at, .. } => ("ASSERTION GAP", at),
+        Finding::Survivor {
+            at,
+            change_since: Some(_),
+            ..
+        } => ("UNTESTED CHANGE", at),
         Finding::Survivor { at, .. } => ("SURVIVOR", at),
     }
 }
@@ -1848,6 +1874,7 @@ mod tests {
                 },
                 survivors: vec!["delete".into()],
                 witness: None,
+                change_since: None,
             }],
             ..Report::default()
         };
@@ -1949,6 +1976,7 @@ mod tests {
                 },
                 survivors: vec![],
                 witness: None,
+                change_since: None,
             }],
             ..Report::default()
         };
@@ -1982,6 +2010,7 @@ mod tests {
                 },
                 survivors: vec![],
                 witness: None,
+                change_since: None,
             })
             .collect(),
             ..Report::default()
@@ -2246,6 +2275,7 @@ mod tests {
             },
             survivors: vec!["the body of `limit` replaced by `0`".into()],
             witness: None,
+            change_since: None,
         };
         assert_eq!(survivor.kind(), "survivor");
         assert_eq!(survivor.at().line, 2);

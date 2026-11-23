@@ -13,6 +13,7 @@ pub mod plan;
 mod progress;
 pub mod propagation;
 pub mod report;
+mod reverts;
 pub mod scope;
 pub mod trace;
 mod witness;

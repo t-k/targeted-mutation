@@ -134,7 +134,7 @@ Building it takes Rust 1.88 or newer. The crates it analyses are built with what
 What to analyse:
 
 - `--package NAME`: the workspace member to analyse. Not needed when `DIR` is the member's own directory.
-- `--since REV`: only the code changed since a git revision, plus untracked files. This is the mode for a pull request: `cargo tmt --since "$(git merge-base origin/main HEAD)"` (the merge base, so that what others added to the main branch meanwhile is not taken for yours). A run of a part can tell that a finding is new; it cannot tell that one outside of it is gone, which takes a run of the whole.
+- `--since REV`: only the code changed since a git revision, plus untracked files. This is the mode for a pull request: `cargo tmt --since "$(git merge-base origin/main HEAD)"` (the merge base, so that what others added to the main branch meanwhile is not taken for yours). A run of a part can tell that a finding is new; it cannot tell that one outside of it is gone, which takes a run of the whole. With `--rebuild` or `--source-only`, each change is also tried undone (see [A change undone](#a-change-undone)).
 - `--lines FILE:FROM-TO`: only these lines (repeatable; `FILE` is relative to the package).
 
 Which tests to use:
@@ -216,6 +216,26 @@ cargo tmt fixtures/operators --rebuild --lines src/lib.rs:72-74
 cargo tmt fixtures/distinguishing --rebuild
 cargo tmt fixtures/batch-store --rebuild --lines src/lib.rs:33
 ```
+
+### A change undone
+
+With `--since REV` and one of the rebuild modes, the old code is a mutant too. Each hunk of the diff in the selected production code is put back as it was at `REV`, built, and run against all tests. When they pass, the tests do not tell the change from what was there before:
+
+```text
+$ cargo tmt --rebuild --since "$(git merge-base origin/main HEAD)"
+UNTESTED CHANGE  src/lib.rs:9:1
+    now - used < 30 && created <= used
+  passes every test with the code as it was: `let _ = used; now - created < 30`
+  no test tells this change from the code as it was at 91e1dc927360: add one that fails without it
+```
+
+Here a session's age is now counted from its last use, and every session in the tests was last used when it was made. A test with a session used later fails on the old code and closes the finding.
+
+- Left out: hunks that change no token (comments, documentation, spacing), and hunks that only touch test code.
+- A hunk that does not build alone counts as a mutant that does not compile. When a file has such a hunk and others, all of the file's changes are also undone together, and after that all changes of all files.
+- A change that is a refactoring passes with the old code by design. Silence it with `// tmt:ignore <reason>` on its first line, or keep it in the baseline.
+- Without a rebuild mode the changes are counted among the mutants that need a build of their own. They are not tried with `--shard` or `--list`.
+- In JSON the finding has `kind: "survivor"` and `change_since` with the revision.
 
 Output: text by default, `--json`, or `--sarif` (SARIF 2.1.0 for code scanning: paths from the top of the git repository, the finding's id as `partialFingerprints`, and what the run looked at under the run's `properties`; with `--workspace` there is one run per package, each with an `automationDetails.id` of its own, and a package whose analysis failed is a run with `executionSuccessful: false` and the error). The JSON report has the same under `analysis`: package, `--since` and `--lines`, features, and whether mutants were built and predictions re-run. `--show-unreached` lists sites with no recorded execution. Long campaigns print completed, failed, timed-out, survived and unevaluated counts on stderr. `--quiet` suppresses progress. If a baseline test fails, stderr includes the available diagnostics and the full log path.
 

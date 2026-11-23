@@ -24,7 +24,7 @@ use crate::report::{self, Finding, Report};
 use crate::scope::{self, Scope};
 use crate::trace::Trace;
 use crate::work_lock::WorkLock;
-use crate::{git_index, leftovers, progress, witness};
+use crate::{git_index, leftovers, progress, reverts, witness};
 
 #[derive(Clone)]
 pub struct Options {
@@ -2519,24 +2519,44 @@ fn requested_scope(
         .collect();
     let mut scope = Scope::parse_lines(&lines)?;
     if let Some(revision) = &options.since {
-        let git = |args: &[&str]| -> Result<String> {
-            let output = Command::new("git")
-                .arg("-C")
-                .arg(workspace)
-                .args(args)
-                .output()
-                .context("running git")?;
-            if !output.status.success() {
-                bail!(
-                    "git {} failed: {}",
-                    args.join(" "),
-                    String::from_utf8_lossy(&output.stderr).trim()
-                );
-            }
-            Ok(String::from_utf8_lossy(&output.stdout).into_owned())
-        };
-        // `--relative` gives paths from the workspace root even inside a larger repository.
-        scope.merge(Scope::from_diff(&git(&[
+        scope.merge(Scope::from_diff(&since_diff(workspace, revision)?));
+        // `-z`: the names as they are, not quoted.
+        for file in git_output(
+            workspace,
+            &["ls-files", "--others", "--exclude-standard", "-z"],
+        )?
+        .split('\0')
+        .filter(|file| !file.is_empty())
+        {
+            scope.add_whole_file(file);
+        }
+    }
+    Ok(Some(scope))
+}
+
+fn git_output(workspace: &Path, args: &[&str]) -> Result<String> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(workspace)
+        .args(args)
+        .output()
+        .context("running git")?;
+    if !output.status.success() {
+        bail!(
+            "git {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr).trim()
+        );
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+/// What changed in the workspace since a revision, as `git diff -U0` says it.
+fn since_diff(workspace: &Path, revision: &str) -> Result<String> {
+    // `--relative` gives paths from the workspace root even inside a larger repository.
+    git_output(
+        workspace,
+        &[
             "diff",
             "-U0",
             "--no-color",
@@ -2546,16 +2566,8 @@ fn requested_scope(
             "--dst-prefix=b/",
             revision,
             "--",
-        ])?));
-        // `-z`: the names as they are, not quoted.
-        for file in git(&["ls-files", "--others", "--exclude-standard", "-z"])?
-            .split('\0')
-            .filter(|file| !file.is_empty())
-        {
-            scope.add_whole_file(file);
-        }
-    }
-    Ok(Some(scope))
+        ],
+    )
 }
 
 /// The sites to disable for one compile error, from the most to the least specific guess:
@@ -5316,8 +5328,151 @@ fn run_package(
                     at,
                     survivors,
                     witness: None,
+                    change_since: None,
                 }),
         );
+    }
+
+    // Each change since the revision, undone: do the tests tell it from what was there?
+    if let Some(revision) = options
+        .since
+        .as_deref()
+        .filter(|_| !options.list && options.shard.is_none())
+    {
+        let hunks = scope::hunks(&since_diff(&workspace, revision)?);
+        let changed: Vec<(&SourceFile, Vec<reverts::Change>)> = files
+            .iter()
+            .filter(|file| built_sources.contains(file) || !options.source_only && !options.rebuild)
+            .filter_map(|file| {
+                let relative = file
+                    .path
+                    .strip_prefix(&copy)
+                    .ok()?
+                    .to_string_lossy()
+                    .replace('\\', "/");
+                let of_file: Vec<_> = hunks
+                    .iter()
+                    .filter(|hunk| hunk.file == relative)
+                    .cloned()
+                    .collect();
+                let changes = reverts::changes(&file.original, &of_file);
+                (!changes.is_empty()).then_some((file, changes))
+            })
+            .collect();
+        let total: usize = changed.iter().map(|(_, changes)| changes.len()).sum();
+        if !(options.rebuild || options.source_only) {
+            report.mutants_not_built += total;
+        } else if total > 0 {
+            session.note(&format!(
+                "building {total} changes undone, one by one (the code as it was at {})",
+                report::short_revision(revision)
+            ));
+            let write = |file: &SourceFile, text: &str, suffix: &str| -> Result<()> {
+                let suffix = if file.path == root_file { suffix } else { "" };
+                state.write(&file.path, &format!("{text}{suffix}"))
+            };
+            // `None`: it does not build.
+            let undone = |edits: &[(&SourceFile, &str)]| -> Result<Option<Outcome>> {
+                let attempted = (|| -> Result<Option<Outcome>> {
+                    for (file, text) in edits {
+                        write(file, text, root_mutant_suffix)?;
+                    }
+                    Ok(match source_build(&cargo_build()?) {
+                        SourceBuild::Built => Some(run_source_tests(&by_speed)?),
+                        SourceBuild::Refused => None,
+                        SourceBuild::Failed(why) => {
+                            session.note(&format!(
+                                "a build failed without the compiler refusing the code; the change undone is not evaluated: {why}"
+                            ));
+                            Some(Outcome::Unable)
+                        }
+                    })
+                })();
+                // The files as they were, whatever went wrong.
+                for (file, _) in edits {
+                    let rendered = file.rendered.as_ref().expect("rendered before building");
+                    write(file, &rendered.text, &root_suffix)?;
+                }
+                attempted
+            };
+            let mut judged = |outcome: Option<Outcome>, at: report::Location, what: String| {
+                match outcome {
+                    None => report.unviable_mutants += 1,
+                    Some(Outcome::Unable) => report.mutants_not_evaluated += 1,
+                    Some(outcome) => {
+                        report.mutants_run += 1;
+                        report.mutants_killed += (outcome != Outcome::Pass) as usize;
+                        report.mutants_timed_out += (outcome == Outcome::Timeout) as usize;
+                    }
+                }
+                if outcome == Some(Outcome::Pass) {
+                    report.findings.push(Finding::Survivor {
+                        at,
+                        survivors: vec![what],
+                        witness: None,
+                        change_since: Some(revision.to_string()),
+                    });
+                }
+            };
+            let place = |file: &SourceFile, change: &reverts::Change| report::Location {
+                file: file.display.clone(),
+                line: change.line,
+                column: 1,
+                code: change.code.clone(),
+                ..Default::default()
+            };
+            // A change that does not build alone may be one part of several that belong
+            // together: then all of the file's are undone at once, and at last all of all.
+            let mut stuck_files = 0;
+            for (file, changes) in &changed {
+                let mut stuck = false;
+                for change in changes {
+                    let outcome = match &change.undone {
+                        Some(text) => undone(&[(file, text.as_str())])?,
+                        None => None,
+                    };
+                    stuck |= outcome.is_none();
+                    judged(outcome, place(file, change), change.describe());
+                }
+                if stuck && changes.len() > 1 {
+                    let whole = reverts::all_undone(&file.original, changes);
+                    let outcome = match &whole {
+                        Some(text) => undone(&[(file, text.as_str())])?,
+                        None => None,
+                    };
+                    stuck = outcome.is_none();
+                    judged(
+                        outcome,
+                        place(file, &changes[0]),
+                        format!("with all {} changes to this file undone", changes.len()),
+                    );
+                }
+                stuck_files += usize::from(stuck);
+            }
+            if stuck_files > 0 && changed.len() > 1 {
+                let whole: Option<Vec<String>> = changed
+                    .iter()
+                    .map(|(file, changes)| reverts::all_undone(&file.original, changes))
+                    .collect();
+                let outcome = match &whole {
+                    Some(texts) => {
+                        let edits: Vec<(&SourceFile, &str)> = changed
+                            .iter()
+                            .zip(texts)
+                            .map(|((file, _), text)| (*file, text.as_str()))
+                            .collect();
+                        undone(&edits)?
+                    }
+                    None => None,
+                };
+                let (file, changes) = &changed[0];
+                judged(
+                    outcome,
+                    place(file, &changes[0]),
+                    format!("with every change undone, in all {} files", changed.len()),
+                );
+            }
+        }
     }
 
     if !witness_candidates.is_empty() {
@@ -5634,6 +5789,7 @@ fn run_package(
                             at: survivor.at,
                             survivors: vec![survivor.candidate.description.clone()],
                             witness: evidence,
+                            change_since: None,
                         });
                     }
                 }

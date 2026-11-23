@@ -592,7 +592,11 @@ new file mode 100644
             );
             assert!(found.iter().all(|hunk| hunk.file == "new"), "{found:?}");
             let all: Vec<&Hunk> = found.iter().collect();
-            assert_eq!(undo(&new, &all).as_deref(), Some(old.as_str()), "{row:?}\n{diff}");
+            assert_eq!(
+                undo(&new, &all).as_deref(),
+                Some(old.as_str()),
+                "{row:?}\n{diff}"
+            );
             // One hunk alone: the old lines there, the rest as it is now.
             if let [first, second] = &found[..] {
                 let only_first = undo(&new, &[first]).unwrap();
@@ -616,8 +620,14 @@ new file mode 100644
             old: "old\n".into(),
         };
         assert_eq!(undo("a\nb\n", &[&hunk(2, 1)]).as_deref(), Some("a\nold\n"));
-        assert_eq!(undo("a\nb\n", &[&hunk(0, 0)]).as_deref(), Some("old\na\nb\n"));
-        assert_eq!(undo("a\nb\n", &[&hunk(2, 0)]).as_deref(), Some("a\nb\nold\n"));
+        assert_eq!(
+            undo("a\nb\n", &[&hunk(0, 0)]).as_deref(),
+            Some("old\na\nb\n")
+        );
+        assert_eq!(
+            undo("a\nb\n", &[&hunk(2, 0)]).as_deref(),
+            Some("a\nb\nold\n")
+        );
         assert_eq!(undo("a\nb", &[&hunk(2, 0)]).as_deref(), Some("a\nb\nold\n"));
         // Lines the text does not have, and two hunks of the same lines.
         assert_eq!(undo("a\nb\n", &[&hunk(3, 1)]), None);

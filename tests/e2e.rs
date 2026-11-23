@@ -1946,7 +1946,16 @@ fn only_changed_code_is_analysed_on_request() {
         report["analysis"]["since"].as_str().map(str::len),
         Some(base.len())
     );
-    assert_eq!(but_how(by_lines), but_how(report));
+    // The lines alone do not say what was there before: with a revision, the changes
+    // undone are mutants that a build of their own would run (the changed comparison,
+    // and the declaration of the new module).
+    let mut since = but_how(report);
+    assert_eq!(
+        since["mutants_not_built"].as_u64().unwrap(),
+        by_lines["mutants_not_built"].as_u64().unwrap() + 2
+    );
+    since["mutants_not_built"] = by_lines["mutants_not_built"].clone();
+    assert_eq!(but_how(by_lines), since);
     let bad = tmt(&dir, &["--quiet", "--lines", "src/lib.rs:9-2"]);
     assert_eq!(bad.code, 1);
     assert!(bad.stderr.contains("not a line range"), "{}", bad.stderr);
@@ -2040,6 +2049,147 @@ fn crates_of_earlier_editions_are_analysed() {
             assert!(report["skipped"].is_null(), "{report:#}");
         }
     }
+}
+
+#[test]
+fn a_change_the_tests_do_not_tell_from_the_old_code_is_found() {
+    let dir = fixture("reverting", "reverting");
+    fs::write(dir.join(".gitignore"), "target/\nCargo.lock\n").unwrap();
+    git_output(&dir, &["init", "-q"]);
+    git_output(&dir, &["add", "-A"]);
+    let base = git_output(&dir, &["write-tree"]);
+    let edit = |file: &str, from: &str, to: &str| {
+        let path = dir.join(file);
+        let source = fs::read_to_string(&path).unwrap();
+        assert!(source.contains(from), "{file}: {from}");
+        fs::write(&path, source.replace(from, to)).unwrap();
+    };
+    // The age of a session is now counted from its last use: no test has a session that
+    // was used after it was made, so the old code passes them all.
+    edit(
+        "src/lib.rs",
+        "    let _ = used;\n    now - created < 30",
+        "    now - used < 30 && created <= used",
+    );
+    // Not the program: the documentation, and a test.
+    edit(
+        "src/lib.rs",
+        "/// Whether a session is still good.",
+        "/// Says if it is.",
+    );
+    edit(
+        "src/lib.rs",
+        "assert!(valid(0, 0, 10));",
+        "assert!(valid(0, 0, 11));",
+    );
+    // A limit that moved, with a test that says so.
+    edit("src/limits.rs", "n.min(10)", "n.min(20)");
+    edit(
+        "src/limits.rs",
+        "        assert_eq!(cap(3), 3);\n",
+        "        assert_eq!(cap(3), 3);\n        assert_eq!(cap(15), 15);\n",
+    );
+    // Two changes that belong together: the function that is new does not go alone.
+    edit(
+        "src/steps.rs",
+        "pub fn label(n: u32) -> u32 {\n    n\n}",
+        "fn zero() -> u32 {\n    0\n}\n\npub fn label(n: u32) -> u32 {\n    n + zero()\n}",
+    );
+    let changes = |report: &Value| -> Vec<(String, u64, String, String)> {
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| !f["change_since"].is_null())
+            .map(|f| {
+                assert_eq!(f["change_since"], base.as_str(), "{f:#}");
+                assert_eq!(f["kind"], "survivor", "{f:#}");
+                (
+                    f["file"].as_str().unwrap().to_string(),
+                    f["line"].as_u64().unwrap(),
+                    f["code"].as_str().unwrap().to_string(),
+                    f["survivors"][0].as_str().unwrap().to_string(),
+                )
+            })
+            .collect()
+    };
+
+    // Built once: the changes are counted among what a build of their own would run.
+    let run = tmt(&dir, &["--json", "--quiet", "--since", &base]);
+    let quick: Value = serde_json::from_str(&run.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}{}", run.stdout, run.stderr));
+    assert_eq!(changes(&quick), [], "{quick:#}");
+    assert!(
+        quick["mutants_not_built"].as_u64().unwrap() >= 4,
+        "{quick:#}"
+    );
+
+    for mode in ["--rebuild", "--source-only"] {
+        let run = tmt(&dir, &["--json", "--quiet", mode, "--since", &base]);
+        assert_eq!(run.code, 2, "{mode}: {}{}", run.stdout, run.stderr);
+        let report: Value = serde_json::from_str(&run.stdout).unwrap();
+        let s = |text: &str| text.to_string();
+        assert_eq!(
+            changes(&report),
+            [
+                (
+                    s("src/lib.rs"),
+                    9,
+                    s("now - used < 30 && created <= used"),
+                    s("with the code as it was: `let _ = used; now - created < 30`")
+                ),
+                (
+                    s("src/steps.rs"),
+                    1,
+                    s("fn zero() -> u32 {"),
+                    s("with all 2 changes to this file undone")
+                ),
+                (
+                    s("src/steps.rs"),
+                    6,
+                    s("n + zero()"),
+                    s("with the code as it was: `n`")
+                ),
+            ],
+            "{mode}: {report:#}"
+        );
+        // The function alone does not go (one that does not build); the limit is told.
+        assert!(
+            report["unviable_mutants"].as_u64().unwrap() >= 1,
+            "{report:#}"
+        );
+        // The working copy is as it was: a second run says the same.
+        let again = tmt(&dir, &["--json", "--quiet", mode, "--since", &base]);
+        let again: Value = serde_json::from_str(&again.stdout).unwrap();
+        assert_eq!(changes(&again), changes(&report), "{mode}");
+    }
+
+    let text = tmt(&dir, &["--quiet", "--rebuild", "--since", &base]);
+    let short = &base[..12];
+    assert!(
+        text.stdout.contains(&format!(
+            "UNTESTED CHANGE  src/lib.rs:9:1\n    now - used < 30 && created <= used\n  \
+             passes every test with the code as it was: `let _ = used; now - created < 30`\n  \
+             no test tells this change from the code as it was at {short}: add one that fails without it\n"
+        )),
+        "{}",
+        text.stdout
+    );
+
+    // With a session used after it was made, the change is told from the old code.
+    edit(
+        "src/lib.rs",
+        "assert!(!valid(0, 0, 40));",
+        "assert!(!valid(0, 0, 40));\n        assert!(valid(0, 90, 100));",
+    );
+    let run = tmt(&dir, &["--json", "--quiet", "--rebuild", "--since", &base]);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert!(
+        changes(&report)
+            .iter()
+            .all(|(file, ..)| file == "src/steps.rs"),
+        "{report:#}"
+    );
 }
 
 #[test]

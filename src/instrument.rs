@@ -1772,8 +1772,9 @@ pub(crate) fn same_tokens(a: &str, b: &str) -> Option<bool> {
             match tree {
                 // `#[doc = ".."]` and `#![doc = ".."]`: what a doc comment is read as.
                 TokenTree::Punct(hash) if hash.as_char() == '#' => {
-                    let bang = matches!(trees.peek(), Some(TokenTree::Punct(p)) if p.as_char() == '!')
-                        .then(|| trees.next());
+                    let bang =
+                        matches!(trees.peek(), Some(TokenTree::Punct(p)) if p.as_char() == '!')
+                            .then(|| trees.next());
                     let is_doc = matches!(trees.peek(), Some(TokenTree::Group(group))
                         if group.delimiter() == proc_macro2::Delimiter::Bracket
                             && matches!(group.stream().into_iter().next(),
@@ -2878,7 +2879,10 @@ mod tests {
         ] {
             assert_eq!(same_tokens(code, other), Some(false), "{other}");
         }
-        assert_eq!(same_tokens("#![doc = \"a\"] fn f() {}", "fn f() {}"), Some(true));
+        assert_eq!(
+            same_tokens("#![doc = \"a\"] fn f() {}", "fn f() {}"),
+            Some(true)
+        );
         assert_eq!(same_tokens(code, "fn f( {"), None);
         assert_eq!(same_tokens("fn f( {", code), None);
     }
