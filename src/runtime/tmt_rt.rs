@@ -1152,7 +1152,8 @@ macro_rules! tmt_arith_ints {
             }
             fn tmt_safe(op: u8, a: $t, b: $t) -> Option<u64> {
                 // A shift amount that does not fit is an overflow like any other.
-                let amount = u32::try_from(b).ok();
+                // Named in full: `TryFrom` is in the prelude only since the 2021 edition.
+                let amount = <u32 as std::convert::TryFrom<$t>>::try_from(b).ok();
                 match op {
                     ADD => a.checked_add(b),
                     SUB => a.checked_sub(b),

@@ -2013,6 +2013,32 @@ fn changed_files_are_found_whatever_their_names() {
 }
 
 #[test]
+fn crates_of_earlier_editions_are_analysed() {
+    for edition in ["2015", "2018"] {
+        let name = format!("edition-{edition}");
+        let dir = fixture(&name, &name);
+        for mode in [&[][..], &["--source-only"][..]] {
+            let mut args = vec!["--json", "--quiet"];
+            args.extend(mode);
+            let run = tmt(&dir, &args);
+            assert_eq!(run.code, 2, "{edition} {mode:?}: {}{}", run.stdout, run.stderr);
+            let report: Value = serde_json::from_str(&run.stdout).unwrap();
+            let codes: Vec<&str> = report["findings"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|f| f["code"].as_str().unwrap())
+                .collect();
+            // The shift is among what was switched while running: its checked form is
+            // what did not build before the 2021 edition.
+            assert!(codes.contains(&"n >= 18"), "{edition} {mode:?}: {report:#}");
+            assert!(report["mutants_run"].as_u64().unwrap() > 5, "{report:#}");
+            assert!(report["skipped"].is_null(), "{report:#}");
+        }
+    }
+}
+
+#[test]
 fn known_findings_can_be_suppressed() {
     let dir = fixture("eligibility", "suppress");
     let baseline = dir.join("tmt-baseline.json");
