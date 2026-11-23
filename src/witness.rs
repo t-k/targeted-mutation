@@ -55,6 +55,10 @@ pub(crate) struct Scenario {
     pub fixture_expectation: Option<String>,
     pub placement: Option<Placement>,
     pub source_test: Option<String>,
+    /// Where the expression is looked at in the middle of a test's own code: what the
+    /// test does after it (`setup` is what it does before). The value is recorded where
+    /// the test computes it and given on to the test.
+    pub after: Option<String>,
     position: bool,
 }
 
@@ -98,20 +102,32 @@ impl Scenario {
             ),
             None => r#"__tmt_witness_std::format!("{result:?}\n")"#.to_owned(),
         };
+        let record = format!(
+            r#"let path = __tmt_witness_std::env::var_os("{OUTPUT_ENV}").unwrap();
+    let mut output = __tmt_witness_std::fs::OpenOptions::new().append(true).open(path).unwrap();
+    __tmt_witness_std::io::Write::write_all(&mut output, ({observation}).as_bytes()).unwrap();"#
+        );
+        let body = match &self.after {
+            // The test as it is written, with the value recorded on its way.
+            Some(after) => format!(
+                "{setup}{{ let result{result_type} = {expression};\n    {{ {record} }}\n    result }}{after}",
+                setup = self.setup,
+                expression = self.expression,
+            ),
+            None => format!(
+                "{setup}\n    let result{result_type} = {expression};\n    {record}",
+                setup = self.setup,
+                expression = self.expression,
+            ),
+        };
         format!(
             r#"
 #[test]
 fn {name}() {{
     extern crate std as __tmt_witness_std;
-    {setup}
-    let result{result_type} = {expression};
-    let path = __tmt_witness_std::env::var_os("{OUTPUT_ENV}").unwrap();
-    let mut output = __tmt_witness_std::fs::OpenOptions::new().append(true).open(path).unwrap();
-    __tmt_witness_std::io::Write::write_all(&mut output, ({observation}).as_bytes()).unwrap();
+    {body}
 }}
-"#,
-            setup = self.setup,
-            expression = self.expression,
+"#
         )
     }
 

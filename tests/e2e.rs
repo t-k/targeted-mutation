@@ -3307,6 +3307,72 @@ fn a_weak_assertion_gets_the_value_its_call_returns() {
 }
 
 #[test]
+fn a_stronger_assertion_has_the_value_the_call_has_where_the_test_makes_it() {
+    let dir = fixture("eligibility", "stronger-assertion-in-place");
+    fs::write(
+        dir.join("src/lib.rs"),
+        r#"use std::cell::Cell;
+thread_local! { static MODE: Cell<i32> = const { Cell::new(1) }; }
+pub fn enable(mode: i32) -> bool {
+    MODE.with(|m| m.set(mode));
+    true
+}
+pub fn f(n: i32) -> i32 {
+    n + MODE.with(|m| m.get())
+}
+
+#[test]
+fn never_gets_there() {
+    let off = true;
+    assert!(off || f(9) != 0);
+}
+
+#[test]
+fn stateful() {
+    assert_eq!(enable(2), f(3) > 0);
+    assert!(enable(1));
+}
+"#,
+    )
+    .unwrap();
+    let run = tmt(&dir, &["--json", "--quiet", "--rebuild"]);
+    assert_eq!(run.code, 2, "{}", run.stderr);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    let finding = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["code"] == "n + MODE.with(|m| m.get())" && f.get("witness").is_some())
+        .unwrap_or_else(|| panic!("{report:#}"));
+    // The call the test never gets to says nothing. The other is looked at after the
+    // mode is set, in the same statement, as the test does it: 3 + 2, not 3 + 1.
+    assert_eq!(finding["witness"]["call"], "f(3)", "{finding:#}");
+    assert_eq!(finding["witness"]["original"], "5", "{finding:#}");
+    assert_eq!(finding["witness"]["assertion"], "assert_eq!(f(3), 5);");
+
+    // Put where the test makes the call, the assertion holds and closes the finding.
+    let path = dir.join("src/lib.rs");
+    let source = fs::read_to_string(&path).unwrap();
+    let pinned = source.replace(
+        "assert_eq!(enable(2), f(3) > 0);",
+        "assert!(enable(2));\n    assert_eq!(f(3), 5);",
+    );
+    assert_ne!(pinned, source);
+    fs::write(&path, pinned).unwrap();
+    let run = tmt(&dir, &["--json", "--quiet", "--rebuild"]);
+    assert_ne!(run.code, 1, "{}", run.stderr);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert!(
+        !report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["code"] == "n + MODE.with(|m| m.get())" && f["kind"] != "input_gap"),
+        "{report:#}"
+    );
+}
+
+#[test]
 fn a_failing_batch_gets_an_assertion_on_its_persisted_state() {
     let dir = fixture("batch-store", "verified-witness-after-error");
     let args = ["--json", "--quiet", "--rebuild", "--lines", "src/lib.rs:33"];
