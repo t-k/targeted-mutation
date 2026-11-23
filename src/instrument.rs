@@ -1803,8 +1803,12 @@ pub(crate) fn inactive_ranges(
         source,
         features,
         found: vec![],
-        own_vec: file.items.iter().any(|item| {
-            matches!(item, syn::Item::Macro(m) if m.ident.as_ref().is_some_and(|name| name == "vec"))
+        // Anywhere in it: in a module, in a function.
+        own_vec: source.split("macro_rules").skip(1).any(|after| {
+            after
+                .trim_start()
+                .strip_prefix('!')
+                .is_some_and(|name| name.trim_start().starts_with("vec"))
         }),
     };
     inactive.visit_file(file);
@@ -1939,10 +1943,12 @@ fn same_tokens_of(a: &str, b: &str, holes: bool) -> Option<bool> {
         let mut callable = false;
         // Whether the last token was the `'` of a lifetime or a label.
         let mut ticked = false;
+        // Whether the last tokens were the `#` or `#!` of an attribute.
+        let mut hashed = false;
         while let Some(tree) = trees.next() {
             let (was_named, was_called, was_callable) = (named, called, callable);
-            let was_ticked = ticked;
-            (named, called, callable, ticked) = (false, false, false, false);
+            let (was_ticked, was_hashed) = (ticked, hashed);
+            (named, called, callable, ticked, hashed) = (false, false, false, false, false);
             match tree {
                 // `#[doc = ".."]` and `#![doc = ".."]`: what a doc comment is read as.
                 TokenTree::Punct(hash) if hash.as_char() == '#' => {
@@ -1969,6 +1975,7 @@ fn same_tokens_of(a: &str, b: &str, holes: bool) -> Option<bool> {
                     if bang.is_some() {
                         out.push("!".to_string());
                     }
+                    hashed = true;
                 }
                 TokenTree::Group(group) => {
                     // `name!(..)`, and `macro_rules! name {..}` with its name between.
@@ -1981,10 +1988,12 @@ fn same_tokens_of(a: &str, b: &str, holes: bool) -> Option<bool> {
                     out.push(format!("{:?}({})", group.delimiter(), inner.join(" ")));
                     // What comes in parentheses right after `(..)` or `[..]` is given
                     // to it: `(self.callback)(value,)`, `table[0](value,)`.
-                    callable = matches!(
-                        group.delimiter(),
-                        proc_macro2::Delimiter::Parenthesis | proc_macro2::Delimiter::Bracket
-                    );
+                    // Not the brackets of an attribute: `#[allow(..)] (a,)` is a tuple.
+                    callable = !was_hashed
+                        && matches!(
+                            group.delimiter(),
+                            proc_macro2::Delimiter::Parenthesis | proc_macro2::Delimiter::Bracket
+                        );
                 }
                 TokenTree::Punct(mark) => {
                     called = was_named && mark.as_char() == '!';
@@ -3267,6 +3276,11 @@ mod tests {
                 "fn f(x: u8) { for (a,) in [(x,)] {} }",
                 "fn f(x: u8) { for (a) in [(x,)] {} }",
             ),
+            // After an attribute.
+            (
+                "fn f() -> impl Sized { #[allow(unused_parens)] (2u8,) }",
+                "fn f() -> impl Sized { #[allow(unused_parens)] (2u8) }",
+            ),
             // After the name of a lifetime or of a label.
             ("fn f<'a>(x: &'a (u8,)) {}", "fn f<'a>(x: &'a (u8)) {}"),
             (
@@ -3456,6 +3470,15 @@ mod tests {
                 "#[cfg(feature = \"extra\")] fn legacy();"
             ]
         );
+        // A `vec!` of the file's own, wherever it is defined, may do anything with what
+        // it is given: nothing in it is taken to be left out.
+        let own = r#"
+            mod m {
+                macro_rules! vec { (#[$attr:meta] $value:expr) => { $value }; }
+                pub fn value() -> u8 { vec![#[cfg(feature = "extra")] 1] }
+            }
+        "#;
+        assert_eq!(inactive_ranges(own, &parse_source(own).unwrap(), &on), []);
         // A variant of an enum and a field of a struct, which a feature may add.
         let shapes = r#"
             pub enum Format { Json, #[cfg(feature = "extra")] Yaml, #[cfg(feature = "basic")] Toml }
