@@ -92,19 +92,39 @@ pub(crate) fn same_build(
         return false;
     }
     // Code that asks where it is can tell a line more above it, or a column more
-    // before it on its line: then every token that is kept has to be where it was.
-    if asks_where_it_is(&built_now) || asks_where_it_is(&built_then) {
-        return matches!(
-            (places(now, off_now), places(then, off_then)),
-            (Some(a), Some(b)) if a == b
-        );
+    // before it on its line. `line!` and `column!` say where they are themselves: those
+    // have to be where they were. The location of a caller can be that of any call:
+    // then every token that is kept has to be.
+    let asked = asks_where_it_is(&built_now).max(asks_where_it_is(&built_then));
+    if asked == Asks::Nothing {
+        return true;
     }
-    true
+    matches!(
+        (places(now, off_now, asked), places(then, off_then, asked)),
+        (Some(a), Some(b)) if a == b
+    )
 }
 
-/// The line and column of every token of a text that is not in the ranges left out,
-/// documentation aside. `None` when the text does not lex.
-fn places(text: &str, off: &[(usize, usize)]) -> Option<Vec<(usize, usize)>> {
+/// What code asks of its own place in the file.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+enum Asks {
+    Nothing,
+    /// `line!` or `column!`: where the macro is written.
+    ItsOwnPlace,
+    /// `#[track_caller]` or `Location::caller`: where something is called from.
+    APlaceOfACall,
+}
+
+type Trees = std::iter::Peekable<proc_macro2::token_stream::IntoIter>;
+
+fn next_is(trees: &mut Trees, mark: char) -> bool {
+    matches!(trees.peek(), Some(proc_macro2::TokenTree::Punct(p)) if p.as_char() == mark)
+}
+
+/// The line and column of the tokens of a text that are not in the ranges left out and
+/// whose place may be asked for: every one (documentation aside), or the `line!` and
+/// `column!` alone. `None` when the text does not lex.
+fn places(text: &str, off: &[(usize, usize)], asked: Asks) -> Option<Vec<(usize, usize)>> {
     fn note(span: proc_macro2::Span, off: &[(usize, usize)], out: &mut Vec<(usize, usize)>) {
         let range = span.byte_range();
         if !off
@@ -117,30 +137,53 @@ fn places(text: &str, off: &[(usize, usize)]) -> Option<Vec<(usize, usize)>> {
     fn walk(
         stream: proc_macro2::TokenStream,
         off: &[(usize, usize)],
+        all: bool,
         out: &mut Vec<(usize, usize)>,
     ) {
-        let mut trees = stream.into_iter().peekable();
+        let mut trees: Trees = stream.into_iter().peekable();
         while let Some(tree) = trees.next() {
             match tree {
                 proc_macro2::TokenTree::Punct(hash) if hash.as_char() == '#' => {
-                    // A doc comment is one token here, and no place of the program.
-                    if let Some(proc_macro2::TokenTree::Group(group)) = trees.peek()
-                        && group
-                            .span()
-                            .source_text()
-                            .is_some_and(|written| written.starts_with('/'))
+                    // Documentation, as a comment or written out, outer or inner, is
+                    // no place of the program (as it is no token of it).
+                    let mut ahead = trees.clone();
+                    if next_is(&mut ahead, '!') {
+                        ahead.next();
+                    }
+                    if matches!(ahead.peek(), Some(proc_macro2::TokenTree::Group(group))
+                        if group.delimiter() == proc_macro2::Delimiter::Bracket
+                            && matches!(group.stream().into_iter().next(),
+                                Some(proc_macro2::TokenTree::Ident(name)) if name == "doc"))
                     {
-                        trees.next();
+                        ahead.next();
+                        trees = ahead;
                         continue;
                     }
-                    note(hash.span(), off, out);
+                    if all {
+                        note(hash.span(), off, out);
+                    }
                 }
                 proc_macro2::TokenTree::Group(group) => {
-                    note(group.span_open(), off, out);
-                    walk(group.stream(), off, out);
-                    note(group.span_close(), off, out);
+                    if all {
+                        note(group.span_open(), off, out);
+                    }
+                    walk(group.stream(), off, all, out);
+                    if all {
+                        note(group.span_close(), off, out);
+                    }
                 }
-                other => note(other.span(), off, out),
+                proc_macro2::TokenTree::Ident(name) => {
+                    let asks_here =
+                        (name == "line" || name == "column") && next_is(&mut trees, '!');
+                    if all || asks_here {
+                        note(name.span(), off, out);
+                    }
+                }
+                other => {
+                    if all {
+                        note(other.span(), off, out);
+                    }
+                }
             }
         }
     }
@@ -148,48 +191,48 @@ fn places(text: &str, off: &[(usize, usize)]) -> Option<Vec<(usize, usize)>> {
     walk(
         text.parse::<proc_macro2::TokenStream>().ok()?,
         off,
+        asked == Asks::APlaceOfACall,
         &mut out,
     );
     Some(out)
 }
 
 /// Whether code uses its own place in the file: `line!`, `column!`, the location of a
-/// caller. A macro of another file that does is not seen.
-fn asks_where_it_is(text: &str) -> bool {
-    fn scan(stream: proc_macro2::TokenStream) -> bool {
-        let mut previous: Option<String> = None;
-        for tree in stream {
+/// caller (`#[track_caller]`, `Location::caller`). A macro of another file that does is
+/// not seen.
+fn asks_where_it_is(text: &str) -> Asks {
+    fn scan(stream: proc_macro2::TokenStream, found: &mut Asks) {
+        let mut trees: Trees = stream.into_iter().peekable();
+        while let Some(tree) = trees.next() {
             match tree {
                 proc_macro2::TokenTree::Ident(name) => {
-                    let name = name.to_string();
-                    if name == "Location" || name == "track_caller" {
-                        return true;
+                    if name == "track_caller" {
+                        *found = Asks::APlaceOfACall;
+                    } else if name == "Location" && next_is(&mut trees, ':') {
+                        // `Location::caller`: a type of that name alone asks nothing.
+                        let mut ahead = trees.clone();
+                        ahead.next();
+                        ahead.next();
+                        if matches!(ahead.next(), Some(proc_macro2::TokenTree::Ident(name)) if name == "caller")
+                        {
+                            *found = Asks::APlaceOfACall;
+                        }
+                    } else if (name == "line" || name == "column") && next_is(&mut trees, '!') {
+                        *found = (*found).max(Asks::ItsOwnPlace);
                     }
-                    previous = Some(name);
                 }
-                proc_macro2::TokenTree::Punct(mark) => {
-                    if mark.as_char() == '!'
-                        && previous
-                            .as_deref()
-                            .is_some_and(|name| name == "line" || name == "column")
-                    {
-                        return true;
-                    }
-                    previous = None;
-                }
-                proc_macro2::TokenTree::Group(group) => {
-                    if scan(group.stream()) {
-                        return true;
-                    }
-                    previous = None;
-                }
-                proc_macro2::TokenTree::Literal(_) => previous = None,
+                proc_macro2::TokenTree::Group(group) => scan(group.stream(), found),
+                _ => {}
             }
         }
-        false
     }
     // What does not lex is not known not to.
-    text.parse::<proc_macro2::TokenStream>().map_or(true, scan)
+    let Ok(stream) = text.parse::<proc_macro2::TokenStream>() else {
+        return Asks::APlaceOfACall;
+    };
+    let mut found = Asks::Nothing;
+    scan(stream, &mut found);
+    found
 }
 
 /// The ranges, each to the end of its last line when only a comment follows there: the
@@ -825,11 +868,54 @@ pub fn basic() -> u32 {
         let base = "#[cfg(feature = \"extra\")]\nfn off() -> u32 {\n    line!()\n}\npub fn n() -> u32 { 1 }\n";
         let with = base.replace("    line!()\n", "    let _ = 2;\n    line!()\n");
         assert!(same_build(&with, &off(&with), base, &off(base)));
-        assert!(asks_where_it_is("#[track_caller] fn f() {}"));
-        assert!(asks_where_it_is("fn f( {"));
-        assert!(!asks_where_it_is(
-            "fn line() { let column = 1; let _ = !column; }"
-        ));
+        assert_eq!(
+            asks_where_it_is("#[track_caller] fn f() {}"),
+            Asks::APlaceOfACall
+        );
+        assert_eq!(asks_where_it_is("fn f( {"), Asks::APlaceOfACall);
+        assert_eq!(
+            asks_where_it_is("fn f() -> u32 { std::panic::Location::caller().line() }"),
+            Asks::APlaceOfACall
+        );
+        assert_eq!(
+            asks_where_it_is("const N: u32 = line!() + column ! ();"),
+            Asks::ItsOwnPlace
+        );
+        // Names alone ask nothing: a function `line`, a type `Location`.
+        assert_eq!(
+            asks_where_it_is(
+                "struct Location; fn line() { let column = 1; let _ = !column; let _ = Location; }"
+            ),
+            Asks::Nothing
+        );
+        // `line!` above code that is left out stays where it is whatever comes after
+        // it: what moves below is not asked for.
+        let above = "pub const START: u32 = line!();\n#[cfg(feature = \"extra\")]\nfn off() -> u8 {\n    41\n}\npub fn answer() -> u32 { 7 }\n";
+        let longer = above.replace("    41\n", "    let value = 41;\n    value + 1\n");
+        assert!(same_build(&longer, &off(&longer), above, &off(above)));
+        // Below it, it moves.
+        let below = "#[cfg(feature = \"extra\")]\nfn off() -> u8 {\n    41\n}\npub const START: u32 = line!();\n";
+        let longer = below.replace("    41\n", "    let value = 41;\n    value + 1\n");
+        assert!(!same_build(&longer, &off(&longer), below, &off(below)));
+        // Documentation that grows before code that is left out moves nothing that is
+        // asked for: written as an attribute of the file or of an item on the line of
+        // the code, or as a comment above it.
+        for (short, long) in [
+            ("#![doc = \"a\"]", "#![doc = \"long\"]"),
+            ("#[doc = \"a\"]", "#[doc = \"long\"]"),
+        ] {
+            let before = format!(
+                "{short} #[cfg(feature = \"extra\")] fn off() {{ 1 }}\n#[track_caller]\npub fn n() -> u32 {{ line!() }}\n"
+            );
+            let after = before.replace(short, long).replace("{ 1 }", "{ 2 }");
+            assert!(
+                same_build(&after, &off(&after), &before, &off(&before)),
+                "{short}"
+            );
+        }
+        let before = "//! Old docs.\n#[cfg(feature = \"extra\")]\nfn off() {}\n#[track_caller]\npub fn n() -> u32 { line!() }\n";
+        let after = before.replace("//! Old docs.", "//! Much longer documentation.");
+        assert!(same_build(&after, &off(&after), before, &off(before)));
     }
 
     #[test]

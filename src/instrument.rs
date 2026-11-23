@@ -1694,6 +1694,8 @@ pub(crate) fn inactive_ranges(
         visit_local, visit::visit_local, syn::Local;
         visit_arm, visit::visit_arm, syn::Arm;
         visit_field_value, visit::visit_field_value, syn::FieldValue;
+        visit_variant, visit::visit_variant, syn::Variant;
+        visit_field, visit::visit_field, syn::Field;
         visit_stmt_macro, visit::visit_stmt_macro, syn::StmtMacro;
         visit_expr_block, visit::visit_expr_block, syn::ExprBlock;
         visit_expr_if, visit::visit_expr_if, syn::ExprIf;
@@ -3145,6 +3147,24 @@ mod tests {
         ] {
             assert!(left_out(off), "{off}");
         }
+        // A variant of an enum and a field of a struct, which a feature may add.
+        let shapes = r#"
+            pub enum Format { Json, #[cfg(feature = "extra")] Yaml, #[cfg(feature = "basic")] Toml }
+            pub struct Options { pub depth: u8, #[cfg(feature = "extra")] pub strict: bool }
+        "#;
+        let shapes_file = parse_source(shapes).unwrap();
+        let shape_ranges = inactive_ranges(shapes, &shapes_file, &on);
+        let texts: Vec<&str> = shape_ranges
+            .iter()
+            .map(|(from, to)| &shapes[*from..*to])
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "#[cfg(feature = \"extra\")] Yaml",
+                "#[cfg(feature = \"extra\")] pub strict: bool"
+            ]
+        );
         for on in ["n > 2", "n > 3", "n > 6", "n + 13", "15 + 1", "struct S"] {
             assert!(!left_out(on), "{on}");
         }
