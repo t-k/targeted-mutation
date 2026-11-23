@@ -2287,6 +2287,53 @@ fn a_key_without_one_of_its_parts_passes_tests_that_never_mix_them() {
 }
 
 #[test]
+fn a_boundary_value_no_input_gives_is_not_asked_for() {
+    let dir = fixture("stepped", "stepped");
+    let (code, report) = json(&dir);
+    assert_eq!(code, 2, "{report:#}");
+    let findings = report["findings"].as_array().unwrap();
+    // 16 and 24 blocks of eight have nothing between them, and neither have the bits
+    // 0100 and 1000 of the mask 1100: only the comparison tested far from its limit
+    // has a gap, and the values to add are ones a count of blocks gives.
+    assert_eq!(findings.len(), 1, "{report:#}");
+    let finding = &findings[0];
+    assert_eq!(finding["line"], 11, "{finding:#}");
+    assert_eq!(
+        finding["add_tests"],
+        serde_json::json!([
+            "`blocks * 8` = 16 (the original gives false)",
+            "`blocks * 8` = 24 (the original gives true)"
+        ]),
+    );
+    // The thresholds named are ones those values find out: `> 21` is `> 20` for
+    // every multiple of eight.
+    assert_eq!(
+        finding["survivors"],
+        serde_json::json!([
+            "`blocks * 8 > 24`",
+            "`blocks * 8 > 15`",
+            "`blocks * 8 > 25`"
+        ]),
+    );
+    assert_eq!(finding["survivor_count"], 24, "{finding:#}");
+    assert_eq!(finding["verified"], true, "{finding:#}");
+
+    // With the two values it asks for (2 and 3 blocks), nothing is left.
+    let path = dir.join("src/lib.rs");
+    let source = fs::read_to_string(&path).unwrap();
+    fs::write(
+        &path,
+        source.replace(
+            "assert!(is_long(5));",
+            "assert!(is_long(5));\n        assert!(!is_long(2));\n        assert!(is_long(3));",
+        ),
+    )
+    .unwrap();
+    let (code, report) = json(&dir);
+    assert_eq!(code, 0, "{report:#}");
+}
+
+#[test]
 fn known_findings_can_be_suppressed() {
     let dir = fixture("eligibility", "suppress");
     let baseline = dir.join("tmt-baseline.json");

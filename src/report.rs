@@ -736,6 +736,7 @@ pub fn input_gap_finding(
             min_shift,
             max_shift,
             missing,
+            same,
         } => {
             let add = missing
                 .iter()
@@ -747,7 +748,9 @@ pub fn input_gap_finding(
                     )
                 })
                 .collect();
-            ((max_shift - min_shift) as u128, add)
+            // Without the shifts that are no mutants: the expression cannot be a
+            // value that tells them from the original.
+            (((max_shift - min_shift) - (same.1 - same.0)) as u128, add)
         }
     };
     Some(Finding::InputGap {
@@ -1459,6 +1462,7 @@ mod tests {
             min_shift: 0,
             max_shift: 2,
             missing: vec![0],
+            same: (0, 0),
         };
         let finding = input_gap_finding("src/lib.rs", &site, &gap, &obs, true).unwrap();
         assert_eq!(
@@ -2120,6 +2124,7 @@ mod tests {
                 min_shift,
                 max_shift,
                 missing: vec![0],
+                same: (0, 0),
             };
             match input_gap_finding("f.rs", &site, &gap, &obs, false) {
                 Some(Finding::InputGap {

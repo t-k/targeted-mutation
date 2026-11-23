@@ -414,6 +414,11 @@ pub enum InputGap {
         min_shift: i128,
         max_shift: i128,
         missing: Vec<i128>,
+        /// The shifts from the first to the second of these answer like the original
+        /// for every value the expression can be (see [`within_reach`]): they are no
+        /// mutants. `(0, 0)` when it can be every number.
+        #[serde(skip_serializing_if = "no_shift")]
+        same: (i128, i128),
     },
     /// The operands were never equal (and carry no integer values); `Op(flipped)` survives.
     /// For floats, `float_gap` is the range of differences no test observed: every
@@ -422,6 +427,10 @@ pub enum InputGap {
         flipped: CmpOp,
         float_gap: Option<(f64, f64)>,
     },
+}
+
+fn no_shift(range: &(i128, i128)) -> bool {
+    *range == (0, 0)
 }
 
 #[derive(Clone, PartialEq, Debug, Default)]
@@ -444,12 +453,14 @@ impl InputGap {
             InputGap::Boundary {
                 min_shift,
                 max_shift,
+                same,
                 ..
             } => {
-                if *max_shift >= 1 {
-                    Some(Mutation::Shift(1))
-                } else if *min_shift <= -1 {
-                    Some(Mutation::Shift(-1))
+                // The nearest shift that is a mutant.
+                if *max_shift > same.1 {
+                    Some(Mutation::Shift(same.1 + 1))
+                } else if *min_shift < same.0 {
+                    Some(Mutation::Shift(same.0 - 1))
                 } else {
                     None
                 }
@@ -464,9 +475,10 @@ impl InputGap {
             InputGap::Boundary {
                 min_shift,
                 max_shift,
+                same,
                 ..
             } => (1..=3)
-                .flat_map(|n| [n, -n])
+                .flat_map(|n| [same.1 + n, same.0 - n])
                 .filter(|s| min_shift <= s && s <= max_shift)
                 .take(3)
                 .map(Mutation::Shift)
@@ -604,12 +616,181 @@ fn plan_boundary(op: CmpOp, obs: &Obs, domain: Option<(i128, i128)>) -> CmpPlan 
         min_shift,
         max_shift,
         missing,
+        same: (0, 0),
     });
     CmpPlan {
         cannot_differ: false,
         gap,
         run,
     }
+}
+
+/// What an integer expression can be whatever its inputs are, read from how it is
+/// written. Each holds also when the arithmetic wraps.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Reach {
+    /// A multiple of this power of two (`x * 8`, `x << 3`).
+    Multiples(i128),
+    /// Not negative, with no bit outside of this mask (`x & 0xF0`).
+    Bits(i128),
+    /// Smaller in size than this (`x % 10`).
+    Below(i128),
+}
+
+impl Reach {
+    pub fn holds(self, value: i128) -> bool {
+        match self {
+            Reach::Multiples(step) => value % step == 0,
+            Reach::Bits(mask) => value >= 0 && value & !mask == 0,
+            Reach::Below(limit) => -limit < value && value < limit,
+        }
+    }
+
+    /// The least value above `value` that the expression can be.
+    fn next_above(self, value: i128) -> Option<i128> {
+        match self {
+            Reach::Multiples(step) => value.div_euclid(step).checked_add(1)?.checked_mul(step),
+            Reach::Bits(_) if value < 0 => Some(0),
+            Reach::Bits(mask) => {
+                let over = value.checked_add(1)?;
+                let outside = over & !mask;
+                if outside == 0 {
+                    return Some(over);
+                }
+                // The bits from the highest one that is not of the mask down cannot
+                // stay: fill them and what else is not of the mask, so that adding one
+                // carries into the next bit of the mask above.
+                let top = 127 - outside.leading_zeros();
+                let low = 1_i128.checked_shl(top + 1)?.checked_sub(1)?;
+                let next = (over | !mask | low).wrapping_add(1) & mask;
+                (next > value).then_some(next)
+            }
+            Reach::Below(limit) => {
+                let next = value.checked_add(1)?.max(1 - limit);
+                (next < limit).then_some(next)
+            }
+        }
+    }
+
+    /// The greatest value below `value` that the expression can be.
+    fn next_below(self, value: i128) -> Option<i128> {
+        match self {
+            Reach::Multiples(step) => value.checked_sub(1)?.div_euclid(step).checked_mul(step),
+            Reach::Bits(_) if value <= 0 => None,
+            Reach::Bits(mask) => {
+                let under = value - 1;
+                let outside = under & !mask;
+                Some(if outside == 0 {
+                    under
+                } else {
+                    // Below the highest bit that is not of the mask, all of the mask.
+                    let top = 127 - outside.leading_zeros();
+                    let low = (1_i128 << top) - 1;
+                    (under & !low & !(1_i128 << top)) | (mask & low)
+                })
+            }
+            Reach::Below(limit) => {
+                let next = value.checked_sub(1)?.min(limit - 1);
+                (next > -limit).then_some(next)
+            }
+        }
+    }
+}
+
+/// The boundary gap of `expr op literal` (or `literal op expr`), given what the
+/// expression can be at all. `None` when no value it can be lies between the values
+/// the tests gave it: every shifted threshold then answers like the original, always.
+/// Otherwise the values to add are ones it can be, and a side that has none is left out.
+pub fn within_reach(
+    gap: InputGap,
+    op: CmpOp,
+    obs: &Obs,
+    reach: Reach,
+    literal: i128,
+    literal_is_rhs: bool,
+) -> Option<InputGap> {
+    let InputGap::Boundary {
+        min_shift,
+        max_shift,
+        missing,
+        same,
+    } = gap
+    else {
+        return Some(gap);
+    };
+    let Some((up, t0)) = op.threshold() else {
+        return Some(InputGap::Boundary {
+            min_shift,
+            max_shift,
+            missing,
+            same,
+        });
+    };
+    // As in `plan_boundary`: the nearest differences seen on each side, and the two
+    // next to the boundary.
+    let (below, above, w_minus, w_plus) = if up {
+        (obs.max_le(t0 - 1), obs.min_ge(t0), t0 - 1, t0)
+    } else {
+        (obs.max_le(t0), obs.min_ge(t0 + 1), t0, t0 + 1)
+    };
+    let (below, above) = (below?, above?);
+    // The expression's value for a difference, and back.
+    let value = |d: i128| {
+        if literal_is_rhs {
+            literal.checked_add(d)
+        } else {
+            literal.checked_sub(d)
+        }
+    };
+    let difference = |v: i128| {
+        if literal_is_rhs {
+            v.checked_sub(literal)
+        } else {
+            literal.checked_sub(v)
+        }
+    };
+    // The nearest difference the expression can make, from `start` towards `bound`
+    // (which it stops short of).
+    let nearest = |start: i128, bound: i128| -> Option<i128> {
+        if (start < bound) != (start <= bound) || start == bound {
+            return None;
+        }
+        let (from, to) = (value(start)?, value(bound)?);
+        let found = if reach.holds(from) {
+            from
+        } else if to > from {
+            reach.next_above(from)?
+        } else {
+            reach.next_below(from)?
+        };
+        let inside = if to > from { found < to } else { found > to };
+        inside.then(|| difference(found)).flatten()
+    };
+    let down = nearest(w_minus, below);
+    let up_side = nearest(w_plus, above);
+    let missing: Vec<i128> = [(w_minus, down), (w_plus, up_side)]
+        .into_iter()
+        .filter(|(w, _)| missing.contains(w))
+        .filter_map(|(_, nearest)| nearest)
+        .collect();
+    if missing.is_empty() {
+        return None;
+    }
+    // A threshold moved by less than it takes to reach the nearest value the expression
+    // can be, on either side, answers like the original for all of them. Where there is
+    // no such value short of what the tests gave, that is the whole side.
+    let (first_under, first_over) = (down.unwrap_or(below), up_side.unwrap_or(above));
+    let same = if up {
+        (first_under - t0 + 1, first_over - t0)
+    } else {
+        (first_under - t0, first_over - t0 - 1)
+    };
+    Some(InputGap::Boundary {
+        min_shift,
+        max_shift,
+        missing,
+        same: (same.0.max(min_shift).min(0), same.1.min(max_shift).max(0)),
+    })
 }
 
 /// What the tests observed at `a && b` / `a || b`.
@@ -871,6 +1052,186 @@ pub fn plan_return(obs: &ReturnObs) -> ReturnPlan {
 mod tests {
     use super::*;
 
+    const REACHES: [Reach; 5] = [
+        Reach::Multiples(4),
+        Reach::Multiples(8),
+        Reach::Bits(0b1010),
+        Reach::Bits(0b0110),
+        Reach::Below(5),
+    ];
+
+    #[test]
+    fn the_next_value_an_expression_can_be() {
+        for reach in REACHES {
+            for value in -40..=40_i128 {
+                let above = (value + 1..=80).find(|v| reach.holds(*v));
+                let below = (-80..value).rev().find(|v| reach.holds(*v));
+                assert_eq!(reach.next_above(value), above, "{reach:?} above {value}");
+                assert_eq!(reach.next_below(value), below, "{reach:?} below {value}");
+            }
+        }
+        // At the ends of the numbers there is no next one.
+        assert_eq!(Reach::Multiples(8).next_above(i128::MAX), None);
+        assert_eq!(Reach::Multiples(8).next_below(i128::MIN), None);
+        assert_eq!(Reach::Below(5).next_above(i128::MAX), None);
+        assert_eq!(Reach::Below(5).next_below(i128::MIN), None);
+        assert_eq!(Reach::Bits(i128::MAX).next_above(i128::MAX), None);
+        assert!(Reach::Bits(0xF0).holds(0x30) && !Reach::Bits(0xF0).holds(0x31));
+        assert!(!Reach::Bits(0xF0).holds(-16));
+    }
+
+    /// Every pair of values the expression can be, one on each side of the boundary,
+    /// as what the tests saw: the gap that is left is checked against all the values
+    /// the expression can be.
+    #[test]
+    fn a_gap_is_kept_only_for_values_the_expression_can_be() {
+        let mut dropped = 0;
+        let mut kept = 0;
+        for reach in REACHES {
+            let can_be: Vec<i128> = (-24..=24).filter(|v| reach.holds(*v)).collect();
+            for op in [CmpOp::Lt, CmpOp::Le, CmpOp::Gt, CmpOp::Ge] {
+                for literal in -6..=14_i128 {
+                    for literal_is_rhs in [true, false] {
+                        let d_of = |v: i128| {
+                            if literal_is_rhs {
+                                v - literal
+                            } else {
+                                literal - v
+                            }
+                        };
+                        for &low in &can_be {
+                            for &high in can_be.iter().filter(|v| **v > low) {
+                                let mut obs = Obs::of_d(d_of(low));
+                                obs.merge(&Obs::of_d(d_of(high)));
+                                let Some(gap @ InputGap::Boundary { .. }) =
+                                    plan_boundary(op, &obs, None).gap
+                                else {
+                                    continue;
+                                };
+                                let InputGap::Boundary {
+                                    min_shift,
+                                    max_shift,
+                                    ..
+                                } = gap.clone()
+                                else {
+                                    unreachable!()
+                                };
+                                // A threshold moved by `shift` answers `op` for the
+                                // difference less the shift.
+                                let differs = |shift: i128, v: i128| {
+                                    op.eval_d(d_of(v)) != op.eval_d(d_of(v) - shift)
+                                };
+                                let told_apart =
+                                    |shift: i128| can_be.iter().any(|v| differs(shift, *v));
+                                let case = format!(
+                                    "{reach:?} {op:?} literal {literal} rhs {literal_is_rhs}, saw {low} and {high}"
+                                );
+                                match within_reach(gap, op, &obs, reach, literal, literal_is_rhs) {
+                                    None => {
+                                        // Nothing it can be tells any of them apart.
+                                        for shift in min_shift..=max_shift {
+                                            assert!(!told_apart(shift), "{case}: shift {shift}");
+                                        }
+                                        dropped += 1;
+                                    }
+                                    Some(InputGap::Boundary {
+                                        min_shift: least,
+                                        max_shift: most,
+                                        missing,
+                                        same,
+                                    }) => {
+                                        assert!(!missing.is_empty(), "{case}");
+                                        assert_eq!((least, most), (min_shift, max_shift), "{case}");
+                                        for d in &missing {
+                                            let v = if literal_is_rhs {
+                                                literal + d
+                                            } else {
+                                                literal - d
+                                            };
+                                            assert!(reach.holds(v), "{case}: {v}");
+                                            assert!(low < v && v < high, "{case}: {v}");
+                                        }
+                                        // The shifts called the same are exactly those that
+                                        // nothing the expression can be tells apart.
+                                        assert!(same.0 <= 0 && 0 <= same.1, "{case}: {same:?}");
+                                        for shift in least..=most {
+                                            assert_eq!(
+                                                same.0 <= shift && shift <= same.1,
+                                                !told_apart(shift),
+                                                "{case}: shift {shift}, same {same:?}"
+                                            );
+                                        }
+                                        // The values to add find out every other one of a
+                                        // side that has a value to add.
+                                        let gap = InputGap::Boundary {
+                                            min_shift: least,
+                                            max_shift: most,
+                                            missing: missing.clone(),
+                                            same,
+                                        };
+                                        for mutation in gap.survivors() {
+                                            let Mutation::Shift(shift) = mutation else {
+                                                panic!("{case}: {mutation:?}")
+                                            };
+                                            assert!(told_apart(shift), "{case}: shift {shift}");
+                                        }
+                                        assert!(gap.representative().is_some(), "{case}");
+                                        kept += 1;
+                                    }
+                                    Some(other) => panic!("{case}: {other:?}"),
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        assert!(
+            dropped > 100 && kept > 1000,
+            "{dropped} dropped, {kept} kept"
+        );
+    }
+
+    #[test]
+    fn gaps_of_another_kind_are_not_touched() {
+        let obs = Obs::of_d(3);
+        for gap in [
+            InputGap::Unreached,
+            InputGap::OneSided { always: true },
+            InputGap::EqualNeverObserved {
+                flipped: CmpOp::Le,
+                float_gap: None,
+            },
+        ] {
+            assert_eq!(
+                within_reach(gap.clone(), CmpOp::Lt, &obs, Reach::Multiples(8), 20, true),
+                Some(gap)
+            );
+        }
+        // `blocks * 8 > 20` seen at 16 and 24: nothing between them is a multiple of 8.
+        let mut obs = Obs::of_d(16 - 20);
+        obs.merge(&Obs::of_d(24 - 20));
+        let gap = plan_boundary(CmpOp::Gt, &obs, None).gap.unwrap();
+        assert_eq!(
+            within_reach(gap, CmpOp::Gt, &obs, Reach::Multiples(8), 20, true),
+            None
+        );
+        // Seen at 8 and 40: 16 and 24 are the values next to the boundary.
+        let mut obs = Obs::of_d(8 - 20);
+        obs.merge(&Obs::of_d(40 - 20));
+        let gap = plan_boundary(CmpOp::Gt, &obs, None).gap.unwrap();
+        assert_eq!(
+            within_reach(gap, CmpOp::Gt, &obs, Reach::Multiples(8), 20, true),
+            Some(InputGap::Boundary {
+                min_shift: -12,
+                max_shift: 19,
+                missing: vec![-4, 4],
+                // `> 16` to `> 23` answer like `> 20` for 16 and 24, and all between.
+                same: (-4, 3),
+            })
+        );
+    }
+
     fn obs_of(ds: &[i128]) -> Obs {
         let mut obs = Obs::default();
         for d in ds {
@@ -902,7 +1263,8 @@ mod tests {
             Some(InputGap::Boundary {
                 min_shift: 0,
                 max_shift: 2,
-                missing: vec![0]
+                missing: vec![0],
+                same: (0, 0),
             })
         );
         // 17 is observed, so `age >= 17` flips a test outcome and has to be run.
@@ -1083,6 +1445,7 @@ mod tests {
             min_shift,
             max_shift,
             missing: vec![0],
+            same: (0, 0),
         };
         assert_eq!(boundary(-3, 1).representative(), Some(Mutation::Shift(1)));
         assert_eq!(boundary(-1, 0).representative(), Some(Mutation::Shift(-1)));
@@ -1421,6 +1784,7 @@ mod tests {
             min_shift,
             max_shift,
             missing: vec![0],
+            same: (0, 0),
         };
         assert_eq!(
             boundary(-9, 9).survivors(),
@@ -1658,6 +2022,7 @@ mod tests {
                 min_shift,
                 max_shift,
                 missing,
+                same: _,
             }) => {
                 assert!(*min_shift <= 0 && 0 <= *max_shift, "{ctx}");
                 for s in (*min_shift..=*max_shift).filter(|s| *s != 0) {

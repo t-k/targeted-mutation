@@ -1721,6 +1721,45 @@ pub(crate) fn inactive_ranges(
     inactive.found
 }
 
+/// What an integer expression can be, as far as its last operation with a literal says:
+/// a multiple (`x * 8`, `x << 3`), the bits of a mask (`x & 0xF0`), a remainder
+/// (`x % 10`). Only what also holds when the arithmetic wraps: a product by a number
+/// that is not a power of two can then be anything.
+pub(crate) fn reach(expr: &str) -> Option<crate::plan::Reach> {
+    use crate::plan::Reach;
+    fn literal(expr: &syn::Expr) -> Option<i128> {
+        match expr {
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Int(integer),
+                ..
+            }) => integer.base10_parse().ok(),
+            syn::Expr::Paren(inner) => literal(&inner.expr),
+            _ => None,
+        }
+    }
+    let mut expr = &syn::parse_str::<syn::Expr>(expr).ok()?;
+    while let syn::Expr::Paren(inner) = expr {
+        expr = &inner.expr;
+    }
+    let syn::Expr::Binary(binary) = expr else {
+        return None;
+    };
+    let (left, right) = (literal(&binary.left), literal(&binary.right));
+    let power_of_two = |k: i128| k >= 2 && k & (k - 1) == 0;
+    match binary.op {
+        syn::BinOp::Mul(_) => left
+            .or(right)
+            .filter(|k| power_of_two(*k))
+            .map(Reach::Multiples),
+        syn::BinOp::Shl(_) => right
+            .filter(|bits| (1..=100).contains(bits))
+            .map(|bits| Reach::Multiples(1 << bits)),
+        syn::BinOp::BitAnd(_) => left.or(right).filter(|mask| *mask >= 0).map(Reach::Bits),
+        syn::BinOp::Rem(_) => right.filter(|limit| *limit >= 1).map(Reach::Below),
+        _ => None,
+    }
+}
+
 /// Byte ranges of the code that only a test build has: what is under `cfg(test)` or
 /// marked as a test.
 pub(crate) fn test_only_ranges(source: &str, file: &syn::File) -> Vec<(usize, usize)> {
@@ -2819,6 +2858,41 @@ pub fn blame(sites: &[Site], enabled: &dyn Fn(u32) -> bool, offset: usize) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn what_an_expression_can_be_is_read_from_its_last_operation() {
+        use crate::plan::Reach;
+        for (expr, expected) in [
+            ("blocks * 8", Some(Reach::Multiples(8))),
+            ("8 * blocks", Some(Reach::Multiples(8))),
+            ("(blocks * (2))", Some(Reach::Multiples(2))),
+            ("blocks << 3", Some(Reach::Multiples(8))),
+            ("flags & 0xF0", Some(Reach::Bits(0xF0))),
+            ("0b1010u8 & flags", Some(Reach::Bits(0b1010))),
+            ("n % 10", Some(Reach::Below(10))),
+            ("(a + b) % 7_u32", Some(Reach::Below(7))),
+            // A product that wraps is a multiple only of a power of two.
+            ("cents * 10", None),
+            ("blocks * 1", None),
+            ("blocks * 0", None),
+            ("a * b", None),
+            ("3 << blocks", None),
+            ("blocks << 0", None),
+            ("blocks << 200", None),
+            ("10 % n", None),
+            ("n % 0", None),
+            ("blocks * 8 + 1", None),
+            ("(blocks * 8) as u8", None),
+            ("-(blocks * 8)", None),
+            ("blocks", None),
+            ("flags | 0xF0", None),
+            ("blocks / 8", None),
+            ("x * 8.0", None),
+            ("not rust (", None),
+        ] {
+            assert_eq!(reach(expr), expected, "{expr}");
+        }
+    }
 
     #[test]
     fn code_of_the_tests_is_told_from_the_rest() {

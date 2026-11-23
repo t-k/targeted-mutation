@@ -2935,14 +2935,33 @@ impl Session {
                 }
                 return Planned::Unreached;
             }
-            SiteKind::Cmp { op, literal, .. } => {
+            SiteKind::Cmp {
+                op,
+                literal,
+                lhs,
+                rhs,
+                ..
+            } => {
                 let op = *op;
                 let mut merged = Obs::default();
                 for bin in &self.binaries {
                     merged.merge(&bin.trace.merged(id));
                 }
                 let bounds = self.binaries.iter().find_map(|b| b.trace.bounds.get(&id));
-                let cmp_plan = plan::plan_cmp(op, &merged, domain_of(*literal, bounds));
+                let mut cmp_plan = plan::plan_cmp(op, &merged, domain_of(*literal, bounds));
+                // Compared with a number, what cannot be every number has a gap only
+                // where a value it can be lies between the values the tests gave it.
+                let against = match literal {
+                    LiteralSide::Rhs(number) => Some((lhs, *number, true)),
+                    LiteralSide::Lhs(number) => Some((rhs, *number, false)),
+                    LiteralSide::None => None,
+                };
+                if let Some((expr, number, is_rhs)) = against
+                    && let Some(reach) = instrument::reach(expr)
+                    && let Some(gap) = cmp_plan.gap.take()
+                {
+                    cmp_plan.gap = plan::within_reach(gap, op, &merged, reach, number, is_rhs);
+                }
                 let mut gaps = vec![];
                 let mut constant = false;
                 match &cmp_plan.gap {

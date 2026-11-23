@@ -88,6 +88,8 @@ INPUT GAP  src/lib.rs:4:5
 
 The tests saw 17 and 20, so any threshold in 18..=20 behaves the same on every test. The tool derives that range from the two observed values and names the one input that pins the boundary.
 
+A value that no input can give is not asked for. Compared with a number, `blocks * 8` is only ever a multiple of eight, `flags & 0xF0` only has bits of the mask, and `n % 10` is smaller than ten: when no such value lies between the ones the tests gave, nothing is reported, and otherwise the values named are ones the expression can be. This is read from the last operation of the expression, for integers, and only where it also holds when the arithmetic wraps (a product by a power of two, a shift, a mask, a remainder).
+
 The second kind of finding is about assertions rather than inputs. `fixtures/batch-store` has an atomic batch commit and a test that checks a failing batch returns an error, but never looks at the store afterwards:
 
 ```text
