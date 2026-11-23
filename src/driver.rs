@@ -711,9 +711,9 @@ impl BuiltSources {
             .unwrap_or_default()
     }
 
-    /// The same for another text of the file (a change undone). `None` when that is
-    /// not Rust, or a build did not say its features: nothing is known then.
-    fn left_out_of(&self, source: &SourceFile, text: &str) -> Option<Vec<(usize, usize)>> {
+    /// The feature sets of the builds that compiled the file. `None` when one of them
+    /// did not say its features.
+    fn builds_of(&self, source: &SourceFile) -> Option<Vec<&BTreeSet<String>>> {
         let mut builds: Vec<&BTreeSet<String>> = vec![];
         for root in &source.owners {
             if !self
@@ -725,18 +725,46 @@ impl BuiltSources {
             }
             builds.extend(self.features.get(root)?);
         }
+        Some(builds)
+    }
+
+    /// The same for another text of the file. `None` when that is not Rust, or a build
+    /// did not say its features: nothing is known then.
+    fn left_out_of(&self, source: &SourceFile, text: &str) -> Option<Vec<(usize, usize)>> {
+        let builds = self.builds_of(source)?;
         let parsed = instrument::parse_source(text).ok()?;
         let per_build: Vec<Vec<(usize, usize)>> = builds
             .iter()
-            .map(|features| {
-                // With them the `cfg` attributes that are on in that build: they are
-                // no part of what is built either.
-                let mut ranges = instrument::inactive_ranges(text, &parsed, features);
-                ranges.extend(instrument::settled_cfg_attributes(text, &parsed, features));
-                ranges
-            })
+            .map(|features| instrument::inactive_ranges(text, &parsed, features))
             .collect();
         Some(left_out_of_all(&per_build))
+    }
+
+    /// Whether two texts of the file are the same program in every build of it: each
+    /// build with what it leaves out of either, and the `cfg` attributes it settles as
+    /// on, which are no part of what it builds. False when that is not known.
+    fn same_program(&self, source: &SourceFile, a: &str, b: &str) -> bool {
+        let (Some(builds), Ok(parsed_a), Ok(parsed_b)) = (
+            self.builds_of(source),
+            instrument::parse_source(a),
+            instrument::parse_source(b),
+        ) else {
+            return false;
+        };
+        let apart = |text: &str, parsed: &syn::File, features: &BTreeSet<String>| {
+            let mut ranges = instrument::inactive_ranges(text, parsed, features);
+            ranges.extend(instrument::settled_cfg_attributes(text, parsed, features));
+            ranges
+        };
+        !builds.is_empty()
+            && builds.iter().all(|features| {
+                reverts::same_build(
+                    a,
+                    &apart(a, &parsed_a, features),
+                    b,
+                    &apart(b, &parsed_b, features),
+                )
+            })
     }
 }
 
@@ -5772,15 +5800,12 @@ fn run_package(
                 // Code this build leaves out (a feature that is off) is the same
                 // program with its change undone: nothing to try.
                 if options.rebuild || options.source_only {
-                    let left_out = built_sources.left_out(file);
                     for change in &mut changes {
-                        // Undone it may be built: a `cfg` that changed decides that.
-                        let then = change
-                            .undone
-                            .as_deref()
-                            .and_then(|undone| built_sources.left_out_of(file, undone));
-                        change.outside =
-                            change.outside_the_build(&file.original, &left_out, then.as_deref());
+                        // The same program undone, in every build: a `cfg` that
+                        // changed may turn code on or off.
+                        change.outside = change.undone.as_deref().is_some_and(|undone| {
+                            built_sources.same_program(file, &file.original, undone)
+                        });
                     }
                     not_built_changes.set(
                         not_built_changes.get()
@@ -5906,11 +5931,7 @@ fn run_package(
                 // along with the code under it), which shows as another program with
                 // those changes undone too than without them.
                 let whole = reverts::all_undone(&file.original, changes);
-                let off = |text: &str| built_sources.left_out_of(file, text);
-                let same = |a: &str, b: &str| match (off(a), off(b)) {
-                    (Some(off_a), Some(off_b)) => reverts::same_build(a, &off_a, b, &off_b),
-                    _ => false,
-                };
+                let same = |a: &str, b: &str| built_sources.same_program(file, a, b);
                 let tried: Vec<reverts::Change> = changes
                     .iter()
                     .filter(|change| !change.outside)
@@ -5950,13 +5971,8 @@ fn run_package(
                     .iter()
                     .map(|(file, changes)| reverts::all_undone(&file.original, changes))
                     .collect();
-                let same = |file: &SourceFile, a: &str, b: &str| match (
-                    built_sources.left_out_of(file, a),
-                    built_sources.left_out_of(file, b),
-                ) {
-                    (Some(off_a), Some(off_b)) => reverts::same_build(a, &off_a, b, &off_b),
-                    _ => false,
-                };
+                let same =
+                    |file: &SourceFile, a: &str, b: &str| built_sources.same_program(file, a, b);
                 // Never the program that is there: in some file it has to be another.
                 let another = whole.as_ref().is_none_or(|texts| {
                     changed

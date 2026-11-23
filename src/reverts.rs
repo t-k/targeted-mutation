@@ -50,6 +50,7 @@ impl Change {
     /// is, `off_then` those of the file with this change undone (`None` when that is
     /// not known: the change is then tried). A change of what decides it (a `cfg` put
     /// on, taken off or reworded) leaves other code out before than after.
+    #[cfg(test)]
     pub fn outside_the_build(
         &self,
         current: &str,
@@ -93,7 +94,7 @@ pub(crate) fn same_build(
         out
     };
     let (built_now, built_then) = (built(now, off_now), built(then, off_then));
-    if instrument::same_tokens(&built_now, &built_then) != Some(true) {
+    if instrument::same_built_tokens(&built_now, &built_then) != Some(true) {
         return false;
     }
     // Code that asks where it is can tell a line more above it, or a column more
@@ -1016,6 +1017,10 @@ pub fn basic() -> u32 {
             gated,
             &settled(gated)
         ));
+        // A call that is left out goes with its semicolon.
+        let plain = "fn f() {\n    a();\n    b();\n}\n";
+        let extra = "fn f() {\n    a();\n    #[cfg(feature = \"extra\")]\n    enable_extra();\n    b();\n}\n";
+        assert!(same_build(extra, &off(extra), plain, &off(plain)));
         // An attribute that is on at the head of what another turns off: all of it is
         // left out.
         let both = "fn f() -> u8 {\n    #[cfg(feature = \"basic\")]\n    #[cfg(feature = \"extra\")]\n    return 1;\n    2\n}\n";

@@ -1848,6 +1848,25 @@ fn test_only_items(source: &str, item: &syn::Item, found: &mut Vec<(usize, usize
 pub(crate) const LEFT_OUT: &str = "__tmt_left_out__";
 
 pub(crate) fn same_tokens(a: &str, b: &str) -> Option<bool> {
+    same_tokens_of(a, b, false)
+}
+
+/// The same for two texts in which what a build leaves out is [`LEFT_OUT`]: it goes with
+/// the comma or the semicolon it stands before.
+pub(crate) fn same_built_tokens(a: &str, b: &str) -> Option<bool> {
+    same_tokens_of(a, b, true)
+}
+
+/// Words that cannot be the name of what is called: `let (a,)` is a pattern in
+/// parentheses, not arguments.
+const KEYWORDS: [&str; 39] = [
+    "as", "async", "await", "box", "break", "const", "continue", "crate", "do", "dyn", "else",
+    "enum", "extern", "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move",
+    "mut", "pub", "ref", "return", "static", "struct", "super", "trait", "try", "type", "unsafe",
+    "use", "where", "while", "yield", "union",
+];
+
+fn same_tokens_of(a: &str, b: &str, holes: bool) -> Option<bool> {
     // `plain`: outside of what is given to a macro. A macro may tell any token from
     // another, also documentation (`stringify!`, a rule that matches an attribute).
     // `list`: the delimiter of the group this is the inside of, and whether a name
@@ -1855,16 +1874,18 @@ pub(crate) fn same_tokens(a: &str, b: &str) -> Option<bool> {
     fn tokens(
         stream: TokenStream,
         plain: bool,
+        holes: bool,
         list: Option<(proc_macro2::Delimiter, bool)>,
     ) -> Vec<String> {
         let mut out = vec![];
         let mut trees = stream.into_iter().peekable();
         // Whether the last tokens were a name and `!`: what follows is a macro's.
         let (mut named, mut called) = (false, false);
-        let mut closed = false;
+        // Whether the last token was a name that something can be called by.
+        let mut callable = false;
         while let Some(tree) = trees.next() {
-            let (was_named, was_called, was_closed) = (named, called, closed);
-            (named, called, closed) = (false, false, false);
+            let (was_named, was_called, was_callable) = (named, called, callable);
+            (named, called, callable) = (false, false, false);
             match tree {
                 // `#[doc = ".."]` and `#![doc = ".."]`: what a doc comment is read as.
                 TokenTree::Punct(hash) if hash.as_char() == '#' => {
@@ -1897,21 +1918,22 @@ pub(crate) fn same_tokens(a: &str, b: &str) -> Option<bool> {
                     let inner = tokens(
                         group.stream(),
                         plain && !was_called,
-                        Some((group.delimiter(), was_named || was_closed)),
+                        holes,
+                        Some((group.delimiter(), was_callable)),
                     );
                     out.push(format!("{:?}({})", group.delimiter(), inner.join(" ")));
                 }
                 TokenTree::Punct(mark) => {
                     called = was_named && mark.as_char() == '!';
-                    // The end of the types of a call: `f::<T>(a,)`.
-                    closed = mark.as_char() == '>';
                     out.push(mark.to_string());
                 }
                 TokenTree::Ident(name) => {
                     named = true;
                     // The name of a macro that is being defined.
                     called = was_called;
-                    out.push(name.to_string());
+                    let name = name.to_string();
+                    callable = !KEYWORDS.contains(&name.as_str());
+                    out.push(name);
                 }
                 other => out.push(other.to_string()),
             }
@@ -1919,28 +1941,32 @@ pub(crate) fn same_tokens(a: &str, b: &str) -> Option<bool> {
         if !plain {
             return out;
         }
-        // What a build leaves out goes with its comma: the one after it, or, at the end
-        // of a list, the one before it.
+        // What a build leaves out goes with its comma (the one after it, or, at the end
+        // of a list, the one before it), or with the semicolon of a statement that is
+        // an expression.
         let mut kept: Vec<String> = Vec::with_capacity(out.len());
+        let mut had_hole = false;
         let mut items = out.into_iter().peekable();
         while let Some(item) = items.next() {
-            if item != LEFT_OUT {
+            if !holes || item != LEFT_OUT {
                 kept.push(item);
-            } else if items.peek().is_some_and(|next| next == ",") {
+                continue;
+            }
+            had_hole = true;
+            if items.peek().is_some_and(|next| next == "," || next == ";") {
                 items.next();
             } else if items.peek().is_none() && kept.last().is_some_and(|last| last == ",") {
                 kept.pop();
             }
         }
-        // A comma after the last of a list says nothing: of braces and brackets, of a
-        // call or the fields after a name, of a tuple of more than one. `(a,)` is not
-        // `(a)`.
+        // A comma after the last of a list says nothing: of braces and brackets, of
+        // what follows a name that is called (arguments, the fields of a tuple struct),
+        // and of parentheses an element was left out of. Elsewhere `(a,)` is not `(a)`.
         if kept.last().is_some_and(|last| last == ",") {
-            let commas = kept.iter().filter(|item| *item == ",").count();
             let says_nothing = match list {
                 Some((proc_macro2::Delimiter::Brace | proc_macro2::Delimiter::Bracket, _)) => true,
                 Some((proc_macro2::Delimiter::Parenthesis, after_a_name)) => {
-                    after_a_name || commas > 1
+                    after_a_name || had_hole
                 }
                 _ => false,
             };
@@ -1950,7 +1976,7 @@ pub(crate) fn same_tokens(a: &str, b: &str) -> Option<bool> {
         }
         kept
     }
-    let lex = |text: &str| Some(tokens(text.parse::<TokenStream>().ok()?, true, None));
+    let lex = |text: &str| Some(tokens(text.parse::<TokenStream>().ok()?, true, holes, None));
     Some(lex(a)? == lex(b)?)
 }
 
@@ -3133,14 +3159,10 @@ mod tests {
             ("enum E { A, B }", "enum E { A, B, }"),
             ("struct S(pub u8);", "struct S(pub u8,);"),
             (
-                "fn f(a: u8) { g(a,); h::<u8>(a,) }",
-                "fn f(a: u8,) { g(a); h::<u8>(a) }",
+                "fn f(a: u8) { g(a,); s.h(a,) }",
+                "fn f(a: u8,) { g(a); s.h(a) }",
             ),
             ("const A: [u8; 2] = [1, 2];", "const A: [u8; 2] = [1, 2,];"),
-            (
-                "const T: (u8, u8) = (1, 2);",
-                "const T: (u8, u8,) = (1, 2,);",
-            ),
             (
                 "fn f(n: u8) -> u8 { match n { 1 => 2, _ => 0 } }",
                 "fn f(n: u8) -> u8 { match n { 1 => 2, _ => 0, } }",
@@ -3150,12 +3172,44 @@ mod tests {
         }
         for (one, other) in [
             ("const T: (u8,) = (1,);", "const T: (u8) = (1);"),
+            // A pattern, a value after a keyword or an operator, one with the commas
+            // of its types in it: a tuple of one is not what it holds.
+            (
+                "fn f() { let (x,) = (1u8,); }",
+                "fn f() { let (x) = (1u8,); }",
+            ),
+            (
+                "fn f() -> (u8,) { return (1,) }",
+                "fn f() -> (u8,) { return (1) }",
+            ),
+            (
+                "fn f() { let t = (Ok::<u8, u8>(1),); }",
+                "fn f() { let t = (Ok::<u8, u8>(1)); }",
+            ),
+            (
+                "fn f(a: (u8,), b: u8) -> bool { a > (b,) }",
+                "fn f(a: (u8,), b: u8) -> bool { a > (b) }",
+            ),
+            (
+                "fn f(x: u8) { for (a,) in [(x,)] {} }",
+                "fn f(x: u8) { for (a) in [(x,)] {} }",
+            ),
             ("m!(a, b);", "m!(a, b,);"),
             ("enum E { A, B }", "enum E { A, B, C }"),
             ("fn f() { g(1, 2) }", "fn f() { g(1,, 2) }"),
         ] {
             assert_eq!(same_tokens(one, other), Some(false), "{one}");
         }
+        // The name that stands for what a build leaves out is a name like any other
+        // where two texts of a program are compared.
+        assert_eq!(
+            same_tokens(
+                &format!("const A: [u8; 2] = [1, {LEFT_OUT}];"),
+                "const A: [u8; 1] = [1];"
+            ),
+            Some(false)
+        );
+        let same_tokens = same_built_tokens;
         // What a build leaves out goes with a comma of its own, wherever it stands.
         let hole = LEFT_OUT;
         for with in [
@@ -3179,6 +3233,19 @@ mod tests {
         assert_eq!(
             same_tokens(&format!("enum E {{ A, {hole}, B }}"), "enum E { A }"),
             Some(false)
+        );
+        // A statement that is an expression goes with its semicolon; a field left out
+        // of a tuple struct leaves no comma that counts.
+        assert_eq!(
+            same_tokens(
+                &format!("fn f() {{ a(); {hole}; b() }}"),
+                "fn f() { a(); b() }"
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            same_tokens(&format!("struct S(pub u8, {hole},);"), "struct S(pub u8);"),
+            Some(true)
         );
         assert_eq!(same_tokens(code, "fn f( {"), None);
         assert_eq!(same_tokens("fn f( {", code), None);
