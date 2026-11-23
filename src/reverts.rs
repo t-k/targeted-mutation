@@ -80,22 +80,11 @@ pub(crate) fn same_build(
         for (from, to) in ranges {
             if from >= at && to <= text.len() {
                 out.push_str(&text[at..from]);
-                // What is left out of a list (a variant, a field, an arm) goes with
-                // its comma: the one after it, or else the one before it.
-                let rest = &text[to..];
-                let after = rest.trim_start();
-                if text[from..to].trim_end().ends_with(',') {
-                    // An arm of a `match` has its comma in it.
-                    at = to;
-                } else if after.starts_with(',') {
-                    at = to + (rest.len() - after.len()) + 1;
-                } else {
-                    let kept = out.trim_end().len();
-                    if out[..kept].ends_with(',') {
-                        out.truncate(kept - 1);
-                    }
-                    at = to;
-                }
+                // In its place a name no program has: what is left out of a list
+                // goes with its comma when the tokens are compared.
+                out.push(' ');
+                out.push_str(instrument::LEFT_OUT);
+                at = to;
                 out.push(' ');
             }
         }
@@ -966,6 +955,75 @@ pub fn basic() -> u32 {
                 "{with}"
             );
         }
+        // However the list is laid out: a last comma here and not there, a comment
+        // before the comma, an arm in braces that has no comma of its own, a field of a
+        // tuple struct on lines of its own.
+        for (without, with) in [
+            (
+                "enum E { A }",
+                "enum E { A, #[cfg(feature = \"extra\")] B, }",
+            ),
+            (
+                "enum E { A, }",
+                "enum E { A, #[cfg(feature = \"extra\")] B }",
+            ),
+            (
+                "enum E { A // explanation\n}",
+                "enum E { A, // explanation\n#[cfg(feature = \"extra\")] B\n}",
+            ),
+            (
+                "enum E { A }",
+                "enum E { #[cfg(feature = \"extra\")] X /* note */, A }",
+            ),
+            (
+                "fn f(n: u8) -> u8 { match n { 0 => 1, _ => 0, } }",
+                "fn f(n: u8) -> u8 { match n { 0 => 1, #[cfg(feature = \"extra\")] 2 => { let x = n.saturating_add(1); x } _ => 0, } }",
+            ),
+            (
+                "pub struct S(pub u8);",
+                "pub struct S(\n    pub u8,\n    #[cfg(feature = \"extra\")] pub std::collections::BTreeMap<String, std::path::PathBuf>,\n);",
+            ),
+        ] {
+            assert!(
+                same_build(with, &off(with), without, &off(without)),
+                "{with}"
+            );
+        }
+        // A `cfg` that is on in the build is no part of it: reworded to another that
+        // is on, put on, or taken off, the build is the same. One that is off is not.
+        let settled = |text: &str| {
+            let parsed = instrument::parse_source(text).unwrap();
+            let mut ranges = instrument::inactive_ranges(text, &parsed, &features);
+            ranges.extend(instrument::settled_cfg_attributes(text, &parsed, &features));
+            ranges
+        };
+        let gated = "#[cfg(feature = \"basic\")]\npub const N: u8 = 1;\n";
+        for other in [
+            "#[cfg(any(feature = \"basic\", feature = \"extra\"))]\npub const N: u8 = 1;\n",
+            "pub const N: u8 = 1;\n",
+            "#[cfg(not(feature = \"extra\"))]\npub const N: u8 = 1;\n",
+        ] {
+            assert!(
+                same_build(other, &settled(other), gated, &settled(gated)),
+                "{other}"
+            );
+        }
+        let off_now = "#[cfg(feature = \"extra\")]\npub const N: u8 = 1;\n";
+        assert!(!same_build(
+            off_now,
+            &settled(off_now),
+            gated,
+            &settled(gated)
+        ));
+        // One that depends on something else stays a token.
+        let target = "#[cfg(unix)]\npub const N: u8 = 1;\n";
+        assert!(!same_build(
+            target,
+            &settled(target),
+            gated,
+            &settled(gated)
+        ));
+
         // A line more above a `column!` moves nothing it tells; a column more does.
         let col = "#[cfg(feature = \"extra\")]\nfn off() -> u8 {\n    41\n}\npub const COL: u32 = column!();\n";
         let longer = col.replace("    41\n", "    let value = 41;\n    value + 1\n");

@@ -1625,6 +1625,40 @@ fn cfg_is_off(attrs: &[syn::Attribute], features: &BTreeSet<String>) -> bool {
     })
 }
 
+/// Byte ranges of the `cfg` attributes that are on whatever else holds, given the
+/// features that are on: with or without one of them the build is the same.
+pub(crate) fn settled_cfg_attributes(
+    source: &str,
+    file: &syn::File,
+    features: &BTreeSet<String>,
+) -> Vec<(usize, usize)> {
+    struct Settled<'a> {
+        source: &'a str,
+        features: &'a BTreeSet<String>,
+        found: Vec<(usize, usize)>,
+    }
+    impl<'ast> Visit<'ast> for Settled<'_> {
+        fn visit_attribute(&mut self, attr: &'ast syn::Attribute) {
+            let range = attr.span().byte_range();
+            if attr.path().is_ident("cfg")
+                && attr
+                    .parse_args::<syn::Meta>()
+                    .is_ok_and(|meta| cfg_value(&meta, self.features) == Some(true))
+                && self.source.get(range.clone()).is_some()
+            {
+                self.found.push((range.start, range.end));
+            }
+        }
+    }
+    let mut settled = Settled {
+        source,
+        features,
+        found: vec![],
+    };
+    settled.visit_file(file);
+    settled.found
+}
+
 /// Byte ranges of the code that the features that are on leave out of the build: what is
 /// under a `cfg` that is off whatever the target is. Its mutants would change nothing.
 pub(crate) fn inactive_ranges(
@@ -1809,16 +1843,28 @@ fn test_only_items(source: &str, item: &syn::Item, found: &mut Vec<(usize, usize
 
 /// Whether two sources are the same program text: the same tokens, whatever the
 /// comments, the documentation and the spacing are. `None` when one does not lex.
+/// What stands for code a build leaves out, where two texts are compared as that build
+/// has them (`reverts::same_build`): no name a program has.
+pub(crate) const LEFT_OUT: &str = "__tmt_left_out__";
+
 pub(crate) fn same_tokens(a: &str, b: &str) -> Option<bool> {
     // `plain`: outside of what is given to a macro. A macro may tell any token from
     // another, also documentation (`stringify!`, a rule that matches an attribute).
-    fn tokens(stream: TokenStream, plain: bool, out: &mut Vec<String>) {
+    // `list`: the delimiter of the group this is the inside of, and whether a name
+    // comes before it (a call, the fields of a tuple struct).
+    fn tokens(
+        stream: TokenStream,
+        plain: bool,
+        list: Option<(proc_macro2::Delimiter, bool)>,
+    ) -> Vec<String> {
+        let mut out = vec![];
         let mut trees = stream.into_iter().peekable();
         // Whether the last tokens were a name and `!`: what follows is a macro's.
         let (mut named, mut called) = (false, false);
+        let mut closed = false;
         while let Some(tree) = trees.next() {
-            let (was_named, was_called) = (named, called);
-            (named, called) = (false, false);
+            let (was_named, was_called, was_closed) = (named, called, closed);
+            (named, called, closed) = (false, false, false);
             match tree {
                 // `#[doc = ".."]` and `#![doc = ".."]`: what a doc comment is read as.
                 TokenTree::Punct(hash) if hash.as_char() == '#' => {
@@ -1847,13 +1893,18 @@ pub(crate) fn same_tokens(a: &str, b: &str) -> Option<bool> {
                     }
                 }
                 TokenTree::Group(group) => {
-                    out.push(format!("{:?}(", group.delimiter()));
                     // `name!(..)`, and `macro_rules! name {..}` with its name between.
-                    tokens(group.stream(), plain && !was_called, out);
-                    out.push(")".to_string());
+                    let inner = tokens(
+                        group.stream(),
+                        plain && !was_called,
+                        Some((group.delimiter(), was_named || was_closed)),
+                    );
+                    out.push(format!("{:?}({})", group.delimiter(), inner.join(" ")));
                 }
                 TokenTree::Punct(mark) => {
                     called = was_named && mark.as_char() == '!';
+                    // The end of the types of a call: `f::<T>(a,)`.
+                    closed = mark.as_char() == '>';
                     out.push(mark.to_string());
                 }
                 TokenTree::Ident(name) => {
@@ -1865,12 +1916,41 @@ pub(crate) fn same_tokens(a: &str, b: &str) -> Option<bool> {
                 other => out.push(other.to_string()),
             }
         }
+        if !plain {
+            return out;
+        }
+        // What a build leaves out goes with its comma: the one after it, or, at the end
+        // of a list, the one before it.
+        let mut kept: Vec<String> = Vec::with_capacity(out.len());
+        let mut items = out.into_iter().peekable();
+        while let Some(item) = items.next() {
+            if item != LEFT_OUT {
+                kept.push(item);
+            } else if items.peek().is_some_and(|next| next == ",") {
+                items.next();
+            } else if items.peek().is_none() && kept.last().is_some_and(|last| last == ",") {
+                kept.pop();
+            }
+        }
+        // A comma after the last of a list says nothing: of braces and brackets, of a
+        // call or the fields after a name, of a tuple of more than one. `(a,)` is not
+        // `(a)`.
+        if kept.last().is_some_and(|last| last == ",") {
+            let commas = kept.iter().filter(|item| *item == ",").count();
+            let says_nothing = match list {
+                Some((proc_macro2::Delimiter::Brace | proc_macro2::Delimiter::Bracket, _)) => true,
+                Some((proc_macro2::Delimiter::Parenthesis, after_a_name)) => {
+                    after_a_name || commas > 1
+                }
+                _ => false,
+            };
+            if says_nothing {
+                kept.pop();
+            }
+        }
+        kept
     }
-    let lex = |text: &str| -> Option<Vec<String>> {
-        let mut out = vec![];
-        tokens(text.parse::<TokenStream>().ok()?, true, &mut out);
-        Some(out)
-    };
+    let lex = |text: &str| Some(tokens(text.parse::<TokenStream>().ok()?, true, None));
     Some(lex(a)? == lex(b)?)
 }
 
@@ -3047,6 +3127,58 @@ mod tests {
         assert_eq!(
             same_tokens("m!(1); /// a\nfn f() {}", "m!(1); /// b\nfn f() {}"),
             Some(true)
+        );
+        // A comma after the last of a list says nothing, except in a tuple of one.
+        for (one, other) in [
+            ("enum E { A, B }", "enum E { A, B, }"),
+            ("struct S(pub u8);", "struct S(pub u8,);"),
+            (
+                "fn f(a: u8) { g(a,); h::<u8>(a,) }",
+                "fn f(a: u8,) { g(a); h::<u8>(a) }",
+            ),
+            ("const A: [u8; 2] = [1, 2];", "const A: [u8; 2] = [1, 2,];"),
+            (
+                "const T: (u8, u8) = (1, 2);",
+                "const T: (u8, u8,) = (1, 2,);",
+            ),
+            (
+                "fn f(n: u8) -> u8 { match n { 1 => 2, _ => 0 } }",
+                "fn f(n: u8) -> u8 { match n { 1 => 2, _ => 0, } }",
+            ),
+        ] {
+            assert_eq!(same_tokens(one, other), Some(true), "{one}");
+        }
+        for (one, other) in [
+            ("const T: (u8,) = (1,);", "const T: (u8) = (1);"),
+            ("m!(a, b);", "m!(a, b,);"),
+            ("enum E { A, B }", "enum E { A, B, C }"),
+            ("fn f() { g(1, 2) }", "fn f() { g(1,, 2) }"),
+        ] {
+            assert_eq!(same_tokens(one, other), Some(false), "{one}");
+        }
+        // What a build leaves out goes with a comma of its own, wherever it stands.
+        let hole = LEFT_OUT;
+        for with in [
+            format!("enum E {{ A, {hole}, B }}"),
+            format!("enum E {{ A, B, {hole}, }}"),
+            format!("enum E {{ A, B, {hole} }}"),
+            format!("enum E {{ {hole}, A, B }}"),
+            format!("enum E {{ A, {hole} /* note */ , B, }}"),
+            format!("{hole} enum E {{ A, B }}"),
+        ] {
+            assert_eq!(same_tokens(&with, "enum E { A, B }"), Some(true), "{with}");
+        }
+        // An arm in braces has no comma of its own: the one before it is another arm's.
+        assert_eq!(
+            same_tokens(
+                &format!("fn f(n: u8) -> u8 {{ match n {{ 0 => 1, {hole} _ => 0, }} }}"),
+                "fn f(n: u8) -> u8 { match n { 0 => 1, _ => 0 } }"
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            same_tokens(&format!("enum E {{ A, {hole}, B }}"), "enum E { A }"),
+            Some(false)
         );
         assert_eq!(same_tokens(code, "fn f( {"), None);
         assert_eq!(same_tokens("fn f( {", code), None);

@@ -728,7 +728,13 @@ impl BuiltSources {
         let parsed = instrument::parse_source(text).ok()?;
         let per_build: Vec<Vec<(usize, usize)>> = builds
             .iter()
-            .map(|features| instrument::inactive_ranges(text, &parsed, features))
+            .map(|features| {
+                // With them the `cfg` attributes that are on in that build: they are
+                // no part of what is built either.
+                let mut ranges = instrument::inactive_ranges(text, &parsed, features);
+                ranges.extend(instrument::settled_cfg_attributes(text, &parsed, features));
+                ranges
+            })
             .collect();
         Some(left_out_of_all(&per_build))
     }
