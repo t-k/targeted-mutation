@@ -80,8 +80,23 @@ pub(crate) fn same_build(
         for (from, to) in ranges {
             if from >= at && to <= text.len() {
                 out.push_str(&text[at..from]);
+                // What is left out of a list (a variant, a field, an arm) goes with
+                // its comma: the one after it, or else the one before it.
+                let rest = &text[to..];
+                let after = rest.trim_start();
+                if text[from..to].trim_end().ends_with(',') {
+                    // An arm of a `match` has its comma in it.
+                    at = to;
+                } else if after.starts_with(',') {
+                    at = to + (rest.len() - after.len()) + 1;
+                } else {
+                    let kept = out.trim_end().len();
+                    if out[..kept].ends_with(',') {
+                        out.truncate(kept - 1);
+                    }
+                    at = to;
+                }
                 out.push(' ');
-                at = to;
             }
         }
         out.push_str(&text[at..]);
@@ -175,8 +190,20 @@ fn places(text: &str, off: &[(usize, usize)], asked: Asks) -> Option<Vec<(usize,
                 proc_macro2::TokenTree::Ident(name) => {
                     let asks_here =
                         (name == "line" || name == "column") && next_is(&mut trees, '!');
-                    if all || asks_here {
+                    if all {
                         note(name.span(), off, out);
+                    } else if asks_here {
+                        // Of what it asks for alone: a line more above a `column!`
+                        // moves nothing it can tell.
+                        let mut place = vec![];
+                        note(name.span(), off, &mut place);
+                        out.extend(place.into_iter().map(|(line, column)| {
+                            if name == "line" {
+                                (line, 0)
+                            } else {
+                                (0, column)
+                            }
+                        }));
                     }
                 }
                 other => {
@@ -842,7 +869,6 @@ pub fn basic() -> u32 {
         for asking in [
             "line !()",
             "line!()",
-            "column ! ()",
             "std::panic::Location::caller().line()",
         ] {
             let base = format!("pub fn n() -> u32 {{ {asking} }}\n");
@@ -852,6 +878,10 @@ pub fn basic() -> u32 {
                 "{asking}"
             );
         }
+        // The column of a line that only moved down is the same.
+        let base = "pub fn n() -> u32 { column ! () }\n";
+        let with = format!("#[cfg(feature = \"extra\")]\npub const OFF: u8 = 42;\n{base}");
+        assert!(same_build(&with, &off(&with), base, &off(base)));
         // A caller's location is asked for somewhere: a change of code that is left
         // out after it, or of the same length, moves no token that is kept.
         let tracked = "#[track_caller]\npub fn checked() {}\n#[cfg(feature = \"extra\")]\nfn off() -> u8 { 41 }\npub fn after() {}\n";
@@ -893,6 +923,53 @@ pub fn basic() -> u32 {
         let above = "pub const START: u32 = line!();\n#[cfg(feature = \"extra\")]\nfn off() -> u8 {\n    41\n}\npub fn answer() -> u32 { 7 }\n";
         let longer = above.replace("    41\n", "    let value = 41;\n    value + 1\n");
         assert!(same_build(&longer, &off(&longer), above, &off(above)));
+        // A variant, a field or an arm that is left out goes with its comma: new in
+        // the middle of a list, at its end with or without a comma of its own.
+        for (without, with) in [
+            (
+                "pub enum F { Json, Toml }",
+                "pub enum F { Json, #[cfg(feature = \"extra\")] Yaml, Toml }",
+            ),
+            (
+                "pub enum F { Json, Toml, }",
+                "pub enum F { Json, Toml, #[cfg(feature = \"extra\")] Yaml, }",
+            ),
+            (
+                "pub enum F { Json, Toml }",
+                "pub enum F { Json, Toml, #[cfg(feature = \"extra\")] Yaml }",
+            ),
+            (
+                "pub enum F { Json }",
+                "pub enum F { #[cfg(feature = \"extra\")] Yaml, Json }",
+            ),
+            (
+                "pub struct O { pub depth: u8 }",
+                "pub struct O { pub depth: u8, #[cfg(feature = \"extra\")] pub strict: bool }",
+            ),
+            (
+                "fn f(n: u8) -> u8 { match n { 1 => 2, _ => 0 } }",
+                "fn f(n: u8) -> u8 { match n { 1 => 2, #[cfg(feature = \"extra\")] 3 => 4, _ => 0 } }",
+            ),
+        ] {
+            assert!(
+                same_build(with, &off(with), without, &off(without)),
+                "{with}"
+            );
+            // Built, it is another program.
+            let all: std::collections::BTreeSet<String> =
+                ["basic".to_string(), "extra".to_string()].into();
+            let none = |text: &str| {
+                instrument::inactive_ranges(text, &instrument::parse_source(text).unwrap(), &all)
+            };
+            assert!(
+                !same_build(with, &none(with), without, &none(without)),
+                "{with}"
+            );
+        }
+        // A line more above a `column!` moves nothing it tells; a column more does.
+        let col = "#[cfg(feature = \"extra\")]\nfn off() -> u8 {\n    41\n}\npub const COL: u32 = column!();\n";
+        let longer = col.replace("    41\n", "    let value = 41;\n    value + 1\n");
+        assert!(same_build(&longer, &off(&longer), col, &off(col)));
         // Below it, it moves.
         let below = "#[cfg(feature = \"extra\")]\nfn off() -> u8 {\n    41\n}\npub const START: u32 = line!();\n";
         let longer = below.replace("    41\n", "    let value = 41;\n    value + 1\n");
