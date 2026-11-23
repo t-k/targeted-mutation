@@ -673,4 +673,108 @@ mod tests {
             }
         }
     }
+    /// Statements a test may consist of: calls that are looked at and calls that are
+    /// not, and text that only looks like either.
+    fn statement() -> impl proptest::strategy::Strategy<Value = String> {
+        use proptest::prelude::*;
+        let call = prop_oneof![
+            (0..5u32).prop_map(|n| format!("bucket({n})")),
+            (0..5u32).prop_map(|n| format!("on({n})")),
+            Just("bucket( 3 )".to_string()),
+            Just("bucket(\n        3,\n    )".to_string()),
+            Just("bucket(n)".to_string()),
+            Just("self::bucket(1)".to_string()),
+            Just("other(2)".to_string()),
+        ];
+        let calls = move || call.clone();
+        prop_oneof![
+            calls().prop_map(|c| format!("assert_eq!({c}, \"none\");")),
+            calls().prop_map(|c| format!("assert_ne!({c}, \"none\");")),
+            calls().prop_map(|c| format!("assert_ne!(\n        {c},\n        \"none\",\n    );")),
+            calls().prop_map(|c| format!("assert!({c} != \"few\", \"{{}}\", 1);")),
+            (calls(), calls())
+                .prop_map(|(c, d)| format!("assert!(!{c}.is_empty() || {d} == \"a\");")),
+            (calls(), calls()).prop_map(|(c, d)| format!("assert_eq!(enable(2), {c} > {d});")),
+            calls().prop_map(|c| format!("let got = {c};")),
+            (calls(), calls()).prop_map(|(c, d)| format!("let pair = ({c}, [{d}]);")),
+            calls().prop_map(|c| format!("let lazy = || {c};")),
+            calls().prop_map(|c| format!("{{ let inner = {c}; }}")),
+            calls().prop_map(|c| format!("#[cfg(unix)] let got = {c};")),
+            calls().prop_map(|c| format!("let text = \"}} {c} {{ é日本\";")),
+            calls().prop_map(|c| format!("// {c} }}\n")),
+            calls().prop_map(|c| format!("/* {{ {c} */")),
+            calls().prop_map(|c| format!("{c};")),
+            calls().prop_map(|c| format!("if flag {{ assert_ne!({c}, \"none\"); }}")),
+            calls().prop_map(|c| format!("let Some(got) = Some({c}) else {{ return; }};")),
+            Just("let bucket = |n: u32| n;".to_string()),
+            Just("let n = 3;".to_string()),
+            Just("set('}');".to_string()),
+            Just("fn helper() -> u32 { 0 }".to_string()),
+        ]
+    }
+
+    proptest::proptest! {
+        /// Whatever a test consists of, a call taken from it is a stretch of its body,
+        /// between all that comes before it and all that comes after.
+        #[test]
+        fn a_call_is_taken_with_all_of_its_test_around_it(
+            statements in proptest::collection::vec(statement(), 0..6),
+            separator in proptest::prop_oneof![
+                proptest::strategy::Just(" "),
+                proptest::strategy::Just("\n    "),
+            ],
+            nested in proptest::bool::ANY,
+        ) {
+            let body = format!(" {}{separator}", statements.join(separator));
+            let test = format!("#[test] fn looks() {{{body}}}");
+            let functions = format!(
+                "{BUCKET}pub fn on(n: u32) -> bool {{ n > 1 }}\nfn other(n: u32) -> u32 {{ n }}\n"
+            );
+            let source = if nested {
+                format!("{functions}#[cfg(test)] mod tests {{ use super::*;\n{test}\n}}\n")
+            } else {
+                format!("{functions}{test}\n")
+            };
+            let Ok(file) = syn::parse_file(&source) else {
+                return Ok(());
+            };
+            for function in unpinned_calls(&source, &file) {
+                let name = source[function.item.clone()]
+                    .split('(')
+                    .next()
+                    .unwrap()
+                    .rsplit(' ')
+                    .next()
+                    .unwrap()
+                    .to_string();
+                proptest::prop_assert!(function.scenarios.len() <= MAX_CALLS, "{source}");
+                let mut places = BTreeSet::new();
+                for scenario in &function.scenarios {
+                    let after = scenario.after.as_deref().unwrap_or("<none>");
+                    let whole = format!("{}{}{after}", scenario.setup, scenario.expression);
+                    proptest::prop_assert_eq!(&whole, &body, "in\n{}", source);
+                    // The same call written twice is taken at two places.
+                    proptest::prop_assert!(places.insert(scenario.setup.len()), "{source}");
+                    let Ok(Expr::Call(call)) = syn::parse_str::<Expr>(&scenario.expression) else {
+                        return Err(proptest::test_runner::TestCaseError::fail(format!(
+                            "`{}` is not a call, in\n{source}",
+                            scenario.expression
+                        )));
+                    };
+                    let Expr::Path(path) = &*call.func else {
+                        panic!("{} in {source}", scenario.expression)
+                    };
+                    proptest::prop_assert!(path.path.is_ident(&name), "{source}");
+                    proptest::prop_assert!(call.args.iter().all(literal), "{source}");
+                    let written = scenario.test_edit(&source, "__tmt_witness", None).replacement;
+                    proptest::prop_assert!(
+                        syn::parse_file(&written).is_ok(),
+                        "the test that looks does not parse:\n{}\nin\n{}",
+                        written,
+                        source
+                    );
+                }
+            }
+        }
+    }
 }

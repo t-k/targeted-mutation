@@ -370,6 +370,7 @@ The probes are written to leave the unmutated program alone: every operand is ev
 - `formal/lean/Planner.lean` also has the two ends of a sequence: with at most one element `first` and `last` are the same, and a sequence whose first and last element differ tells them apart.
 - `formal/pict/slice_ends.pict`: which end is asked for, of what (slice, `Vec`, array, set, field, `&mut`, a type of the crate's own, an iterator), and how long the sequences of the tests were. The table (`tests/data/slice_ends.pict.tsv`) is made into a crate and run in `tests/e2e.rs` (`slice_end_table`).
 - `formal/pict/unpinned_calls.pict`: where a test calls a function (in an `assert_ne!`, an `assert!`, a `let`, as one side of an `assert_eq!` or inside one), with what arguments, what kind of function, and where the test is. The table (`tests/data/unpinned_calls.pict.tsv`) is replayed in `witness::assertions::tests::pict_table`.
+- `tests/properties.rs` (proptest): for the sources of this repository and for generated programs (operators with a line end or a comment beside them, attributes, guards, macros, `const` and `async` functions, methods), every site is a stretch of the source, the text with any choice of probes is a Rust source file with the lines of the original, no probe at all leaves the text as it is, and every source mutant is a Rust source file that is another program. Only the text is looked at: that a probed program compiles and behaves is what the end-to-end tests are for. `witness::assertions::tests::a_call_is_taken_with_all_of_its_test_around_it` does the same for the calls taken from tests: a call is a stretch of its test's body between all that comes before and all that comes after, and the test written to look at it parses.
 - `formal/pict/planner.pict`: 3-way combinations of operator, observation shape, literal position and type range. The generated table (`tests/data/planner.pict.tsv`) is replayed against a brute-force oracle in `plan::tests::pict_table`.
 - `formal/tla/RepairLoop.tla`: the instrument, build, disable-failing-probes loop terminates and never ships a probe that does not compile. Checked with TLC. The model covers compile errors only; that a probe which compiles also behaves like the code it replaces is what `fixtures/semantics` tests.
 - `formal/tla/JobPool.tla`: the parallel runner runs every mutant exactly once and has every result when the workers stop. Checked with TLC.
@@ -438,7 +439,7 @@ The idea of generating mutants with knowledge of the tests is called *test-aware
 ## Development
 
 ```text
-cargo test          # unit tests, PICT tables, end-to-end runs on fixtures/, parity with cargo-mutants
+cargo test          # unit tests, PICT tables, properties (PROPTEST_CASES=N for more), end-to-end runs on fixtures/, parity with cargo-mutants
 cargo test -- --ignored   # also: every mutant of four fixtures built from the source and compared with its probe (minutes)
 cargo run -- .      # the tool on itself
 ```

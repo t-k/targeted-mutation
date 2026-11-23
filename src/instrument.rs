@@ -660,6 +660,19 @@ fn is_plain_place(expr: &syn::Expr) -> bool {
     }
 }
 
+/// Whether the expression is the word `false`, in parentheses or not.
+fn written_false(expr: &syn::Expr) -> bool {
+    match expr {
+        syn::Expr::Paren(e) => written_false(&e.expr),
+        syn::Expr::Group(e) => written_false(&e.expr),
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Bool(value),
+            ..
+        }) => !value.value,
+        _ => false,
+    }
+}
+
 fn is_literal(expr: &syn::Expr) -> bool {
     match expr {
         syn::Expr::Paren(e) => is_literal(&e.expr),
@@ -2568,6 +2581,8 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             };
             let guard = match &arm.guard {
                 None => ArmGuard::None(arrow),
+                // The arm with `false` for its guard is the program as it is.
+                Some((_, expr)) if written_false(expr) => continue,
                 Some((_, expr)) => match self.range(expr.span()) {
                     Some((from, to)) => ArmGuard::Existing(from, to),
                     None => continue,
@@ -2613,6 +2628,8 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             if let Some((_, guard)) = &arm.guard
                 && !matches!(**guard, syn::Expr::Let(_))
                 && !in_let_chain(guard)
+                // A guard written `true` or `false` has itself among its mutants.
+                && !is_literal(guard)
                 && let (Some((start, end)), Some((pattern, _))) =
                     (self.range(guard.span()), self.range(arm.pat.span()))
             {
@@ -3053,9 +3070,6 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                      let __tmt_r = (__TMT_PLACE__).{same}(); \
                      __tmt_s.tmt_end_seen({id}u32, &__tmt_r); __tmt_r }} }}"
                 );
-                // A line that ends inside the call still ends: `line!()` after it says
-                // what it said.
-                let lines = "\n".repeat(source[call.0..call.1].matches('\n').count());
                 // A variable is the same place each time it is named, so it is named
                 // again for the call: the call then borrows it exactly as it did (a `&mut`
                 // for as long as it is one). Any other receiver is evaluated once and
@@ -3073,14 +3087,14 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     let (head, tail) = decide
                         .split_once("__TMT_BORROWED__")
                         .expect("the receiver is borrowed once");
-                    (format!("({{ {head}&("), format!("){tail} }}){lines}"))
+                    (format!("({{ {head}&("), format!("){tail} }})"))
                 } else {
                     let decide = decide
                         .replace("__TMT_BORROWED__", "__tmt_a")
                         .replace("__TMT_PLACE__", "*__tmt_a");
                     (
                         "(match (&(".to_string(),
-                        format!(")) {{ __tmt_a => {{ {decide} }} }}){lines}"),
+                        format!(")) {{ __tmt_a => {{ {decide} }} }})"),
                     )
                 };
                 edits.push(Edit {
@@ -3238,8 +3252,13 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
             segments.push((text.len(), cursor, edit.pos - cursor));
             text.push_str(&source[cursor..edit.pos]);
         }
-        inserted.push((text.len(), edit.text.len(), edit.site));
+        // A line that ends inside a replaced stretch still ends: `line!()` and the place
+        // of a panic after it are what they were.
+        let replaced = &source[cursor.max(edit.pos)..cursor.max(edit.end)];
+        let lines = "\n".repeat(replaced.matches('\n').count());
+        inserted.push((text.len(), edit.text.len() + lines.len(), edit.site));
         text.push_str(&edit.text);
+        text.push_str(&lines);
         cursor = cursor.max(edit.end);
     }
     segments.push((text.len(), cursor, source.len() - cursor));
@@ -5113,6 +5132,31 @@ mod tests {
             out.ends_with(" })}; crate::__tmt_rt::ret(0u32, __tmt_v) }"),
             "{out}"
         );
+    }
+
+    #[test]
+    fn a_guard_that_is_written_true_or_false_is_not_a_site() {
+        // `true` in place of `true` is the program it was made from.
+        let src = "fn f(k: u8) -> u8 { match k { 0 if true => 1, 1 if (false) => 2, n if n > 3 => 3, _ => 4 } }";
+        let found = discover(src, 0).unwrap();
+        let guards: Vec<&str> = found
+            .sites
+            .iter()
+            .chain(&found.rebuild_sites)
+            .filter(|site| matches!(site.kind, SiteKind::Guard { .. }))
+            .map(|site| site.text.as_str())
+            .collect();
+        assert_eq!(guards, ["n > 3"]);
+        // An arm whose guard is written `false` is not there: `false` for its guard is
+        // the same program. One whose guard is written `true` can still go.
+        let arms: Vec<&str> = found
+            .sites
+            .iter()
+            .chain(&found.rebuild_sites)
+            .filter(|site| matches!(site.kind, SiteKind::Arm { .. }))
+            .map(|site| site.text.as_str())
+            .collect();
+        assert_eq!(arms, ["0 if true => ..", "n if n > 3 => .."]);
     }
 
     #[test]
