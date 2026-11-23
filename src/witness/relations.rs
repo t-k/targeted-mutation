@@ -612,6 +612,7 @@ fn push_candidate(
         existing: false,
         advice: None,
         file: Default::default(),
+        finding_at: None,
         scenarios: vec![scenario],
     });
 }

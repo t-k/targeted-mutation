@@ -2475,9 +2475,49 @@ fn candidate_edit(
     }
 }
 
+/// For every mutant of the source in a function that a test calls with a result it does
+/// not pin down: that mutant with those calls. Each is only tried where the mutant is a
+/// finding already; the calls are then run on both to see whether one tells them apart.
+fn stronger_assertions(
+    original: &str,
+    parsed: &syn::File,
+    sites: &[Site],
+) -> Vec<witness::Candidate> {
+    let mut candidates = vec![];
+    for function in witness::unpinned_calls(original, parsed) {
+        let inside = sites
+            .iter()
+            .filter(|site| function.item.start <= site.start && site.end <= function.item.end);
+        for site in inside {
+            let lines = original
+                .get(site.start..site.end)
+                .map_or(0, |text| text.matches('\n').count());
+            for mutant in instrument::source_mutants(site) {
+                candidates.push(witness::Candidate {
+                    description: report::describe(site, mutation_of(site, &mutant)),
+                    edits: vec![witness::Edit {
+                        span: mutant.start..mutant.end,
+                        replacement: mutant.replacement,
+                    }],
+                    scope: site.line..=site.line + lines,
+                    signature_lines: vec![function.signature_line],
+                    existing: true,
+                    advice: None,
+                    file: Default::default(),
+                    scenarios: function.scenarios.clone(),
+                    finding_at: Some((site.line, site.column)),
+                });
+            }
+        }
+    }
+    candidates
+}
+
 fn witness_location(source: &SourceFile, candidate: &witness::Candidate) -> report::Location {
     let span = &candidate.edits[0].span;
-    let (line, column) = source.lines.position(&source.original, span.start);
+    let (line, column) = candidate
+        .finding_at
+        .unwrap_or_else(|| source.lines.position(&source.original, span.start));
     report::Location {
         file: source.display.clone(),
         line,
@@ -4153,6 +4193,16 @@ fn run_package(
                                 candidate
                             }),
                     );
+                    if !options.list {
+                        witness_candidates.extend(
+                            stronger_assertions(&original, &parsed, &found.sites)
+                                .into_iter()
+                                .map(|mut candidate| {
+                                    candidate.file = path.clone();
+                                    candidate
+                                }),
+                        );
+                    }
                 }
                 next_id += found.sites.len() as u32;
                 if owners.consumers.len() != 1 || !owners.consumers.contains(&root_file) {
@@ -6214,6 +6264,8 @@ fn run_package(
                                     && location.line == at.line
                                     && location.column == at.column
                                     && finding.survivors().contains(&candidate.description)
+                                    && (candidate.finding_at.is_none()
+                                        || !matches!(finding, Finding::InputGap { .. }))
                             })
                         })
                         .flatten();
@@ -6615,7 +6667,7 @@ fn describe_effects(
     }
     if by_change.is_empty() {
         return vec![
-            "with the mutant, these tests still reach the same code with the same outcomes: they do not use its result, or it is the same for their inputs".to_string(),
+            "with the mutant, these tests still reach the same code with the same outcomes, as far as that is recorded: they do not use its result, it is the same for their inputs, or what they assert holds for both".to_string(),
         ];
     }
     let mut out = vec![];
@@ -7642,7 +7694,7 @@ serde = { path = "../../serde-fork" }
         assert_eq!(
             describe_effects(&BTreeMap::new(), &sites),
             [
-                "with the mutant, these tests still reach the same code with the same outcomes: they do not use its result, or it is the same for their inputs"
+                "with the mutant, these tests still reach the same code with the same outcomes, as far as that is recorded: they do not use its result, it is the same for their inputs, or what they assert holds for both"
             ]
         );
     }

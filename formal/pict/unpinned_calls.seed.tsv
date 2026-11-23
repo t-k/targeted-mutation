@@ -1,0 +1,7 @@
+Where	Args	Callee	Module
+assert_ne	literal	free_fn	nested
+assert_eq_direct	literal	free_fn	nested
+assert_true	literal	free_fn	top
+let_binding	variable	free_fn	nested
+assert_eq_nested	literal	free_fn	nested
+assert_ne	literal	method	nested

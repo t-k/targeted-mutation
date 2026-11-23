@@ -1483,7 +1483,11 @@ fn other_end<R>(site: u32, len: usize, other: impl FnOnce() -> R) -> End<R> {
     if mutant_at(site) == Some(Mutant::OtherEnd) {
         return End::Other(other());
     }
-    record_bits(b'A', site, if len <= 1 { ARITH_SAME } else { ARITH_DIFFERS });
+    record_bits(
+        b'A',
+        site,
+        if len <= 1 { ARITH_SAME } else { ARITH_DIFFERS },
+    );
     End::Same
 }
 

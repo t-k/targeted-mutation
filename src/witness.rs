@@ -10,11 +10,14 @@ use syn::{Expr, FnArg, Item, ItemFn, Pat, Type};
 
 use crate::report::VerifiedWitness;
 
+mod assertions;
 mod keys;
 mod relations;
 mod rounding;
 mod sequences;
 mod simple;
+
+pub(crate) use assertions::unpinned_calls;
 
 pub(crate) const TEST_NAME: &str = "__tmt_witness";
 pub(crate) const OUTPUT_ENV: &str = "TMT_WITNESS_OUTPUT";
@@ -37,9 +40,13 @@ pub(crate) struct Candidate {
     /// The file the candidate is of, in the working copy: set by who asked.
     pub file: std::path::PathBuf,
     pub scenarios: Vec<Scenario>,
+    /// Line and column of the finding the candidate is the mutant of, where that is not
+    /// where its first edit starts. Such a candidate only looks for a stronger
+    /// assertion: it has nothing to say about a finding that asks for an input.
+    pub finding_at: Option<(usize, usize)>,
 }
 
-#[derive(Debug, Default)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct Scenario {
     pub setup: String,
     pub expression: String,
@@ -51,7 +58,7 @@ pub(crate) struct Scenario {
     position: bool,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct Placement {
     pub offset: usize,
     pub module: String,
@@ -262,6 +269,7 @@ pub(crate) fn discover_parsed(
                 existing: false,
                 advice: None,
                 file: Default::default(),
+                finding_at: None,
                 scenarios: vec![scenario],
             }
         })

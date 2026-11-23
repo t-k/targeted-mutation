@@ -348,6 +348,7 @@ pub(super) fn discover(source: &str, file: &syn::File, out: &mut Vec<Candidate>)
                     "no test has two values in one place that differ in `{without}` alone: add one that puts two such values together and checks that they stay apart"
                 )),
                 file: Default::default(),
+                finding_at: None,
             });
         };
         match body {

@@ -2739,7 +2739,7 @@ fn surviving_mutants_are_traced_to_what_they_change() {
     assert_eq!(
         strings(&total["effects"]),
         [
-            "with the mutant, these tests still reach the same code with the same outcomes: they do not use its result, or it is the same for their inputs"
+            "with the mutant, these tests still reach the same code with the same outcomes, as far as that is recorded: they do not use its result, it is the same for their inputs, or what they assert holds for both"
         ]
     );
 
@@ -3241,6 +3241,64 @@ fn unicode_arguments_fields_and_sort_keys_get_distinguishing_tests() {
 }
 
 #[test]
+fn a_weak_assertion_gets_the_value_its_call_returns() {
+    let dir = fixture("shapes", "stronger-assertion");
+    let run = tmt(&dir, &["--json", "--quiet", "--rebuild"]);
+    assert_eq!(run.code, 2, "{}", run.stderr);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    // `assert_ne!(bucket(3), "none")` has the input; only what it compares with is weak.
+    let finding = findings(&report, "assertion_gap")
+        .into_iter()
+        .find(|f| f["code"] == "few if few < 10 => ..")
+        .unwrap_or_else(|| panic!("{report:#}"));
+    assert_eq!(finding["witness"]["call"], "bucket(3)", "{finding:#}");
+    assert_eq!(finding["witness"]["original"], "\"few\"", "{finding:#}");
+    assert_eq!(finding["witness"]["mutant"], "\"many\"", "{finding:#}");
+    assert_eq!(
+        finding["witness"]["assertion"],
+        "assert_eq!(bucket(3), \"few\");"
+    );
+    assert_eq!(
+        finding["witness"]["guidance"],
+        "`tests::buckets` already calls `bucket(3)`: compare its result with this value."
+    );
+    // A finding that asks for an input is not given a call of the tests: they all
+    // return what the original returns.
+    for gap in findings(&report, "input_gap") {
+        assert!(gap.get("witness").is_none(), "{gap:#}");
+    }
+    let text = tmt(
+        &dir,
+        &["--quiet", "--rebuild", "--lines", "src/lib.rs:36-40"],
+    );
+    assert!(
+        text.stdout.contains(
+            "  verified on `bucket(3)`: original returned \"few\", mutant returned \"many\"\n  \
+             `tests::buckets` already calls `bucket(3)`: compare its result with this value.\n  \
+             add a test with `assert_eq!(bucket(3), \"few\");`"
+        ),
+        "{}",
+        text.stdout
+    );
+
+    // The proposed line closes the finding.
+    append(
+        &dir.join("src/lib.rs"),
+        "\n#[test] fn pinned() { assert_eq!(bucket(3), \"few\"); }\n",
+    );
+    let run = tmt(&dir, &["--json", "--quiet", "--rebuild"]);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert!(
+        !report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["code"] == "few if few < 10 => .."),
+        "{report:#}"
+    );
+}
+
+#[test]
 fn a_failing_batch_gets_an_assertion_on_its_persisted_state() {
     let dir = fixture("batch-store", "verified-witness-after-error");
     let args = ["--json", "--quiet", "--rebuild", "--lines", "src/lib.rs:33"];
@@ -3488,7 +3546,8 @@ fn an_inconclusive_shared_witness_retries_the_original_test_name() {
     assert_eq!(run.code, 2, "{}", run.stderr);
     assert!(
         run.stderr
-            .contains("sharing a build for 2 original witness inputs"),
+            // The range, the search, and the call of `bucket` for each of its two findings.
+            .contains("sharing a build for 4 original witness inputs"),
         "{}",
         run.stderr
     );
@@ -5193,7 +5252,11 @@ fn slice_end_table() {
     let (code, report) = json(&dir);
     assert_eq!(code, 2, "{report:#}");
     assert_eq!(report["skipped_sites"], 0, "{report:#}");
-    assert_eq!(report["unstable"].as_array().unwrap().len(), 0, "{report:#}");
+    assert_eq!(
+        report["unstable"].as_array().unwrap().len(),
+        0,
+        "{report:#}"
+    );
     let all = report["findings"].as_array().unwrap();
     for row in &rows {
         let found: Vec<&Value> = all.iter().filter(|f| f["line"] == row.line).collect();

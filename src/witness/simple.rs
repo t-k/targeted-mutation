@@ -37,7 +37,7 @@ pub(super) fn discover(
     }
 }
 
-fn supports(function: &ItemFn) -> bool {
+pub(super) fn supports(function: &ItemFn) -> bool {
     let signature = &function.sig;
     signature.generics.params.is_empty()
         && signature.asyncness.is_none()
@@ -456,6 +456,7 @@ fn candidate(
         existing,
         advice: None,
         file: Default::default(),
+        finding_at: None,
         scenarios,
     }
 }

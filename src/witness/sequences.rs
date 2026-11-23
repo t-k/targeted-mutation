@@ -35,14 +35,14 @@ pub(super) fn discover(
     }
 }
 
-struct Test<'a> {
-    function: &'a ItemFn,
-    module: String,
-    insertion: Option<usize>,
+pub(super) struct Test<'a> {
+    pub(super) function: &'a ItemFn,
+    pub(super) module: String,
+    pub(super) insertion: Option<usize>,
 }
 
 impl Test<'_> {
-    fn name(&self) -> String {
+    pub(super) fn name(&self) -> String {
         qualified(&self.module, &self.function.sig.ident)
     }
 }
@@ -57,7 +57,7 @@ fn qualified(module: &str, item: &syn::Ident) -> String {
     }
 }
 
-fn collect_tests<'a>(
+pub(super) fn collect_tests<'a>(
     items: &'a [Item],
     module: &str,
     insertion: Option<usize>,
@@ -379,6 +379,7 @@ fn round_trip_candidates(
             existing: false,
             advice: None,
             file: Default::default(),
+            finding_at: None,
             scenarios,
         });
     }
@@ -646,6 +647,7 @@ fn batch_candidates(
                 existing: true,
                 advice: None,
                 file: Default::default(),
+                finding_at: None,
                 scenarios,
             });
         }

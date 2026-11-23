@@ -770,14 +770,61 @@ fn deletable(expr: &syn::Expr) -> bool {
 /// iterator itself, which a probe that only borrows its receiver could not give it.
 fn yields_iterator(receiver: &syn::Expr) -> bool {
     const MAKERS: &[&str] = &[
-        "iter", "iter_mut", "into_iter", "chars", "char_indices", "bytes", "lines", "keys",
-        "values", "values_mut", "into_keys", "into_values", "drain", "windows", "chunks",
-        "chunks_exact", "rchunks", "split", "rsplit", "splitn", "rsplitn", "split_terminator",
-        "split_whitespace", "split_ascii_whitespace", "split_inclusive", "matches",
-        "match_indices", "components", "ancestors", "range", "map", "filter", "filter_map",
-        "flat_map", "flatten", "rev", "skip", "skip_while", "take", "take_while", "step_by",
-        "zip", "chain", "enumerate", "peekable", "cloned", "copied", "inspect", "scan", "fuse",
-        "by_ref", "map_while", "cycle", "args", "encode_utf16",
+        "iter",
+        "iter_mut",
+        "into_iter",
+        "chars",
+        "char_indices",
+        "bytes",
+        "lines",
+        "keys",
+        "values",
+        "values_mut",
+        "into_keys",
+        "into_values",
+        "drain",
+        "windows",
+        "chunks",
+        "chunks_exact",
+        "rchunks",
+        "split",
+        "rsplit",
+        "splitn",
+        "rsplitn",
+        "split_terminator",
+        "split_whitespace",
+        "split_ascii_whitespace",
+        "split_inclusive",
+        "matches",
+        "match_indices",
+        "components",
+        "ancestors",
+        "range",
+        "map",
+        "filter",
+        "filter_map",
+        "flat_map",
+        "flatten",
+        "rev",
+        "skip",
+        "skip_while",
+        "take",
+        "take_while",
+        "step_by",
+        "zip",
+        "chain",
+        "enumerate",
+        "peekable",
+        "cloned",
+        "copied",
+        "inspect",
+        "scan",
+        "fuse",
+        "by_ref",
+        "map_while",
+        "cycle",
+        "args",
+        "encode_utf16",
     ];
     match receiver {
         syn::Expr::Paren(e) => yields_iterator(&e.expr),
@@ -4532,7 +4579,12 @@ mod tests {
                 "fn f(v: &[u8], s: &S) { let _ = v.first(); let _ = s.items.last(); \
                  let _ = s.all().last(); let _ = (v).first().copied(); }"
             ),
-            ["end v.first()", "end s.items.last()", "end s.all().last()", "end (v).first()"]
+            [
+                "end v.first()",
+                "end s.items.last()",
+                "end s.all().last()",
+                "end (v).first()"
+            ]
         );
         // With an argument, a type or an attribute it is not the method of a slice, and
         // the last of an iterator is found by running through it.
@@ -4549,7 +4601,10 @@ mod tests {
         let found = discover(src, 0).unwrap();
         let out = render(src, &found.sites, &|_| true).text;
         assert!(out.contains("(match (&(v)) { __tmt_a =>"), "{out}");
-        assert!(out.contains("tmt_other_end(") && out.contains(", false)"), "{out}");
+        assert!(
+            out.contains("tmt_other_end(") && out.contains(", false)"),
+            "{out}"
+        );
         assert!(out.contains("End::Same => (*__tmt_a).last()"), "{out}");
     }
 

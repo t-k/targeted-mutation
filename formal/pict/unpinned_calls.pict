@@ -1,0 +1,6 @@
+# A call of a function of the file in one of its tests: is its result a value a stronger
+# assertion could be written for? Replayed in src/witness/assertions.rs (pict_table).
+Where:  assert_ne, assert_true, let_binding, assert_eq_direct, assert_eq_nested
+Args:   literal, variable, no_argument
+Callee: free_fn, generic_fn, method, unit_fn
+Module: nested, top
