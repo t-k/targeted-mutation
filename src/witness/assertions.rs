@@ -78,7 +78,8 @@ pub(crate) fn unpinned_calls(source: &str, file: &syn::File) -> Vec<CalledFuncti
                 // and not to the other, or change something in between.
                 let scenarios = found.entry(name).or_default();
                 if scenarios.len() < MAX_CALLS {
-                    scenarios.push(scenario(test, before, call, after));
+                    let line = source[..at.start].matches('\n').count() + 1;
+                    scenarios.push(scenario(test, before, call, after, line));
                 }
             }
         }
@@ -99,11 +100,12 @@ pub(crate) fn unpinned_calls(source: &str, file: &syn::File) -> Vec<CalledFuncti
 /// The test is run again as it is written, and the value of the call is recorded where
 /// the test makes it: after everything the test does before, in the order the test does
 /// it, and only if the test gets there. What the test does afterwards it does here too.
-fn scenario(test: &Test<'_>, before: &str, call: String, after: &str) -> Scenario {
+fn scenario(test: &Test<'_>, before: &str, call: String, after: &str, line: usize) -> Scenario {
     let name = test.name();
     Scenario {
         setup: before.to_owned(),
         after: Some(after.to_owned()),
+        call_line: Some(line),
         expression: call,
         placement: test.insertion.map(|offset| Placement {
             offset,
@@ -222,6 +224,28 @@ impl<'a> Calls<'a> {
         (text.chars().count() <= 100 && !text.contains('\n'))
             .then(|| (name.as_str(), text.to_owned()))
     }
+
+    /// Whether the expression calls a function of the file by its name, with whatever
+    /// arguments.
+    fn calls_the_file(&self, expr: &Expr) -> bool {
+        struct Named<'a>(&'a BTreeMap<String, &'a ItemFn>, bool);
+        impl<'ast> Visit<'ast> for Named<'_> {
+            fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+                if let Expr::Path(path) = call.func.as_ref()
+                    && path
+                        .path
+                        .get_ident()
+                        .is_some_and(|name| self.0.contains_key(&name.to_string()))
+                {
+                    self.1 = true;
+                }
+                syn::visit::visit_expr_call(self, call);
+            }
+        }
+        let mut named = Named(self.names, false);
+        named.visit_expr(expr);
+        named.1
+    }
 }
 
 fn assertion(mac: &syn::Macro) -> bool {
@@ -270,9 +294,12 @@ impl<'ast> Visit<'ast> for Calls<'_> {
             }
             // One side of an `assert_eq!` is pinned down already, negated or not, and so
             // is what an `assert!` takes as it is or negated: a mutant that passes the
-            // test returns that very value.
+            // test returns that very value. Not where the other side calls a function
+            // of the file too: `assert_eq!(f(1), f(2))` holds for any value both have.
+            let other = args.iter().nth(1 - index.min(1)).filter(|_| compares);
             let pinned = match arg {
                 _ if differs => false,
+                _ if other.is_some_and(|other| self.calls_the_file(other)) => false,
                 Expr::Unary(not) if matches!(not.op, syn::UnOp::Not(_)) => {
                     matches!(not.expr.as_ref(), Expr::Call(call) if self.call(call).is_some())
                 }
@@ -520,6 +547,18 @@ mod tests {
             // What is negated is pinned down like what is not, where it is compared
             // and where it is asserted; another operator leaves the call to be seen.
             ("assert_eq!(!bucket(3), 1);", vec![]),
+            // Two calls that are compared with each other pin nothing down.
+            (
+                "assert_eq!(bucket(1), bucket(2));",
+                vec!["bucket(1)", "bucket(2)"],
+            ),
+            (
+                "assert_eq!(!bucket(3), !bucket(4));",
+                vec!["bucket(3)", "bucket(4)"],
+            ),
+            ("assert_eq!(bucket(1), size(text) + 1);", vec!["bucket(1)"]),
+            ("assert_eq!(bucket(1), helper(2));", vec![]),
+            ("assert_eq!(\"x\", bucket(1), \"{}\", size(\"a\"));", vec![]),
             ("assert!(!bucket(3));", vec![]),
             ("assert!(-bucket(3));", vec!["bucket(3)"]),
             ("assert_ne!(!bucket(3), 1);", vec!["bucket(3)"]),
@@ -640,6 +679,9 @@ mod tests {
                 ("b", " set(1); assert_ne!(bucket(3), \"none\"); assert_ne!(")
             ]
         );
+        // Each is on a line of the file (the function is on the first).
+        let lines: Vec<_> = found[0].scenarios.iter().map(|s| s.call_line).collect();
+        assert_eq!(lines, [Some(2), Some(3), Some(3)]);
     }
 
     #[test]

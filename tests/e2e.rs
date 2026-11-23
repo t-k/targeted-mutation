@@ -3270,6 +3270,7 @@ fn a_weak_assertion_gets_the_value_its_call_returns() {
         finding["witness"]["in_test"], "tests::buckets",
         "{finding:#}"
     );
+    assert_eq!(finding["witness"]["in_test_line"], 67, "{finding:#}");
     // A finding that asks for an input is not given a call of the tests: they all
     // return what the original returns.
     for gap in findings(&report, "input_gap") {
@@ -3281,8 +3282,8 @@ fn a_weak_assertion_gets_the_value_its_call_returns() {
     );
     assert!(
         text.stdout.contains(
-            "  verified on `bucket(3)` where `tests::buckets` calls it: original returned \"few\", mutant returned \"many\"\n  \
-             in `tests::buckets`, compare the result of that call with this value: `assert_eq!(bucket(3), \"few\");`"
+            "  verified on `bucket(3)` where `tests::buckets` calls it on line 67: original returned \"few\", mutant returned \"many\"\n  \
+             in `tests::buckets`, compare the result of the call on line 67 with this value: `assert_eq!(bucket(3), \"few\");`"
         ),
         "{}",
         text.stdout
@@ -3331,6 +3332,21 @@ fn stateful() {
     assert_eq!(enable(2), f(3) > 0);
     assert!(enable(1));
 }
+
+pub fn timeout() -> u64 {
+    60 * 1000
+}
+pub fn place(n: u32) -> u32 {
+    let _ = n
+        + 1;
+    line!()
+}
+
+#[test]
+fn weak() {
+    assert!(timeout() > 0);
+    assert!(place(3) > 0);
+}
 "#,
     )
     .unwrap();
@@ -3350,6 +3366,36 @@ fn stateful() {
     assert_eq!(finding["witness"]["assertion"], "assert_eq!(f(3), 5);");
     // The value is the one the call has in that test, and the report says so.
     assert_eq!(finding["witness"]["in_test"], "stateful", "{finding:#}");
+    assert_eq!(finding["witness"]["in_test_line"], 19, "{finding:#}");
+    // A product of two numbers is mutated by building it only: its mutant that passes
+    // is looked at like any other.
+    let product = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["code"] == "60 * 1000" && f.get("witness").is_some())
+        .unwrap_or_else(|| panic!("{report:#}"));
+    assert_eq!(product["witness"]["call"], "timeout()", "{product:#}");
+    assert_eq!(product["witness"]["original"], "60000", "{product:#}");
+    assert_eq!(product["witness"]["in_test"], "weak", "{product:#}");
+    // A mutant keeps the lines of the source: an operator with a line end beside it
+    // does not move the `line!()` after it, and nothing tells the two results apart.
+    let moved: Vec<_> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["item"] == "place")
+        .collect();
+    assert!(moved.len() > 1, "{report:#}");
+    for finding in moved {
+        if finding["code"] == "fn place(n: u32) -> u32" {
+            // The body replaced by a number does return another: the line is the
+            // one `line!()` is on in the source.
+            assert_eq!(finding["witness"]["original"], "29", "{finding:#}");
+        } else {
+            assert!(finding.get("witness").is_none(), "{finding:#}");
+        }
+    }
 
     // Put where the test makes the call, the assertion holds and closes the finding.
     let path = dir.join("src/lib.rs");

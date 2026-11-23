@@ -660,16 +660,16 @@ fn is_plain_place(expr: &syn::Expr) -> bool {
     }
 }
 
-/// Whether the expression is the word `false`, in parentheses or not.
-fn written_false(expr: &syn::Expr) -> bool {
+/// The value of an expression that is the word `true` or `false`, in parentheses or not.
+fn written_bool(expr: &syn::Expr) -> Option<bool> {
     match expr {
-        syn::Expr::Paren(e) => written_false(&e.expr),
-        syn::Expr::Group(e) => written_false(&e.expr),
+        syn::Expr::Paren(e) => written_bool(&e.expr),
+        syn::Expr::Group(e) => written_bool(&e.expr),
         syn::Expr::Lit(syn::ExprLit {
             lit: syn::Lit::Bool(value),
             ..
-        }) => !value.value,
-        _ => false,
+        }) => Some(value.value),
+        _ => None,
     }
 }
 
@@ -1121,6 +1121,21 @@ pub(crate) fn source_boundary_mutant(site: &Site) -> Option<SourceMutant> {
     })
 }
 
+/// Gives each mutant the line ends of what it replaces: the lines after it are the lines
+/// they were, so `line!()` and the place of a panic say the same in the mutant.
+pub fn keep_line_ends(source: &str, mutants: &mut [SourceMutant]) {
+    for mutant in mutants {
+        let Some(replaced) = source.get(mutant.start..mutant.end) else {
+            continue;
+        };
+        let lines = replaced.matches('\n').count();
+        let kept = mutant.replacement.matches('\n').count();
+        mutant
+            .replacement
+            .push_str(&"\n".repeat(lines.saturating_sub(kept)));
+    }
+}
+
 pub fn source_mutants(site: &Site) -> Vec<SourceMutant> {
     let change =
         |start: usize, end: usize, replacement: String, what: &str, into: &str| SourceMutant {
@@ -1231,6 +1246,13 @@ pub fn source_mutants(site: &Site) -> Vec<SourceMutant> {
         SiteKind::Guard { can_be_false } => [true, false]
             .into_iter()
             .filter(|value| *value || *can_be_false)
+            // Not the value the guard is written as.
+            .filter(|value| {
+                syn::parse_str::<syn::Expr>(&site.text)
+                    .ok()
+                    .and_then(|guard| written_bool(&guard))
+                    != Some(*value)
+            })
             .map(|value| {
                 change(
                     site.start,
@@ -2582,7 +2604,7 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             let guard = match &arm.guard {
                 None => ArmGuard::None(arrow),
                 // The arm with `false` for its guard is the program as it is.
-                Some((_, expr)) if written_false(expr) => continue,
+                Some((_, expr)) if written_bool(expr) == Some(false) => continue,
                 Some((_, expr)) => match self.range(expr.span()) {
                     Some((from, to)) => ArmGuard::Existing(from, to),
                     None => continue,
@@ -2628,15 +2650,29 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             if let Some((_, guard)) = &arm.guard
                 && !matches!(**guard, syn::Expr::Let(_))
                 && !in_let_chain(guard)
-                // A guard written `true` or `false` has itself among its mutants.
-                && !is_literal(guard)
                 && let (Some((start, end)), Some((pattern, _))) =
                     (self.range(guard.span()), self.range(arm.pat.span()))
             {
                 let kind = SiteKind::Guard {
                     can_be_false: !removable.contains(&pattern),
                 };
-                self.push(kind, start, end, guard.span());
+                if written_bool(guard).is_some() {
+                    // A guard written `true` or `false` is one of its two mutants: the
+                    // other is built, as a probe would report the one that is the
+                    // program for never being told from it.
+                    let at = guard.span().start();
+                    self.add_rebuild(Site {
+                        id: 0,
+                        kind,
+                        line: at.line,
+                        column: at.column + 1,
+                        start,
+                        end,
+                        text: self.source[start..end].to_string(),
+                    });
+                } else {
+                    self.push(kind, start, end, guard.span());
+                }
             }
         }
         visit::visit_expr_match(self, node);
@@ -5144,18 +5180,39 @@ mod tests {
     }
 
     #[test]
-    fn a_guard_that_is_written_true_or_false_is_not_a_site() {
+    fn a_guard_that_is_written_true_or_false_has_only_the_other_for_a_mutant() {
         // `true` in place of `true` is the program it was made from.
         let src = "fn f(k: u8) -> u8 { match k { 0 if true => 1, 1 if (false) => 2, n if n > 3 => 3, _ => 4 } }";
         let found = discover(src, 0).unwrap();
-        let guards: Vec<&str> = found
-            .sites
-            .iter()
-            .chain(&found.rebuild_sites)
-            .filter(|site| matches!(site.kind, SiteKind::Guard { .. }))
-            .map(|site| site.text.as_str())
-            .collect();
-        assert_eq!(guards, ["n > 3"]);
+        let guards = |sites: &[Site]| -> Vec<String> {
+            sites
+                .iter()
+                .filter(|site| matches!(site.kind, SiteKind::Guard { .. }))
+                .map(|site| {
+                    let into: Vec<String> =
+                        source_mutants(site).into_iter().map(|m| m.into).collect();
+                    format!("{} -> {}", site.text, into.join(" "))
+                })
+                .collect()
+        };
+        assert_eq!(guards(&found.sites), ["n > 3 -> true"]);
+        // Built, not probed: a probe would report the mutant that is the program. The
+        // arm with `true` can be removed, which is its guard being `false`.
+        assert_eq!(
+            guards(&found.rebuild_sites),
+            ["true -> ", "(false) -> true"]
+        );
+        let mut mutants = source_mutants(&Site {
+            id: 0,
+            kind: SiteKind::Stmt,
+            line: 1,
+            column: 1,
+            start: 0,
+            end: 7,
+            text: String::new(),
+        });
+        keep_line_ends("a(\n1\n);\nb", &mut mutants);
+        assert_eq!(mutants[0].replacement, "\n\n");
         // An arm whose guard is written `false` is not there: `false` for its guard is
         // the same program. One whose guard is written `true` can still go.
         let arms: Vec<&str> = found

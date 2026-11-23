@@ -2478,21 +2478,23 @@ fn candidate_edit(
 /// For every mutant of the source in a function that a test calls with a result it does
 /// not pin down: that mutant with those calls. Each is only tried where the mutant is a
 /// finding already; the calls are then run on both to see whether one tells them apart.
-fn stronger_assertions(
+fn stronger_assertions<'a>(
     original: &str,
     parsed: &syn::File,
-    sites: &[Site],
+    sites: impl Iterator<Item = &'a Site> + Clone,
 ) -> Vec<witness::Candidate> {
     let mut candidates = vec![];
     for function in witness::unpinned_calls(original, parsed) {
         let inside = sites
-            .iter()
+            .clone()
             .filter(|site| function.item.start <= site.start && site.end <= function.item.end);
         for site in inside {
             let lines = original
                 .get(site.start..site.end)
                 .map_or(0, |text| text.matches('\n').count());
-            for mutant in instrument::source_mutants(site) {
+            let mut mutants = instrument::source_mutants(site);
+            instrument::keep_line_ends(original, &mut mutants);
+            for mutant in mutants {
                 // A comparison is planned in other words than it is written in: the
                 // finding may name the negation where the source says `!=`.
                 for mutation in mutations_like(site, &mutant, false) {
@@ -4206,12 +4208,18 @@ fn run_package(
                     // one these candidates write.
                     if !options.list && !options.literal_operators {
                         witness_candidates.extend(
-                            stronger_assertions(&original, &parsed, &found.sites)
-                                .into_iter()
-                                .map(|mut candidate| {
-                                    candidate.file = path.clone();
-                                    candidate
-                                }),
+                            // Also for what is mutated by building it only (the
+                            // product of two literals).
+                            stronger_assertions(
+                                &original,
+                                &parsed,
+                                found.sites.iter().chain(&found.rebuild_sites),
+                            )
+                            .into_iter()
+                            .map(|mut candidate| {
+                                candidate.file = path.clone();
+                                candidate
+                            }),
                         );
                     }
                 }
@@ -4381,6 +4389,7 @@ fn run_package(
         if options.literal_operators {
             instrument::literal_operator_mutants(&file.original, site, &mut mutants);
         }
+        instrument::keep_line_ends(&file.original, &mut mutants);
         mutants
     };
     let counts = options.shard.map(|_| {
@@ -5594,7 +5603,9 @@ fn run_package(
                         .find(|&index| jobs[index].mutation == mutation)
                 };
                 let mut compared = vec![];
-                for mutant in instrument::source_mutants(site) {
+                let mut mutants = instrument::source_mutants(site);
+                instrument::keep_line_ends(&file.original, &mut mutants);
+                for mutant in mutants {
                     // The first of the mutations that are this change and that was run.
                     let job = mutations_like(site, &mutant, integers)
                         .into_iter()

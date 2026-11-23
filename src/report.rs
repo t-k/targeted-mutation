@@ -95,6 +95,9 @@ pub struct VerifiedWitness {
     /// after what that test does before it. In a test of its own it may return another.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub in_test: Option<String>,
+    /// The line of the finding's file on which that test makes the call.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_test_line: Option<usize>,
 }
 
 impl Finding {
@@ -1165,13 +1168,23 @@ fn finding_body(finding: &Finding) -> Vec<String> {
 
 fn witness_lines(witness: &VerifiedWitness) -> Vec<String> {
     if let Some(test) = &witness.in_test {
+        // The test may make the call more than once, with another result each time.
+        let (on, of) = witness.in_test_line.map_or_else(
+            || (String::new(), "that call".to_string()),
+            |line| {
+                (
+                    format!(" on line {line}"),
+                    format!("the call on line {line}"),
+                )
+            },
+        );
         return vec![
             format!(
-                "verified on `{}` where `{test}` calls it: original returned {}, mutant returned {}",
+                "verified on `{}` where `{test}` calls it{on}: original returned {}, mutant returned {}",
                 witness.call, witness.original, witness.mutant,
             ),
             format!(
-                "in `{test}`, compare the result of that call with this value: `{}`",
+                "in `{test}`, compare the result of {of} with this value: `{}`",
                 witness.assertion
             ),
         ];

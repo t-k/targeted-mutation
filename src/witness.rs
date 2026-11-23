@@ -59,6 +59,9 @@ pub(crate) struct Scenario {
     /// test does after it (`setup` is what it does before). The value is recorded where
     /// the test computes it and given on to the test.
     pub after: Option<String>,
+    /// The line of the file on which the test has the expression, where `after` is set:
+    /// a test may make the same call on several.
+    pub call_line: Option<usize>,
     position: bool,
 }
 
@@ -181,6 +184,7 @@ fn {name}() {{
                 guidance,
                 individually_killed: None,
                 in_test: self.after.as_ref().and(self.source_test.clone()),
+                in_test_line: self.after.as_ref().and(self.call_line),
             }
         })
     }

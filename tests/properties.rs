@@ -9,7 +9,9 @@
 use std::path::{Path, PathBuf};
 
 use proptest::prelude::*;
-use targeted_mutation::instrument::{Discovery, discover, offset_of, render, source_mutants};
+use targeted_mutation::instrument::{
+    Discovery, discover, keep_line_ends, offset_of, render, source_mutants,
+};
 
 /// What must hold for a source file the instrumenter accepts. `Err` says what does not.
 fn check(source: &str) -> Result<(), String> {
@@ -87,7 +89,11 @@ fn mutants_change_the_file(source: &str, found: &Discovery, every: usize) -> Res
     };
     let original = tokens(source).map_err(|error| format!("the source has no tokens: {error}"))?;
     let sites = found.sites.iter().chain(&found.rebuild_sites);
-    let mutants = sites.flat_map(|site| source_mutants(site).into_iter().map(move |m| (site, m)));
+    let mutants = sites.flat_map(|site| {
+        let mut mutants = source_mutants(site);
+        keep_line_ends(source, &mut mutants);
+        mutants.into_iter().map(move |mutant| (site, mutant))
+    });
     for (site, mutant) in mutants.step_by(every) {
         {
             let name = format!(
@@ -103,6 +109,9 @@ fn mutants_change_the_file(source: &str, found: &Discovery, every: usize) -> Res
             text.replace_range(mutant.start..mutant.end, &mutant.replacement);
             if let Err(error) = syn::parse_file(&text) {
                 return Err(format!("{name} does not parse: {error}\n{text}"));
+            }
+            if text.matches('\n').count() != source.matches('\n').count() {
+                return Err(format!("{name} has other lines than the source\n{text}"));
             }
             if tokens(&text).ok().as_ref() == Some(&original) {
                 return Err(format!("{name} is the program it was made from"));
