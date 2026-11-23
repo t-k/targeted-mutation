@@ -637,6 +637,20 @@ fn left_out_of_all(per_build: &[Vec<(usize, usize)>]) -> Vec<(usize, usize)> {
     all
 }
 
+/// Whether a cargo configuration file that holds for a build in `dir` speaks of both a
+/// `--cfg` flag and a feature (`rustflags = ["--cfg", 'feature="x"']`): read as text, so
+/// rather once too often than once too rarely.
+fn configuration_names_a_feature(dir: &Path, cargo_home: Option<PathBuf>) -> bool {
+    let home = cargo_home
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cargo")));
+    dir.ancestors()
+        .map(|dir| dir.join(".cargo"))
+        .chain(home)
+        .flat_map(|dir| [dir.join("config.toml"), dir.join("config")])
+        .filter_map(|file| fs::read_to_string(file).ok())
+        .any(|text| text.contains("--cfg") && text.contains("feature"))
+}
+
 /// Whether the compiler may be told of features that cargo does not report
 /// (`RUSTFLAGS='--cfg feature="x"'`).
 fn features_from_flags(flags: impl IntoIterator<Item = Option<std::ffi::OsString>>) -> bool {
@@ -647,21 +661,16 @@ fn features_from_flags(flags: impl IntoIterator<Item = Option<std::ffi::OsString
 }
 
 impl BuiltSources {
+    /// `features_known` is false where something other than cargo's features may turn
+    /// one on: nothing is then taken to be left out.
     fn from_artifacts(
         artifacts: &[(PathBuf, Vec<PathBuf>)],
         features: &[(PathBuf, Vec<String>)],
+        features_known: bool,
         copy: &Path,
     ) -> Self {
         let mut built = Self::default();
-        let by_flags = features_from_flags(
-            [
-                "RUSTFLAGS",
-                "CARGO_ENCODED_RUSTFLAGS",
-                "CARGO_BUILD_RUSTFLAGS",
-            ]
-            .map(std::env::var_os),
-        );
-        for (root, features) in features.iter().filter(|_| !by_flags) {
+        for (root, features) in features.iter().filter(|_| features_known) {
             let set: BTreeSet<String> = features.iter().cloned().collect();
             let sets = built.features.entry(root.clone()).or_default();
             if !sets.contains(&set) {
@@ -2700,9 +2709,18 @@ fn domain_of(
     bounds: Option<&crate::trace::TypeBounds>,
 ) -> Option<(i128, i128)> {
     let bounds = bounds?;
+    // A literal past the values of the type it is compared with is another number
+    // there (`256i8` is 0 where that is allowed): nothing is known of the difference.
+    let within = |k: i128, (low, high): (i128, i128)| (low <= k && k <= high).then_some(k);
     match literal {
-        LiteralSide::Rhs(k) => Some((bounds.lhs.0.checked_sub(k)?, bounds.lhs.1.checked_sub(k)?)),
-        LiteralSide::Lhs(k) => Some((k.checked_sub(bounds.rhs.1)?, k.checked_sub(bounds.rhs.0)?)),
+        LiteralSide::Rhs(k) => {
+            let k = within(k, bounds.lhs)?;
+            Some((bounds.lhs.0.checked_sub(k)?, bounds.lhs.1.checked_sub(k)?))
+        }
+        LiteralSide::Lhs(k) => {
+            let k = within(k, bounds.rhs)?;
+            Some((k.checked_sub(bounds.rhs.1)?, k.checked_sub(bounds.rhs.0)?))
+        }
         LiteralSide::None => None,
     }
 }
@@ -3053,13 +3071,16 @@ impl Session {
                     };
                     // A literal past the largest value of the type is another number
                     // there (`255i8` is -1 where that is allowed): nothing is read from it.
+                    // Without the type nothing is read from it. A shift was checked
+                    // against the width already (its stride need not be a value).
                     let fits = |value: i128| {
-                        bounds.is_none_or(|b| value <= if is_rhs { b.lhs.1 } else { b.rhs.1 })
+                        bounds.is_some_and(|b| value <= if is_rhs { b.lhs.1 } else { b.rhs.1 })
                     };
                     let (plan::Reach::Multiples(value)
                     | plan::Reach::Bits(value)
                     | plan::Reach::Below(value)) = reach;
-                    (fits(value) && primitive(from, to)).then_some((reach, number, is_rhs))
+                    ((shift.is_some() || fits(value)) && primitive(from, to))
+                        .then_some((reach, number, is_rhs))
                 });
                 let mut domain = domain_of(*literal, bounds);
                 // Between the least and the greatest value it can be: by what it is
@@ -4585,7 +4606,25 @@ fn run_package(
         }
     };
     let built_sources = if options.rebuild || options.source_only || options.audit.is_some() {
-        BuiltSources::from_artifacts(&build.artifacts, &build.features, &copy)
+        // A feature can also be turned on behind cargo's back: by compiler flags (in
+        // the environment or a configuration file) and by a build script.
+        let behind_cargo = features_from_flags(
+            [
+                "RUSTFLAGS",
+                "CARGO_ENCODED_RUSTFLAGS",
+                "CARGO_BUILD_RUSTFLAGS",
+            ]
+            .map(std::env::var_os),
+        ) || build.build_scripts.iter().any(|script| {
+            script["cfgs"].as_array().is_some_and(|cfgs| {
+                cfgs.iter()
+                    .any(|cfg| cfg.as_str().is_some_and(|cfg| cfg.contains("feature")))
+            })
+        }) || configuration_names_a_feature(
+            &copy,
+            std::env::var_os("CARGO_HOME").map(PathBuf::from),
+        );
+        BuiltSources::from_artifacts(&build.artifacts, &build.features, !behind_cargo, &copy)
     } else {
         BuiltSources::default()
     };
@@ -5774,7 +5813,9 @@ fn run_package(
         }
         if !(options.rebuild || options.source_only) {
             report.mutants_not_built += total;
-        } else if total > 0 {
+        } else if total > 0 || changed.iter().any(|(_, changes)| changes.len() > 1) {
+            // Also with nothing to try alone: several changes of code that is left out
+            // may be a change of the build together.
             session.note(&format!(
                 "building {total} changes undone, one by one (the code as it was at {})",
                 report::short_revision(revision)
@@ -5848,10 +5889,31 @@ fn run_package(
                     stuck |= outcome.is_none();
                     judged(outcome, place(file, change), change.describe());
                 }
-                // Also where a change that is left out now may be built with another
-                // undone (a `cfg` that changed along with the code under it).
-                if alone > 0 && (stuck || alone < changes.len()) && changes.len() > 1 {
-                    let whole = reverts::all_undone(&file.original, changes);
+                // All together: where one does not build alone, and where what is left
+                // out now is built once the others are undone (a `cfg` that changed
+                // along with the code under it), which shows as another program with
+                // those changes undone too than without them.
+                let whole = reverts::all_undone(&file.original, changes);
+                let off = |text: &str| built_sources.left_out_of(file, text);
+                let same = |a: &str, b: &str| match (off(a), off(b)) {
+                    (Some(off_a), Some(off_b)) => reverts::same_build(a, &off_a, b, &off_b),
+                    _ => false,
+                };
+                let tried: Vec<reverts::Change> = changes
+                    .iter()
+                    .filter(|change| !change.outside)
+                    .cloned()
+                    .collect();
+                let left_out_matter = alone < changes.len()
+                    && match (&whole, reverts::all_undone(&file.original, &tried)) {
+                        (Some(all), Some(without)) => !same(all, &without),
+                        _ => true,
+                    };
+                // And never a program that is the one that is there.
+                let another = whole
+                    .as_deref()
+                    .is_none_or(|all| !same(all, &file.original));
+                if changes.len() > 1 && another && (stuck || left_out_matter) {
                     let outcome = match &whole {
                         Some(text) => undone(&[(file, text.as_str())])?,
                         None => None,
@@ -6546,6 +6608,44 @@ mod tests {
         );
         assert_eq!(left_out_of_all(&[]), []);
         assert_eq!(left_out_of_all(&[vec![], with]), []);
+    }
+
+    #[test]
+    fn a_configuration_that_passes_a_feature_to_the_compiler_is_seen() {
+        let dir = scratch("config-feature");
+        let inner = dir.join("a/b");
+        fs::create_dir_all(&inner).unwrap();
+        let home = dir.join("home");
+        fs::create_dir_all(&home).unwrap();
+        let asks = |home: &Path| configuration_names_a_feature(&inner, Some(home.to_path_buf()));
+        assert!(!asks(&home));
+        // In a directory above the build, in either file name, and in cargo's home.
+        for (place, name) in [
+            (dir.join("a/.cargo"), "config.toml"),
+            (dir.join(".cargo"), "config"),
+        ] {
+            fs::create_dir_all(&place).unwrap();
+            fs::write(
+                place.join(name),
+                "[build]\nrustflags = [\"--cfg\", 'feature=\"extra\"']\n",
+            )
+            .unwrap();
+            assert!(asks(&home), "{name}");
+            fs::remove_dir_all(&place).unwrap();
+        }
+        fs::write(
+            home.join("config.toml"),
+            "[build]\nrustflags = \"--cfg feature=\\\"x\\\"\"\n",
+        )
+        .unwrap();
+        assert!(asks(&home));
+        // A target table and a flag that names no feature are not that.
+        fs::write(
+            home.join("config.toml"),
+            "[target.'cfg(unix)']\nrustflags = [\"-C\", \"target-feature=+crt-static\"]\n",
+        )
+        .unwrap();
+        assert!(!asks(&home));
     }
 
     #[test]

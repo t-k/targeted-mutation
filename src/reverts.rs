@@ -45,76 +45,94 @@ impl Change {
 }
 
 impl Change {
-    /// Whether the change is of code the build leaves out both as it is and undone:
-    /// then undoing it gives the same program, and there is nothing to try. `off_now`
-    /// are the ranges left out of the file as it is, `off_then` those of the file with
-    /// this change undone (`None` when that is not known: the change is then tried). A
-    /// change of what decides it (a `cfg` put on, taken off or reworded) is left out on
-    /// one side only.
+    /// Whether undoing the change gives the same program for the build: then there is
+    /// nothing to try. `off_now` are the ranges the build leaves out of the file as it
+    /// is, `off_then` those of the file with this change undone (`None` when that is
+    /// not known: the change is then tried). A change of what decides it (a `cfg` put
+    /// on, taken off or reworded) leaves other code out before than after.
     pub fn outside_the_build(
         &self,
         current: &str,
         off_now: &[(usize, usize)],
         off_then: Option<&[(usize, usize)]>,
     ) -> bool {
-        let Some(off_then) = off_then else {
-            return false;
-        };
-        let (from, to) = self.range;
-        // Lines that come or go move the lines after them, which code that is built
-        // may ask for.
-        let lines = |text: &str| text.matches('\n').count();
-        if lines(&current[from..to]) != lines(&self.put_back) && current.contains("line!") {
-            return false;
-        }
-        // The code of a side, without the line end and the spacing around it: an item
-        // ends at its last token.
-        let code = |text: &str, at: usize| {
-            let spacing = text.len() - text.trim_start().len();
-            (at + spacing, at + text.trim_end().len())
-        };
-        let inside = |ranges: &[(usize, usize)], (first, last): (usize, usize)| {
-            ranges
-                .iter()
-                .any(|(start, end)| *start <= first && last <= *end)
-        };
-        // The place of a side that has no code is in code that is left out.
-        let place = |ranges: &[(usize, usize)]| {
-            ranges
-                .iter()
-                .any(|(start, end)| *start < from && from < *end)
-        };
-        // A side that is whole items that are left out, one after the other: with or
-        // without them the build is the same.
-        let whole = |ranges: &[(usize, usize)], text: &str, (first, last): (usize, usize)| {
-            let mut at = first;
-            while at < last {
-                let Some((_, end)) = ranges
-                    .iter()
-                    .find(|(start, end)| *start == at && *end <= last)
-                else {
-                    return false;
-                };
-                at = *end + (text[*end - first..].len() - text[*end - first..].trim_start().len());
-            }
-            first < last
-        };
-        let now_text = &current[from..to];
-        let now = code(now_text, from);
-        let then = code(&self.put_back, from);
-        match (now.0 < now.1, then.0 < then.1) {
-            (true, true) => inside(off_now, now) && inside(off_then, then),
-            (true, false) => {
-                whole(off_now, now_text.trim_start(), now)
-                    || (inside(off_now, now) && place(off_then))
-            }
-            (false, true) => {
-                whole(off_then, self.put_back.trim_start(), then)
-                    || (inside(off_then, then) && place(off_now))
-            }
-            (false, false) => false,
+        match (&self.undone, off_then) {
+            (Some(undone), Some(off_then)) => same_build(current, off_now, undone, off_then),
+            _ => false,
         }
     }
+}
+
+/// Whether two texts of a file are the same program for a build that leaves these
+/// ranges of each out: the same tokens in what is left. Lines that come or go move the
+/// lines after them, which code that asks where it is can tell: then they are not.
+pub(crate) fn same_build(
+    now: &str,
+    off_now: &[(usize, usize)],
+    then: &str,
+    off_then: &[(usize, usize)],
+) -> bool {
+    let built = |text: &str, off: &[(usize, usize)]| {
+        let mut ranges = off.to_vec();
+        ranges.sort_unstable();
+        let mut out = String::with_capacity(text.len());
+        let mut at = 0;
+        for (from, to) in ranges {
+            if from >= at && to <= text.len() {
+                out.push_str(&text[at..from]);
+                out.push(' ');
+                at = to;
+            }
+        }
+        out.push_str(&text[at..]);
+        out
+    };
+    let (built_now, built_then) = (built(now, off_now), built(then, off_then));
+    if now.matches('\n').count() != then.matches('\n').count()
+        && (asks_where_it_is(&built_now) || asks_where_it_is(&built_then))
+    {
+        return false;
+    }
+    instrument::same_tokens(&built_now, &built_then) == Some(true)
+}
+
+/// Whether code uses its own place in the file: `line!`, `column!`, the location of a
+/// caller. A macro of another file that does is not seen.
+fn asks_where_it_is(text: &str) -> bool {
+    fn scan(stream: proc_macro2::TokenStream) -> bool {
+        let mut previous: Option<String> = None;
+        for tree in stream {
+            match tree {
+                proc_macro2::TokenTree::Ident(name) => {
+                    let name = name.to_string();
+                    if name == "Location" || name == "track_caller" {
+                        return true;
+                    }
+                    previous = Some(name);
+                }
+                proc_macro2::TokenTree::Punct(mark) => {
+                    if mark.as_char() == '!'
+                        && previous
+                            .as_deref()
+                            .is_some_and(|name| name == "line" || name == "column")
+                    {
+                        return true;
+                    }
+                    previous = None;
+                }
+                proc_macro2::TokenTree::Group(group) => {
+                    if scan(group.stream()) {
+                        return true;
+                    }
+                    previous = None;
+                }
+                proc_macro2::TokenTree::Literal(_) => previous = None,
+            }
+        }
+        false
+    }
+    // What does not lex is not known not to.
+    text.parse::<proc_macro2::TokenStream>().map_or(true, scan)
 }
 
 /// The ranges, each to the end of its last line when only a comment follows there: the
@@ -685,6 +703,55 @@ pub fn basic() -> u32 {
         // As many lines as before move nothing.
         let same = longer.replace("let _ = 2;", "let _ = 3;");
         assert!(outside(&longer, &same, &["basic"]));
+    }
+
+    #[test]
+    fn the_same_build_is_the_same_tokens_in_what_is_built() {
+        // Two attributes on one statement, both reworded: either alone leaves it out,
+        // both together put it back.
+        let old = "fn f() -> u8 {\n    #[cfg(feature = \"basic\")]\n    #[allow(unreachable_code)]\n    #[cfg(feature = \"basic\")]\n    return 1;\n    2\n}\n";
+        let new = old.replace("basic", "extra");
+        let features: std::collections::BTreeSet<String> = ["basic".to_string()].into();
+        let off = |text: &str| {
+            instrument::inactive_ranges(text, &instrument::parse_source(text).unwrap(), &features)
+        };
+        let found = between(old, &new);
+        assert_eq!(found.len(), 2, "{found:?}");
+        for change in &found {
+            let undone = change.undone.as_deref().unwrap();
+            assert!(change.outside_the_build(&new, &off(&new), Some(&off(undone))));
+        }
+        let both = all_undone(&new, &found).unwrap();
+        assert_eq!(both, old);
+        assert!(!same_build(&new, &off(&new), &both, &off(&both)));
+        // An item that is left out, with a comment after it, is no part of the build.
+        let base = "pub const N: u8 = 7;\n";
+        let with =
+            format!("{base}#[cfg(feature = \"extra\")] pub const OFF: u8 = 42; // optional\n");
+        assert!(same_build(&with, &off(&with), base, &off(base)));
+        // Where code asks for its line, however that is spaced, lines count.
+        for asking in [
+            "line !()",
+            "line!()",
+            "column ! ()",
+            "std::panic::Location::caller().line()",
+        ] {
+            let base = format!("pub fn n() -> u32 {{ {asking} }}\n");
+            let with = format!("#[cfg(feature = \"extra\")]\npub const OFF: u8 = 42;\n{base}");
+            assert!(
+                !same_build(&with, &off(&with), &base, &off(&base)),
+                "{asking}"
+            );
+        }
+        // In code that is left out it asks nothing of this build.
+        let base = "#[cfg(feature = \"extra\")]\nfn off() -> u32 {\n    line!()\n}\npub fn n() -> u32 { 1 }\n";
+        let with = base.replace("    line!()\n", "    let _ = 2;\n    line!()\n");
+        assert!(same_build(&with, &off(&with), base, &off(base)));
+        assert!(asks_where_it_is("#[track_caller] fn f() {}"));
+        assert!(asks_where_it_is("fn f( {"));
+        assert!(!asks_where_it_is(
+            "fn line() { let column = 1; let _ = !column; }"
+        ));
     }
 
     #[test]

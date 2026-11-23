@@ -4090,6 +4090,51 @@ fn code_a_feature_leaves_out_is_not_a_survivor_when_built_one_by_one() {
         "{since:#}"
     );
     assert_eq!(run.code, 2, "{since:#}");
+    // Two `cfg` on one statement, both reworded: either alone leaves it out as it is
+    // now, both together put it back. And next to a change the tests find out, a
+    // change of code that is left out asks for nothing more.
+    fs::write(&path, &source).unwrap();
+    append(
+        &path,
+        "\npub fn twice() -> u32 {\n    #[cfg(feature = \"basic\")]\n    #[allow(unreachable_code)]\n    \
+         #[cfg(feature = \"basic\")]\n    return 9;\n    #[allow(unreachable_code)]\n    2\n}\n\n\
+         #[test]\nfn twice_is_something() {\n    assert!(twice() > 0);\n}\n",
+    );
+    git_output(&dir, &["add", "-A"]);
+    let base = git_output(&dir, &["write-tree"]);
+    let with_twice = fs::read_to_string(&path).unwrap();
+    let undone_of = |text: String| -> (i32, Vec<String>) {
+        fs::write(&path, text).unwrap();
+        let run = tmt(&dir, &["--json", "--quiet", "--rebuild", "--since", &base]);
+        let report: Value = serde_json::from_str(&run.stdout)
+            .unwrap_or_else(|e| panic!("{e}: {}{}", run.stdout, run.stderr));
+        let undone = report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| !f["change_since"].is_null())
+            .map(|f| f["survivors"][0].as_str().unwrap().to_string())
+            .collect();
+        (run.code, undone)
+    };
+    assert_eq!(
+        undone_of(with_twice.replace(
+            "    #[cfg(feature = \"basic\")]\n    #[allow(unreachable_code)]\n    #[cfg(feature = \"basic\")]\n    return 9;",
+            "    #[cfg(feature = \"extra\")]\n    #[allow(unreachable_code)]\n    #[cfg(feature = \"extra\")]\n    return 9;",
+        )),
+        (2, vec!["with all 2 changes to this file undone".to_string()])
+    );
+    assert_eq!(
+        undone_of(
+            with_twice
+                .replace("n > 5", "n > 6")
+                .replace("assert!(!super::basic(5));", "assert!(!super::basic(6));")
+                .replace("assert!(super::basic(6));", "assert!(super::basic(7));")
+                .replace("n > 10", "n > 11")
+        )
+        .1,
+        Vec::<String>::new()
+    );
     fs::write(&path, &source).unwrap();
 
     // With the feature the same code is judged, and found far from its limit.
