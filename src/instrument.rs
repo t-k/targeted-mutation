@@ -1725,7 +1725,7 @@ pub(crate) fn inactive_ranges(
 /// a multiple (`x * 8`, `x << 3`), the bits of a mask (`x & 0xF0`), a remainder
 /// (`x % 10`). Only what also holds when the arithmetic wraps: a product by a number
 /// that is not a power of two can then be anything.
-pub(crate) fn reach(expr: &str) -> Option<crate::plan::Reach> {
+pub(crate) fn reach(expr: &str) -> Option<(crate::plan::Reach, Option<u32>)> {
     use crate::plan::Reach;
     fn literal(expr: &syn::Expr) -> Option<i128> {
         match expr {
@@ -1746,18 +1746,21 @@ pub(crate) fn reach(expr: &str) -> Option<crate::plan::Reach> {
     };
     let (left, right) = (literal(&binary.left), literal(&binary.right));
     let power_of_two = |k: i128| k >= 2 && k & (k - 1) == 0;
-    match binary.op {
+    // With the number of bits of a shift: it is a multiple only when the type is wider.
+    let reach = match binary.op {
         syn::BinOp::Mul(_) => left
             .or(right)
             .filter(|k| power_of_two(*k))
             .map(Reach::Multiples),
-        syn::BinOp::Shl(_) => right
-            .filter(|bits| (1..=100).contains(bits))
-            .map(|bits| Reach::Multiples(1 << bits)),
+        syn::BinOp::Shl(_) => {
+            let bits = right.filter(|bits| (1..=100).contains(bits))?;
+            return Some((Reach::Multiples(1 << bits), Some(bits as u32)));
+        }
         syn::BinOp::BitAnd(_) => left.or(right).filter(|mask| *mask >= 0).map(Reach::Bits),
         syn::BinOp::Rem(_) => right.filter(|limit| *limit >= 1).map(Reach::Below),
         _ => None,
-    }
+    };
+    reach.map(|reach| (reach, None))
 }
 
 /// Byte ranges of the code that only a test build has: what is under `cfg(test)` or
@@ -2876,6 +2879,7 @@ mod tests {
             ("8 * blocks", Some(Reach::Multiples(8))),
             ("(blocks * (2))", Some(Reach::Multiples(2))),
             ("blocks << 3", Some(Reach::Multiples(8))),
+            ("blocks << 9", Some(Reach::Multiples(512))),
             ("flags & 0xF0", Some(Reach::Bits(0xF0))),
             ("0b1010u8 & flags", Some(Reach::Bits(0b1010))),
             ("n % 10", Some(Reach::Below(10))),
@@ -2899,7 +2903,13 @@ mod tests {
             ("x * 8.0", None),
             ("not rust (", None),
         ] {
-            assert_eq!(reach(expr), expected, "{expr}");
+            assert_eq!(reach(expr).map(|(reach, _)| reach), expected, "{expr}");
+            // Only a shift comes with a number of bits to check against the type.
+            assert_eq!(
+                reach(expr).and_then(|(_, bits)| bits).is_some(),
+                expr.contains("<<") && expected.is_some(),
+                "{expr}"
+            );
         }
     }
 

@@ -21,6 +21,11 @@ pub fn has_a_last_digit(n: u32) -> bool {
     n % 10 < 10
 }
 
+/// The two bits of the mask are never the number one: there is no other outcome.
+pub fn is_exactly_one(flags: u8) -> bool {
+    flags & 0b1100 == 1
+}
+
 /// A rate in eighths, with a multiplication of its own: times eight it is any number.
 pub struct Eighths(pub u32);
 
@@ -49,6 +54,7 @@ mod tests {
         assert!(!is_marked(0b0100));
         assert!(is_marked(0b1000));
         assert!(has_a_last_digit(7));
+        assert!(!is_exactly_one(0b0100));
         assert!(!is_rated(Eighths(16)));
         assert!(is_rated(Eighths(24)));
     }

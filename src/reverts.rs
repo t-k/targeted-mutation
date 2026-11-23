@@ -15,6 +15,10 @@ pub(crate) struct Change {
     pub code: String,
     /// The file with this change alone undone; `None` when that is not Rust any more.
     pub undone: Option<String>,
+    /// Where the change is in the file as it is now, and what is put there to undo
+    /// it: the old lines, with the lines of the tests as they are now.
+    pub range: (usize, usize),
+    pub put_back: String,
 }
 
 impl Change {
@@ -150,11 +154,15 @@ fn classify(current: &str, hunks: &[Hunk]) -> Vec<(Hunk, Kind)> {
             .lines()
             .find(|text| !text.trim().is_empty())
             .unwrap_or("");
+        // What stands between the text before the change and the text after it.
+        let put_back = undone[from..undone.len() - (current.len() - to)].to_string();
         kind(Kind::Program(Change {
             hunk: hunk.clone(),
             line,
             code: crate::report::one_line(code_line.trim()),
             undone: undone_parsed.map(|_| undone),
+            range: (from, to),
+            put_back,
         }));
     }
     found
@@ -230,8 +238,19 @@ pub(crate) fn test_hunks(current: &str, hunks: &[Hunk]) -> Vec<Hunk> {
 
 /// The file with all of these changes undone; `None` when that is not Rust.
 pub(crate) fn all_undone(current: &str, changes: &[Change]) -> Option<String> {
-    let hunks: Vec<&Hunk> = changes.iter().map(|change| &change.hunk).collect();
-    let undone = scope::undo(current, &hunks)?;
+    // Each as it is undone alone: the tests stay as they are, here too.
+    let mut ordered: Vec<&Change> = changes.iter().collect();
+    ordered.sort_by_key(|change| std::cmp::Reverse(change.range));
+    let mut undone = current.to_string();
+    let mut before = current.len();
+    for change in ordered {
+        let (from, to) = change.range;
+        if to > before {
+            return None;
+        }
+        undone.replace_range(from..to, &change.put_back);
+        before = from;
+    }
     instrument::parse_source(&undone).ok().map(|_| undone)
 }
 
@@ -386,7 +405,19 @@ pub fn limit() -> u32 { 41 }
         // The old limit with the test as it is now: that is what the tests are asked.
         let wanted = NEXT_TO.replace("limit(), 41", "limit(), 42");
         assert_eq!(found[0].undone.as_deref(), Some(wanted.as_str()));
-        assert_eq!(all_undone(&new, &found).as_deref(), Some(NEXT_TO));
+        // Undone together with others, the test is kept as well.
+        assert_eq!(all_undone(&new, &found).as_deref(), Some(wanted.as_str()));
+        let renamed = NEXT_TO.to_string()
+            + "\npub fn kept() {}\n\nfn helper() -> u32 { 1 }\n\npub fn uses() -> u32 { helper() }\n";
+        let new = renamed.replace("41", "42").replace("helper", "one");
+        let found = between(&renamed, &new);
+        // The definition and the use do not build one without the other: all three
+        // changes go back together, and the test stays.
+        assert_eq!(found.len(), 3, "{found:?}");
+        assert_eq!(
+            all_undone(&new, &found).as_deref(),
+            Some(renamed.replace("limit(), 41", "limit(), 42").as_str())
+        );
         // The test first and the program after it: the same.
         let (first, second) = NEXT_TO.split_once('\n').unwrap();
         let old = format!("{second}{first}\n");

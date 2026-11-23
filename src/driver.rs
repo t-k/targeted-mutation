@@ -2993,7 +2993,16 @@ impl Session {
                     LiteralSide::None => None,
                 }
                 .and_then(|(expr, (from, to), number, is_rhs)| {
-                    let reach = instrument::reach(expr)?;
+                    let (reach, shift) = instrument::reach(expr)?;
+                    // A shift by the width of its type or more is a shift by less when
+                    // overflow is not checked: the width has to be known and greater.
+                    if let Some(bits) = shift {
+                        let (low, high) = bounds.map(|b| if is_rhs { b.lhs } else { b.rhs })?;
+                        let values = high.checked_sub(low)?;
+                        if values < 1_i128.checked_shl(bits)? {
+                            return None;
+                        }
+                    }
                     primitive(from, to).then_some((reach, number, is_rhs))
                 });
                 let mut domain = domain_of(*literal, bounds);
@@ -3014,7 +3023,15 @@ impl Session {
                 if let Some((reach, number, is_rhs)) = against
                     && let Some(gap) = cmp_plan.gap.take()
                 {
-                    cmp_plan.gap = plan::within_reach(gap, op, &merged, reach, number, is_rhs);
+                    // Equal to a number it cannot be: there is no other outcome.
+                    if matches!(op, plan::CmpOp::Eq | plan::CmpOp::Ne)
+                        && !reach.holds(number)
+                        && matches!(gap, plan::InputGap::OneSided { .. })
+                    {
+                        cmp_plan.cannot_differ = true;
+                    } else {
+                        cmp_plan.gap = plan::within_reach(gap, op, &merged, reach, number, is_rhs);
+                    }
                 }
                 let mut gaps = vec![];
                 let mut constant = false;
@@ -5620,6 +5637,7 @@ fn run_package(
         .filter(|_| !options.list && options.shard.is_none())
     {
         let hunks = scope::hunks(&since_diff(&workspace, revision)?);
+        let not_built_changes = std::cell::Cell::new(0usize);
         let changed: Vec<(&SourceFile, Vec<reverts::Change>)> = files
             .iter()
             .filter(|file| built_sources.contains(file) || !options.source_only && !options.rebuild)
@@ -5635,10 +5653,25 @@ fn run_package(
                     .filter(|hunk| hunk.file == relative)
                     .cloned()
                     .collect();
-                let changes = reverts::changes(&file.original, &of_file);
+                let mut changes = reverts::changes(&file.original, &of_file);
+                // Code this build leaves out (a feature that is off) is the same
+                // program with its change undone: nothing to try.
+                if options.rebuild || options.source_only {
+                    let left_out = built_sources.left_out(file);
+                    let before = changes.len();
+                    changes.retain(|change| {
+                        !left_out
+                            .iter()
+                            .any(|(from, to)| *from <= change.range.0 && change.range.1 <= *to)
+                    });
+                    not_built_changes.set(not_built_changes.get() + before - changes.len());
+                }
                 (!changes.is_empty()).then_some((file, changes))
             })
             .collect();
+        let not_built_changes = not_built_changes.get();
+        report.mutants_not_evaluated += not_built_changes;
+        report.mutants_not_compiled += not_built_changes;
         let total: usize = changed.iter().map(|(_, changes)| changes.len()).sum();
         // A change of the program and its tests in lines that cannot be told apart
         // would be undone with the tests: nothing is said of it.

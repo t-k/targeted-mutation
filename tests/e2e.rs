@@ -2189,7 +2189,9 @@ fn a_change_the_tests_do_not_tell_from_the_old_code_is_found() {
     append(
         &dir.join("src/lib.rs"),
         "\npub const DEFAULT_LIMIT: u32 = 41;\n\npub fn limit() -> u32 { 41 }\n\
-         #[test] fn the_limit() { assert_eq!(limit(), 41); assert!(DEFAULT_LIMIT > 0); }\n",
+         #[test] fn the_limit() { assert_eq!(limit(), 41); assert!(DEFAULT_LIMIT > 0); }\n\n\
+         fn helper() -> u32 { 1 }\n\npub fn uses() -> u32 { helper() }\n\n\
+         #[test] fn used() { assert_eq!(uses(), 1); }\n",
     );
     git_output(&dir, &["add", "-A"]);
     let with_limit = git_output(&dir, &["write-tree"]);
@@ -2208,6 +2210,15 @@ fn a_change_the_tests_do_not_tell_from_the_old_code_is_found() {
         "DEFAULT_LIMIT: u32 = 41;",
         "DEFAULT_LIMIT: u32 = 42;",
     );
+    // A helper under another name: its definition and its use do not build one without
+    // the other, so all changes of the file are undone together. The tests stay as
+    // they are there too, and find the old limit out.
+    edit(
+        "src/lib.rs",
+        "fn helper() -> u32 { 1 }",
+        "fn one() -> u32 { 1 }",
+    );
+    edit("src/lib.rs", "{ helper() }", "{ one() }");
     for mode in ["--rebuild", "--source-only"] {
         let run = tmt(&dir, &["--json", "--quiet", mode, "--since", &with_limit]);
         let report: Value = serde_json::from_str(&run.stdout)
@@ -2238,6 +2249,12 @@ fn a_change_the_tests_do_not_tell_from_the_old_code_is_found() {
         "assert_eq!(limit(), 42);",
         "assert_eq!(limit(), 41);",
     );
+    edit(
+        "src/lib.rs",
+        "fn one() -> u32 { 1 }",
+        "fn helper() -> u32 { 1 }",
+    );
+    edit("src/lib.rs", "{ one() }", "{ helper() }");
     let run = tmt(
         &dir,
         &["--json", "--quiet", "--rebuild", "--since", &with_limit],
@@ -3944,6 +3961,47 @@ fn code_a_feature_leaves_out_is_not_a_survivor_when_built_one_by_one() {
         text.stdout
     );
     assert!(!text.stdout.contains("largest value"), "{}", text.stdout);
+    // A change to code the feature leaves out is not a change of this build: undone,
+    // it is the same program, which says nothing of the tests.
+    fs::write(dir.join(".gitignore"), "target/\nCargo.lock\n").unwrap();
+    git_output(&dir, &["init", "-q"]);
+    git_output(&dir, &["add", "-A"]);
+    let base = git_output(&dir, &["write-tree"]);
+    let path = dir.join("src/lib.rs");
+    let source = fs::read_to_string(&path).unwrap();
+    fs::write(&path, source.replace("n > 10", "n > 11")).unwrap();
+    let run = tmt(&dir, &["--json", "--quiet", "--rebuild", "--since", &base]);
+    let since: Value = serde_json::from_str(&run.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}{}", run.stdout, run.stderr));
+    assert_eq!(since["findings"], serde_json::json!([]), "{since:#}");
+    assert!(
+        since["mutants_not_compiled"].as_u64().unwrap() >= 1,
+        "{since:#}"
+    );
+    let run = tmt(
+        &dir,
+        &[
+            "--json",
+            "--quiet",
+            "--rebuild",
+            "--since",
+            &base,
+            "--features",
+            "extra",
+        ],
+    );
+    let since: Value = serde_json::from_str(&run.stdout).unwrap();
+    // With the feature it is a change, and one the far-off test does not tell.
+    assert!(
+        since["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| !f["change_since"].is_null() && f["code"] == "n > 11"),
+        "{since:#}"
+    );
+    fs::write(&path, &source).unwrap();
+
     // With the feature the same code is judged, and found far from its limit.
     let run = tmt(
         &dir,
