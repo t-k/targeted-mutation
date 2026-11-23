@@ -4002,6 +4002,57 @@ fn code_a_feature_leaves_out_is_not_a_survivor_when_built_one_by_one() {
     );
     fs::write(&path, &source).unwrap();
 
+    // An item on one line that the feature leaves out is no change of this build
+    // either. But the `cfg` itself is: with it reworded the function gives 2 and not
+    // 9, which a test that only asks for more than nothing does not tell.
+    append(
+        &path,
+        "\n#[cfg(feature = \"extra\")]\npub const LIMIT: u32 = 41;\n\n\
+         pub fn step() -> u32 {\n    #[cfg(feature = \"basic\")]\n    return 9;\n    \
+         #[allow(unreachable_code)]\n    2\n}\n\n\
+         #[test]\nfn steps_forward() {\n    assert!(step() > 0);\n}\n",
+    );
+    git_output(&dir, &["add", "-A"]);
+    let base = git_output(&dir, &["write-tree"]);
+    let with_step = fs::read_to_string(&path).unwrap();
+    fs::write(
+        &path,
+        with_step.replace("LIMIT: u32 = 41;", "LIMIT: u32 = 42;"),
+    )
+    .unwrap();
+    let run = tmt(&dir, &["--json", "--quiet", "--rebuild", "--since", &base]);
+    let since: Value = serde_json::from_str(&run.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}{}", run.stdout, run.stderr));
+    assert_eq!(since["findings"], serde_json::json!([]), "{since:#}");
+    assert_eq!(since["mutants_not_compiled"], 1, "{since:#}");
+    fs::write(
+        &path,
+        with_step.replace(
+            "    #[cfg(feature = \"basic\")]\n    return 9;",
+            "    #[cfg(feature = \"extra\")]\n    return 9;",
+        ),
+    )
+    .unwrap();
+    let run = tmt(&dir, &["--json", "--quiet", "--rebuild", "--since", &base]);
+    assert_eq!(run.code, 2, "{}{}", run.stdout, run.stderr);
+    let since: Value = serde_json::from_str(&run.stdout).unwrap();
+    let undone: Vec<&Value> = since["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| !f["change_since"].is_null())
+        .collect();
+    assert_eq!(undone.len(), 1, "{since:#}");
+    assert_eq!(
+        undone[0]["code"], "#[cfg(feature = \"extra\")]",
+        "{since:#}"
+    );
+    assert_eq!(
+        undone[0]["survivors"][0],
+        "with the code as it was: `#[cfg(feature = \"basic\")]`"
+    );
+    fs::write(&path, &source).unwrap();
+
     // With the feature the same code is judged, and found far from its limit.
     let run = tmt(
         &dir,

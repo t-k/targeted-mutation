@@ -646,6 +646,19 @@ impl Reach {
         }
     }
 
+    /// What `x << bits` can be for a type whose values go from `low` to `high`. Where
+    /// overflow is not checked, a shift by the width of the type or more is a shift by
+    /// the remainder: only that many low bits are sure to be zero. `None` when that is
+    /// none, or the width cannot be told.
+    pub fn of_shift(bits: u32, (low, high): (i128, i128)) -> Option<Reach> {
+        let values = high.checked_sub(low)?.checked_add(1)?;
+        if values < 2 || values & (values - 1) != 0 {
+            return None;
+        }
+        let effective = bits % values.trailing_zeros();
+        (effective > 0).then(|| Reach::Multiples(1 << effective))
+    }
+
     /// The numbers the expression lies between, where it has such bounds.
     pub fn interval(self) -> Option<(i128, i128)> {
         match self {
@@ -1234,6 +1247,40 @@ mod tests {
             assert_eq!(plan.gap.is_some(), differs, "{reach:?} {op:?} {literal}");
         }
         assert_eq!(Reach::Multiples(8).interval(), None);
+    }
+
+    #[test]
+    fn a_shift_is_a_multiple_by_the_bits_that_are_shifted_in_fact() {
+        let (byte, signed_byte) = ((0, 255), (-128, 127));
+        for (bits, range, expected) in [
+            (3, byte, Some(Reach::Multiples(8))),
+            (7, byte, Some(Reach::Multiples(128))),
+            // By the width and more: the remainder is what is shifted.
+            (8, byte, None),
+            (9, byte, Some(Reach::Multiples(2))),
+            (16, byte, None),
+            (9, signed_byte, Some(Reach::Multiples(2))),
+            (33, (0, u32::MAX as i128), Some(Reach::Multiples(2))),
+            (3, (0, u32::MAX as i128), Some(Reach::Multiples(8))),
+            // No width to tell: nothing is said.
+            (3, (0, 9), None),
+            (3, (0, 0), None),
+            (3, (5, 4), None),
+            (3, (i128::MIN, i128::MAX), None),
+        ] {
+            assert_eq!(Reach::of_shift(bits, range), expected, "{bits} {range:?}");
+        }
+        // Against what a byte does when overflow is not checked.
+        for bits in 1..=20u32 {
+            let reach = Reach::of_shift(bits, byte);
+            for n in 0..=255u8 {
+                let shifted = i128::from(n.wrapping_shl(bits));
+                assert!(
+                    reach.is_none_or(|reach| reach.holds(shifted)),
+                    "{n} << {bits}"
+                );
+            }
+        }
     }
 
     #[test]

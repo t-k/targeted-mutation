@@ -661,6 +661,13 @@ impl BuiltSources {
     /// the features of every build that owns the file turn off. Nothing when one of
     /// those builds did not say its features.
     fn left_out(&self, source: &SourceFile) -> Vec<(usize, usize)> {
+        self.left_out_of(source, &source.original)
+            .unwrap_or_default()
+    }
+
+    /// The same for another text of the file (a change undone). `None` when that is
+    /// not Rust, or a build did not say its features: nothing is known then.
+    fn left_out_of(&self, source: &SourceFile, text: &str) -> Option<Vec<(usize, usize)>> {
         let mut features = BTreeSet::new();
         for root in &source.owners {
             if !self
@@ -670,14 +677,11 @@ impl BuiltSources {
             {
                 continue;
             }
-            match self.features.get(root) {
-                Some(of_root) => features.extend(of_root.iter().cloned()),
-                None => return vec![],
-            }
+            features.extend(self.features.get(root)?.iter().cloned());
         }
-        instrument::parse_source(&source.original)
-            .map(|parsed| instrument::inactive_ranges(&source.original, &parsed, &features))
-            .unwrap_or_default()
+        instrument::parse_source(text)
+            .map(|parsed| instrument::inactive_ranges(text, &parsed, &features))
+            .ok()
     }
 }
 
@@ -2995,14 +2999,14 @@ impl Session {
                 .and_then(|(expr, (from, to), number, is_rhs)| {
                     let (reach, shift) = instrument::reach(expr)?;
                     // A shift by the width of its type or more is a shift by less when
-                    // overflow is not checked: the width has to be known and greater.
-                    if let Some(bits) = shift {
-                        let (low, high) = bounds.map(|b| if is_rhs { b.lhs } else { b.rhs })?;
-                        let values = high.checked_sub(low)?;
-                        if values < 1_i128.checked_shl(bits)? {
-                            return None;
-                        }
-                    }
+                    // overflow is not checked: the type says by how much.
+                    let reach = match shift {
+                        Some(bits) => plan::Reach::of_shift(
+                            bits,
+                            bounds.map(|b| if is_rhs { b.lhs } else { b.rhs })?,
+                        )?,
+                        None => reach,
+                    };
                     primitive(from, to).then_some((reach, number, is_rhs))
                 });
                 let mut domain = domain_of(*literal, bounds);
@@ -5660,9 +5664,12 @@ fn run_package(
                     let left_out = built_sources.left_out(file);
                     let before = changes.len();
                     changes.retain(|change| {
-                        !left_out
-                            .iter()
-                            .any(|(from, to)| *from <= change.range.0 && change.range.1 <= *to)
+                        // Undone it may be built: a `cfg` that changed decides that.
+                        let then = change
+                            .undone
+                            .as_deref()
+                            .and_then(|undone| built_sources.left_out_of(file, undone));
+                        !change.outside_the_build(&file.original, &left_out, then.as_deref())
                     });
                     not_built_changes.set(not_built_changes.get() + before - changes.len());
                 }

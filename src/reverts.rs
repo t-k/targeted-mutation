@@ -41,6 +41,45 @@ impl Change {
     }
 }
 
+impl Change {
+    /// Whether the change is of code the build leaves out both as it is and undone:
+    /// then undoing it gives the same program, and there is nothing to try. `off_now`
+    /// are the ranges left out of the file as it is, `off_then` those of the file with
+    /// this change undone (`None` when that is not known: the change is then tried). A
+    /// change of what decides it (a `cfg` put on, taken off or reworded) is left out on
+    /// one side only.
+    pub fn outside_the_build(
+        &self,
+        current: &str,
+        off_now: &[(usize, usize)],
+        off_then: Option<&[(usize, usize)]>,
+    ) -> bool {
+        let Some(off_then) = off_then else {
+            return false;
+        };
+        // The code of a side, without the line end and the spacing around it: an item
+        // ends at its last token.
+        let code = |text: &str, at: usize| {
+            let spacing = text.len() - text.trim_start().len();
+            (at + spacing, at + text.trim_end().len())
+        };
+        // A side with no code is a place: lines were added there, or taken from it.
+        let (from, to) = self.range;
+        let inside = |ranges: &[(usize, usize)], (first, last): (usize, usize)| {
+            ranges.iter().any(|(start, end)| {
+                if first < last {
+                    *start <= first && last <= *end
+                } else {
+                    *start <= from && from < *end
+                }
+            })
+        };
+        let now = code(&current[from..to], from);
+        let then = code(&self.put_back, from);
+        (now.0 < now.1 || then.0 < then.1) && inside(off_now, now) && inside(off_then, then)
+    }
+}
+
 /// What a hunk of a file changes.
 enum Kind {
     /// The program: worth trying undone.
@@ -472,6 +511,79 @@ pub fn limit() -> u32 { 41 }
         let tests = old.replace("limit(), 41", "limit(), 40 + 1");
         assert_eq!(mixed(&tests, &dir_hunks(&old, &tests)), 0);
         assert_eq!(test_hunks(&tests, &dir_hunks(&old, &tests)).len(), 1);
+    }
+
+    /// Whether the one change between two texts is outside of a build with these
+    /// features, now and undone.
+    fn outside(old: &str, new: &str, features: &[&str]) -> bool {
+        let features: std::collections::BTreeSet<String> =
+            features.iter().map(|name| name.to_string()).collect();
+        let off = |text: &str| {
+            instrument::parse_source(text)
+                .map(|parsed| instrument::inactive_ranges(text, &parsed, &features))
+                .ok()
+        };
+        let found = between(old, new);
+        assert_eq!(found.len(), 1, "{found:?}");
+        let then = found[0].undone.as_deref().and_then(off);
+        found[0].outside_the_build(new, &off(new).unwrap(), then.as_deref())
+    }
+
+    #[test]
+    fn a_change_is_outside_the_build_only_if_it_is_so_undone_too() {
+        let code = "\
+#[cfg(feature = \"extra\")]
+pub fn extra() -> u32 { 41 }
+
+#[cfg(feature = \"extra\")]
+pub const LIMIT: u32 = 41;
+
+#[cfg(feature = \"basic\")]
+pub fn basic() -> u32 {
+    41
+}
+";
+        // In code the feature leaves out, whatever the shape of the item: a function
+        // on one line, a constant, the body of a function of several lines.
+        for (from, to) in [
+            (
+                "pub fn extra() -> u32 { 41 }",
+                "pub fn extra() -> u32 { 42 }",
+            ),
+            ("pub const LIMIT: u32 = 41;", "pub const LIMIT: u32 = 42;"),
+        ] {
+            assert!(outside(code, &code.replace(from, to), &["basic"]), "{to}");
+            assert!(
+                !outside(code, &code.replace(from, to), &["basic", "extra"]),
+                "{to}"
+            );
+        }
+        let body = code.replace("    41\n", "    42\n");
+        assert!(!outside(code, &body, &["basic"]));
+        assert!(outside(code, &body, &["extra"]));
+        // The attribute itself: left out now and built before, or the other way round.
+        let moved = code.replace(
+            "#[cfg(feature = \"basic\")]\npub fn basic",
+            "#[cfg(feature = \"extra\")]\npub fn basic",
+        );
+        assert!(!outside(code, &moved, &["basic"]));
+        assert!(!outside(&moved, code, &["basic"]));
+        // Off under either name: nothing changes for this build.
+        assert!(outside(code, &moved, &[]));
+        // An attribute that is new, and one that is gone.
+        let added = code.replace("#[cfg(feature = \"basic\")]\n", "");
+        assert!(!outside(&added, code, &["extra"]));
+        assert!(!outside(code, &added, &["extra"]));
+        // Lines added to code that is left out, and taken from it.
+        let longer = code.replace(
+            "pub fn extra() -> u32 { 41 }",
+            "pub fn extra() -> u32 {\n    let n = 41;\n    n\n}",
+        );
+        assert!(outside(code, &longer, &["basic"]));
+        assert!(outside(&longer, code, &["basic"]));
+        // What the build was before is not known: tried.
+        let found = between(code, &body);
+        assert!(!found[0].outside_the_build(&body, &[(0, body.len())], None));
     }
 
     #[test]
