@@ -82,6 +82,39 @@ pub fn accumulate(log: &RefCell<Vec<&'static str>>) -> u32 {
     total
 }
 
+/// The borrow that `first()` is called on lives until the end of the statement, like any
+/// temporary of its receiver.
+pub fn end_borrow_state(cell: &RefCell<Vec<u8>>) -> (Option<u8>, bool) {
+    let pair = (cell.borrow().first().copied(), cell.try_borrow_mut().is_ok());
+    pair
+}
+
+fn counted<'a>(calls: &Cell<u32>, values: &'a [u8]) -> &'a [u8] {
+    calls.set(calls.get() + 1);
+    values
+}
+
+/// The receiver of `last()` is evaluated once.
+pub fn last_of_counted(calls: &Cell<u32>, values: &[u8]) -> Option<u8> {
+    counted(calls, values).last().copied()
+}
+
+/// What `first()` and `last()` give lives as long as the sequence, not as the variable
+/// that refers to it.
+pub fn head<'a>(names: &'a [String]) -> Option<&'a String> {
+    names.first()
+}
+
+pub fn tail<'a>(names: &'a Vec<String>) -> Option<&'a String> {
+    let names = names;
+    names.last()
+}
+
+/// The end of a sequence that is made on the spot.
+pub fn made_on_the_spot(n: u8) -> Option<u8> {
+    [n, n + 1].to_vec().last().copied()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -139,5 +172,19 @@ mod tests {
         let log = RefCell::new(Vec::new());
         assert_eq!(accumulate(&log), 11);
         assert_eq!(*log.borrow(), ["value", "index"]);
+    }
+
+    #[test]
+    fn the_ends_of_a_sequence_are_asked_for_as_written() {
+        let cell = RefCell::new([1u8, 2].to_vec());
+        assert_eq!(end_borrow_state(&cell), (Some(1), false));
+        let calls = Cell::new(0);
+        assert_eq!(last_of_counted(&calls, &[4, 5]), Some(5));
+        assert_eq!(last_of_counted(&calls, &[]), None);
+        assert_eq!(calls.get(), 2);
+        let names = ["a".to_string(), "b".to_string()].to_vec();
+        assert_eq!(head(&names).map(String::as_str), Some("a"));
+        assert_eq!(tail(&names).map(String::as_str), Some("b"));
+        assert_eq!(made_on_the_spot(3), Some(4));
     }
 }

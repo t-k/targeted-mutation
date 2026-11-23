@@ -209,4 +209,27 @@ theorem masked_within (a m : Nat) : a &&& m ≤ m := Nat.and_le_right
 theorem remainder_below (a m : Int) (h : 0 < m) : -m < Int.tmod a m ∧ Int.tmod a m < m :=
   ⟨Int.lt_tmod_of_pos a h, Int.tmod_lt_of_pos a h⟩
 
+/-! ## The two ends of a sequence
+
+`v.first()` and `v.last()` (src/runtime/tmt_rt.rs, `SliceEnd`): a test that gives at most
+one element cannot tell them apart, and one whose first and last element differ can. -/
+
+/-- With at most one element both ends are the same: the other end is the original on
+every such observation. -/
+theorem ends_agree_upto_one {α : Type} (l : List α) (h : l.length ≤ 1) :
+    l.head? = l.getLast? := by
+  match l, h with
+  | [], _ => rfl
+  | [_], _ => rfl
+  | _ :: _ :: _, h => exact absurd h (by simp)
+
+/-- The input the finding asks for tells the two apart. -/
+theorem ends_differ_when_asked {α : Type} (a b : α) (mid : List α) (h : a ≠ b) :
+    (a :: (mid ++ [b])).head? ≠ (a :: (mid ++ [b])).getLast? := by
+  have last : (a :: (mid ++ [b])).getLast? = some b := by
+    rw [← List.cons_append, List.getLast?_append]
+    simp
+  rw [last]
+  simp [h]
+
 end Tmt

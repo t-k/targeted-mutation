@@ -1,0 +1,12 @@
+# `v.first()` / `v.last()`: which end is asked for, what it is asked of, and how long
+# the sequences were that the tests gave. Replayed in tests/e2e.rs (slice_end_table).
+Method:   first, last
+Receiver: slice, vec, array, set, field, mut_ref, own_type, iterator
+Seen:     none, empty, one, empty_and_one, many, many_same_ends
+
+# An iterator has no `first`.
+IF [Receiver] = "iterator" THEN [Method] = "last";
+# The length of an array is in its type: one element or two.
+IF [Receiver] = "array" THEN [Seen] IN {"none", "one", "many", "many_same_ends"};
+# A set of two has two different ends.
+IF [Receiver] = "set" THEN [Seen] <> "many_same_ends";

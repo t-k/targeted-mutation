@@ -3236,12 +3236,13 @@ impl Session {
                     }),
                 }
             }
-            SiteKind::Arith { .. } | SiteKind::MinMax { .. } => {
+            SiteKind::Arith { .. } | SiteKind::MinMax { .. } | SiteKind::SliceEnd { .. } => {
                 // `max` / `min` are recorded like an operator and its swap: they agree
                 // exactly when the operands are equal.
                 let merged = self.merged(|t| t.arith.get(&id), plan::ArithObs::merge);
                 let mutations: Vec<(Mutation, plan::ArithObs)> = match &site.kind {
                     SiteKind::MinMax { .. } => vec![(Mutation::MinMax, merged)],
+                    SiteKind::SliceEnd { .. } => vec![(Mutation::OtherEnd, merged)],
                     SiteKind::Arith { op, assign, .. } if op.second(*assign).is_some() => vec![
                         (Mutation::ArithSwap, merged),
                         (Mutation::ArithSwap2, merged.second()),
@@ -3257,6 +3258,8 @@ impl Session {
                         plan::ArithPlan::NeverDiffers => {
                             let finding = if mutation == Mutation::MinMax {
                                 report::min_max_gap_finding(file, site, verify)
+                            } else if mutation == Mutation::OtherEnd {
+                                report::slice_end_gap_finding(file, site, verify)
                             } else {
                                 report::arith_gap_finding(file, site, mutation, verify)
                             };

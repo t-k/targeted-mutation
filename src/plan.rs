@@ -328,6 +328,8 @@ pub enum Mutation {
     RangeEnd,
     /// `a.max(b)` becomes `a.min(b)` and the other way round.
     MinMax,
+    /// `v.first()` becomes `v.last()` and the other way round.
+    OtherEnd,
 }
 
 impl Mutation {
@@ -348,6 +350,7 @@ impl Mutation {
             Mutation::DropNot => "unn".to_string(),
             Mutation::RangeEnd => "rng".to_string(),
             Mutation::MinMax => "mmx".to_string(),
+            Mutation::OtherEnd => "end".to_string(),
         }
     }
 }
@@ -2095,6 +2098,7 @@ mod tests {
         assert_eq!(Mutation::DropNot.encode(), "unn");
         assert_eq!(Mutation::RangeEnd.encode(), "rng");
         assert_eq!(Mutation::MinMax.encode(), "mmx");
+        assert_eq!(Mutation::OtherEnd.encode(), "end");
     }
 
     fn candidate_mutations(op: CmpOp) -> Vec<Mutation> {

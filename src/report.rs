@@ -553,6 +553,12 @@ pub fn describe(site: &Site, m: Mutation) -> String {
             let other = if *max { "min" } else { "max" };
             format!("`{}.{other}({})`", one_line(receiver), one_line(argument))
         }
+        SiteKind::SliceEnd {
+            first, receiver, ..
+        } => {
+            let other = if *first { "last" } else { "first" };
+            format!("`{}.{other}()`", one_line(receiver))
+        }
         SiteKind::Logic { and, lhs, rhs, .. } => {
             let (lhs, rhs) = (one_line(lhs), one_line(rhs));
             match m {
@@ -802,6 +808,24 @@ pub fn logic_gap_finding(
         survivors: vec![describe(site, mutation)],
         survivor_count: 1,
         add_tests: vec![add],
+        observed: None,
+        verified,
+    })
+}
+
+/// Input gap at `v.first()` / `v.last()`: no test gave more than one element.
+pub fn slice_end_gap_finding(file: &str, site: &Site, verified: bool) -> Option<Finding> {
+    let SiteKind::SliceEnd { receiver, .. } = &site.kind else {
+        return None;
+    };
+    Some(Finding::InputGap {
+        at: location(file, site),
+        survivors: vec![describe(site, Mutation::OtherEnd)],
+        survivor_count: 1,
+        add_tests: vec![format!(
+            "`{}` with two or more elements, the first different from the last",
+            one_line(receiver)
+        )],
         observed: None,
         verified,
     })
@@ -1870,6 +1894,25 @@ mod tests {
         };
         assert_eq!(add_tests[0], "`drift` different from `peak.get()`");
         assert_eq!(min_max_gap_finding("f.rs", &assign, true), None);
+
+        let end = Site {
+            kind: SiteKind::SliceEnd {
+                first: false,
+                receiver: "self.items".into(),
+                call: (0, 0),
+            },
+            ..assign.clone()
+        };
+        assert_eq!(describe(&end, Mutation::OtherEnd), "`self.items.first()`");
+        let Some(Finding::InputGap { add_tests, .. }) = slice_end_gap_finding("f.rs", &end, true)
+        else {
+            panic!()
+        };
+        assert_eq!(
+            add_tests[0],
+            "`self.items` with two or more elements, the first different from the last"
+        );
+        assert_eq!(slice_end_gap_finding("f.rs", &clamp, true), None);
 
         let rem = site_of("fn f(n: u32, k: u32) -> u32 { n % k }");
         assert_eq!(describe(&rem, Mutation::ArithSwap), "`n / k`");

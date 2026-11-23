@@ -1,0 +1,8 @@
+Method	Receiver	Seen
+first	slice	empty_and_one
+last	vec	one
+first	slice	many_same_ends
+last	iterator	many
+first	array	one
+last	slice	many
+first	mut_ref	one

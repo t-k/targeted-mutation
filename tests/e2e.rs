@@ -5045,3 +5045,202 @@ fn what_a_failed_test_left_running_in_another_group_is_stopped() {
     let stopped: u64 = note.split(' ').nth(2).unwrap().parse().unwrap();
     assert!(stopped >= killed, "{note}");
 }
+
+/// One function and one test for a row of `tests/data/slice_ends.pict.tsv`: the call, on
+/// a line of its own, and what is expected there.
+struct EndRow {
+    line: usize,
+    receiver: &'static str,
+    other: &'static str,
+    expected: Option<&'static str>,
+    /// An assertion on a sequence of two different elements.
+    closing: String,
+    label: String,
+}
+
+fn slice_end_crate(table: &str) -> (String, Vec<EndRow>) {
+    let mut source = String::from(
+        "pub struct Held { pub items: Vec<u32> }\n\
+         pub struct Own(pub Vec<u32>);\n\
+         impl Own {\n\
+         pub fn first(&self) -> Option<u32> { self.0.get(0).copied() }\n\
+         pub fn last(&self) -> Option<u32> { self.0.iter().next_back().copied() }\n\
+         }\n",
+    );
+    let mut tests = String::new();
+    let mut rows = vec![];
+    for (n, row) in table.lines().skip(1).enumerate() {
+        let cells: Vec<&str> = row.split('\t').collect();
+        let [method, receiver, seen] = cells[..] else {
+            panic!("{row}")
+        };
+        let other = if method == "first" { "last" } else { "first" };
+        let inputs: &[(&[u32], Option<u32>)] = match (seen, method) {
+            ("none", _) => &[],
+            ("empty", _) => &[(&[], None)],
+            ("one", _) => &[(&[7], Some(7))],
+            ("empty_and_one", _) => &[(&[], None), (&[7], Some(7))],
+            ("many", "first") => &[(&[10, 20], Some(10))],
+            ("many", _) => &[(&[10, 20], Some(20))],
+            ("many_same_ends", _) => &[(&[5, 5], Some(5))],
+            _ => panic!("{row}"),
+        };
+        let length = if seen == "one" { 1 } else { 2 };
+        // (the receiver as written, the function's head, its body, how a test calls it)
+        let (written, head, body, call): (&str, String, String, Box<dyn Fn(&str) -> String>) =
+            match receiver {
+                "slice" => (
+                    "v",
+                    format!("pub fn row_{n}(v: &[u32]) -> Option<u32> {{"),
+                    format!("v.{method}().copied()"),
+                    Box::new(move |items| format!("row_{n}(&[{items}])")),
+                ),
+                "vec" => (
+                    "v",
+                    format!("pub fn row_{n}(v: Vec<u32>) -> Option<u32> {{"),
+                    format!("v.{method}().copied()"),
+                    Box::new(move |items| format!("row_{n}(vec![{items}])")),
+                ),
+                "array" => (
+                    "v",
+                    format!("pub fn row_{n}(v: [u32; {length}]) -> Option<u32> {{"),
+                    format!("v.{method}().copied()"),
+                    Box::new(move |items| format!("row_{n}([{items}])")),
+                ),
+                "set" => (
+                    "v",
+                    format!(
+                        "pub fn row_{n}(v: &std::collections::BTreeSet<u32>) -> Option<u32> {{"
+                    ),
+                    format!("v.{method}().copied()"),
+                    Box::new(move |items| {
+                        format!("row_{n}(&std::collections::BTreeSet::from([{items}]))")
+                    }),
+                ),
+                "field" => (
+                    "self.items",
+                    format!("impl Held {{ pub fn row_{n}(&self) -> Option<u32> {{"),
+                    format!("self.items.{method}().copied() }}"),
+                    Box::new(move |items| format!("Held {{ items: vec![{items}] }}.row_{n}()")),
+                ),
+                "mut_ref" => (
+                    "v",
+                    format!("pub fn row_{n}(v: &mut Vec<u32>) -> Option<u32> {{"),
+                    format!("v.{method}().copied()"),
+                    Box::new(move |items| format!("row_{n}(&mut vec![{items}])")),
+                ),
+                "own_type" => (
+                    "v",
+                    format!("pub fn row_{n}(v: &Own) -> Option<u32> {{"),
+                    format!("v.{method}()"),
+                    Box::new(move |items| format!("row_{n}(&Own(vec![{items}]))")),
+                ),
+                "iterator" => (
+                    "v.iter()",
+                    format!("pub fn row_{n}(v: &[u32]) -> Option<u32> {{"),
+                    format!("v.iter().{method}().copied()"),
+                    Box::new(move |items| format!("row_{n}(&[{items}])")),
+                ),
+                _ => panic!("{row}"),
+            };
+        source.push_str(&head);
+        source.push('\n');
+        let line = source.lines().count() + 1;
+        source.push_str(&body);
+        source.push_str("\n}\n");
+        if !inputs.is_empty() {
+            tests.push_str(&format!("#[test]\nfn test_row_{n}() {{\n"));
+            for (items, result) in inputs {
+                let items: Vec<String> = items.iter().map(u32::to_string).collect();
+                tests.push_str(&format!(
+                    "assert_eq!({}, {result:?});\n",
+                    call(&items.join(", "))
+                ));
+            }
+            tests.push_str("}\n");
+        }
+        // A sequence of this crate's own, an iterator and a `&mut` are left alone, and an
+        // array of one element has only one end.
+        let plain = matches!(receiver, "slice" | "vec" | "set" | "field" | "array");
+        let expected = match seen {
+            "empty" | "one" | "empty_and_one" if plain && receiver != "array" => Some("input_gap"),
+            "many_same_ends" if plain => Some("assertion_gap"),
+            _ => None,
+        };
+        rows.push(EndRow {
+            line,
+            receiver: written,
+            other,
+            expected,
+            closing: format!(
+                "assert_eq!({}, Some({}));\n",
+                call("10, 20"),
+                if method == "first" { 10 } else { 20 }
+            ),
+            label: format!("row {n} ({row})"),
+        });
+    }
+    source.push_str(&tests);
+    (source, rows)
+}
+
+#[test]
+fn slice_end_table() {
+    let table = include_str!("data/slice_ends.pict.tsv");
+    let (source, rows) = slice_end_crate(table);
+    let dir = fixture("eligibility", "slice-ends");
+    fs::write(dir.join("src/lib.rs"), &source).unwrap();
+    let (code, report) = json(&dir);
+    assert_eq!(code, 2, "{report:#}");
+    assert_eq!(report["skipped_sites"], 0, "{report:#}");
+    assert_eq!(report["unstable"].as_array().unwrap().len(), 0, "{report:#}");
+    let all = report["findings"].as_array().unwrap();
+    for row in &rows {
+        let found: Vec<&Value> = all.iter().filter(|f| f["line"] == row.line).collect();
+        let kinds: Vec<&str> = found.iter().map(|f| f["kind"].as_str().unwrap()).collect();
+        let expected: Vec<&str> = row.expected.into_iter().collect();
+        assert_eq!(kinds, expected, "{}: {found:#?}", row.label);
+        let Some(finding) = found.first() else {
+            continue;
+        };
+        assert_eq!(
+            strings(&finding["survivors"]),
+            [format!("`{}.{}()`", row.receiver, row.other)],
+            "{}",
+            row.label
+        );
+        if row.expected == Some("input_gap") {
+            assert_eq!(
+                strings(&finding["add_tests"]),
+                [format!(
+                    "`{}` with two or more elements, the first different from the last",
+                    row.receiver
+                )],
+                "{}",
+                row.label
+            );
+            assert_eq!(finding["verified"], true, "{}", row.label);
+        }
+    }
+
+    // A test with two different ends closes every input gap.
+    let closing: String = rows
+        .iter()
+        .filter(|row| row.expected == Some("input_gap"))
+        .map(|row| row.closing.as_str())
+        .collect();
+    append(
+        &dir.join("src/lib.rs"),
+        &format!("#[test]\nfn closes_the_gaps() {{\n{closing}}}\n"),
+    );
+    let (_, report) = json(&dir);
+    for row in rows.iter().filter(|row| row.expected == Some("input_gap")) {
+        let left: Vec<&Value> = report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["line"] == row.line)
+            .collect();
+        assert!(left.is_empty(), "{}: {left:#?}", row.label);
+    }
+}

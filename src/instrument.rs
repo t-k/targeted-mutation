@@ -82,6 +82,14 @@ pub enum SiteKind {
         call: (usize, usize),
         close: (usize, usize),
     },
+    /// `receiver.first()` or `.last()` of a slice, a `Vec`, an array or a `BTreeSet`: the
+    /// other end. The two are the same element while there is at most one.
+    SliceEnd {
+        first: bool,
+        receiver: String,
+        /// Byte range of `.first()`.
+        call: (usize, usize),
+    },
     /// `lhs..rhs` or `lhs..=rhs` on integers: the end moves by one.
     Range {
         inclusive: bool,
@@ -757,6 +765,29 @@ fn deletable(expr: &syn::Expr) -> bool {
     }
 }
 
+/// Whether the receiver of a `last()` is written as an iterator: a call of one of the
+/// methods of the standard library that make or adapt one. `Iterator::last` takes the
+/// iterator itself, which a probe that only borrows its receiver could not give it.
+fn yields_iterator(receiver: &syn::Expr) -> bool {
+    const MAKERS: &[&str] = &[
+        "iter", "iter_mut", "into_iter", "chars", "char_indices", "bytes", "lines", "keys",
+        "values", "values_mut", "into_keys", "into_values", "drain", "windows", "chunks",
+        "chunks_exact", "rchunks", "split", "rsplit", "splitn", "rsplitn", "split_terminator",
+        "split_whitespace", "split_ascii_whitespace", "split_inclusive", "matches",
+        "match_indices", "components", "ancestors", "range", "map", "filter", "filter_map",
+        "flat_map", "flatten", "rev", "skip", "skip_while", "take", "take_while", "step_by",
+        "zip", "chain", "enumerate", "peekable", "cloned", "copied", "inspect", "scan", "fuse",
+        "by_ref", "map_while", "cycle", "args", "encode_utf16",
+    ];
+    match receiver {
+        syn::Expr::Paren(e) => yields_iterator(&e.expr),
+        syn::Expr::Group(e) => yields_iterator(&e.expr),
+        syn::Expr::MethodCall(e) => MAKERS.contains(&e.method.to_string().as_str()),
+        syn::Expr::Range(_) => true,
+        _ => false,
+    }
+}
+
 fn deletable_call(expr: &syn::Expr) -> bool {
     match expr {
         syn::Expr::Call(_) | syn::Expr::MethodCall(_) => true,
@@ -1139,7 +1170,9 @@ pub fn source_mutants(site: &Site) -> Vec<SourceMutant> {
             };
             vec![change(gap.0, gap.1, to.to_string(), from, to)]
         }
-        SiteKind::Return { .. } | SiteKind::MinMax { .. } => vec![],
+        SiteKind::Return { .. } | SiteKind::MinMax { .. } | SiteKind::SliceEnd { .. } => {
+            vec![]
+        }
     }
 }
 
@@ -2344,6 +2377,24 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             };
             self.push(kind, start, end, node.receiver.span());
         }
+        if (name == "first" || name == "last")
+            && node.args.is_empty()
+            && node.turbofish.is_none()
+            && node.attrs.is_empty()
+            && !(name == "last" && yields_iterator(&node.receiver))
+            && let (Some((start, receiver_end)), Some((_, end))) = (
+                self.range(node.receiver.span()),
+                self.range(node.paren_token.span.close()),
+            )
+            && in_order(receiver_end, end)
+        {
+            let kind = SiteKind::SliceEnd {
+                first: name == "first",
+                receiver: self.source[start..receiver_end].to_string(),
+                call: (receiver_end, end),
+            };
+            self.push(kind, start, end, node.receiver.span());
+        }
         visit::visit_expr_method_call(self, node);
     }
 
@@ -2890,6 +2941,26 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     text: format!(
                         ") {{ (__tmt_a, __tmt_b) => {{ #[allow(unused_imports)] use {rt}::{{AnyMinMax as _, MinMaxPrim as _}}; \
                          if (&{rt}::Mm(__tmt_a, &__tmt_b)).tmt_other({}u32) {{ (*__tmt_a).{other}(__tmt_b) }} else {{ (*__tmt_a).{same}(__tmt_b) }} }} }})",
+                        site.id
+                    ),
+                    site: site.id,
+                });
+                ("(match (&(".to_string(), String::new())
+            }
+            SiteKind::SliceEnd { first, call, .. } => {
+                // The call is made as it was written, on the borrowed receiver. Only where
+                // the runtime knows the receiver's type does it give the other end itself;
+                // for anything else it has nothing to say, whatever the call returns.
+                let same = if *first { "first" } else { "last" };
+                edits.push(Edit {
+                    pos: call.0,
+                    end: call.1,
+                    phase: 1,
+                    order: 0,
+                    text: format!(
+                        ")) {{ __tmt_a => {{ #[allow(unused_imports)] use {rt}::{{AnyEnd as _, SliceEnd as _}}; \
+                         match (&{rt}::Ends(__tmt_a)).tmt_other_end({}u32, {first}) {{ \
+                         {rt}::End::Other(__tmt_r) => __tmt_r, {rt}::End::Same => (*__tmt_a).{same}() }} }} }})",
                         site.id
                     ),
                     site: site.id,
@@ -4348,6 +4419,7 @@ mod tests {
                     SiteKind::Not { .. } => "not",
                     SiteKind::Return { .. } => "return",
                     SiteKind::MinMax { .. } => "minmax",
+                    SiteKind::SliceEnd { .. } => "end",
                     SiteKind::Range { .. } => "range",
                     SiteKind::Arm { .. } => "arm",
                     SiteKind::Stmt => "stmt",
@@ -4451,6 +4523,34 @@ mod tests {
             ),
             ["return fn g(a: u8) -> bool", "cmp a > 2"]
         );
+    }
+
+    #[test]
+    fn first_and_last_of_what_may_be_a_slice() {
+        assert_eq!(
+            labelled(
+                "fn f(v: &[u8], s: &S) { let _ = v.first(); let _ = s.items.last(); \
+                 let _ = s.all().last(); let _ = (v).first().copied(); }"
+            ),
+            ["end v.first()", "end s.items.last()", "end s.all().last()", "end (v).first()"]
+        );
+        // With an argument, a type or an attribute it is not the method of a slice, and
+        // the last of an iterator is found by running through it.
+        assert_eq!(
+            labelled(
+                "fn f(v: &[u8], t: &T) { let _ = t.first(1); let _ = t.last::<u8>(); \
+                 let _ = #[allow(unused)] v.last(); let _ = v.iter().last(); \
+                 let _ = (v.iter().map(g)).last(); let _ = t.name.split('/').last(); \
+                 let _ = v.first_mut(); }"
+            ),
+            [] as [&str; 0]
+        );
+        let src = "fn f(v: &[u8]) -> Option<&u8> { v.last() }";
+        let found = discover(src, 0).unwrap();
+        let out = render(src, &found.sites, &|_| true).text;
+        assert!(out.contains("(match (&(v)) { __tmt_a =>"), "{out}");
+        assert!(out.contains("tmt_other_end(") && out.contains(", false)"), "{out}");
+        assert!(out.contains("End::Same => (*__tmt_a).last()"), "{out}");
     }
 
     #[test]
@@ -5227,7 +5327,10 @@ mod tests {
         let src = "fn f(a: u8, b: u8) -> bool { g(); for _ in a..b {} a.max(b) > 1 }";
         let sites = discover(src, 0).unwrap().sites;
         for site in &sites {
-            let none = matches!(site.kind, SiteKind::Return { .. } | SiteKind::MinMax { .. });
+            let none = matches!(
+                site.kind,
+                SiteKind::Return { .. } | SiteKind::MinMax { .. } | SiteKind::SliceEnd { .. }
+            );
             assert_eq!(source_mutants(site).is_empty(), none, "{:?}", site.kind);
         }
         // A range has its end taken in or left out, whichever it is not.

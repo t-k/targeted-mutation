@@ -167,6 +167,8 @@ pub enum Mutant {
     RangeEnd,
     /// `a.max(b)` becomes `a.min(b)` and the other way round.
     MinMax,
+    /// `v.first()` becomes `v.last()` and the other way round.
+    OtherEnd,
 }
 
 pub fn parse_mutant(spec: &str) -> Option<(u32, Mutant)> {
@@ -185,6 +187,7 @@ pub fn parse_mutant(spec: &str) -> Option<(u32, Mutant)> {
         "unn" => Mutant::DropNot,
         "rng" => Mutant::RangeEnd,
         "mmx" => Mutant::MinMax,
+        "end" => Mutant::OtherEnd,
         _ if m.starts_with("op") => Mutant::Op(m[2..].parse().ok().filter(|c| *c <= NE)?),
         _ if m.starts_with("shf") => {
             Mutant::ShiftF(m[3..].parse().ok().filter(|s: &f64| s.is_finite())?)
@@ -1455,5 +1458,99 @@ impl<'r, 'a, A, B> AnyMinMax for &'r Mm<'a, A, B> {
             record_bits(b'A', site, ARITH_OPAQUE);
         }
         false
+    }
+}
+
+/// The receiver of `v.first()` / `v.last()`, looked at before the call. The call itself
+/// stays in the code as it was written; where the receiver is a sequence of the standard
+/// library, the `OtherEnd` mutant is given its other end here.
+pub struct Ends<'a, A: ?Sized>(pub &'a A);
+
+/// What a probe of `first()` / `last()` does: take the other end, or make the call.
+pub enum End<R> {
+    Other(R),
+    Same,
+}
+
+/// A slice, a `Vec`, an array or a `BTreeSet`, or a shared reference to one. With no
+/// element both ends are `None`, and with one they are that element.
+pub trait SliceEnd {
+    type Out;
+    fn tmt_other_end(&self, site: u32, first: bool) -> End<Self::Out>;
+}
+
+fn other_end<R>(site: u32, len: usize, other: impl FnOnce() -> R) -> End<R> {
+    if mutant_at(site) == Some(Mutant::OtherEnd) {
+        return End::Other(other());
+    }
+    record_bits(b'A', site, if len <= 1 { ARITH_SAME } else { ARITH_DIFFERS });
+    End::Same
+}
+
+macro_rules! tmt_ends {
+    ($([$($generics:tt)*] $t:ty, $elem:ty;)*) => {$(
+        impl<'a, $($generics)*> SliceEnd for Ends<'a, $t> {
+            type Out = Option<&'a $elem>;
+            fn tmt_other_end(&self, site: u32, first: bool) -> End<Self::Out> {
+                let all: &'a $t = self.0;
+                other_end(site, all.len(), || if first { all.last() } else { all.first() })
+            }
+        }
+        impl<'a, 'b, $($generics)*> SliceEnd for Ends<'a, &'b $t> {
+            type Out = Option<&'b $elem>;
+            fn tmt_other_end(&self, site: u32, first: bool) -> End<Self::Out> {
+                let all: &'b $t = *self.0;
+                other_end(site, all.len(), || if first { all.last() } else { all.first() })
+            }
+        }
+    )*};
+}
+tmt_ends! {
+    [T] [T], T;
+    [T] Vec<T>, T;
+    [T: Ord] std::collections::BTreeSet<T>, T;
+}
+
+/// An array has its length in its type. One of fewer than two elements has one end, and
+/// no test could give it another: nothing is mutated there.
+fn other_end_of_array<'x, T, const N: usize>(
+    site: u32,
+    first: bool,
+    all: &'x [T; N],
+) -> End<Option<&'x T>> {
+    if N <= 1 {
+        if !idle(site) {
+            record_bits(b'A', site, ARITH_OPAQUE);
+        }
+        return End::Same;
+    }
+    other_end(site, N, || if first { all.last() } else { all.first() })
+}
+
+impl<'a, T, const N: usize> SliceEnd for Ends<'a, [T; N]> {
+    type Out = Option<&'a T>;
+    fn tmt_other_end(&self, site: u32, first: bool) -> End<Self::Out> {
+        other_end_of_array(site, first, self.0)
+    }
+}
+
+impl<'a, 'b, T, const N: usize> SliceEnd for Ends<'a, &'b [T; N]> {
+    type Out = Option<&'b T>;
+    fn tmt_other_end(&self, site: u32, first: bool) -> End<Self::Out> {
+        other_end_of_array(site, first, *self.0)
+    }
+}
+
+/// `first` / `last` of anything else: the call as it was written.
+pub trait AnyEnd {
+    fn tmt_other_end<R>(&self, site: u32, first: bool) -> End<R>;
+}
+
+impl<'r, 'a, A: ?Sized> AnyEnd for &'r Ends<'a, A> {
+    fn tmt_other_end<R>(&self, site: u32, first: bool) -> End<R> {
+        if !idle(site) {
+            record_bits(b'A', site, ARITH_OPAQUE);
+        }
+        End::Same
     }
 }
