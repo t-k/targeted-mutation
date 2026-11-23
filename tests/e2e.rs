@@ -3267,8 +3267,8 @@ fn a_weak_assertion_gets_the_value_its_call_returns() {
         "assert_eq!(bucket(3), \"few\");"
     );
     assert_eq!(
-        finding["witness"]["guidance"],
-        "`tests::buckets` already calls `bucket(3)`: compare its result with this value."
+        finding["witness"]["in_test"], "tests::buckets",
+        "{finding:#}"
     );
     // A finding that asks for an input is not given a call of the tests: they all
     // return what the original returns.
@@ -3281,9 +3281,8 @@ fn a_weak_assertion_gets_the_value_its_call_returns() {
     );
     assert!(
         text.stdout.contains(
-            "  verified on `bucket(3)`: original returned \"few\", mutant returned \"many\"\n  \
-             `tests::buckets` already calls `bucket(3)`: compare its result with this value.\n  \
-             add a test with `assert_eq!(bucket(3), \"few\");`"
+            "  verified on `bucket(3)` where `tests::buckets` calls it: original returned \"few\", mutant returned \"many\"\n  \
+             in `tests::buckets`, compare the result of that call with this value: `assert_eq!(bucket(3), \"few\");`"
         ),
         "{}",
         text.stdout
@@ -3349,6 +3348,8 @@ fn stateful() {
     assert_eq!(finding["witness"]["call"], "f(3)", "{finding:#}");
     assert_eq!(finding["witness"]["original"], "5", "{finding:#}");
     assert_eq!(finding["witness"]["assertion"], "assert_eq!(f(3), 5);");
+    // The value is the one the call has in that test, and the report says so.
+    assert_eq!(finding["witness"]["in_test"], "stateful", "{finding:#}");
 
     // Put where the test makes the call, the assertion holds and closes the finding.
     let path = dir.join("src/lib.rs");

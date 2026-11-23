@@ -19,9 +19,6 @@ use super::{Placement, Scenario};
 /// At most this many calls are tried for one function.
 const MAX_CALLS: usize = 4;
 
-/// The calls of one function: (call, test) pairs that were taken, and what to run for them.
-type Tried = (BTreeSet<(String, String)>, Vec<Scenario>);
-
 /// A function of the file and the calls its tests make of it.
 #[derive(Debug)]
 pub(crate) struct CalledFunction {
@@ -49,7 +46,7 @@ pub(crate) fn unpinned_calls(source: &str, file: &syn::File) -> Vec<CalledFuncti
     }
     let mut tests = Vec::new();
     collect_tests(&file.items, "", None, &mut tests);
-    let mut found: BTreeMap<&str, Tried> = BTreeMap::new();
+    let mut found: BTreeMap<&str, Vec<Scenario>> = BTreeMap::new();
     for test in tests.iter().filter(|test| plain(test.function)) {
         let shadowed = bound_names(&test.function.block);
         let body = test.function.block.brace_token.span.open().byte_range().end;
@@ -77,9 +74,10 @@ pub(crate) fn unpinned_calls(source: &str, file: &syn::File) -> Vec<CalledFuncti
                 if shadowed.contains(name) {
                     continue;
                 }
-                // The same call again in the same test is tried once.
-                let (seen, scenarios) = found.entry(name).or_default();
-                if scenarios.len() < MAX_CALLS && seen.insert((call.clone(), test.name())) {
+                // The same call written twice is two calls: the test may get to one
+                // and not to the other, or change something in between.
+                let scenarios = found.entry(name).or_default();
+                if scenarios.len() < MAX_CALLS {
                     scenarios.push(scenario(test, before, call, after));
                 }
             }
@@ -87,7 +85,7 @@ pub(crate) fn unpinned_calls(source: &str, file: &syn::File) -> Vec<CalledFuncti
     }
     found
         .into_iter()
-        .map(|(name, (_, scenarios))| {
+        .map(|(name, scenarios)| {
             let function = functions[name];
             CalledFunction {
                 item: function.span().byte_range(),
@@ -106,9 +104,6 @@ fn scenario(test: &Test<'_>, before: &str, call: String, after: &str) -> Scenari
     Scenario {
         setup: before.to_owned(),
         after: Some(after.to_owned()),
-        guidance: Some(format!(
-            "`{name}` already calls `{call}`: compare its result with this value."
-        )),
         expression: call,
         placement: test.insertion.map(|offset| Placement {
             offset,
@@ -349,14 +344,12 @@ mod tests {
         let placement = scenario.placement.as_ref().unwrap();
         assert_eq!(placement.module, "tests");
         assert_eq!(placement.offset, source.len() - 1);
-        assert_eq!(
-            scenario.guidance.as_deref(),
-            Some("`tests::buckets` already calls `bucket(3)`: compare its result with this value.")
-        );
+        assert_eq!(scenario.source_test.as_deref(), Some("tests::buckets"));
+        assert_eq!(scenario.guidance, None);
     }
 
     #[test]
-    fn each_call_is_tried_once_and_only_a_few_of_them() {
+    fn only_a_few_calls_are_tried_for_a_function() {
         let asserts: String = (0..9)
             .map(|n| format!("assert!(bucket({n}) != \"\"); assert!(bucket({n}) != \"x\");"))
             .collect();
@@ -368,9 +361,9 @@ mod tests {
                 Some("many".to_string()),
                 vec![
                     "bucket(0)".to_string(),
+                    "bucket(0)".into(),
                     "bucket(1)".into(),
-                    "bucket(2)".into(),
-                    "bucket(3)".into()
+                    "bucket(1)".into()
                 ]
             )]
         );
@@ -537,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn the_same_call_is_tried_once_for_a_test() {
+    fn the_same_call_written_again_is_another_call() {
         let source = format!(
             "{BUCKET}#[test] fn a() {{ set(0); assert_ne!(bucket(3), \"none\"); }}\n\
              #[test] fn b() {{ set(1); assert_ne!(bucket(3), \"none\"); assert_ne!(bucket(3), \"x\"); }}"
@@ -551,7 +544,11 @@ mod tests {
             .collect();
         assert_eq!(
             tests,
-            [("a", " set(0); assert_ne!("), ("b", " set(1); assert_ne!(")]
+            [
+                ("a", " set(0); assert_ne!("),
+                ("b", " set(1); assert_ne!("),
+                ("b", " set(1); assert_ne!(bucket(3), \"none\"); assert_ne!(")
+            ]
         );
     }
 

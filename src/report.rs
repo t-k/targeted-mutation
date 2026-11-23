@@ -91,6 +91,10 @@ pub struct VerifiedWitness {
     pub guidance: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub individually_killed: Option<usize>,
+    /// The test that makes the call, where the values are those the call has there:
+    /// after what that test does before it. In a test of its own it may return another.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_test: Option<String>,
 }
 
 impl Finding {
@@ -1160,6 +1164,18 @@ fn finding_body(finding: &Finding) -> Vec<String> {
 }
 
 fn witness_lines(witness: &VerifiedWitness) -> Vec<String> {
+    if let Some(test) = &witness.in_test {
+        return vec![
+            format!(
+                "verified on `{}` where `{test}` calls it: original returned {}, mutant returned {}",
+                witness.call, witness.original, witness.mutant,
+            ),
+            format!(
+                "in `{test}`, compare the result of that call with this value: `{}`",
+                witness.assertion
+            ),
+        ];
+    }
     let mut lines = vec![format!(
         "verified on `{}`: original returned {}, mutant returned {}",
         witness.call, witness.original, witness.mutant,

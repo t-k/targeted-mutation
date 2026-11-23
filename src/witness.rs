@@ -180,6 +180,7 @@ fn {name}() {{
                 mutant,
                 guidance,
                 individually_killed: None,
+                in_test: self.after.as_ref().and(self.source_test.clone()),
             }
         })
     }
