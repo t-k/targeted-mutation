@@ -266,11 +266,13 @@ impl<'a> Calls<'a> {
                 self.tokens(mac.tokens.clone());
             }
             fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
+                // By its name alone or through a path (`super::f(2)`).
                 if let Expr::Path(path) = call.func.as_ref()
                     && path
                         .path
-                        .get_ident()
-                        .is_some_and(|name| self.0.contains_key(&name.to_string()))
+                        .segments
+                        .last()
+                        .is_some_and(|name| self.0.contains_key(&name.ident.to_string()))
                 {
                     self.1 = true;
                 }
@@ -599,6 +601,10 @@ mod tests {
             ),
             (
                 "assert_eq!(dbg!((bucket(2))), bucket(1));",
+                vec!["bucket(1)"],
+            ),
+            (
+                "assert_eq!(bucket(1), super::bucket(2));",
                 vec!["bucket(1)"],
             ),
             ("assert_eq!(bucket(1), format!(\"{}\", bucket));", vec![]),
