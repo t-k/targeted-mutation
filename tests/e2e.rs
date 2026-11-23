@@ -1955,6 +1955,64 @@ fn only_changed_code_is_analysed_on_request() {
 }
 
 #[test]
+fn changed_files_are_found_whatever_their_names() {
+    let dir = fixture("eligibility", "since-names");
+    fs::write(dir.join(".gitignore"), "target/\nCargo.lock\n").unwrap();
+    let module = |name: &str| {
+        format!(
+            "pub fn {name}(n: u32) -> bool {{\n    n >= 100\n}}\n\n\
+             #[test]\nfn far_from_the_limit() {{\n    assert!({name}(500));\n    assert!(!{name}(5));\n}}\n"
+        )
+    };
+    // A name git quotes (bytes that are not ASCII), one it follows with a tab (a space).
+    fs::write(dir.join("src/価格.rs"), module("priced")).unwrap();
+    fs::write(dir.join("src/two words.rs"), module("worded")).unwrap();
+    append(
+        &dir.join("src/lib.rs"),
+        "\n#[path = \"価格.rs\"]\npub mod price;\n#[path = \"two words.rs\"]\npub mod words;\n",
+    );
+    git_output(&dir, &["init", "-q"]);
+    git_output(&dir, &["add", "-A"]);
+    let base = git_output(&dir, &["write-tree"]);
+    for file in ["src/価格.rs", "src/two words.rs"] {
+        let path = dir.join(file);
+        let source = fs::read_to_string(&path).unwrap();
+        fs::write(&path, source.replace("n >= 100", "n >= 200")).unwrap();
+    }
+    for quote_path in ["true", "false"] {
+        git_output(&dir, &["config", "core.quotePath", quote_path]);
+        let run = tmt(&dir, &["--json", "--quiet", "--since", &base]);
+        assert_eq!(run.code, 2, "{}{}", run.stdout, run.stderr);
+        let report: Value = serde_json::from_str(&run.stdout).unwrap();
+        let mut files: Vec<&str> = report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| f["code"] == "n >= 200")
+            .map(|f| f["file"].as_str().unwrap())
+            .collect();
+        files.sort_unstable();
+        assert_eq!(files, ["src/two words.rs", "src/価格.rs"], "{report:#}");
+    }
+    // Not yet known to git: the whole file.
+    fs::write(dir.join("src/新 しい.rs"), module("fresh")).unwrap();
+    append(
+        &dir.join("src/lib.rs"),
+        "\n#[path = \"新 しい.rs\"]\npub mod fresh;\n",
+    );
+    let run = tmt(&dir, &["--json", "--quiet", "--since", &base]);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["file"] == "src/新 しい.rs" && f["code"] == "n >= 100"),
+        "{report:#}"
+    );
+}
+
+#[test]
 fn known_findings_can_be_suppressed() {
     let dir = fixture("eligibility", "suppress");
     let baseline = dir.join("tmt-baseline.json");

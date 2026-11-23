@@ -2500,7 +2500,11 @@ fn requested_scope(
             revision,
             "--",
         ])?));
-        for file in git(&["ls-files", "--others", "--exclude-standard"])?.lines() {
+        // `-z`: the names as they are, not quoted.
+        for file in git(&["ls-files", "--others", "--exclude-standard", "-z"])?
+            .split('\0')
+            .filter(|file| !file.is_empty())
+        {
             scope.add_whole_file(file);
         }
     }

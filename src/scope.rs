@@ -48,7 +48,12 @@ impl Scope {
         let mut file: Option<String> = None;
         for line in diff.lines() {
             if let Some(path) = line.strip_prefix("+++ ") {
-                // `+++ b/path`, or `+++ /dev/null` for a deleted file.
+                // `+++ b/path`, or `+++ /dev/null` for a deleted file. Git quotes a path
+                // with bytes outside printable ASCII, and puts a tab after one with a space.
+                let path = match unquote(path) {
+                    Some(path) => path,
+                    None => path.strip_suffix('\t').unwrap_or(path).to_string(),
+                };
                 file = path.strip_prefix("b/").map(str::to_string);
             } else if line.starts_with("@@ ")
                 && let Some(file) = &file
@@ -111,6 +116,45 @@ impl Scope {
                 .any(|(from, to)| first <= *to && *from <= last)
         })
     }
+}
+
+/// The path git wrote between double quotes (`"b/src/\344\276\241.rs"`): C escapes, and
+/// three octal digits for each byte that is not printable ASCII. `None` for text that is
+/// not quoted that way.
+fn unquote(text: &str) -> Option<String> {
+    let inner = text.strip_prefix('"')?.strip_suffix('"')?;
+    let mut bytes = Vec::with_capacity(inner.len());
+    let mut rest = inner.bytes();
+    while let Some(byte) = rest.next() {
+        if byte == b'"' {
+            return None;
+        }
+        if byte != b'\\' {
+            bytes.push(byte);
+            continue;
+        }
+        bytes.push(match rest.next()? {
+            b'a' => 7,
+            b'b' => 8,
+            b't' => b'\t',
+            b'n' => b'\n',
+            b'v' => 11,
+            b'f' => 12,
+            b'r' => b'\r',
+            b'"' => b'"',
+            b'\\' => b'\\',
+            first @ b'0'..=b'3' => {
+                let mut value = u32::from(first - b'0');
+                for _ in 0..2 {
+                    let digit = rest.next().filter(|digit| (b'0'..=b'7').contains(digit))?;
+                    value = value * 8 + u32::from(digit - b'0');
+                }
+                u8::try_from(value).ok()?
+            }
+            _ => return None,
+        });
+    }
+    String::from_utf8(bytes).ok()
 }
 
 /// Byte offsets of the line starts in one source file.
@@ -291,6 +335,64 @@ new file mode 100644
         assert!(scope.touches("src/new.rs", 4, 4));
         assert!(!scope.touches("src/new.rs", 5, 5));
         assert_eq!(Scope::from_diff(""), Scope::default());
+    }
+
+    #[test]
+    fn paths_are_read_as_git_writes_them() {
+        // A path with a space is followed by a tab; one with other bytes is quoted, with
+        // the prefix inside the quotes and octal for what is not ASCII.
+        let diff = "\
+--- a/src/two words.rs\t
++++ b/src/two words.rs\t
+@@ -3 +3 @@
+--- \"a/src/\\344\\276\\241\\346\\240\\274.rs\"
++++ \"b/src/\\344\\276\\241\\346\\240\\274.rs\"
+@@ -5 +5 @@
+--- \"a/src/a\\\"b\\\\c\\td e.rs\"
++++ \"b/src/a\\\"b\\\\c\\td e.rs\"
+@@ -7 +7 @@
+--- a/src/価格.rs
++++ b/src/価格.rs
+@@ -9 +9 @@
+--- \"a/src/gone \\303\\251.rs\"
++++ /dev/null
+@@ -1 +0,0 @@
+";
+        let scope = Scope::from_diff(diff);
+        assert_eq!(
+            scope.files().collect::<Vec<_>>(),
+            [
+                // Stored with `/`, as every path is (a Windows separator).
+                "src/a\"b/c\td e.rs",
+                "src/two words.rs",
+                "src/価格.rs"
+            ]
+        );
+        assert!(scope.touches("src/two words.rs", 3, 3));
+        // Quoted or not (`core.quotePath`), the same file.
+        assert!(scope.touches("src/価格.rs", 5, 5));
+        assert!(scope.touches("src/価格.rs", 9, 9));
+        assert!(scope.touches("src/a\"b\\c\td e.rs", 7, 7));
+    }
+
+    #[test]
+    fn a_quoted_path_is_what_its_escapes_spell() {
+        for (quoted, path) in [
+            (r#""plain""#, Some("plain")),
+            (r#""a\tb\nc\\d\"e""#, Some("a\tb\nc\\d\"e")),
+            (r#""\a\b\f\r\v""#, Some("\u{7}\u{8}\u{c}\r\u{b}")),
+            (r#""\343\201\202\101""#, Some("あA")),
+            // Not closed, an escape git does not write, octal cut short, bytes that
+            // are no text: nothing is guessed.
+            (r#""open"#, None),
+            (r#""a\qb""#, None),
+            (r#""\34""#, None),
+            (r#""\377""#, None),
+            (r#""a"b""#, None),
+            ("bare", None),
+        ] {
+            assert_eq!(unquote(quoted).as_deref(), path, "{quoted}");
+        }
     }
 
     #[test]
