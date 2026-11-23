@@ -359,6 +359,9 @@ pub struct Report {
     /// Mutants that could not be run as what they are (a range that ends at the largest
     /// value of its type cannot be made to include it): neither killed nor survivors.
     pub mutants_not_evaluated: usize,
+    /// Of those, the mutants of code that is not part of this build (another target's
+    /// file, or a `cfg` the features turn off).
+    pub mutants_not_compiled: usize,
     pub mutants_run: usize,
     pub mutants_killed: usize,
     /// Killed mutants that were stopped by the timeout (typically an endless loop).
@@ -1261,10 +1264,18 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
             ));
         }
     }
-    if report.mutants_not_evaluated > 0 {
+    if report.mutants_not_compiled > 0 {
         out.push_str(&format!(
-            "({} mutants not evaluated: a range that ends at the largest value of its type cannot be made to include it)\n",
-            report.mutants_not_evaluated
+            "({} mutants not evaluated: their code is not part of this build (a `cfg` or a feature that is off, or a file of another target); other --features may build it)\n",
+            report.mutants_not_compiled
+        ));
+    }
+    let not_evaluated = report
+        .mutants_not_evaluated
+        .saturating_sub(report.mutants_not_compiled);
+    if not_evaluated > 0 {
+        out.push_str(&format!(
+            "({not_evaluated} mutants not evaluated: a range that ends at the largest value of its type cannot be made to include it, or a run that could not be judged)\n"
         ));
     }
     if report.mutants_not_built > 0 {
@@ -2295,6 +2306,7 @@ mod tests {
             unviable_mutants: 2,
             mutants_not_built: 0,
             mutants_not_evaluated: 0,
+            mutants_not_compiled: 0,
             mutants_run: 3,
             mutants_killed: 2,
             mutants_timed_out: 0,
@@ -2601,10 +2613,36 @@ mod tests {
         };
         assert!(
             render_text(&at_top, false).ends_with(
-                "\n(1 mutants not evaluated: a range that ends at the largest value of its type cannot be made to include it)\n"
+                "\n(1 mutants not evaluated: a range that ends at the largest value of its type cannot be made to include it, or a run that could not be judged)\n"
             ),
             "{}",
             render_text(&at_top, false)
+        );
+        // Each reason is said for the mutants it holds for, and only when it holds for some.
+        let not_built = Report {
+            mutants_not_evaluated: 5,
+            mutants_not_compiled: 5,
+            ..Report::default()
+        };
+        let text = render_text(&not_built, false);
+        assert!(
+            text.ends_with("\n(5 mutants not evaluated: their code is not part of this build (a `cfg` or a feature that is off, or a file of another target); other --features may build it)\n"),
+            "{text}"
+        );
+        assert!(!text.contains("largest value"), "{text}");
+        let both = Report {
+            mutants_not_evaluated: 7,
+            mutants_not_compiled: 5,
+            ..Report::default()
+        };
+        let text = render_text(&both, false);
+        assert!(
+            text.contains("(5 mutants not evaluated: their code"),
+            "{text}"
+        );
+        assert!(
+            text.contains("\n(2 mutants not evaluated: a range"),
+            "{text}"
         );
         let quick = Report {
             mutants_not_built: 1,

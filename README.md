@@ -8,7 +8,65 @@ Classic mutation testing changes `<` to `<=` and then asks whether a test fails.
 
 The command is `cargo tmt`. It works on Rust crates.
 
+## Try it
+
+```sh
+cargo install targeted-mutation
+cargo new --lib demo && cd demo
+```
+
+Put this in `src/lib.rs`:
+
+```rust
+pub fn is_eligible(age: u32) -> bool {
+    age >= 18
+}
+
+#[test]
+fn minor_is_rejected() {
+    assert!(!is_eligible(17));
+}
+
+#[test]
+fn adult_is_accepted() {
+    assert!(is_eligible(20));
+}
+```
+
+```text
+$ cargo tmt --quiet
+INPUT GAP  src/lib.rs:2:5
+    age >= 18
+  passes every test as: `age >= 19`, `age >= 20`  [re-run: tests pass]
+  nearest values the tests passed: `age` = 17, 20
+  add a test with `age` = 18 (the original gives true)
+
+demo: 4 sites, 1 input gaps, 0 assertion gaps, 8 mutants run (6 killed), 0 sites unreached
+$ echo $?
+2
+```
+
+Add the test it asks for and run it again:
+
+```rust
+#[test]
+fn eighteen_is_accepted() {
+    assert!(is_eligible(18));
+}
+```
+
+```text
+$ cargo tmt --quiet
+demo: 4 sites, 0 input gaps, 0 assertion gaps, 7 mutants run (7 killed), 0 sites unreached
+$ echo $?
+0
+```
+
+`cargo tmt` builds and runs the crate's tests and build scripts, as `cargo test` does: run it on code you trust.
+
 ## What it reports
+
+The examples below are crates under `fixtures/` in the repository.
 
 ```rust
 pub fn is_eligible(age: u32) -> bool {
@@ -161,7 +219,7 @@ cargo tmt fixtures/batch-store --rebuild --lines src/lib.rs:33
 
 Output: text by default, `--json`, or `--sarif` (SARIF 2.1.0 for code scanning: paths from the top of the git repository, the finding's id as `partialFingerprints`, and what the run looked at under the run's `properties`; with `--workspace` there is one run per package, each with an `automationDetails.id` of its own, and a package whose analysis failed is a run with `executionSuccessful: false` and the error). The JSON report has the same under `analysis`: package, `--since` and `--lines`, features, and whether mutants were built and predictions re-run. `--show-unreached` lists sites with no recorded execution. Long campaigns print completed, failed, timed-out, survived and unevaluated counts on stderr. `--quiet` suppresses progress. If a baseline test fails, stderr includes the available diagnostics and the full log path.
 
-Exit status: `0` no gaps, `1` analysis error (such as failing unmutated tests), `2` gaps or an unstable prediction, and `3` work selected but no mutations executed. In source-only mode, `3` also takes precedence when a mutant times out or its source was not compiled. A scoped selection with zero sites skips the build and baseline. JSON and SARIF expose `evaluation` as `no_sites` or `no_mutants_executed` for those cases. Structured `skipped` records include their source span and reason, with a compiler diagnostic for repaired probes.
+Exit status: `0` no gaps, `1` analysis error (such as failing unmutated tests), `2` gaps or an unstable prediction, and `3` work selected but no mutations executed. In source-only mode, `3` also takes precedence when a mutant times out or its source was not compiled. Code under a `cfg` that the features of the build turn off is reported as `source_not_built` too (the features are the ones cargo reports for the build; a `cfg` that depends on anything else is taken to be on), and the text output says how many mutants that holds for. A scoped selection with zero sites skips the build and baseline. JSON and SARIF expose `evaluation` as `no_sites` or `no_mutants_executed` for those cases. Structured `skipped` records include their source span and reason, with a compiler diagnostic for repaired probes.
 
 Your source tree is never modified. In a git repository only the files git does not ignore are copied (submodules by their own rules), so build output, caches and local files kept out of the repository stay where they are. The copy contains no symbolic links: a linked file is copied as a file, and a linked directory is followed only if it lies inside the workspace. The workspace is copied to `<target dir>/tmt/src` (or `--work-dir`) and built in a `target` directory next to that copy. Cargo intermediates also stay in that directory, even if `build.build-dir` is configured for ordinary builds. Path dependencies that point outside the workspace are rewritten to absolute paths in the copy.
 

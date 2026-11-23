@@ -2021,7 +2021,11 @@ fn crates_of_earlier_editions_are_analysed() {
             let mut args = vec!["--json", "--quiet"];
             args.extend(mode);
             let run = tmt(&dir, &args);
-            assert_eq!(run.code, 2, "{edition} {mode:?}: {}{}", run.stdout, run.stderr);
+            assert_eq!(
+                run.code, 2,
+                "{edition} {mode:?}: {}{}",
+                run.stdout, run.stderr
+            );
             let report: Value = serde_json::from_str(&run.stdout).unwrap();
             let codes: Vec<&str> = report["findings"]
                 .as_array()
@@ -3348,6 +3352,58 @@ fn the_features_asked_for_are_the_ones_analysed() {
     let bad = tmt(&dir, &["--quiet", "--features", "nope"]);
     assert_eq!(bad.code, 1, "{}", bad.stderr);
     assert!(bad.stderr.contains("nope"), "{}", bad.stderr);
+}
+
+#[test]
+fn code_a_feature_leaves_out_is_not_a_survivor_when_built_one_by_one() {
+    let dir = fixture("featured", "featured-source");
+    let run = tmt(&dir, &["--json", "--quiet", "--source-only"]);
+    let report: Value = serde_json::from_str(&run.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}{}", run.stdout, run.stderr));
+    // `extra` is off: the mutants of its function change nothing that is built.
+    let findings = report["findings"].as_array().unwrap();
+    assert!(findings.iter().all(|f| f["code"] != "n > 10"), "{report:#}");
+    let skipped: Vec<&Value> = report["skipped"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|s| s["reason"] == "source_not_built")
+        .collect();
+    assert!(!skipped.is_empty(), "{report:#}");
+    assert!(
+        skipped.iter().all(|s| (s["line"] == 9 || s["line"] == 10)
+            && s["diagnostic"] == "under a `cfg` that the features of this build turn off"),
+        "{report:#}"
+    );
+    let left_out = report["mutants_not_compiled"].as_u64().unwrap();
+    assert!(left_out > 0, "{report:#}");
+    assert_eq!(report["mutants_not_evaluated"], left_out, "{report:#}");
+    // What is built is judged as before: `basic` is tested at its limit.
+    assert!(report["mutants_killed"].as_u64().unwrap() > 0, "{report:#}");
+    let text = tmt(&dir, &["--quiet", "--source-only"]);
+    assert!(
+        text.stdout.contains(&format!(
+            "({left_out} mutants not evaluated: their code is not part of this build"
+        )),
+        "{}",
+        text.stdout
+    );
+    assert!(!text.stdout.contains("largest value"), "{}", text.stdout);
+    // With the feature the same code is judged, and found far from its limit.
+    let run = tmt(
+        &dir,
+        &["--json", "--quiet", "--source-only", "--features", "extra"],
+    );
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(report["mutants_not_compiled"], 0, "{report:#}");
+    assert!(
+        report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["code"] == "n > 10"),
+        "{report:#}"
+    );
 }
 
 #[test]

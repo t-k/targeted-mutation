@@ -7,7 +7,7 @@
 //! The rewrite only inserts text on the line where the site is, so line numbers in compiler
 //! diagnostics still match the original file.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashSet};
 
 use anyhow::{Context, Result};
 use proc_macro2::{Span, TokenStream, TokenTree};
@@ -1571,6 +1571,177 @@ pub(crate) fn cfg_possible_without_test(meta: &syn::Meta, desired: bool) -> bool
     true
 }
 
+/// What a `cfg` predicate is, as far as the features that are on decide it: `None` when
+/// it depends on something else (the target, `test`, a `--cfg` of the build).
+fn cfg_value(meta: &syn::Meta, features: &BTreeSet<String>) -> Option<bool> {
+    match meta {
+        syn::Meta::NameValue(pair) if pair.path.is_ident("feature") => match &pair.value {
+            syn::Expr::Lit(syn::ExprLit {
+                lit: syn::Lit::Str(name),
+                ..
+            }) => Some(features.contains(&name.value())),
+            _ => None,
+        },
+        syn::Meta::List(list) => {
+            let parts = list
+                .parse_args_with(
+                    syn::punctuated::Punctuated::<syn::Meta, syn::Token![,]>::parse_terminated,
+                )
+                .ok()?;
+            let mut values = parts.iter().map(|part| cfg_value(part, features));
+            if list.path.is_ident("not") && parts.len() == 1 {
+                values.next()?.map(|value| !value)
+            } else if list.path.is_ident("all") {
+                // One part that is off settles it; otherwise every part must be known.
+                values
+                    .try_fold(Some(true), |all, value| match (all, value) {
+                        (_, Some(false)) => Err(()),
+                        (Some(true), Some(true)) => Ok(Some(true)),
+                        _ => Ok(None),
+                    })
+                    .unwrap_or(Some(false))
+            } else if list.path.is_ident("any") {
+                values
+                    .try_fold(Some(false), |any, value| match (any, value) {
+                        (_, Some(true)) => Err(()),
+                        (Some(false), Some(false)) => Ok(Some(false)),
+                        _ => Ok(None),
+                    })
+                    .unwrap_or(Some(true))
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn cfg_is_off(attrs: &[syn::Attribute], features: &BTreeSet<String>) -> bool {
+    attrs.iter().any(|attr| {
+        attr.path().is_ident("cfg")
+            && attr
+                .parse_args::<syn::Meta>()
+                .is_ok_and(|meta| cfg_value(&meta, features) == Some(false))
+    })
+}
+
+/// Byte ranges of the code that the features that are on leave out of the build: what is
+/// under a `cfg` that is off whatever the target is. Its mutants would change nothing.
+pub(crate) fn inactive_ranges(
+    source: &str,
+    file: &syn::File,
+    features: &BTreeSet<String>,
+) -> Vec<(usize, usize)> {
+    struct Inactive<'a> {
+        source: &'a str,
+        features: &'a BTreeSet<String>,
+        found: Vec<(usize, usize)>,
+    }
+    impl Inactive<'_> {
+        /// Whether the node is left out; then its range is noted and it is not entered.
+        fn off(&mut self, attrs: &[syn::Attribute], span: Span) -> bool {
+            if !cfg_is_off(attrs, self.features) {
+                return false;
+            }
+            let range = span.byte_range();
+            if self.source.get(range.clone()).is_some() {
+                self.found.push((range.start, range.end));
+            }
+            true
+        }
+    }
+    macro_rules! nodes {
+        ($($visit:ident, $default:path, $node:ty;)*) => {
+            impl<'ast> Visit<'ast> for Inactive<'_> {
+                $(fn $visit(&mut self, node: &'ast $node) {
+                    if !self.off(&node.attrs, node.span()) {
+                        $default(self, node);
+                    }
+                })*
+                fn visit_item(&mut self, node: &'ast syn::Item) {
+                    if !self.off(item_attrs(node), node.span()) {
+                        visit::visit_item(self, node);
+                    }
+                }
+                fn visit_impl_item(&mut self, node: &'ast syn::ImplItem) {
+                    let attrs = match node {
+                        syn::ImplItem::Const(item) => &item.attrs[..],
+                        syn::ImplItem::Fn(item) => &item.attrs,
+                        syn::ImplItem::Type(item) => &item.attrs,
+                        syn::ImplItem::Macro(item) => &item.attrs,
+                        _ => &[],
+                    };
+                    if !self.off(attrs, node.span()) {
+                        visit::visit_impl_item(self, node);
+                    }
+                }
+                fn visit_trait_item(&mut self, node: &'ast syn::TraitItem) {
+                    let attrs = match node {
+                        syn::TraitItem::Const(item) => &item.attrs[..],
+                        syn::TraitItem::Fn(item) => &item.attrs,
+                        syn::TraitItem::Type(item) => &item.attrs,
+                        syn::TraitItem::Macro(item) => &item.attrs,
+                        _ => &[],
+                    };
+                    if !self.off(attrs, node.span()) {
+                        visit::visit_trait_item(self, node);
+                    }
+                }
+            }
+        };
+    }
+    nodes! {
+        visit_local, visit::visit_local, syn::Local;
+        visit_arm, visit::visit_arm, syn::Arm;
+        visit_field_value, visit::visit_field_value, syn::FieldValue;
+        visit_stmt_macro, visit::visit_stmt_macro, syn::StmtMacro;
+        visit_expr_block, visit::visit_expr_block, syn::ExprBlock;
+        visit_expr_if, visit::visit_expr_if, syn::ExprIf;
+        visit_expr_call, visit::visit_expr_call, syn::ExprCall;
+        visit_expr_method_call, visit::visit_expr_method_call, syn::ExprMethodCall;
+        visit_expr_macro, visit::visit_expr_macro, syn::ExprMacro;
+        visit_expr_match, visit::visit_expr_match, syn::ExprMatch;
+        visit_expr_assign, visit::visit_expr_assign, syn::ExprAssign;
+        visit_expr_return, visit::visit_expr_return, syn::ExprReturn;
+        visit_expr_for_loop, visit::visit_expr_for_loop, syn::ExprForLoop;
+        visit_expr_while, visit::visit_expr_while, syn::ExprWhile;
+        visit_expr_loop, visit::visit_expr_loop, syn::ExprLoop;
+        visit_expr_unsafe, visit::visit_expr_unsafe, syn::ExprUnsafe;
+        visit_expr_binary, visit::visit_expr_binary, syn::ExprBinary;
+    }
+    if cfg_is_off(&file.attrs, features) {
+        return vec![(0, source.len())];
+    }
+    let mut inactive = Inactive {
+        source,
+        features,
+        found: vec![],
+    };
+    inactive.visit_file(file);
+    inactive.found
+}
+
+fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
+    match item {
+        syn::Item::Const(item) => &item.attrs,
+        syn::Item::Enum(item) => &item.attrs,
+        syn::Item::ExternCrate(item) => &item.attrs,
+        syn::Item::Fn(item) => &item.attrs,
+        syn::Item::ForeignMod(item) => &item.attrs,
+        syn::Item::Impl(item) => &item.attrs,
+        syn::Item::Macro(item) => &item.attrs,
+        syn::Item::Mod(item) => &item.attrs,
+        syn::Item::Static(item) => &item.attrs,
+        syn::Item::Struct(item) => &item.attrs,
+        syn::Item::Trait(item) => &item.attrs,
+        syn::Item::TraitAlias(item) => &item.attrs,
+        syn::Item::Type(item) => &item.attrs,
+        syn::Item::Union(item) => &item.attrs,
+        syn::Item::Use(item) => &item.attrs,
+        _ => &[],
+    }
+}
+
 /// Detect test attributes and cfg predicates that require `test` to be true.
 pub(crate) fn is_test_only(attrs: &[syn::Attribute]) -> bool {
     attrs.iter().any(|attr| {
@@ -2564,6 +2735,115 @@ pub fn blame(sites: &[Site], enabled: &dyn Fn(u32) -> bool, offset: usize) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_cfg_is_decided_only_as_far_as_the_features_decide_it() {
+        let on: BTreeSet<String> = ["basic".to_string()].into();
+        for (predicate, expected) in [
+            (r#"feature = "basic""#, Some(true)),
+            (r#"feature = "extra""#, Some(false)),
+            (r#"not(feature = "extra")"#, Some(true)),
+            (r#"not(feature = "basic")"#, Some(false)),
+            ("test", None),
+            (r#"target_os = "linux""#, None),
+            ("not(test)", None),
+            ("all()", Some(true)),
+            ("any()", Some(false)),
+            (r#"all(feature = "basic", feature = "extra")"#, Some(false)),
+            (r#"all(test, feature = "extra")"#, Some(false)),
+            (r#"all(feature = "extra", test)"#, Some(false)),
+            (r#"all(test, feature = "basic")"#, None),
+            (
+                r#"all(feature = "basic", not(feature = "extra"))"#,
+                Some(true),
+            ),
+            (r#"any(feature = "basic", feature = "extra")"#, Some(true)),
+            (r#"any(test, feature = "basic")"#, Some(true)),
+            (r#"any(feature = "basic", test)"#, Some(true)),
+            (r#"any(test, feature = "extra")"#, None),
+            (r#"any(feature = "extra", feature = "more")"#, Some(false)),
+            (r#"not(any(test, feature = "basic"))"#, Some(false)),
+            (r#"not(test, feature = "basic")"#, None),
+            ("feature = 3", None),
+            (r#"unknown(feature = "extra")"#, None),
+            ("all(=)", None),
+        ] {
+            let meta: syn::Meta = syn::parse_str(predicate).unwrap();
+            assert_eq!(cfg_value(&meta, &on), expected, "{predicate}");
+        }
+    }
+
+    #[test]
+    fn code_under_a_feature_that_is_off_is_not_in_the_build() {
+        let source = r#"
+            #[cfg(feature = "extra")]
+            pub fn item(n: u32) -> bool { n > 1 }
+            #[cfg(feature = "basic")]
+            pub fn kept(n: u32) -> bool { n > 2 }
+            #[cfg(test)]
+            fn only_tests(n: u32) -> bool { n > 3 }
+            #[cfg(feature = "extra")]
+            mod module { pub fn inside(n: u32) -> bool { n > 4 } }
+            struct S;
+            impl S {
+                #[cfg(feature = "extra")]
+                fn method(&self, n: u32) -> bool { n > 5 }
+                fn open(&self, n: u32) -> bool { n > 6 }
+            }
+            trait T {
+                #[cfg(feature = "extra")]
+                fn provided(&self, n: u32) -> bool { n > 7 }
+            }
+            #[cfg(feature = "extra")]
+            impl T for S {}
+            fn body(n: u32) -> u32 {
+                #[cfg(feature = "extra")]
+                let n = n + 8;
+                #[cfg(feature = "extra")]
+                { return n + 9; }
+                #[cfg(feature = "extra")]
+                if n > 10 { return 0; }
+                #[cfg(feature = "extra")]
+                assert!(n > 11);
+                match n {
+                    #[cfg(feature = "extra")]
+                    12 => 0,
+                    _ => n + 13,
+                }
+            }
+            #[cfg(not(feature = "extra"))]
+            mod kept_module {
+                #[cfg(feature = "extra")]
+                const OFF: u32 = 14 + 1;
+                const ON: u32 = 15 + 1;
+            }
+        "#;
+        let file = parse_source(source).unwrap();
+        let on: BTreeSet<String> = ["basic".to_string()].into();
+        let ranges = inactive_ranges(source, &file, &on);
+        let left_out = |text: &str| {
+            let at = source.find(text).unwrap_or_else(|| panic!("{text}"));
+            ranges.iter().any(|(from, to)| *from <= at && at < *to)
+        };
+        for off in [
+            "n > 1 ", "n > 4", "n > 5", "n > 7", "n + 8", "n + 9", "n > 10", "n > 11", "12 =>",
+            "14 + 1",
+        ] {
+            assert!(left_out(off), "{off}");
+        }
+        for on in ["n > 2", "n > 3", "n > 6", "n + 13", "15 + 1", "struct S"] {
+            assert!(!left_out(on), "{on}");
+        }
+        // With the feature only what asks for its absence is left out, and a file that is
+        // off as a whole is all out.
+        let both: BTreeSet<String> = ["basic".to_string(), "extra".to_string()].into();
+        let with_extra = inactive_ranges(source, &file, &both);
+        assert_eq!(with_extra.len(), 1, "{with_extra:?}");
+        assert!(source[with_extra[0].0..with_extra[0].1].starts_with("#[cfg(not(feature"));
+        let whole = "#![cfg(feature = \"extra\")]\nfn f() {}\n";
+        let file = parse_source(whole).unwrap();
+        assert_eq!(inactive_ranges(whole, &file, &on), [(0, whole.len())]);
+    }
 
     fn all(_: u32) -> bool {
         true

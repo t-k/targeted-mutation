@@ -294,6 +294,8 @@ struct CargoMessage {
     executable: Option<PathBuf>,
     #[serde(default)]
     filenames: Vec<PathBuf>,
+    /// The features the target was built with; absent from what is not an artifact.
+    features: Option<Vec<String>>,
     message: Option<Diagnostic>,
 }
 
@@ -350,6 +352,8 @@ struct BuildOutput {
     diagnostics: Vec<String>,
     build_scripts: Vec<serde_json::Value>,
     artifacts: Vec<(PathBuf, Vec<PathBuf>)>,
+    /// The features each root file was built with, as cargo reports them.
+    features: Vec<(PathBuf, Vec<String>)>,
 }
 
 /// What a build of changed source came to.
@@ -424,7 +428,11 @@ fn parse_build_output(stdout: &str, packages: &[&str]) -> BuildOutput {
             "compiler-artifact" => {
                 let Some(target) = msg.target else { continue };
                 if let Some(path) = target.src_path {
-                    out.artifacts.push((normalize(&path), msg.filenames));
+                    let root = normalize(&path);
+                    if let Some(features) = msg.features {
+                        out.features.push((root.clone(), features));
+                    }
+                    out.artifacts.push((root, msg.filenames));
                 }
                 if let (Some(exe), Some(profile), Some(id)) =
                     (msg.executable, msg.profile, msg.package_id.as_deref())
@@ -603,16 +611,32 @@ fn artifact_inputs(artifact: &Path, root: &Path, copy: &Path) -> BTreeSet<PathBu
 }
 
 #[derive(Default)]
-struct BuiltSources(BTreeMap<PathBuf, BTreeSet<PathBuf>>);
+struct BuiltSources {
+    files: BTreeMap<PathBuf, BTreeSet<PathBuf>>,
+    /// The features a root file was built with in any of its builds. A root without an
+    /// entry was built by a cargo that did not say.
+    features: BTreeMap<PathBuf, BTreeSet<String>>,
+}
 
 impl BuiltSources {
-    fn from_artifacts(artifacts: &[(PathBuf, Vec<PathBuf>)], copy: &Path) -> Self {
+    fn from_artifacts(
+        artifacts: &[(PathBuf, Vec<PathBuf>)],
+        features: &[(PathBuf, Vec<String>)],
+        copy: &Path,
+    ) -> Self {
         let mut built = Self::default();
+        for (root, features) in features {
+            built
+                .features
+                .entry(root.clone())
+                .or_default()
+                .extend(features.iter().cloned());
+        }
         for (root, artifacts) in artifacts {
             if !root.starts_with(copy) {
                 continue;
             }
-            let files = built.0.entry(root.clone()).or_default();
+            let files = built.files.entry(root.clone()).or_default();
             files.insert(root.clone());
             if let Some(inputs) = artifacts
                 .iter()
@@ -627,10 +651,33 @@ impl BuiltSources {
 
     fn contains(&self, source: &SourceFile) -> bool {
         source.owners.iter().any(|root| {
-            self.0
+            self.files
                 .get(root)
                 .is_some_and(|files| files.contains(&source.path))
         })
+    }
+
+    /// The parts of a built file that no build of it compiled: code under a `cfg` that
+    /// the features of every build that owns the file turn off. Nothing when one of
+    /// those builds did not say its features.
+    fn left_out(&self, source: &SourceFile) -> Vec<(usize, usize)> {
+        let mut features = BTreeSet::new();
+        for root in &source.owners {
+            if !self
+                .files
+                .get(root)
+                .is_some_and(|files| files.contains(&source.path))
+            {
+                continue;
+            }
+            match self.features.get(root) {
+                Some(of_root) => features.extend(of_root.iter().cloned()),
+                None => return vec![],
+            }
+        }
+        instrument::parse_source(&source.original)
+            .map(|parsed| instrument::inactive_ranges(&source.original, &parsed, &features))
+            .unwrap_or_default()
     }
 }
 
@@ -4314,7 +4361,7 @@ fn run_package(
         }
     };
     let built_sources = if options.rebuild || options.source_only || options.audit.is_some() {
-        BuiltSources::from_artifacts(&build.artifacts, &copy)
+        BuiltSources::from_artifacts(&build.artifacts, &build.features, &copy)
     } else {
         BuiltSources::default()
     };
@@ -5119,6 +5166,8 @@ fn run_package(
         // All tests are run against each of them; the quick ones first, since one
         // failure is enough.
         let mut skipped_targets = BTreeSet::new();
+        // Per file, the code its builds leave out.
+        let mut left_out: BTreeMap<&PathBuf, Vec<(usize, usize)>> = BTreeMap::new();
         let mut survivors: Vec<(report::Location, Vec<String>)> = vec![];
         progress::track(
             options.progress,
@@ -5131,19 +5180,28 @@ fn run_package(
                         .map(|phase| phase.get::<Option<Outcome>>(index))
                         .transpose()?
                         .flatten();
-                    if !built_sources.contains(file) {
+                    let left_out = left_out
+                        .entry(&file.path)
+                        .or_insert_with(|| built_sources.left_out(file))
+                        .iter()
+                        .any(|(from, to)| *from <= site.start && site.end <= *to);
+                    if left_out || !built_sources.contains(file) {
                         if let Some(phase) = source_checkpoint.as_ref().filter(|_| cached.is_none())
                         {
                             phase.record(index, &Some(Outcome::Unable))?;
                         }
                         if twin.is_none() {
                             report.mutants_not_evaluated += 1;
+                            report.mutants_not_compiled += 1;
                             if skipped_targets.insert((&file.path, site.start, site.end)) {
                                 report.skipped.push(report::SkippedSite::new(
                                     report::location(&file.display, site),
                                     file.lines.position(&file.original, site.end),
                                     report::SkipReason::SourceNotBuilt,
-                                    None,
+                                    left_out.then(|| {
+                                        "under a `cfg` that the features of this build turn off"
+                                            .to_string()
+                                    }),
                                 ));
                             }
                         } else if let Some(audit) = report.audit.as_mut() {
