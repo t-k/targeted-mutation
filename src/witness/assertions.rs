@@ -206,7 +206,9 @@ impl<'a> Calls<'a> {
         let Expr::Path(path) = call.func.as_ref() else {
             return None;
         };
-        if path.qself.is_some() || !call.attrs.is_empty() || !path.attrs.is_empty() {
+        // An attribute of the call may leave it out. A path that is one name has no
+        // type before it, and an attribute in front of it is the call's.
+        if !call.attrs.is_empty() {
             return None;
         }
         let name = path.path.get_ident()?.to_string();
@@ -461,6 +463,9 @@ mod tests {
             none
         );
         assert_eq!(found_in("let n = Some(bucket(3).len());"), ["bucket(3)"]);
+        // The last statement, with no semicolon, is a statement like the others.
+        assert_eq!(found_in("assert_ne!(bucket(3), \"none\")"), ["bucket(3)"]);
+        assert_eq!(found_in("assert_ne!(<u8>::bucket(3), \"none\");"), none);
         // Only an assertion is known to evaluate what it is given, once and in order.
         assert_eq!(found_in("let all = vec![bucket(3).len()];"), none);
         assert_eq!(found_in("matches!(bucket(3).len(), 3);"), none);
