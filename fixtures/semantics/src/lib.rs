@@ -115,6 +115,46 @@ pub fn made_on_the_spot(n: u8) -> Option<u8> {
     [n, n + 1].to_vec().last().copied()
 }
 
+/// A `&mut` stays one for the call: what it gives lives as long as the sequence.
+pub fn head_of_exclusive(values: &mut Vec<u8>) -> Option<&u8> {
+    let end = values.first();
+    end
+}
+
+/// The line a call ends on is the line the next one starts on.
+pub fn lines_between(values: &[u8]) -> u32 {
+    let before = line!();
+    let _ = values
+        .first();
+    line!() - before
+}
+
+pub mod shadowed {
+    /// A `first` and a `last` that a trait of the crate gives to `Vec`: they are found before
+    /// the methods of a slice, and are not its ends.
+    pub trait Ends {
+        fn first(&self) -> Option<&u8>;
+        fn last(&self) -> Option<&u8>;
+    }
+
+    impl Ends for Vec<u8> {
+        fn first(&self) -> Option<&u8> {
+            None
+        }
+        fn last(&self) -> Option<&u8> {
+            self.as_slice().get(1)
+        }
+    }
+
+    pub fn first_by_the_trait(values: Vec<u8>) -> Option<u8> {
+        values.first().copied()
+    }
+
+    pub fn last_by_the_trait(values: Vec<u8>) -> Option<u8> {
+        values.last().copied()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -186,5 +226,12 @@ mod tests {
         assert_eq!(head(&names).map(String::as_str), Some("a"));
         assert_eq!(tail(&names).map(String::as_str), Some("b"));
         assert_eq!(made_on_the_spot(3), Some(4));
+        assert_eq!(head_of_exclusive(&mut [8, 9].to_vec()), Some(&8));
+        assert_eq!(lines_between(&[1, 2]), 3);
+        // One element each: of a slice, that would be the same end.
+        assert_eq!(shadowed::first_by_the_trait([7].to_vec()), None);
+        assert_eq!(shadowed::last_by_the_trait([7].to_vec()), None);
+        assert_eq!(shadowed::last_by_the_trait([7, 8].to_vec()), Some(8));
+        assert_eq!(shadowed::last_by_the_trait(Vec::new()), None);
     }
 }

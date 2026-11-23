@@ -1063,8 +1063,8 @@ pub struct SourceMutant {
 
 /// The mutants of a site as changes of the source, for the sites that are mutated by
 /// building them. The replacements of an operator are those of cargo-mutants. Sites that
-/// only exist as probes (a result replaced after the body ran, a deleted statement, the
-/// other of `min` / `max`, the end of a range) have none.
+/// only exist as probes (a result replaced after the body ran, the other of `min` /
+/// `max`) have none.
 /// A strict/non-strict boundary replacement for runs without operand observations.
 pub(crate) fn source_boundary_mutant(site: &Site) -> Option<SourceMutant> {
     let SiteKind::Cmp { op, gap, .. } = &site.kind else {
@@ -1217,9 +1217,16 @@ pub fn source_mutants(site: &Site) -> Vec<SourceMutant> {
             };
             vec![change(gap.0, gap.1, to.to_string(), from, to)]
         }
-        SiteKind::Return { .. } | SiteKind::MinMax { .. } | SiteKind::SliceEnd { .. } => {
-            vec![]
+        // The other method, called as the first was.
+        SiteKind::SliceEnd { first, call, .. } => {
+            let (from, to) = if *first {
+                ("first", "last")
+            } else {
+                ("last", "first")
+            };
+            vec![change(call.0, call.1, format!(".{to}()"), from, to)]
         }
+        SiteKind::Return { .. } | SiteKind::MinMax { .. } => vec![],
     }
 }
 
@@ -2994,25 +3001,58 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                 });
                 ("(match (&(".to_string(), String::new())
             }
-            SiteKind::SliceEnd { first, call, .. } => {
-                // The call is made as it was written, on the borrowed receiver. Only where
-                // the runtime knows the receiver's type does it give the other end itself;
-                // for anything else it has nothing to say, whatever the call returns.
-                let same = if *first { "first" } else { "last" };
+            SiteKind::SliceEnd {
+                first,
+                receiver,
+                call,
+            } => {
+                // Both calls are made as they are written. Only where the runtime knows
+                // the receiver's type does it ever ask for the other one; of anything else
+                // it has nothing to say, whatever the call returns.
+                let (same, other) = if *first {
+                    ("first", "last")
+                } else {
+                    ("last", "first")
+                };
+                let id = site.id;
+                let decide = format!(
+                    "#[allow(unused_imports)] use {rt}::{{AnyEnd as _, SliceEnd as _}}; \
+                     match (&{rt}::Ends(__TMT_BORROWED__)).tmt_other_end({id}u32, {first}) {{ \
+                     {rt}::End::Other => (__TMT_PLACE__).{other}(), {rt}::End::Same(__tmt_s) => {{ \
+                     let __tmt_r = (__TMT_PLACE__).{same}(); \
+                     __tmt_s.tmt_end_seen({id}u32, &__tmt_r); __tmt_r }} }}"
+                );
+                // A line that ends inside the call still ends: `line!()` after it says
+                // what it said.
+                let lines = "\n".repeat(source[call.0..call.1].matches('\n').count());
+                // A variable is the same place each time it is named, so it is named
+                // again for the call: the call then borrows it, or takes it, exactly as
+                // it did (a `&mut` for as long as it is one). Any
+                // other receiver is evaluated once and borrowed for the probe.
+                let variable = syn::parse_str::<syn::Ident>(receiver.trim()).is_ok();
+                let (open, close) = if variable {
+                    let decide = decide
+                        .replace("__TMT_BORROWED__", &format!("&({receiver})"))
+                        .replace("__TMT_PLACE__", receiver);
+                    ("({ let _ = &(", format!("); {decide} }}){lines}"))
+                } else {
+                    let decide = decide
+                        .replace("__TMT_BORROWED__", "__tmt_a")
+                        .replace("__TMT_PLACE__", "*__tmt_a");
+                    (
+                        "(match (&(",
+                        format!(")) {{ __tmt_a => {{ {decide} }} }}){lines}"),
+                    )
+                };
                 edits.push(Edit {
                     pos: call.0,
                     end: call.1,
                     phase: 1,
                     order: 0,
-                    text: format!(
-                        ")) {{ __tmt_a => {{ #[allow(unused_imports)] use {rt}::{{AnyEnd as _, SliceEnd as _}}; \
-                         match (&{rt}::Ends(__tmt_a)).tmt_other_end({}u32, {first}) {{ \
-                         {rt}::End::Other(__tmt_r) => __tmt_r, {rt}::End::Same => (*__tmt_a).{same}() }} }} }})",
-                        site.id
-                    ),
+                    text: close,
                     site: site.id,
                 });
-                ("(match (&(".to_string(), String::new())
+                (open.to_string(), String::new())
             }
             SiteKind::Range { inclusive, gap, .. } => {
                 edits.push(Edit {
@@ -4600,12 +4640,39 @@ mod tests {
         let src = "fn f(v: &[u8]) -> Option<&u8> { v.last() }";
         let found = discover(src, 0).unwrap();
         let out = render(src, &found.sites, &|_| true).text;
-        assert!(out.contains("(match (&(v)) { __tmt_a =>"), "{out}");
+        // A variable is named again for the call.
+        assert!(out.contains("({ let _ = &(v); #[allow"), "{out}");
         assert!(
-            out.contains("tmt_other_end(") && out.contains(", false)"),
+            out.contains("(&crate::__tmt_rt::Ends(&(v))).tmt_other_end("),
             "{out}"
         );
-        assert!(out.contains("End::Same => (*__tmt_a).last()"), "{out}");
+        assert!(out.contains(", false) {"), "{out}");
+        assert!(
+            out.contains("End::Other => (v).first(), crate::__tmt_rt::End::Same(__tmt_s) => { let __tmt_r = (v).last(); __tmt_s.tmt_end_seen("),
+            "{out}"
+        );
+        // Anything else is evaluated once, and a line that ends in the call still ends.
+        let src = "fn f(s: &S) -> Option<&u8> { s.all()\n  .first() }";
+        let found = discover(src, 0).unwrap();
+        let out = render(src, &found.sites, &|_| true).text;
+        assert!(out.contains("(match (&(s.all())) { __tmt_a =>"), "{out}");
+        assert!(out.contains("End::Other => (*__tmt_a).last(),"), "{out}");
+        assert!(out.contains("let __tmt_r = (*__tmt_a).first();"), "{out}");
+        assert!(out.contains("__tmt_r } } } })\n }"), "{out}");
+        assert_eq!(out.matches('\n').count(), 1, "{out}");
+        let src = "fn f(v: &[u8]) -> Option<&u8> { v.last() }";
+        let found = discover(src, 0).unwrap();
+        // Written into the source, the other method is called as the first was.
+        let mutants: Vec<_> = found.sites.iter().flat_map(source_mutants).collect();
+        let end = mutants.iter().find(|m| m.what == "last").unwrap();
+        assert_eq!(
+            (
+                &src[end.start..end.end],
+                end.replacement.as_str(),
+                end.into.as_str()
+            ),
+            (".last()", ".first()", "first")
+        );
     }
 
     #[test]
@@ -5382,10 +5449,7 @@ mod tests {
         let src = "fn f(a: u8, b: u8) -> bool { g(); for _ in a..b {} a.max(b) > 1 }";
         let sites = discover(src, 0).unwrap().sites;
         for site in &sites {
-            let none = matches!(
-                site.kind,
-                SiteKind::Return { .. } | SiteKind::MinMax { .. } | SiteKind::SliceEnd { .. }
-            );
+            let none = matches!(site.kind, SiteKind::Return { .. } | SiteKind::MinMax { .. });
             assert_eq!(source_mutants(site).is_empty(), none, "{:?}", site.kind);
         }
         // A range has its end taken in or left out, whichever it is not.

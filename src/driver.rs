@@ -3289,6 +3289,11 @@ impl Session {
                     ],
                     _ => vec![(Mutation::ArithSwap, merged)],
                 };
+                // A `first()` that did not give the first element of the sequence is a
+                // method of another name's making: its `last()` is anyone's guess.
+                if matches!(site.kind, SiteKind::SliceEnd { .. }) && merged.opaque {
+                    return Planned::Nothing;
+                }
                 let (mut gaps, mut run) = (vec![], vec![]);
                 for (mutation, seen) in mutations {
                     match plan::plan_arith(&seen) {
@@ -6619,6 +6624,7 @@ fn mutation_of(site: &Site, mutant: &instrument::SourceMutant) -> Mutation {
         SiteKind::Logic { .. } => Mutation::LogicSwap,
         SiteKind::Not { .. } => Mutation::DropNot,
         SiteKind::Range { .. } => Mutation::RangeEnd,
+        SiteKind::SliceEnd { .. } => Mutation::OtherEnd,
         // The other kinds have one mutant of the source: a statement, an arm, a field or
         // a minus that is not there, a body that is another.
         _ => Mutation::Delete,

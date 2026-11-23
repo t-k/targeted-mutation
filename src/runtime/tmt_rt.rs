@@ -1461,100 +1461,111 @@ impl<'r, 'a, A, B> AnyMinMax for &'r Mm<'a, A, B> {
     }
 }
 
-/// The receiver of `v.first()` / `v.last()`, looked at before the call. The call itself
-/// stays in the code as it was written; where the receiver is a sequence of the standard
-/// library, the `OtherEnd` mutant is given its other end here.
+/// The receiver of `v.first()` / `v.last()`, looked at before the call. Both calls stay in
+/// the code as they are written, so that a type with methods of these names of its own
+/// gets those; the probe only says which of the two to make.
 pub struct Ends<'a, A: ?Sized>(pub &'a A);
 
-/// What a probe of `first()` / `last()` does: take the other end, or make the call.
-pub enum End<R> {
-    Other(R),
-    Same,
+/// What a probe of `first()` / `last()` does: call the other method, or the one that is
+/// written and say what it returned.
+pub enum End<S> {
+    Other,
+    Same(S),
 }
 
 /// A slice, a `Vec`, an array or a `BTreeSet`, or a shared reference to one. With no
 /// element both ends are `None`, and with one they are that element.
 pub trait SliceEnd {
-    type Out;
-    fn tmt_other_end(&self, site: u32, first: bool) -> End<Self::Out>;
+    type Elem;
+    fn tmt_other_end(&self, site: u32, first: bool) -> End<EndOf<Self::Elem>>;
 }
 
-fn other_end<R>(site: u32, len: usize, other: impl FnOnce() -> R) -> End<R> {
-    if mutant_at(site) == Some(Mutant::OtherEnd) {
-        return End::Other(other());
+/// The end the standard library gives, kept by its address: it borrows nothing, so the
+/// call as it was written is made on a receiver that is as free as it was.
+pub struct EndOf<T> {
+    len: usize,
+    end: Option<*const T>,
+    /// An array of fewer than two elements has one end, and no test could give it
+    /// another: nothing is mutated there.
+    fixed: bool,
+}
+
+impl<T> EndOf<T> {
+    /// `got`: what the call as it was written returned. It may be another method of that
+    /// name (one a trait of the crate adds to `Vec`): where it did not return the very
+    /// element the standard library gives, nothing is known about its other end, and
+    /// nothing is mutated.
+    pub fn tmt_end_seen(&self, site: u32, got: &Option<&T>) {
+        let same = match (self.end, got) {
+            (None, None) => true,
+            (Some(ours), Some(theirs)) => std::ptr::eq(ours, *theirs),
+            _ => false,
+        };
+        if self.fixed || !same {
+            if !idle(site) {
+                record_bits(b'A', site, ARITH_OPAQUE);
+            }
+        } else {
+            record_bits(
+                b'A',
+                site,
+                if self.len <= 1 {
+                    ARITH_SAME
+                } else {
+                    ARITH_DIFFERS
+                },
+            );
+        }
     }
-    record_bits(
-        b'A',
-        site,
-        if len <= 1 { ARITH_SAME } else { ARITH_DIFFERS },
-    );
-    End::Same
 }
 
 macro_rules! tmt_ends {
-    ($([$($generics:tt)*] $t:ty, $elem:ty;)*) => {$(
+    ($([$($generics:tt)*] $t:ty, $elem:ty, $fixed:expr;)*) => {$(
         impl<'a, $($generics)*> SliceEnd for Ends<'a, $t> {
-            type Out = Option<&'a $elem>;
-            fn tmt_other_end(&self, site: u32, first: bool) -> End<Self::Out> {
-                let all: &'a $t = self.0;
-                other_end(site, all.len(), || if first { all.last() } else { all.first() })
+            type Elem = $elem;
+            fn tmt_other_end(&self, site: u32, first: bool) -> End<EndOf<$elem>> {
+                let all: &$t = self.0;
+                let fixed: bool = $fixed;
+                if !fixed && mutant_at(site) == Some(Mutant::OtherEnd) {
+                    return End::Other;
+                }
+                let end = if first { all.first() } else { all.last() };
+                End::Same(EndOf { len: all.len(), end: end.map(|end| end as *const $elem), fixed })
             }
         }
         impl<'a, 'b, $($generics)*> SliceEnd for Ends<'a, &'b $t> {
-            type Out = Option<&'b $elem>;
-            fn tmt_other_end(&self, site: u32, first: bool) -> End<Self::Out> {
-                let all: &'b $t = *self.0;
-                other_end(site, all.len(), || if first { all.last() } else { all.first() })
+            type Elem = $elem;
+            fn tmt_other_end(&self, site: u32, first: bool) -> End<EndOf<$elem>> {
+                (&Ends::<$t>(*self.0)).tmt_other_end(site, first)
             }
         }
     )*};
 }
 tmt_ends! {
-    [T] [T], T;
-    [T] Vec<T>, T;
-    [T: Ord] std::collections::BTreeSet<T>, T;
-}
-
-/// An array has its length in its type. One of fewer than two elements has one end, and
-/// no test could give it another: nothing is mutated there.
-fn other_end_of_array<'x, T, const N: usize>(
-    site: u32,
-    first: bool,
-    all: &'x [T; N],
-) -> End<Option<&'x T>> {
-    if N <= 1 {
-        if !idle(site) {
-            record_bits(b'A', site, ARITH_OPAQUE);
-        }
-        return End::Same;
-    }
-    other_end(site, N, || if first { all.last() } else { all.first() })
-}
-
-impl<'a, T, const N: usize> SliceEnd for Ends<'a, [T; N]> {
-    type Out = Option<&'a T>;
-    fn tmt_other_end(&self, site: u32, first: bool) -> End<Self::Out> {
-        other_end_of_array(site, first, self.0)
-    }
-}
-
-impl<'a, 'b, T, const N: usize> SliceEnd for Ends<'a, &'b [T; N]> {
-    type Out = Option<&'b T>;
-    fn tmt_other_end(&self, site: u32, first: bool) -> End<Self::Out> {
-        other_end_of_array(site, first, *self.0)
-    }
+    [T] [T], T, false;
+    [T] Vec<T>, T, false;
+    [T, const N: usize] [T; N], T, N < 2;
+    [T: Ord] std::collections::BTreeSet<T>, T, false;
 }
 
 /// `first` / `last` of anything else: the call as it was written.
 pub trait AnyEnd {
-    fn tmt_other_end<R>(&self, site: u32, first: bool) -> End<R>;
+    fn tmt_other_end(&self, site: u32, first: bool) -> End<NoEnd>;
 }
 
 impl<'r, 'a, A: ?Sized> AnyEnd for &'r Ends<'a, A> {
-    fn tmt_other_end<R>(&self, site: u32, first: bool) -> End<R> {
+    fn tmt_other_end(&self, site: u32, first: bool) -> End<NoEnd> {
+        End::Same(NoEnd)
+    }
+}
+
+/// Nothing is known of the ends of a type that is not a sequence of the standard library.
+pub struct NoEnd;
+
+impl NoEnd {
+    pub fn tmt_end_seen<R>(&self, site: u32, got: &R) {
         if !idle(site) {
             record_bits(b'A', site, ARITH_OPAQUE);
         }
-        End::Same
     }
 }

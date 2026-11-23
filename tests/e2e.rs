@@ -1852,6 +1852,14 @@ fn probes_do_not_change_what_the_code_does() {
     // The argument of the local `vec!` and the indexed `+=` are not probed.
     assert!(!codes.iter().any(|c| c.contains("a < 3")), "{report:#}");
     assert!(!codes.iter().any(|c| c.contains("slots[")), "{report:#}");
+    // A `first` / `last` that is not the one of a slice is not taken for it: with one
+    // element the two would be the same, and these are not.
+    assert!(
+        !codes
+            .iter()
+            .any(|c| *c == "values.first()" || *c == "values.last()"),
+        "{report:#}"
+    );
 }
 
 fn git_output(dir: &Path, args: &[&str]) -> String {
@@ -5117,6 +5125,9 @@ struct EndRow {
     label: String,
 }
 
+/// A call of a row's function with these elements.
+type Call = Box<dyn Fn(&str) -> String>;
+
 fn slice_end_crate(table: &str) -> (String, Vec<EndRow>) {
     let mut source = String::from(
         "pub struct Held { pub items: Vec<u32> }\n\
@@ -5146,62 +5157,59 @@ fn slice_end_crate(table: &str) -> (String, Vec<EndRow>) {
         };
         let length = if seen == "one" { 1 } else { 2 };
         // (the receiver as written, the function's head, its body, how a test calls it)
-        let (written, head, body, call): (&str, String, String, Box<dyn Fn(&str) -> String>) =
-            match receiver {
-                "slice" => (
-                    "v",
-                    format!("pub fn row_{n}(v: &[u32]) -> Option<u32> {{"),
-                    format!("v.{method}().copied()"),
-                    Box::new(move |items| format!("row_{n}(&[{items}])")),
-                ),
-                "vec" => (
-                    "v",
-                    format!("pub fn row_{n}(v: Vec<u32>) -> Option<u32> {{"),
-                    format!("v.{method}().copied()"),
-                    Box::new(move |items| format!("row_{n}(vec![{items}])")),
-                ),
-                "array" => (
-                    "v",
-                    format!("pub fn row_{n}(v: [u32; {length}]) -> Option<u32> {{"),
-                    format!("v.{method}().copied()"),
-                    Box::new(move |items| format!("row_{n}([{items}])")),
-                ),
-                "set" => (
-                    "v",
-                    format!(
-                        "pub fn row_{n}(v: &std::collections::BTreeSet<u32>) -> Option<u32> {{"
-                    ),
-                    format!("v.{method}().copied()"),
-                    Box::new(move |items| {
-                        format!("row_{n}(&std::collections::BTreeSet::from([{items}]))")
-                    }),
-                ),
-                "field" => (
-                    "self.items",
-                    format!("impl Held {{ pub fn row_{n}(&self) -> Option<u32> {{"),
-                    format!("self.items.{method}().copied() }}"),
-                    Box::new(move |items| format!("Held {{ items: vec![{items}] }}.row_{n}()")),
-                ),
-                "mut_ref" => (
-                    "v",
-                    format!("pub fn row_{n}(v: &mut Vec<u32>) -> Option<u32> {{"),
-                    format!("v.{method}().copied()"),
-                    Box::new(move |items| format!("row_{n}(&mut vec![{items}])")),
-                ),
-                "own_type" => (
-                    "v",
-                    format!("pub fn row_{n}(v: &Own) -> Option<u32> {{"),
-                    format!("v.{method}()"),
-                    Box::new(move |items| format!("row_{n}(&Own(vec![{items}]))")),
-                ),
-                "iterator" => (
-                    "v.iter()",
-                    format!("pub fn row_{n}(v: &[u32]) -> Option<u32> {{"),
-                    format!("v.iter().{method}().copied()"),
-                    Box::new(move |items| format!("row_{n}(&[{items}])")),
-                ),
-                _ => panic!("{row}"),
-            };
+        let (written, head, body, call): (&str, String, String, Call) = match receiver {
+            "slice" => (
+                "v",
+                format!("pub fn row_{n}(v: &[u32]) -> Option<u32> {{"),
+                format!("v.{method}().copied()"),
+                Box::new(move |items| format!("row_{n}(&[{items}])")),
+            ),
+            "vec" => (
+                "v",
+                format!("pub fn row_{n}(v: Vec<u32>) -> Option<u32> {{"),
+                format!("v.{method}().copied()"),
+                Box::new(move |items| format!("row_{n}(vec![{items}])")),
+            ),
+            "array" => (
+                "v",
+                format!("pub fn row_{n}(v: [u32; {length}]) -> Option<u32> {{"),
+                format!("v.{method}().copied()"),
+                Box::new(move |items| format!("row_{n}([{items}])")),
+            ),
+            "set" => (
+                "v",
+                format!("pub fn row_{n}(v: &std::collections::BTreeSet<u32>) -> Option<u32> {{"),
+                format!("v.{method}().copied()"),
+                Box::new(move |items| {
+                    format!("row_{n}(&std::collections::BTreeSet::from([{items}]))")
+                }),
+            ),
+            "field" => (
+                "self.items",
+                format!("impl Held {{ pub fn row_{n}(&self) -> Option<u32> {{"),
+                format!("self.items.{method}().copied() }}"),
+                Box::new(move |items| format!("Held {{ items: vec![{items}] }}.row_{n}()")),
+            ),
+            "mut_ref" => (
+                "v",
+                format!("pub fn row_{n}(v: &mut Vec<u32>) -> Option<u32> {{"),
+                format!("v.{method}().copied()"),
+                Box::new(move |items| format!("row_{n}(&mut vec![{items}])")),
+            ),
+            "own_type" => (
+                "v",
+                format!("pub fn row_{n}(v: &Own) -> Option<u32> {{"),
+                format!("v.{method}()"),
+                Box::new(move |items| format!("row_{n}(&Own(vec![{items}]))")),
+            ),
+            "iterator" => (
+                "v.iter()",
+                format!("pub fn row_{n}(v: &[u32]) -> Option<u32> {{"),
+                format!("v.iter().{method}().copied()"),
+                Box::new(move |items| format!("row_{n}(&[{items}])")),
+            ),
+            _ => panic!("{row}"),
+        };
         source.push_str(&head);
         source.push('\n');
         let line = source.lines().count() + 1;
@@ -5285,6 +5293,26 @@ fn slice_end_table() {
             assert_eq!(finding["verified"], true, "{}", row.label);
         }
     }
+
+    // Written into the source, the other end passes the same tests.
+    let gap = rows
+        .iter()
+        .find(|row| row.expected == Some("input_gap"))
+        .unwrap();
+    let lines = format!("src/lib.rs:{}", gap.line);
+    let built = tmt(
+        &dir,
+        &["--json", "--quiet", "--source-only", "--lines", &lines],
+    );
+    let built: Value = serde_json::from_str(&built.stdout).unwrap();
+    let survivors = findings(&built, "survivor");
+    assert_eq!(survivors.len(), 1, "{built:#}");
+    assert_eq!(survivors[0]["line"], gap.line, "{built:#}");
+    assert_eq!(
+        strings(&survivors[0]["survivors"]),
+        [format!("`{}.{}()`", gap.receiver, gap.other)],
+        "{built:#}"
+    );
 
     // A test with two different ends closes every input gap.
     let closing: String = rows

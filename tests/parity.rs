@@ -94,7 +94,8 @@ fn keys_of(source: &str, site: &Site) -> Vec<Key> {
             // Not one of cargo-mutants either, but it can be written in the source.
             SiteKind::Range { .. } => key("range", site.line, &mutant.what, &mutant.into),
             SiteKind::Stmt => key("statement", site.line, &site.text, ""),
-            SiteKind::Return { .. } | SiteKind::MinMax { .. } | SiteKind::SliceEnd { .. } => {
+            SiteKind::SliceEnd { .. } => key("end", site.line, &mutant.what, &mutant.into),
+            SiteKind::Return { .. } | SiteKind::MinMax { .. } => {
                 unreachable!("no source mutants")
             }
         })
