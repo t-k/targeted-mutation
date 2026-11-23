@@ -131,14 +131,20 @@ fn next_is(trees: &mut Trees, mark: char) -> bool {
 /// whose place may be asked for: every one (documentation aside), or the `line!` and
 /// `column!` alone. `None` when the text does not lex.
 fn places(text: &str, off: &[(usize, usize)], asked: Asks) -> Option<Vec<(usize, usize)>> {
-    fn note(span: proc_macro2::Span, off: &[(usize, usize)], out: &mut Vec<(usize, usize)>) {
+    /// Whether the token is kept; then its place is noted.
+    fn note(
+        span: proc_macro2::Span,
+        off: &[(usize, usize)],
+        out: &mut Vec<(usize, usize)>,
+    ) -> bool {
         let range = span.byte_range();
-        if !off
+        let kept = !off
             .iter()
-            .any(|(from, to)| *from <= range.start && range.end <= *to)
-        {
+            .any(|(from, to)| *from <= range.start && range.end <= *to);
+        if kept {
             out.push((span.start().line, span.start().column));
         }
+        kept
     }
     fn walk(
         stream: proc_macro2::TokenStream,
@@ -147,7 +153,12 @@ fn places(text: &str, off: &[(usize, usize)], asked: Asks) -> Option<Vec<(usize,
         out: &mut Vec<(usize, usize)>,
     ) {
         let mut trees: Trees = stream.into_iter().peekable();
+        // Whether the last token was left out: its comma or semicolon goes with it,
+        // as where the tokens are compared.
+        let mut after_left_out = false;
         while let Some(tree) = trees.next() {
+            let was_left_out = after_left_out;
+            after_left_out = false;
             match tree {
                 proc_macro2::TokenTree::Punct(hash) if hash.as_char() == '#' => {
                     // Documentation, as a comment or written out, outer or inner, is
@@ -166,15 +177,20 @@ fn places(text: &str, off: &[(usize, usize)], asked: Asks) -> Option<Vec<(usize,
                         continue;
                     }
                     if all {
-                        note(hash.span(), off, out);
+                        after_left_out = !note(hash.span(), off, out);
+                    } else {
+                        after_left_out = was_left_out;
                     }
                 }
                 proc_macro2::TokenTree::Group(group) => {
                     if all {
-                        note(group.span_open(), off, out);
+                        after_left_out = !note(group.span(), off, &mut vec![]);
+                        if !after_left_out {
+                            note(group.span_open(), off, out);
+                        }
                     }
                     walk(group.stream(), off, all, out);
-                    if all {
+                    if all && !after_left_out {
                         note(group.span_close(), off, out);
                     }
                 }
@@ -182,7 +198,7 @@ fn places(text: &str, off: &[(usize, usize)], asked: Asks) -> Option<Vec<(usize,
                     let asks_here =
                         (name == "line" || name == "column") && next_is(&mut trees, '!');
                     if all {
-                        note(name.span(), off, out);
+                        after_left_out = !note(name.span(), off, out);
                     } else if asks_here {
                         // Of what it asks for alone: a line more above a `column!`
                         // moves nothing it can tell.
@@ -197,9 +213,11 @@ fn places(text: &str, off: &[(usize, usize)], asked: Asks) -> Option<Vec<(usize,
                         }));
                     }
                 }
+                proc_macro2::TokenTree::Punct(mark)
+                    if was_left_out && matches!(mark.as_char(), ',' | ';') => {}
                 other => {
                     if all {
-                        note(other.span(), off, out);
+                        after_left_out = !note(other.span(), off, out);
                     }
                 }
             }
@@ -1027,6 +1045,15 @@ pub fn basic() -> u32 {
             "fn f() -> impl Sized {\n    #[cfg(feature = \"extra\")]\n    trace();\n    (1u8)\n}\n";
         let tuple = one.replace("(1u8)", "(1u8,)");
         assert!(!same_build(&tuple, &off(&tuple), one, &off(one)));
+        // In a function that tells its caller's place, a statement that is left out in
+        // place of a blank line moves nothing that is kept, its semicolon included.
+        let blank = "#[track_caller]\npub fn checked() {\n\n    a();\n}\n";
+        let stated = blank.replace("{\n\n", "{\n    #[cfg(feature = \"extra\")] extra();\n");
+        assert!(same_build(&stated, &off(&stated), blank, &off(blank)));
+        // A comma that is kept and moved is told.
+        let moved = "#[track_caller]\npub fn checked() {\n    a(1,\n      2);\n}\n";
+        let wider = moved.replace("a(1,", "a(1  ,");
+        assert!(!same_build(&wider, &off(&wider), moved, &off(moved)));
         // A call that is left out goes with its semicolon.
         let plain = "fn f() {\n    a();\n    b();\n}\n";
         let extra = "fn f() {\n    a();\n    #[cfg(feature = \"extra\")]\n    enable_extra();\n    b();\n}\n";

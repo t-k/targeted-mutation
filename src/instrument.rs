@@ -1670,6 +1670,8 @@ pub(crate) fn inactive_ranges(
         source: &'a str,
         features: &'a BTreeSet<String>,
         found: Vec<(usize, usize)>,
+        /// The file defines a `vec!` of its own, which may do anything.
+        own_vec: bool,
     }
     impl Inactive<'_> {
         /// Whether the node is left out; then its range is noted and it is not entered.
@@ -1707,6 +1709,31 @@ pub(crate) fn inactive_ranges(
                     };
                     if !self.off(attrs, node.span()) {
                         visit::visit_impl_item(self, node);
+                    }
+                }
+                fn visit_foreign_item(&mut self, node: &'ast syn::ForeignItem) {
+                    let attrs = match node {
+                        syn::ForeignItem::Fn(item) => &item.attrs[..],
+                        syn::ForeignItem::Static(item) => &item.attrs,
+                        syn::ForeignItem::Type(item) => &item.attrs,
+                        syn::ForeignItem::Macro(item) => &item.attrs,
+                        _ => &[],
+                    };
+                    if !self.off(attrs, node.span()) {
+                        visit::visit_foreign_item(self, node);
+                    }
+                }
+                // The elements of `vec![a, b]` are those of an array: one under a
+                // `cfg` that is off is left out of it.
+                fn visit_macro(&mut self, node: &'ast syn::Macro) {
+                    type Args = syn::punctuated::Punctuated<syn::Expr, syn::Token![,]>;
+                    if node.path.segments.last().is_some_and(|name| name.ident == "vec")
+                        && !self.own_vec
+                        && let Ok(args) = node.parse_body_with(Args::parse_terminated)
+                    {
+                        for arg in &args {
+                            self.visit_expr(arg);
+                        }
                     }
                 }
                 fn visit_trait_item(&mut self, node: &'ast syn::TraitItem) {
@@ -1767,6 +1794,7 @@ pub(crate) fn inactive_ranges(
         visit_expr_const, visit::visit_expr_const, syn::ExprConst;
         visit_expr_yield, visit::visit_expr_yield, syn::ExprYield;
         visit_expr_try_block, visit::visit_expr_try_block, syn::ExprTryBlock;
+        visit_expr_raw_addr, visit::visit_expr_raw_addr, syn::ExprRawAddr;
     }
     if cfg_is_off(&file.attrs, features) {
         return vec![(0, source.len())];
@@ -1775,6 +1803,9 @@ pub(crate) fn inactive_ranges(
         source,
         features,
         found: vec![],
+        own_vec: file.items.iter().any(|item| {
+            matches!(item, syn::Item::Macro(m) if m.ident.as_ref().is_some_and(|name| name == "vec"))
+        }),
     };
     inactive.visit_file(file);
     inactive.found
@@ -1948,6 +1979,12 @@ fn same_tokens_of(a: &str, b: &str, holes: bool) -> Option<bool> {
                         Some((group.delimiter(), was_callable)),
                     );
                     out.push(format!("{:?}({})", group.delimiter(), inner.join(" ")));
+                    // What comes in parentheses right after `(..)` or `[..]` is given
+                    // to it: `(self.callback)(value,)`, `table[0](value,)`.
+                    callable = matches!(
+                        group.delimiter(),
+                        proc_macro2::Delimiter::Parenthesis | proc_macro2::Delimiter::Bracket
+                    );
                 }
                 TokenTree::Punct(mark) => {
                     called = was_named && mark.as_char() == '!';
@@ -3194,6 +3231,11 @@ mod tests {
             ),
             ("const A: [u8; 2] = [1, 2];", "const A: [u8; 2] = [1, 2,];"),
             ("type Hook = fn(u8);", "type Hook = fn(u8,);"),
+            // What is called need not have a name.
+            (
+                "fn f(s: &S, t: &[fn(u8)]) { (s.callback)(1); t[0](2) }",
+                "fn f(s: &S, t: &[fn(u8)]) { (s.callback)(1,); t[0](2,) }",
+            ),
             (
                 "fn f(n: u8) -> u8 { match n { 1 => 2, _ => 0 } }",
                 "fn f(n: u8) -> u8 { match n { 1 => 2, _ => 0, } }",
@@ -3396,6 +3438,8 @@ mod tests {
         let listed = r#"
             pub const FORMATS: &[&str] = &["json", #[cfg(feature = "extra")] "yaml", #[cfg(feature = "basic")] "toml"];
             fn f() -> u8 { g(1, #[cfg(feature = "extra")] 2) }
+            fn v(n: u8) -> Vec<bool> { std::vec![false, #[cfg(feature = "extra")] (n > 0)] }
+            unsafe extern "C" { #[cfg(feature = "extra")] fn legacy(); fn kept(); }
         "#;
         let listed_file = parse_source(listed).unwrap();
         let listed_ranges = inactive_ranges(listed, &listed_file, &on);
@@ -3407,7 +3451,9 @@ mod tests {
             texts,
             [
                 "#[cfg(feature = \"extra\")] \"yaml\"",
-                "#[cfg(feature = \"extra\")] 2"
+                "#[cfg(feature = \"extra\")] 2",
+                "#[cfg(feature = \"extra\")] (n > 0)",
+                "#[cfg(feature = \"extra\")] fn legacy();"
             ]
         );
         // A variant of an enum and a field of a struct, which a feature may add.
