@@ -3271,6 +3271,7 @@ fn a_weak_assertion_gets_the_value_its_call_returns() {
         "{finding:#}"
     );
     assert_eq!(finding["witness"]["in_test_line"], 67, "{finding:#}");
+    assert_eq!(finding["witness"]["in_test_column"], 20, "{finding:#}");
     // A finding that asks for an input is not given a call of the tests: they all
     // return what the original returns.
     for gap in findings(&report, "input_gap") {
@@ -3282,8 +3283,8 @@ fn a_weak_assertion_gets_the_value_its_call_returns() {
     );
     assert!(
         text.stdout.contains(
-            "  verified on `bucket(3)` where `tests::buckets` calls it on line 67: original returned \"few\", mutant returned \"many\"\n  \
-             in `tests::buckets`, compare the result of the call on line 67 with this value: `assert_eq!(bucket(3), \"few\");`"
+            "  verified on `bucket(3)` where `tests::buckets` calls it at line 67, column 20: original returned \"few\", mutant returned \"many\"\n  \
+             in `tests::buckets`, compare the result of the call at line 67, column 20 with this value: `assert_eq!(bucket(3), \"few\");`"
         ),
         "{}",
         text.stdout

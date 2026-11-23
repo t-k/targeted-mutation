@@ -78,8 +78,12 @@ pub(crate) fn unpinned_calls(source: &str, file: &syn::File) -> Vec<CalledFuncti
                 // and not to the other, or change something in between.
                 let scenarios = found.entry(name).or_default();
                 if scenarios.len() < MAX_CALLS {
-                    let line = source[..at.start].matches('\n').count() + 1;
-                    scenarios.push(scenario(test, before, call, after, line));
+                    let line_start = source[..at.start].rfind('\n').map_or(0, |end| end + 1);
+                    let place = (
+                        source[..at.start].matches('\n').count() + 1,
+                        source[line_start..at.start].chars().count() + 1,
+                    );
+                    scenarios.push(scenario(test, before, call, after, place));
                 }
             }
         }
@@ -100,12 +104,18 @@ pub(crate) fn unpinned_calls(source: &str, file: &syn::File) -> Vec<CalledFuncti
 /// The test is run again as it is written, and the value of the call is recorded where
 /// the test makes it: after everything the test does before, in the order the test does
 /// it, and only if the test gets there. What the test does afterwards it does here too.
-fn scenario(test: &Test<'_>, before: &str, call: String, after: &str, line: usize) -> Scenario {
+fn scenario(
+    test: &Test<'_>,
+    before: &str,
+    call: String,
+    after: &str,
+    at: (usize, usize),
+) -> Scenario {
     let name = test.name();
     Scenario {
         setup: before.to_owned(),
         after: Some(after.to_owned()),
-        call_line: Some(line),
+        call_at: Some(at),
         expression: call,
         placement: test.insertion.map(|offset| Placement {
             offset,
@@ -229,7 +239,32 @@ impl<'a> Calls<'a> {
     /// arguments.
     fn calls_the_file(&self, expr: &Expr) -> bool {
         struct Named<'a>(&'a BTreeMap<String, &'a ItemFn>, bool);
+        impl Named<'_> {
+            /// A name of the file with parentheses after it, anywhere in what a macro
+            /// is given (`format!("{}", f(2))`, `dbg!(f(2))`).
+            fn tokens(&mut self, tokens: proc_macro2::TokenStream) {
+                let mut named = false;
+                for token in tokens {
+                    match token {
+                        proc_macro2::TokenTree::Ident(name) => {
+                            named = self.0.contains_key(&name.to_string());
+                        }
+                        proc_macro2::TokenTree::Group(group) => {
+                            if named && group.delimiter() == proc_macro2::Delimiter::Parenthesis {
+                                self.1 = true;
+                            }
+                            named = false;
+                            self.tokens(group.stream());
+                        }
+                        _ => named = false,
+                    }
+                }
+            }
+        }
         impl<'ast> Visit<'ast> for Named<'_> {
+            fn visit_macro(&mut self, mac: &'ast syn::Macro) {
+                self.tokens(mac.tokens.clone());
+            }
             fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
                 if let Expr::Path(path) = call.func.as_ref()
                     && path
@@ -558,6 +593,16 @@ mod tests {
             ),
             ("assert_eq!(bucket(1), size(text) + 1);", vec!["bucket(1)"]),
             ("assert_eq!(bucket(1), helper(2));", vec![]),
+            (
+                "assert_eq!(bucket(1), format!(\"{}\", bucket(2)));",
+                vec!["bucket(1)"],
+            ),
+            (
+                "assert_eq!(dbg!((bucket(2))), bucket(1));",
+                vec!["bucket(1)"],
+            ),
+            ("assert_eq!(bucket(1), format!(\"{}\", bucket));", vec![]),
+            ("assert_eq!(bucket(1), format!(\"{}\", helper(2)));", vec![]),
             ("assert_eq!(\"x\", bucket(1), \"{}\", size(\"a\"));", vec![]),
             ("assert!(!bucket(3));", vec![]),
             ("assert!(-bucket(3));", vec!["bucket(3)"]),
@@ -680,8 +725,8 @@ mod tests {
             ]
         );
         // Each is on a line of the file (the function is on the first).
-        let lines: Vec<_> = found[0].scenarios.iter().map(|s| s.call_line).collect();
-        assert_eq!(lines, [Some(2), Some(3), Some(3)]);
+        let places: Vec<_> = found[0].scenarios.iter().map(|s| s.call_at).collect();
+        assert_eq!(places, [Some((2, 37)), Some((3, 37)), Some((3, 68))]);
     }
 
     #[test]

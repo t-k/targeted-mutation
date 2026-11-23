@@ -1157,20 +1157,23 @@ pub fn source_mutants(site: &Site) -> Vec<SourceMutant> {
                 Some((
                     site.text.get(..left)?.trim_end(),
                     site.text.get(right..)?.trim_start(),
+                    // The line ends between the operands stay between them: each
+                    // operand is on the lines it was on.
+                    "\n".repeat(site.text.get(left..right)?.matches('\n').count()),
                 ))
             });
         match (binds, operands) {
-            (std::cmp::Ordering::Less, Some((left, right))) => change(
+            (std::cmp::Ordering::Less, Some((left, right, lines))) => change(
                 site.start,
                 site.end,
-                format!("({left} {to} {right})"),
+                format!("({left} {to} {lines}{right})"),
                 &from,
                 &to,
             ),
-            (std::cmp::Ordering::Greater, Some((left, right))) => change(
+            (std::cmp::Ordering::Greater, Some((left, right, lines))) => change(
                 site.start,
                 site.end,
-                format!("({left}) {to} ({right})"),
+                format!("({left}) {to} {lines}({right})"),
                 &from,
                 &to,
             ),
@@ -2653,10 +2656,11 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                 && let (Some((start, end)), Some((pattern, _))) =
                     (self.range(guard.span()), self.range(arm.pat.span()))
             {
-                let kind = SiteKind::Guard {
-                    can_be_false: !removable.contains(&pattern),
-                };
-                if written_bool(guard).is_some() {
+                let can_be_false = !removable.contains(&pattern);
+                let kind = SiteKind::Guard { can_be_false };
+                if written_bool(guard) == Some(true) && !can_be_false {
+                    // Written `true`, and `false` is the arm removed: no mutant is left.
+                } else if written_bool(guard).is_some() {
                     // A guard written `true` or `false` is one of its two mutants: the
                     // other is built, as a probe would report the one that is the
                     // program for never being told from it.
@@ -5198,10 +5202,22 @@ mod tests {
         assert_eq!(guards(&found.sites), ["n > 3 -> true"]);
         // Built, not probed: a probe would report the mutant that is the program. The
         // arm with `true` can be removed, which is its guard being `false`.
-        assert_eq!(
-            guards(&found.rebuild_sites),
-            ["true -> ", "(false) -> true"]
+        assert_eq!(guards(&found.rebuild_sites), ["(false) -> true"]);
+        // Where the arm cannot be removed, `false` for a guard written `true` is built.
+        let stuck = discover(
+            "fn f(k: Option<u8>) -> u8 { match k { Some(0) if true => 1, Some(_) => 2, None => 3 } }",
+            0,
         );
+        assert_eq!(guards(&stuck.unwrap().rebuild_sites), ["true -> false"]);
+        // An operator that binds otherwise is written with its operands, each on the
+        // lines it was on.
+        let split = discover("fn f(a: bool, b: bool) -> bool {\n    a ||\n    b\n}", 0).unwrap();
+        let or = split
+            .sites
+            .iter()
+            .find(|site| matches!(site.kind, SiteKind::Logic { .. }))
+            .unwrap();
+        assert_eq!(source_mutants(or)[0].replacement, "(a) && \n(b)");
         let mut mutants = source_mutants(&Site {
             id: 0,
             kind: SiteKind::Stmt,

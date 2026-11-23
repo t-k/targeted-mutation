@@ -5817,7 +5817,9 @@ fn run_package(
                     let survived = outcome == Some(Outcome::Pass);
                     if survived {
                         let at = report::location(&file.display, site);
-                        let text = match (&site.kind, mutant.replacement.is_empty()) {
+                        // Nothing but the line ends of what was there.
+                        let removed = mutant.replacement.trim().is_empty();
+                        let text = match (&site.kind, removed) {
                             (SiteKind::Field { .. }, true) => {
                                 format!("without the field `{}`", report::one_line(&site.text))
                             }

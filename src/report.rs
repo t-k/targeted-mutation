@@ -98,6 +98,8 @@ pub struct VerifiedWitness {
     /// The line of the finding's file on which that test makes the call.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub in_test_line: Option<usize>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_test_column: Option<usize>,
 }
 
 impl Finding {
@@ -1169,14 +1171,13 @@ fn finding_body(finding: &Finding) -> Vec<String> {
 fn witness_lines(witness: &VerifiedWitness) -> Vec<String> {
     if let Some(test) = &witness.in_test {
         // The test may make the call more than once, with another result each time.
-        let (on, of) = witness.in_test_line.map_or_else(
+        let place = witness
+            .in_test_line
+            .zip(witness.in_test_column)
+            .map(|(line, column)| format!("line {line}, column {column}"));
+        let (on, of) = place.map_or_else(
             || (String::new(), "that call".to_string()),
-            |line| {
-                (
-                    format!(" on line {line}"),
-                    format!("the call on line {line}"),
-                )
-            },
+            |place| (format!(" at {place}"), format!("the call at {place}")),
         );
         return vec![
             format!(
