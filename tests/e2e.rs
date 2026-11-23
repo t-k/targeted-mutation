@@ -2193,6 +2193,53 @@ fn a_change_the_tests_do_not_tell_from_the_old_code_is_found() {
 }
 
 #[test]
+fn rounding_too_early_is_told_by_an_amount_that_is_not_round() {
+    let dir = fixture("rounding", "rounding");
+    // Switched while running, every mutant is found out: the tests look thorough.
+    let (code, quick) = json(&dir);
+    assert_eq!(code, 0, "{quick:#}");
+    assert_eq!(quick["findings"], serde_json::json!([]), "{quick:#}");
+
+    let run = tmt(&dir, &["--json", "--quiet", "--rebuild"]);
+    assert_eq!(run.code, 2, "{}{}", run.stdout, run.stderr);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    let findings = report["findings"].as_array().unwrap();
+    assert_eq!(findings.len(), 1, "{report:#}");
+    let finding = &findings[0];
+    assert_eq!(finding["line"], 5, "{finding:#}");
+    assert_eq!(
+        finding["survivors"],
+        serde_json::json!([
+            "`u64::from(cents) / 10_000 * u64::from(bps)` (divide before multiplying)"
+        ]),
+    );
+    // 80 is the least remainder that 125 basis points show: 80 * 125 = 10000.
+    let witness = &finding["witness"];
+    assert_eq!(witness["call"], "fee(10080, 125)", "{finding:#}");
+    assert_eq!(witness["original"], "126", "{finding:#}");
+    assert_eq!(witness["mutant"], "125", "{finding:#}");
+    assert_eq!(witness["assertion"], "assert_eq!(fee(10080, 125), 126);");
+    assert_eq!(
+        witness["guidance"],
+        "Every `cents` the tests pass is a multiple of 10000: for those, dividing before multiplying gives the same."
+    );
+
+    // With the assertion it asks for, nothing is left.
+    let path = dir.join("src/lib.rs");
+    let source = fs::read_to_string(&path).unwrap();
+    fs::write(
+        &path,
+        source.replace(
+            "assert_eq!(fee(20_000, 250), 500);",
+            "assert_eq!(fee(20_000, 250), 500);\n        assert_eq!(fee(10080, 125), 126);",
+        ),
+    )
+    .unwrap();
+    let run = tmt(&dir, &["--json", "--quiet", "--rebuild"]);
+    assert_eq!(run.code, 0, "{}{}", run.stdout, run.stderr);
+}
+
+#[test]
 fn known_findings_can_be_suppressed() {
     let dir = fixture("eligibility", "suppress");
     let baseline = dir.join("tmt-baseline.json");

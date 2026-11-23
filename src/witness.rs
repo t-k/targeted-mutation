@@ -11,6 +11,7 @@ use syn::{Expr, FnArg, Item, ItemFn, Pat, Type};
 use crate::report::VerifiedWitness;
 
 mod relations;
+mod rounding;
 mod sequences;
 mod simple;
 
@@ -260,6 +261,7 @@ pub(crate) fn discover_parsed(
         .collect();
     simple::discover(source, file, &mut candidates, include_existing);
     relations::discover(source, file, &mut candidates);
+    rounding::discover(source, file, &mut candidates);
     sequences::discover(source, file, &mut candidates, include_existing);
     candidates
 }

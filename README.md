@@ -208,6 +208,7 @@ The rules recognize specific Rust patterns at the library crate root and simple 
 - Try a partial multi-bit mask to distinguish any-bit and all-bit checks, and a non-ASCII character to distinguish text character counts and byte lengths.
 - Substitute same-type integer arguments or record fields in comparisons and put the two values on opposite sides of the boundary. For slice sorting by a record field, try two records whose order depends on the choice of key.
 - When a failing batch is only checked for an error, try a read borrowed from a nearby test for a key in the attempted batch.
+- For `a * b / c` on integer arguments with a literal `c`, try dividing first (`a / c * b`), which rounds earlier. Take a call from the tests and change `a` by the smallest remainder that shows the difference; when every `a` in the tests is a multiple of `c`, the report says so. `fixtures/rounding` is an example: all six mutants that are switched while running are found out, and this one passes until an amount that is not round is tested.
 - When a test checks an integer codec by round trip, try changing the byte order on both sides. TMT checks that the selected tests detect each component change alone and pass with both changes. A fixed byte array on the encoding side can distinguish the implementations.
 
 ```sh
@@ -215,6 +216,7 @@ cargo tmt fixtures/shapes --rebuild --lines src/lib.rs:4-9 --lines src/lib.rs:28
 cargo tmt fixtures/operators --rebuild --lines src/lib.rs:72-74
 cargo tmt fixtures/distinguishing --rebuild
 cargo tmt fixtures/batch-store --rebuild --lines src/lib.rs:33
+cargo tmt fixtures/rounding --rebuild
 ```
 
 ### A change undone
