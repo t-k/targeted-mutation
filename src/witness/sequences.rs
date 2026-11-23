@@ -377,6 +377,7 @@ fn round_trip_candidates(
                 encoder.replacement, decoder.replacement
             ),
             existing: false,
+            advice: None,
             scenarios,
         });
     }
@@ -642,6 +643,7 @@ fn batch_candidates(
                 signature_lines: vec![method.sig.span().start().line],
                 description: format!("delete `{code}`"),
                 existing: true,
+                advice: None,
                 scenarios,
             });
         }

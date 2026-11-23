@@ -75,6 +75,9 @@ pub enum Finding {
         /// was put back.
         #[serde(skip_serializing_if = "Option::is_none")]
         change_since: Option<String>,
+        /// What to add, when the kind of mutant says it and nothing was verified.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        advice: Option<String>,
     },
 }
 
@@ -1104,11 +1107,16 @@ fn finding_body(finding: &Finding) -> Vec<String> {
             ));
         }
         Finding::Survivor {
-            survivors, witness, ..
+            survivors,
+            witness,
+            advice,
+            ..
         } => {
             lines.push(format!("passes every test as: {}", survivors.join(", ")));
             if let Some(witness) = witness {
                 lines.extend(witness_lines(witness));
+            } else if let Some(advice) = advice {
+                lines.push(advice.clone());
             } else {
                 lines.push(
                     "built on its own, where nothing can be recorded: either no test runs this code, or one does and does not check what it gives"
@@ -1875,6 +1883,7 @@ mod tests {
                 survivors: vec!["delete".into()],
                 witness: None,
                 change_since: None,
+                advice: None,
             }],
             ..Report::default()
         };
@@ -1977,6 +1986,7 @@ mod tests {
                 survivors: vec![],
                 witness: None,
                 change_since: None,
+                advice: None,
             }],
             ..Report::default()
         };
@@ -2011,6 +2021,7 @@ mod tests {
                 survivors: vec![],
                 witness: None,
                 change_since: None,
+                advice: None,
             })
             .collect(),
             ..Report::default()
@@ -2276,6 +2287,7 @@ mod tests {
             survivors: vec!["the body of `limit` replaced by `0`".into()],
             witness: None,
             change_since: None,
+            advice: None,
         };
         assert_eq!(survivor.kind(), "survivor");
         assert_eq!(survivor.at().line, 2);

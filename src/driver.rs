@@ -5329,6 +5329,7 @@ fn run_package(
                     survivors,
                     witness: None,
                     change_since: None,
+                    advice: None,
                 }),
         );
     }
@@ -5410,6 +5411,7 @@ fn run_package(
                         at,
                         survivors: vec![what],
                         witness: None,
+                        advice: None,
                         change_since: Some(revision.to_string()),
                     });
                 }
@@ -5788,6 +5790,11 @@ fn run_package(
                         report.findings.push(Finding::Survivor {
                             at: survivor.at,
                             survivors: vec![survivor.candidate.description.clone()],
+                            advice: survivor
+                                .candidate
+                                .advice
+                                .clone()
+                                .filter(|_| evidence.is_none()),
                             witness: evidence,
                             change_since: None,
                         });

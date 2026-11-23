@@ -2240,6 +2240,53 @@ fn rounding_too_early_is_told_by_an_amount_that_is_not_round() {
 }
 
 #[test]
+fn a_key_without_one_of_its_parts_passes_tests_that_never_mix_them() {
+    let dir = fixture("keyed", "keyed");
+    // Both languages with both pages, and every mutant switched while running is found
+    // out: the tests look thorough.
+    let (code, quick) = json(&dir);
+    assert_eq!(code, 0, "{quick:#}");
+
+    let run = tmt(&dir, &["--json", "--quiet", "--rebuild"]);
+    assert_eq!(run.code, 2, "{}{}", run.stdout, run.stderr);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    let findings = report["findings"].as_array().unwrap();
+    // Without the page two texts of one store collide, which the tests see; without
+    // the language nothing does, as no store has two languages.
+    assert_eq!(findings.len(), 1, "{report:#}");
+    assert_eq!(
+        findings[0]["survivors"],
+        serde_json::json!([r#"`format!("/{slug}")` (without `language`)"#]),
+    );
+    assert_eq!(findings[0]["line"], 7);
+    let text = tmt(&dir, &["--quiet", "--rebuild"]);
+    assert!(
+        text.stdout.contains(
+            "  passes every test as: `format!(\"/{slug}\")` (without `language`)\n  \
+             no test has two values in one place that differ in `language` alone: add one that puts two such values together and checks that they stay apart\n"
+        ),
+        "{}",
+        text.stdout
+    );
+    assert!(!text.stdout.contains("built on its own"), "{}", text.stdout);
+
+    // One language put, the other asked for: the two lines that tell.
+    let path = dir.join("src/lib.rs");
+    let source = fs::read_to_string(&path).unwrap();
+    fs::write(
+        &path,
+        source.replace(
+            "        assert_eq!(labels.get(\"ja\", \"home\"), Some(\"こんにちは\"));\n",
+            "        assert_eq!(labels.get(\"ja\", \"home\"), Some(\"こんにちは\"));\n        \
+             assert_eq!(labels.get(\"en\", \"home\"), None);\n",
+        ),
+    )
+    .unwrap();
+    let run = tmt(&dir, &["--json", "--quiet", "--rebuild"]);
+    assert_eq!(run.code, 0, "{}{}", run.stdout, run.stderr);
+}
+
+#[test]
 fn known_findings_can_be_suppressed() {
     let dir = fixture("eligibility", "suppress");
     let baseline = dir.join("tmt-baseline.json");

@@ -454,6 +454,7 @@ fn candidate(
         signature_lines: vec![function.sig.span().start().line],
         description,
         existing,
+        advice: None,
         scenarios,
     }
 }

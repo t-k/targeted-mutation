@@ -10,6 +10,7 @@ use syn::{Expr, FnArg, Item, ItemFn, Pat, Type};
 
 use crate::report::VerifiedWitness;
 
+mod keys;
 mod relations;
 mod rounding;
 mod sequences;
@@ -31,6 +32,8 @@ pub(crate) struct Candidate {
     pub signature_lines: Vec<usize>,
     pub description: String,
     pub existing: bool,
+    /// What to do about a survivor that no scenario could show the effect of.
+    pub advice: Option<String>,
     pub scenarios: Vec<Scenario>,
 }
 
@@ -255,6 +258,7 @@ pub(crate) fn discover_parsed(
                 signature_lines: vec![search.signature_line],
                 description: "replace `position` with `rposition`".to_owned(),
                 existing: false,
+                advice: None,
                 scenarios: vec![scenario],
             }
         })
@@ -262,6 +266,7 @@ pub(crate) fn discover_parsed(
     simple::discover(source, file, &mut candidates, include_existing);
     relations::discover(source, file, &mut candidates);
     rounding::discover(source, file, &mut candidates);
+    keys::discover(source, file, &mut candidates);
     sequences::discover(source, file, &mut candidates, include_existing);
     candidates
 }

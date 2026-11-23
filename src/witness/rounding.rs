@@ -294,6 +294,7 @@ pub(super) fn discover(source: &str, file: &syn::File, out: &mut Vec<Candidate>)
                     "`{first} / {divisor} * {second}` (divide before multiplying)"
                 ),
                 existing: false,
+                advice: None,
                 scenarios: scenario.into_iter().collect(),
             });
         }

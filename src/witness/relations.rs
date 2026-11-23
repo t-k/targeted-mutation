@@ -610,6 +610,7 @@ fn push_candidate(
         signature_lines: vec![function.sig.span().start().line],
         description,
         existing: false,
+        advice: None,
         scenarios: vec![scenario],
     });
 }

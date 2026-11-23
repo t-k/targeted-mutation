@@ -209,6 +209,7 @@ The rules recognize specific Rust patterns at the library crate root and simple 
 - Substitute same-type integer arguments or record fields in comparisons and put the two values on opposite sides of the boundary. For slice sorting by a record field, try two records whose order depends on the choice of key.
 - When a failing batch is only checked for an error, try a read borrowed from a nearby test for a key in the attempted batch.
 - For `a * b / c` on integer arguments with a literal `c`, try dividing first (`a / c * b`), which rounds earlier. Take a call from the tests and change `a` by the smallest remainder that shows the difference; when every `a` in the tests is a multiple of `c`, the report says so. `fixtures/rounding` is an example: all six mutants that are switched while running are found out, and this one passes until an amount that is not round is tested.
+- For a function that makes one value of several arguments (a `format!` or a tuple of them, such as the key of a map), try the value without each argument. Tests pass it when they never have two values in one place that differ in that argument alone: `fixtures/keyed` keeps texts by language and page, tests both languages with both pages, and still passes with a key that leaves the language out, because no store in the tests holds two languages. No test is generated for this one yet; the report says what kind to add.
 - When a test checks an integer codec by round trip, try changing the byte order on both sides. TMT checks that the selected tests detect each component change alone and pass with both changes. A fixed byte array on the encoding side can distinguish the implementations.
 
 ```sh
@@ -217,6 +218,7 @@ cargo tmt fixtures/operators --rebuild --lines src/lib.rs:72-74
 cargo tmt fixtures/distinguishing --rebuild
 cargo tmt fixtures/batch-store --rebuild --lines src/lib.rs:33
 cargo tmt fixtures/rounding --rebuild
+cargo tmt fixtures/keyed --rebuild
 ```
 
 ### A change undone
