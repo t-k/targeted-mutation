@@ -1,0 +1,7 @@
+Shape	Position	OldNewline	NewNewline	Hunks	Dashes
+replace	middle	yes	yes	one	plain
+add	last	yes	yes	one	plain
+delete	first	yes	yes	one	plain
+replace	last	no	no	one	plain
+delete	middle	yes	yes	one	leading-dashes
+replace	first	yes	yes	two	plain

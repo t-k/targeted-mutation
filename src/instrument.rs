@@ -1721,6 +1721,89 @@ pub(crate) fn inactive_ranges(
     inactive.found
 }
 
+/// Byte ranges of the code that only a test build has: what is under `cfg(test)` or
+/// marked as a test.
+pub(crate) fn test_only_ranges(source: &str, file: &syn::File) -> Vec<(usize, usize)> {
+    if is_test_only(&file.attrs) {
+        return vec![(0, source.len())];
+    }
+    let mut found = vec![];
+    for item in &file.items {
+        test_only_items(source, item, &mut found);
+    }
+    found
+}
+
+fn test_only_items(source: &str, item: &syn::Item, found: &mut Vec<(usize, usize)>) {
+    let mut note = |attrs: &[syn::Attribute], span: Span| {
+        let test_only = is_test_only(attrs);
+        let range = span.byte_range();
+        if test_only && source.get(range.clone()).is_some() {
+            found.push((range.start, range.end));
+        }
+        test_only
+    };
+    if note(item_attrs(item), item.span()) {
+        return;
+    }
+    match item {
+        syn::Item::Mod(module) => {
+            for inner in module.content.iter().flat_map(|(_, items)| items) {
+                test_only_items(source, inner, found);
+            }
+        }
+        syn::Item::Impl(block) => {
+            for inner in &block.items {
+                if let syn::ImplItem::Fn(function) = inner {
+                    note(&function.attrs, inner.span());
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Whether two sources are the same program text: the same tokens, whatever the
+/// comments, the documentation and the spacing are. `None` when one does not lex.
+pub(crate) fn same_tokens(a: &str, b: &str) -> Option<bool> {
+    fn tokens(stream: TokenStream, out: &mut Vec<String>) {
+        let mut trees = stream.into_iter().peekable();
+        while let Some(tree) = trees.next() {
+            match tree {
+                // `#[doc = ".."]` and `#![doc = ".."]`: what a doc comment is read as.
+                TokenTree::Punct(hash) if hash.as_char() == '#' => {
+                    let bang = matches!(trees.peek(), Some(TokenTree::Punct(p)) if p.as_char() == '!')
+                        .then(|| trees.next());
+                    let is_doc = matches!(trees.peek(), Some(TokenTree::Group(group))
+                        if group.delimiter() == proc_macro2::Delimiter::Bracket
+                            && matches!(group.stream().into_iter().next(),
+                                Some(TokenTree::Ident(name)) if name == "doc"));
+                    if is_doc {
+                        trees.next();
+                        continue;
+                    }
+                    out.push("#".to_string());
+                    if bang.is_some() {
+                        out.push("!".to_string());
+                    }
+                }
+                TokenTree::Group(group) => {
+                    out.push(format!("{:?}(", group.delimiter()));
+                    tokens(group.stream(), out);
+                    out.push(")".to_string());
+                }
+                other => out.push(other.to_string()),
+            }
+        }
+    }
+    let lex = |text: &str| -> Option<Vec<String>> {
+        let mut out = vec![];
+        tokens(text.parse::<TokenStream>().ok()?, &mut out);
+        Some(out)
+    };
+    Some(lex(a)? == lex(b)?)
+}
+
 fn item_attrs(item: &syn::Item) -> &[syn::Attribute] {
     match item {
         syn::Item::Const(item) => &item.attrs,
@@ -2735,6 +2818,70 @@ pub fn blame(sites: &[Site], enabled: &dyn Fn(u32) -> bool, offset: usize) -> Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn code_of_the_tests_is_told_from_the_rest() {
+        let source = r#"
+            pub fn open(n: u32) -> bool { n > 1 }
+            #[test]
+            fn at_the_top() { assert!(open(2)); }
+            #[cfg(test)]
+            mod tests { fn helper() -> u32 { 3 } }
+            mod plain {
+                pub fn inside(n: u32) -> bool { n > 4 }
+                #[cfg(test)]
+                fn only_tested() -> u32 { 5 }
+            }
+            struct S;
+            impl S {
+                fn method(&self) -> u32 { 6 }
+                #[cfg(test)]
+                fn test_method(&self) -> u32 { 7 }
+            }
+            #[cfg(not(test))]
+            fn never_in_tests() -> u32 { 8 }
+        "#;
+        let file = parse_source(source).unwrap();
+        let ranges = test_only_ranges(source, &file);
+        let of_tests = |text: &str| {
+            let at = source.find(text).unwrap_or_else(|| panic!("{text}"));
+            ranges.iter().any(|(from, to)| *from <= at && at < *to)
+        };
+        for text in ["open(2)", "{ 3 }", "{ 5 }", "{ 7 }", "fn at_the_top"] {
+            assert!(of_tests(text), "{text}");
+        }
+        for text in ["n > 1", "n > 4", "{ 6 }", "{ 8 }", "struct S", "mod plain"] {
+            assert!(!of_tests(text), "{text}");
+        }
+        let whole = "#![cfg(test)]\nfn f() {}\n";
+        let file = parse_source(whole).unwrap();
+        assert_eq!(test_only_ranges(whole, &file), [(0, whole.len())]);
+    }
+
+    #[test]
+    fn comments_documentation_and_spacing_are_not_program_text() {
+        let code = "/// Says.\n#[inline]\nfn f(a: u8) -> u8 {\n    a + 1 // one more\n}\n";
+        for same in [
+            "#[inline] fn f(a:u8)->u8{a+1}",
+            "/// Says something else.\n#[inline]\nfn f(a: u8) -> u8 { /* why */ a + 1 }",
+            "#[doc = \"other\"] #[inline] fn f(a: u8) -> u8 { a + 1 }",
+        ] {
+            assert_eq!(same_tokens(code, same), Some(true), "{same}");
+        }
+        for other in [
+            "#[inline] fn f(a: u8) -> u8 { a + 2 }",
+            "fn f(a: u8) -> u8 { a + 1 }",
+            "#[inline] fn f(a: u8) -> u8 { (a + 1) }",
+            "#[inline] fn f(a: u8) -> u8 { a + 1 } fn g() {}",
+            "#![inline] fn f(a: u8) -> u8 { a + 1 }",
+            "#[inline] fn f(a: u8) -> u8 { [a + 1][0] }",
+        ] {
+            assert_eq!(same_tokens(code, other), Some(false), "{other}");
+        }
+        assert_eq!(same_tokens("#![doc = \"a\"] fn f() {}", "fn f() {}"), Some(true));
+        assert_eq!(same_tokens(code, "fn f( {"), None);
+        assert_eq!(same_tokens("fn f( {", code), None);
+    }
 
     #[test]
     fn a_cfg_is_decided_only_as_far_as_the_features_decide_it() {

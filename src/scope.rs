@@ -48,13 +48,8 @@ impl Scope {
         let mut file: Option<String> = None;
         for line in diff.lines() {
             if let Some(path) = line.strip_prefix("+++ ") {
-                // `+++ b/path`, or `+++ /dev/null` for a deleted file. Git quotes a path
-                // with bytes outside printable ASCII, and puts a tab after one with a space.
-                let path = match unquote(path) {
-                    Some(path) => path,
-                    None => path.strip_suffix('\t').unwrap_or(path).to_string(),
-                };
-                file = path.strip_prefix("b/").map(str::to_string);
+                // `+++ b/path`, or `+++ /dev/null` for a deleted file.
+                file = new_path(path);
             } else if line.starts_with("@@ ")
                 && let Some(file) = &file
                 && let Some(added) = line.split(' ').find_map(|part| part.strip_prefix('+'))
@@ -116,6 +111,124 @@ impl Scope {
                 .any(|(from, to)| first <= *to && *from <= last)
         })
     }
+}
+
+/// One hunk of `git diff -U0`: where the new lines are, and the lines that were there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Hunk {
+    /// Path relative to the workspace root, with `/` separators.
+    pub file: String,
+    /// The first new line (1-based); with no new lines, the line the old ones came after.
+    pub start: usize,
+    /// How many new lines there are.
+    pub count: usize,
+    /// The old lines, each with its line end (the last one without, if the old file
+    /// ended without one there).
+    pub old: String,
+}
+
+/// The hunks of the files that are still there. The lines of a hunk are counted as its
+/// header says, so a removed line that starts with `--` is not taken for a file header.
+pub fn hunks(diff: &str) -> Vec<Hunk> {
+    let mut found = Vec::new();
+    let mut file: Option<String> = None;
+    let mut lines = diff.split_inclusive('\n').peekable();
+    while let Some(line) = lines.next() {
+        let line = line.strip_suffix('\n').unwrap_or(line);
+        if let Some(path) = line.strip_prefix("+++ ") {
+            file = new_path(path);
+            continue;
+        }
+        let Some((old_count, start, count)) = hunk_header(line) else {
+            continue;
+        };
+        let mut old = String::new();
+        let (mut old_left, mut new_left) = (old_count, count);
+        while old_left + new_left > 0 {
+            let Some(body) = lines.next() else { break };
+            match body.as_bytes().first() {
+                Some(b'-') if old_left > 0 => {
+                    old.push_str(&body[1..]);
+                    old_left -= 1;
+                }
+                Some(b'+') if new_left > 0 => new_left -= 1,
+                _ => break,
+            }
+            if lines.peek().is_some_and(|next| next.starts_with('\\')) {
+                // `\ No newline at end of file`, about the line just read.
+                lines.next();
+                if body.starts_with('-') {
+                    old.truncate(old.trim_end_matches(['\n', '\r']).len());
+                }
+            }
+        }
+        if let Some(file) = &file {
+            found.push(Hunk {
+                file: file.replace('\\', "/"),
+                start,
+                count,
+                old,
+            });
+        }
+    }
+    found
+}
+
+/// `@@ -a,b +c,d @@`: the count of old lines, the first new line and the count of new ones.
+fn hunk_header(line: &str) -> Option<(usize, usize, usize)> {
+    let mut parts = line.strip_prefix("@@ -")?.split(' ');
+    let pair = |text: &str| -> Option<(usize, usize)> {
+        let (start, count) = text.split_once(',').unwrap_or((text, "1"));
+        Some((start.parse().ok()?, count.parse().ok()?))
+    };
+    let (_, old_count) = pair(parts.next()?)?;
+    let (start, count) = pair(parts.next()?.strip_prefix('+')?)?;
+    Some((old_count, start, count))
+}
+
+/// The path of a `+++ ` line: `None` for `/dev/null`.
+fn new_path(path: &str) -> Option<String> {
+    // Git quotes a path with bytes outside printable ASCII, and puts a tab after one
+    // with a space.
+    let path = match unquote(path) {
+        Some(path) => path,
+        None => path.strip_suffix('\t').unwrap_or(path).to_string(),
+    };
+    path.strip_prefix("b/").map(str::to_string)
+}
+
+/// `text` with the hunks undone: the old lines where the new ones are. The hunks are of
+/// this text and do not overlap. `None` when one of them does not fit the text.
+pub fn undo(text: &str, hunks: &[&Hunk]) -> Option<String> {
+    let starts: Vec<usize> = std::iter::once(0)
+        .chain(text.match_indices('\n').map(|(at, _)| at + 1))
+        .collect();
+    // The offset where line `n` (1-based) starts; past the last line, the end.
+    let start_of = |line: usize| starts.get(line - 1).copied().unwrap_or(text.len());
+    let mut ordered: Vec<&Hunk> = hunks.to_vec();
+    ordered.sort_by_key(|hunk| (hunk.start, hunk.count));
+    let mut out = String::with_capacity(text.len());
+    let mut done = 0;
+    for hunk in ordered {
+        let (from, to) = if hunk.count == 0 {
+            let at = start_of(hunk.start + 1);
+            (at, at)
+        } else {
+            (start_of(hunk.start), start_of(hunk.start + hunk.count))
+        };
+        if from < done || to > text.len() || (hunk.count > 0 && from == to) {
+            return None;
+        }
+        out.push_str(&text[done..from]);
+        // Old lines put after a last line that has no line end need one before them.
+        if from == to && from == text.len() && !text.is_empty() && !text.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str(&hunk.old);
+        done = to;
+    }
+    out.push_str(&text[done..]);
+    Some(out)
 }
 
 /// The path git wrote between double quotes (`"b/src/\344\276\241.rs"`): C escapes, and
@@ -393,6 +506,126 @@ new file mode 100644
         ] {
             assert_eq!(unquote(quoted).as_deref(), path, "{quoted}");
         }
+    }
+
+    /// The old and new text of one row of the table.
+    fn revert_case(row: &[&str]) -> (String, String) {
+        let [shape, position, old_newline, new_newline, hunks, dashes] = row else {
+            panic!("{row:?}")
+        };
+        let line = |name: &str| match *dashes {
+            "plain" => format!("{name}\n"),
+            _ => format!("-- {name}\n"),
+        };
+        let keep = |n: usize| format!("kept {n}\n");
+        let change = |old: &mut String, new: &mut String, tag: &str| match *shape {
+            "replace" => {
+                old.push_str(&line(&format!("old {tag}")));
+                new.push_str(&line(&format!("new {tag}")));
+            }
+            "add" => new.push_str(&line(&format!("new {tag}"))),
+            _ => old.push_str(&line(&format!("old {tag}"))),
+        };
+        let (mut old, mut new) = (String::new(), String::new());
+        let both = |old: &mut String, new: &mut String, text: String| {
+            old.push_str(&text);
+            new.push_str(&text);
+        };
+        let two = *hunks == "two";
+        match *position {
+            "first" => {
+                change(&mut old, &mut new, "a");
+                both(&mut old, &mut new, keep(1) + &keep(2));
+                if two {
+                    change(&mut old, &mut new, "b");
+                    both(&mut old, &mut new, keep(3));
+                }
+            }
+            "middle" => {
+                both(&mut old, &mut new, keep(1));
+                change(&mut old, &mut new, "a");
+                both(&mut old, &mut new, keep(2));
+            }
+            _ => {
+                if two {
+                    both(&mut old, &mut new, keep(0));
+                    change(&mut old, &mut new, "b");
+                }
+                both(&mut old, &mut new, keep(1) + &keep(2));
+                change(&mut old, &mut new, "a");
+            }
+        }
+        for (text, newline) in [(&mut old, old_newline), (&mut new, new_newline)] {
+            if *newline == "no" {
+                text.pop();
+            }
+        }
+        (old, new)
+    }
+
+    #[test]
+    fn undoing_the_hunks_of_a_diff_gives_the_old_text() {
+        let dir = std::env::temp_dir().join(format!("tmt-reverts-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let table = include_str!("../tests/data/reverts.pict.tsv");
+        let mut rows = 0;
+        for row in table.lines().skip(1) {
+            let row: Vec<&str> = row.split('\t').collect();
+            let (old, new) = revert_case(&row);
+            std::fs::write(dir.join("old"), &old).unwrap();
+            std::fs::write(dir.join("new"), &new).unwrap();
+            let output = std::process::Command::new("git")
+                .current_dir(&dir)
+                .args(["diff", "--no-index", "-U0", "--no-color", "--no-ext-diff"])
+                .args(["--src-prefix=a/", "--dst-prefix=b/", "old", "new"])
+                .output()
+                .unwrap();
+            let diff = String::from_utf8(output.stdout).unwrap();
+            let found = hunks(&diff);
+            // A line end that comes or goes at the end is a hunk of its own, or part of
+            // the one that changes the last line.
+            let changes = if row[4] == "two" { 2 } else { 1 };
+            assert!(
+                (changes..=changes + 1).contains(&found.len())
+                    || (found.len() == 1 && row[1] == "last"),
+                "{row:?}\n{diff}\n{found:?}"
+            );
+            assert!(found.iter().all(|hunk| hunk.file == "new"), "{found:?}");
+            let all: Vec<&Hunk> = found.iter().collect();
+            assert_eq!(undo(&new, &all).as_deref(), Some(old.as_str()), "{row:?}\n{diff}");
+            // One hunk alone: the old lines there, the rest as it is now.
+            if let [first, second] = &found[..] {
+                let only_first = undo(&new, &[first]).unwrap();
+                let only_second = undo(&new, &[second]).unwrap();
+                assert_ne!(only_first, old, "{row:?}");
+                assert_ne!(only_first, new, "{row:?}");
+                assert_ne!(only_first, only_second, "{row:?}");
+            }
+            rows += 1;
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(rows, 23);
+    }
+
+    #[test]
+    fn a_hunk_that_does_not_fit_the_text_is_not_applied() {
+        let hunk = |start, count| Hunk {
+            file: "f".into(),
+            start,
+            count,
+            old: "old\n".into(),
+        };
+        assert_eq!(undo("a\nb\n", &[&hunk(2, 1)]).as_deref(), Some("a\nold\n"));
+        assert_eq!(undo("a\nb\n", &[&hunk(0, 0)]).as_deref(), Some("old\na\nb\n"));
+        assert_eq!(undo("a\nb\n", &[&hunk(2, 0)]).as_deref(), Some("a\nb\nold\n"));
+        assert_eq!(undo("a\nb", &[&hunk(2, 0)]).as_deref(), Some("a\nb\nold\n"));
+        // Lines the text does not have, and two hunks of the same lines.
+        assert_eq!(undo("a\nb\n", &[&hunk(3, 1)]), None);
+        assert_eq!(undo("a\nb\n", &[&hunk(1, 2), &hunk(2, 1)]), None);
+        assert_eq!(hunks("@@ nonsense @@\n@@ -1 +x @@\n"), []);
+        // A hunk before any file is of no file; one of a deleted file has no new lines.
+        assert_eq!(hunks("@@ -1 +1 @@\n-a\n+b\n"), []);
+        assert_eq!(hunks("--- a/f\n+++ /dev/null\n@@ -1 +0,0 @@\n-a\n"), []);
     }
 
     #[test]

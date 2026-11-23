@@ -1,0 +1,11 @@
+# One changed file as `git diff -U0` shows it, and the old text got back from the new one.
+# tests/data/reverts.pict.tsv is generated from this model with /o:3 and the seed file.
+Shape:      replace, add, delete
+Position:   first, middle, last
+OldNewline: yes, no
+NewNewline: yes, no
+Hunks:      one, two
+Dashes:     plain, leading-dashes
+
+# A second change needs a place of its own, away from the first.
+IF [Hunks] = "two" THEN [Position] <> "middle";
