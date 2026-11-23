@@ -3047,7 +3047,9 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                 let decide = format!(
                     "#[allow(unused_imports)] use {rt}::{{AnyEnd as _, SliceEnd as _}}; \
                      match (&{rt}::Ends(__TMT_BORROWED__)).tmt_other_end({id}u32, {first}) {{ \
-                     {rt}::End::Other => (__TMT_PLACE__).{other}(), {rt}::End::Same(__tmt_s) => {{ \
+                     {rt}::End::Other => {{ let __tmt_o = (__TMT_PLACE__).{other}(); \
+                     if false {{ {rt}::same_type(&__tmt_o, &(__TMT_PLACE__).{same}()); }} __tmt_o }}, \
+                     {rt}::End::Same(__tmt_s) => {{ \
                      let __tmt_r = (__TMT_PLACE__).{same}(); \
                      __tmt_s.tmt_end_seen({id}u32, &__tmt_r); __tmt_r }} }}"
                 );
@@ -4683,10 +4685,10 @@ mod tests {
             out.contains("match (&crate::__tmt_rt::Ends(&(v))).tmt_other_end("),
             "{out}"
         );
-        assert_eq!(out.matches("(v)").count(), 3, "{out}");
+        assert_eq!(out.matches("(v)").count(), 4, "{out}");
         assert!(out.contains(", false) {"), "{out}");
         assert!(
-            out.contains("End::Other => (v).first(), crate::__tmt_rt::End::Same(__tmt_s) => { let __tmt_r = (v).last(); __tmt_s.tmt_end_seen("),
+            out.contains("End::Other => { let __tmt_o = (v).first(); if false { crate::__tmt_rt::same_type(&__tmt_o, &(v).last()); } __tmt_o }, crate::__tmt_rt::End::Same(__tmt_s) => { let __tmt_r = (v).last(); __tmt_s.tmt_end_seen("),
             "{out}"
         );
         // Anything else is evaluated once, and a line that ends in the call still ends.
@@ -4694,7 +4696,10 @@ mod tests {
         let found = discover(src, 0).unwrap();
         let out = render(src, &found.sites, &|_| true).text;
         assert!(out.contains("(match (&(s.all())) { __tmt_a =>"), "{out}");
-        assert!(out.contains("End::Other => (*__tmt_a).last(),"), "{out}");
+        assert!(
+            out.contains("End::Other => { let __tmt_o = (*__tmt_a).last();"),
+            "{out}"
+        );
         assert!(out.contains("let __tmt_r = (*__tmt_a).first();"), "{out}");
         assert!(out.contains("__tmt_r } } } })\n }"), "{out}");
         assert_eq!(out.matches('\n').count(), 1, "{out}");

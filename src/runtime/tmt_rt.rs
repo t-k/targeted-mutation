@@ -1548,6 +1548,11 @@ tmt_ends! {
     [T: Ord] std::collections::BTreeSet<T>, T, false;
 }
 
+/// Never run: makes the compiler refuse a probe whose two calls return different types.
+/// Left to itself it would turn one into the other where it can (a `&[u8; 2]` into a
+/// `&[u8]`), and the call as it was written would no longer return what it did.
+pub fn same_type<T: ?Sized>(_: &T, _: &T) {}
+
 /// `first` / `last` of anything else: the call as it was written.
 pub trait AnyEnd {
     fn tmt_other_end(&self, site: u32, first: bool) -> End<NoEnd>;

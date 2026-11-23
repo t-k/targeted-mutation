@@ -48,29 +48,40 @@ pub(crate) fn unpinned_calls(source: &str, file: &syn::File) -> Vec<CalledFuncti
     collect_tests(&file.items, "", None, &mut tests);
     let mut found: BTreeMap<&str, (BTreeSet<String>, Vec<Scenario>)> = BTreeMap::new();
     for test in tests.iter().filter(|test| plain(test.function)) {
-        let mut calls = Calls {
-            source,
-            names: &functions,
-            found: vec![],
-        };
         let shadowed = bound_names(&test.function.block);
-        if !test
-            .function
-            .block
-            .stmts
-            .iter()
-            .all(|stmt| calls.only_looks(stmt))
-        {
-            continue;
-        }
-        calls.visit_block(&test.function.block);
-        for (name, call) in calls.found {
-            if shadowed.contains(name) {
+        let body = test.function.block.brace_token.span.open().byte_range().end;
+        for stmt in &test.function.block.stmts {
+            // Only what the test itself does, one statement after the other: not what
+            // is in a loop or a branch, which may run never or often.
+            let looks = match stmt {
+                syn::Stmt::Macro(stmt) => assertion(&stmt.mac),
+                syn::Stmt::Expr(Expr::Macro(expr), _) => assertion(&expr.mac),
+                syn::Stmt::Local(local) => local
+                    .init
+                    .as_ref()
+                    .is_some_and(|init| init.diverge.is_none()),
+                _ => false,
+            };
+            if !looks {
                 continue;
             }
-            let (seen, scenarios) = found.entry(name).or_default();
-            if scenarios.len() < MAX_CALLS && seen.insert(call.clone()) {
-                scenarios.push(scenario(test, call));
+            let Some(setup) = source.get(body..stmt.span().byte_range().start) else {
+                continue;
+            };
+            let mut calls = Calls {
+                source,
+                names: &functions,
+                found: vec![],
+            };
+            calls.visit_stmt(stmt);
+            for (name, call) in calls.found {
+                if shadowed.contains(name) {
+                    continue;
+                }
+                let (seen, scenarios) = found.entry(name).or_default();
+                if scenarios.len() < MAX_CALLS && seen.insert(call.clone()) {
+                    scenarios.push(scenario(test, setup, call));
+                }
             }
         }
     }
@@ -87,9 +98,12 @@ pub(crate) fn unpinned_calls(source: &str, file: &syn::File) -> Vec<CalledFuncti
         .collect()
 }
 
-fn scenario(test: &Test<'_>, call: String) -> Scenario {
+/// `setup`: what the test does before the statement of the call, done again before the
+/// call is made on its own: the call may depend on it.
+fn scenario(test: &Test<'_>, setup: &str, call: String) -> Scenario {
     let name = test.name();
     Scenario {
+        setup: setup.to_owned(),
         guidance: Some(format!(
             "`{name}` already calls `{call}`: compare its result with this value."
         )),
@@ -195,26 +209,6 @@ impl<'a> Calls<'a> {
         (text.chars().count() <= 100 && !text.contains('\n'))
             .then(|| (name.as_str(), text.to_owned()))
     }
-
-    /// Whether a statement of a test only looks at results: an assertion, or a variable
-    /// given a literal, another variable or a call that is itself looked at. A test that
-    /// does anything else may prepare what the call depends on, and the call on its own
-    /// would then not be the call of the test.
-    fn only_looks(&self, stmt: &syn::Stmt) -> bool {
-        match stmt {
-            syn::Stmt::Macro(stmt) => assertion(&stmt.mac),
-            syn::Stmt::Expr(Expr::Macro(expr), _) => assertion(&expr.mac),
-            syn::Stmt::Local(local) => local.init.as_ref().is_some_and(|init| {
-                init.diverge.is_none()
-                    && match init.expr.as_ref() {
-                        Expr::Path(path) => path.qself.is_none(),
-                        Expr::Call(call) => self.call(call).is_some(),
-                        other => literal(other),
-                    }
-            }),
-            _ => false,
-        }
-    }
 }
 
 fn assertion(mac: &syn::Macro) -> bool {
@@ -240,6 +234,8 @@ impl<'ast> Visit<'ast> for Calls<'_> {
 
     /// What a closure calls is called when the closure is, if ever.
     fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
+    /// A block may leave before it gets to a call.
+    fn visit_block(&mut self, _: &'ast syn::Block) {}
 
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
         if !assertion(mac) {
@@ -435,6 +431,73 @@ mod tests {
         assert_eq!(
             found("assert_ne!(other((1)), 2); assert_ne!(other(-1i32 as u32), 2);"),
             ["other((1))"]
+        );
+    }
+
+    fn found_in(test: &str) -> Vec<String> {
+        let source = format!(
+            "{BUCKET}fn size(text: &str) -> usize {{ text.len() }}\n#[test] fn t() {{ {test} }}"
+        );
+        calls(&source)
+            .into_iter()
+            .flat_map(|(_, _, calls)| calls)
+            .collect()
+    }
+
+    #[test]
+    fn the_call_is_taken_to_the_letter_from_where_the_test_makes_it() {
+        assert_eq!(found_in("assert!(size(\"a  b\") > 1);"), ["size(\"a  b\")"]);
+        assert_eq!(found_in("assert!(size(\n\"a\") > 0);"), [] as [&str; 0]);
+        // What is in a loop, a branch, a block or a closure may run never or often.
+        for nested in [
+            "for n in 0..3 { assert_ne!(bucket(3), \"none\"); }",
+            "if true { assert_ne!(bucket(3), \"none\"); }",
+            "assert!({ bucket(3); true });",
+            "assert!((|| bucket(3) != \"none\")());",
+            "helper(bucket(3));",
+        ] {
+            assert_eq!(found_in(nested), [] as [&str; 0], "{nested}");
+        }
+        // A name the test binds itself is not the function of the file.
+        assert_eq!(
+            found_in("let bucket = size; assert_ne!(bucket(\"3\"), 4);"),
+            [] as [&str; 0]
+        );
+        assert_eq!(
+            found_in("fn bucket(n: u32) -> u32 { n } assert_ne!(bucket(3), 4);"),
+            [] as [&str; 0]
+        );
+        assert_eq!(
+            found_in("use super::bucket; assert_ne!(bucket(3), \"none\");"),
+            ["bucket(3)"]
+        );
+    }
+
+    #[test]
+    fn what_the_test_does_before_the_call_is_done_again() {
+        let source = format!(
+            "{BUCKET}#[cfg(test)] mod tests {{\n#[test] fn t() {{ use super::bucket; MODE.set(2);\n\
+             assert!(enable()); let b = bucket(1); assert_ne!(bucket(3), b); }} }}"
+        );
+        let file = syn::parse_file(&source).unwrap();
+        let found = unpinned_calls(&source, &file);
+        let setups: Vec<(&str, &str)> = found[0]
+            .scenarios
+            .iter()
+            .map(|scenario| (scenario.expression.as_str(), scenario.setup.as_str()))
+            .collect();
+        assert_eq!(
+            setups,
+            [
+                (
+                    "bucket(1)",
+                    " use super::bucket; MODE.set(2);\nassert!(enable()); "
+                ),
+                (
+                    "bucket(3)",
+                    " use super::bucket; MODE.set(2);\nassert!(enable()); let b = bucket(1); "
+                ),
+            ]
         );
     }
 

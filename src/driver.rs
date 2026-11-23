@@ -6281,10 +6281,10 @@ fn run_package(
                             })
                         })
                         .flatten();
-                    // One look for a stronger assertion is enough for a finding, and none
-                    // is needed where a rule that knows the code has one to try.
+                    // One look for a stronger assertion is enough for a finding. A rule
+                    // that knows the code has its own try beside it, and goes first.
                     let existing = existing
-                        .filter(|index| claimed.insert(*index) || candidate.finding_at.is_none());
+                        .filter(|index| candidate.finding_at.is_none() || claimed.insert(*index));
                     let scenarios: Vec<_> = candidate
                         .scenarios
                         .iter()
