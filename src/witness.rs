@@ -34,6 +34,8 @@ pub(crate) struct Candidate {
     pub existing: bool,
     /// What to do about a survivor that no scenario could show the effect of.
     pub advice: Option<String>,
+    /// The file the candidate is of, in the working copy: set by who asked.
+    pub file: std::path::PathBuf,
     pub scenarios: Vec<Scenario>,
 }
 
@@ -259,6 +261,7 @@ pub(crate) fn discover_parsed(
                 description: "replace `position` with `rposition`".to_owned(),
                 existing: false,
                 advice: None,
+                file: Default::default(),
                 scenarios: vec![scenario],
             }
         })

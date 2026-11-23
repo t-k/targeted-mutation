@@ -2259,16 +2259,23 @@ fn a_key_without_one_of_its_parts_passes_tests_that_never_mix_them() {
         serde_json::json!([r#"`format!("/{slug}")` (without `language`)"#]),
     );
     assert_eq!(findings[0]["line"], 7);
-    let text = tmt(&dir, &["--quiet", "--rebuild"]);
-    assert!(
-        text.stdout.contains(
-            "  passes every test as: `format!(\"/{slug}\")` (without `language`)\n  \
-             no test has two values in one place that differ in `language` alone: add one that puts two such values together and checks that they stay apart\n"
-        ),
-        "{}",
-        text.stdout
+    // A value one test puts, read with the language of the other: what was run to
+    // see the two keys differ, and the lines to add.
+    let witness = &findings[0]["witness"];
+    assert_eq!(
+        witness["call"], "labels.get(\"en\", \"home\")",
+        "{report:#}"
     );
-    assert!(!text.stdout.contains("built on its own"), "{}", text.stdout);
+    assert_eq!(witness["original"], "None", "{report:#}");
+    assert_eq!(witness["mutant"], "Some(\"こんにちは\")", "{report:#}");
+    assert_eq!(
+        witness["assertion"],
+        "let mut labels = Labels::default(); labels.put(\"ja\", \"home\", \"こんにちは\"); assert_eq!(labels.get(\"en\", \"home\"), None);"
+    );
+    assert_eq!(
+        witness["guidance"],
+        "No test has \"ja\" and \"en\" for `language` in one place."
+    );
 
     // One language put, the other asked for: the two lines that tell.
     let path = dir.join("src/lib.rs");
@@ -2331,6 +2338,56 @@ fn a_boundary_value_no_input_gives_is_not_asked_for() {
     .unwrap();
     let (code, report) = json(&dir);
     assert_eq!(code, 0, "{report:#}");
+}
+
+#[test]
+fn a_distinguishing_test_is_found_in_a_file_that_is_a_module() {
+    // The same code as the fixtures have at the top of the library, one file down:
+    // the test that shows the difference is put into that file, under its module.
+    for (fixture_name, line, call, assertion) in [
+        (
+            "batch-store",
+            33,
+            "store.get(\"a\")",
+            "assert_eq!(store.get(\"a\"), None);",
+        ),
+        (
+            "rounding",
+            5,
+            "fee(10080, 125)",
+            "assert_eq!(fee(10080, 125), 126);",
+        ),
+    ] {
+        let dir = fixture(fixture_name, &format!("{fixture_name}-module"));
+        fs::rename(dir.join("src/lib.rs"), dir.join("src/inner.rs")).unwrap();
+        fs::write(dir.join("src/lib.rs"), "pub mod inner;\n").unwrap();
+        let lines = format!("src/inner.rs:{line}");
+        let run = tmt(&dir, &["--json", "--quiet", "--rebuild", "--lines", &lines]);
+        assert_eq!(run.code, 2, "{fixture_name}: {}{}", run.stdout, run.stderr);
+        let report: Value = serde_json::from_str(&run.stdout).unwrap();
+        let witnesses: Vec<&Value> = report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|f| !f["witness"].is_null())
+            .collect();
+        assert_eq!(witnesses.len(), 1, "{fixture_name}: {report:#}");
+        let finding = witnesses[0];
+        assert_eq!(finding["file"], "src/inner.rs", "{finding:#}");
+        assert_eq!(finding["line"], line, "{finding:#}");
+        assert_eq!(finding["witness"]["call"], call, "{finding:#}");
+        assert!(
+            finding["witness"]["assertion"]
+                .as_str()
+                .unwrap()
+                .ends_with(assertion),
+            "{finding:#}"
+        );
+        // The working copy is left as it was: the same again.
+        let again = tmt(&dir, &["--json", "--quiet", "--rebuild", "--lines", &lines]);
+        let again: Value = serde_json::from_str(&again.stdout).unwrap();
+        assert_eq!(again["findings"], report["findings"], "{fixture_name}");
+    }
 }
 
 #[test]

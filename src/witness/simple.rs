@@ -455,6 +455,7 @@ fn candidate(
         description,
         existing,
         advice: None,
+        file: Default::default(),
         scenarios,
     }
 }

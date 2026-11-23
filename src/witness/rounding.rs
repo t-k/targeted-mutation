@@ -295,6 +295,7 @@ pub(super) fn discover(source: &str, file: &syn::File, out: &mut Vec<Candidate>)
                 ),
                 existing: false,
                 advice: None,
+                file: Default::default(),
                 scenarios: scenario.into_iter().collect(),
             });
         }

@@ -611,6 +611,7 @@ fn push_candidate(
         description,
         existing: false,
         advice: None,
+        file: Default::default(),
         scenarios: vec![scenario],
     });
 }

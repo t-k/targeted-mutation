@@ -2292,9 +2292,30 @@ fn observe_witness(
     scenario: &witness::Scenario,
     name: &str,
     compares: bool,
+    in_root: bool,
 ) -> Result<Option<witness::Observation>> {
     use std::io::Read as _;
     let test_name = scenario.test_name(name);
+    // In a file that is a module the test is under the module's name, which the
+    // binary knows: the one test that ends with the name is it.
+    let test_name = if in_root {
+        test_name
+    } else {
+        let inner = format!("::{test_name}");
+        let listed = list_tests(
+            &exe,
+            &baseline.cwd,
+            &baseline.git_ceiling,
+            false,
+            false,
+            baseline.work_lock.as_deref(),
+        )?;
+        let mut named = listed.into_iter().filter(|test| test.ends_with(&inner));
+        match (named.next(), named.next()) {
+            (Some(only), None) => only,
+            _ => return Ok(None),
+        }
+    };
     let test = TestBinary {
         name: test_name.clone(),
         cwd: baseline.cwd.clone(),
@@ -2404,6 +2425,7 @@ fn shared_witnesses(
     source: &str,
     survivors: &[WitnessSurvivor<'_>],
     wrapper: Option<&Path>,
+    in_root: bool,
     compile: impl Fn(&[witness::Edit]) -> Result<Option<PathBuf>>,
     note: impl Fn(&str),
 ) -> Result<Vec<Option<SharedWitness>>> {
@@ -2443,9 +2465,10 @@ fn shared_witnesses(
         let observed: Vec<_> = batch
             .iter()
             .filter_map(|(index, scenario, runner, name)| {
-                let value = observe_witness(runner, exe.clone(), wrapper, scenario, name, false)
-                    .ok()??
-                    .value;
+                let value =
+                    observe_witness(runner, exe.clone(), wrapper, scenario, name, false, in_root)
+                        .ok()??
+                        .value;
                 witness::is_expected_literal(&value)
                     .then_some((*index, *scenario, *runner, name, value))
             })
@@ -2462,7 +2485,8 @@ fn shared_witnesses(
             continue;
         };
         for (index, scenario, runner, name, value) in observed {
-            let checked = observe_witness(runner, exe.clone(), wrapper, scenario, name, true);
+            let checked =
+                observe_witness(runner, exe.clone(), wrapper, scenario, name, true, in_root);
             if checked.is_ok_and(|value_read| {
                 value_read
                     .is_some_and(|read| read.equals_expected == Some(true) && read.value == value)
@@ -3939,9 +3963,20 @@ fn run_package(
             Ok(parsed) => {
                 let mut found =
                     instrument::discover_parsed(&original, &parsed, next_id, &error_values);
-                if want_witnesses && selected_file && path == root_file {
-                    witness_candidates =
-                        witness::discover_parsed(&original, &parsed, !options.list);
+                // A test can be put into a file that the library alone builds.
+                if want_witnesses
+                    && selected_file
+                    && owners.consumers.len() == 1
+                    && owners.consumers.contains(&root_file)
+                {
+                    witness_candidates.extend(
+                        witness::discover_parsed(&original, &parsed, !options.list)
+                            .into_iter()
+                            .map(|mut candidate| {
+                                candidate.file = path.clone();
+                                candidate
+                            }),
+                    );
                 }
                 next_id += found.sites.len() as u32;
                 if owners.consumers.len() != 1 || !owners.consumers.contains(&root_file) {
@@ -4008,48 +4043,49 @@ fn run_package(
             file.sites.retain(in_scope);
             file.rebuild_sites.retain(in_scope);
         }
-        files.retain(|f| !f.sites.is_empty() || !f.rebuild_sites.is_empty() || f.path == root_file);
+        files.retain(|f| {
+            !f.sites.is_empty()
+                || !f.rebuild_sites.is_empty()
+                || f.path == root_file
+                || witness_candidates.iter().any(|c| c.file == f.path)
+        });
     }
-    if !witness_candidates.is_empty()
-        && let Some(file) = files.iter_mut().find(|file| file.path == root_file)
-    {
+    if !options.list {
+        for candidate in witness_candidates.iter().filter(|c| !c.existing) {
+            if let Some(file) = files.iter_mut().find(|file| file.path == candidate.file) {
+                let at = witness_location(file, candidate);
+                file.places.push((at.line, at.column, at.code));
+            }
+        }
+    }
+    witness_candidates.retain(|candidate| {
+        let Some(file) = files.iter().find(|file| file.path == candidate.file) else {
+            return false;
+        };
         let relative = file
             .path
             .strip_prefix(&copy)
             .unwrap_or(&file.path)
             .to_string_lossy();
-        if !options.list {
-            let locations: Vec<_> = witness_candidates
-                .iter()
-                .filter(|candidate| !candidate.existing)
-                .map(|candidate| {
-                    let at = witness_location(file, candidate);
-                    (at.line, at.column, at.code)
+        scope.as_ref().is_none_or(|scope| {
+            let site_in_scope = if candidate.edits.len() == 1 {
+                scope.touches(&relative, *candidate.scope.start(), *candidate.scope.end())
+            } else {
+                candidate.edits.iter().any(|edit| {
+                    scope.touches(
+                        &relative,
+                        file.lines.line_of(edit.span.start),
+                        file.lines.line_of(edit.span.end),
+                    )
                 })
-                .collect();
-            file.places.extend(locations);
-        }
-        witness_candidates.retain(|candidate| {
-            scope.as_ref().is_none_or(|scope| {
-                let site_in_scope = if candidate.edits.len() == 1 {
-                    scope.touches(&relative, *candidate.scope.start(), *candidate.scope.end())
-                } else {
-                    candidate.edits.iter().any(|edit| {
-                        scope.touches(
-                            &relative,
-                            file.lines.line_of(edit.span.start),
-                            file.lines.line_of(edit.span.end),
-                        )
-                    })
-                };
-                site_in_scope
-                    || candidate
-                        .signature_lines
-                        .iter()
-                        .any(|&line| scope.touches(&relative, line, line))
-            })
-        });
-    }
+            };
+            site_in_scope
+                || candidate
+                    .signature_lines
+                    .iter()
+                    .any(|&line| scope.touches(&relative, line, line))
+        })
+    });
     let total_sites: usize = files
         .iter()
         .map(|f| f.sites.len() + f.rebuild_sites.len())
@@ -4197,12 +4233,13 @@ fn run_package(
                 }
             }
         }
-        if let Some(root) = files.iter().find(|file| file.path == root_file) {
-            candidates.extend(
-                witness_candidates
-                    .iter()
-                    .filter(|candidate| !candidate.existing)
-                    .map(|candidate| report::Candidate {
+        candidates.extend(
+            witness_candidates
+                .iter()
+                .filter(|candidate| !candidate.existing)
+                .filter_map(|candidate| {
+                    let file = files.iter().find(|file| file.path == candidate.file)?;
+                    Some(report::Candidate {
                         what: "witness".into(),
                         into: candidate.description.clone(),
                         requires_rebuild: true,
@@ -4211,16 +4248,16 @@ fn run_package(
                             .iter()
                             .map(|edit| {
                                 candidate_edit(
-                                    root,
+                                    file,
                                     edit.span.start,
                                     edit.span.end,
                                     edit.replacement.clone(),
                                 )
                             })
                             .collect(),
-                    }),
-            );
-        }
+                    })
+                }),
+        );
         report.mutants = Some(candidates);
         return Ok(report);
     }
@@ -5496,13 +5533,30 @@ fn run_package(
         }
     }
 
-    if !witness_candidates.is_empty() {
+    // File by file: the test that shows a difference is put at the end of the file the
+    // candidate is of, where the names of the file are in scope.
+    let mut witness_files: Vec<&PathBuf> = vec![];
+    for candidate in &witness_candidates {
+        if !witness_files.contains(&&candidate.file) {
+            witness_files.push(&candidate.file);
+        }
+    }
+    for witness_file in witness_files {
+        let in_root = *witness_file == root_file;
+        let witness_candidates: Vec<&witness::Candidate> = witness_candidates
+            .iter()
+            .filter(|candidate| candidate.file == *witness_file)
+            .collect();
         let file = files
             .iter()
-            .find(|file| file.path == root_file)
-            .expect("witness candidates in the root file");
+            .find(|file| file.path == *witness_file)
+            .expect("witness candidates are of files that are analysed");
         let rendered = file.rendered.as_ref().expect("rendered before building");
-        let restore = format!("{}{root_suffix}", rendered.text);
+        let restore = if in_root {
+            format!("{}{root_suffix}", rendered.text)
+        } else {
+            rendered.text.clone()
+        };
         let library_runners: Vec<_> = session
             .binaries
             .iter()
@@ -5533,8 +5587,19 @@ fn run_package(
                     .source_test
                     .as_ref()
                     .is_none_or(|required| match &bin.runner {
+                        // In a file that is a module, the test's name comes after the
+                        // module's.
+                        Runner::Exe(_) if !in_root => {
+                            let inner = format!("::{required}");
+                            bin.tests
+                                .iter()
+                                .any(|test| test.ends_with(&inner) && !ignored.contains(test))
+                        }
                         Runner::Exe(_) => {
                             bin.tests.contains(required) && !ignored.contains(required)
+                        }
+                        Runner::Isolated { test, .. } if !in_root => {
+                            test.ends_with(&format!("::{required}"))
                         }
                         Runner::Isolated { test, .. } => test == required,
                         Runner::Doc { .. } | Runner::Nextest { .. } => false,
@@ -5545,7 +5610,8 @@ fn run_package(
             let Some(source) = witness::render_edits(&file.original, edits, None) else {
                 return Ok(false);
             };
-            state.write(&root_file, &format!("{source}{root_mutant_suffix}"))?;
+            let suffix = if in_root { root_mutant_suffix } else { "" };
+            state.write(&file.path, &format!("{source}{suffix}"))?;
             Ok(true)
         };
         let suite = |edits: &[witness::Edit]| -> Result<Option<Outcome>> {
@@ -5585,6 +5651,7 @@ fn run_package(
                 scenario,
                 witness::TEST_NAME,
                 expected.is_some(),
+                in_root,
             )
         };
         let witness_checkpoint = if checkpoint.is_some() {
@@ -5599,7 +5666,12 @@ fn run_package(
                     serde_json::to_string(&(&candidate.description, edits))
                 })
                 .collect::<std::result::Result<Vec<_>, _>>()?;
-            phase("witness", keys)?
+            let name = if in_root {
+                "witness".to_string()
+            } else {
+                format!("witness:{}", file.display)
+            };
+            phase(&name, keys)?
         } else {
             None
         };
@@ -5609,7 +5681,7 @@ fn run_package(
             "source witness mutants",
             witness_candidates.len(),
             |progress| -> Result<()> {
-                for (index, candidate) in witness_candidates.iter().enumerate() {
+                for (index, candidate) in witness_candidates.iter().copied().enumerate() {
                     let cached = witness_checkpoint
                         .as_ref()
                         .map(|phase| phase.get::<WitnessTrial>(index))
@@ -5664,7 +5736,7 @@ fn run_package(
                             Ok(suite(&candidate.edits)?
                                 .map_or(WitnessTrial::Unviable, WitnessTrial::Evaluated))
                         })();
-                        state.write(&root_file, &restore)?;
+                        state.write(&file.path, &restore)?;
                         let trial = attempted?;
                         if let Some(phase) = &witness_checkpoint {
                             phase.record(index, &trial)?;
@@ -5709,11 +5781,12 @@ fn run_package(
             &file.original,
             &survivors,
             wrapper.as_deref(),
+            in_root,
             compile_observer,
             note,
         );
         if !survivors.is_empty() {
-            state.write(&root_file, &restore)?;
+            state.write(&file.path, &restore)?;
         }
         let originals = originals?;
 
@@ -5745,6 +5818,7 @@ fn run_package(
                                         scenario,
                                         &shared.name,
                                         true,
+                                        in_root,
                                     )
                                     .ok()
                                     .flatten()
@@ -5799,7 +5873,7 @@ fn run_package(
                             )),
                         }
                     }
-                    state.write(&root_file, &restore)?;
+                    state.write(&file.path, &restore)?;
                     progress.complete(Outcome::Pass.into());
                     if let Some(index) = survivor.existing {
                         if let Some(evidence) = evidence {

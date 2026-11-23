@@ -378,6 +378,7 @@ fn round_trip_candidates(
             ),
             existing: false,
             advice: None,
+            file: Default::default(),
             scenarios,
         });
     }
@@ -644,6 +645,7 @@ fn batch_candidates(
                 description: format!("delete `{code}`"),
                 existing: true,
                 advice: None,
+                file: Default::default(),
                 scenarios,
             });
         }
