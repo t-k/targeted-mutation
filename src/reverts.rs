@@ -88,12 +88,69 @@ pub(crate) fn same_build(
         out
     };
     let (built_now, built_then) = (built(now, off_now), built(then, off_then));
-    // Code that asks where it is can tell any other text from this one: a line more
-    // above it, a column more before it on its line.
-    if now != then && (asks_where_it_is(&built_now) || asks_where_it_is(&built_then)) {
+    if instrument::same_tokens(&built_now, &built_then) != Some(true) {
         return false;
     }
-    instrument::same_tokens(&built_now, &built_then) == Some(true)
+    // Code that asks where it is can tell a line more above it, or a column more
+    // before it on its line: then every token that is kept has to be where it was.
+    if asks_where_it_is(&built_now) || asks_where_it_is(&built_then) {
+        return matches!(
+            (places(now, off_now), places(then, off_then)),
+            (Some(a), Some(b)) if a == b
+        );
+    }
+    true
+}
+
+/// The line and column of every token of a text that is not in the ranges left out,
+/// documentation aside. `None` when the text does not lex.
+fn places(text: &str, off: &[(usize, usize)]) -> Option<Vec<(usize, usize)>> {
+    fn note(span: proc_macro2::Span, off: &[(usize, usize)], out: &mut Vec<(usize, usize)>) {
+        let range = span.byte_range();
+        if !off
+            .iter()
+            .any(|(from, to)| *from <= range.start && range.end <= *to)
+        {
+            out.push((span.start().line, span.start().column));
+        }
+    }
+    fn walk(
+        stream: proc_macro2::TokenStream,
+        off: &[(usize, usize)],
+        out: &mut Vec<(usize, usize)>,
+    ) {
+        let mut trees = stream.into_iter().peekable();
+        while let Some(tree) = trees.next() {
+            match tree {
+                proc_macro2::TokenTree::Punct(hash) if hash.as_char() == '#' => {
+                    // A doc comment is one token here, and no place of the program.
+                    if let Some(proc_macro2::TokenTree::Group(group)) = trees.peek()
+                        && group
+                            .span()
+                            .source_text()
+                            .is_some_and(|written| written.starts_with('/'))
+                    {
+                        trees.next();
+                        continue;
+                    }
+                    note(hash.span(), off, out);
+                }
+                proc_macro2::TokenTree::Group(group) => {
+                    note(group.span_open(), off, out);
+                    walk(group.stream(), off, out);
+                    note(group.span_close(), off, out);
+                }
+                other => note(other.span(), off, out),
+            }
+        }
+    }
+    let mut out = vec![];
+    walk(
+        text.parse::<proc_macro2::TokenStream>().ok()?,
+        off,
+        &mut out,
+    );
+    Some(out)
 }
 
 /// Whether code uses its own place in the file: `line!`, `column!`, the location of a
@@ -700,9 +757,13 @@ pub fn basic() -> u32 {
             &longer.replace("line!()", "4"),
             &["basic"]
         ));
-        // Not even with as many lines as before: a column may be asked for too.
+        // With every token that is kept where it was, nothing can be told: a number of
+        // the same length in code that is left out. One digit more moves nothing either
+        // when nothing that is kept comes after it on its line.
         let same = longer.replace("let _ = 2;", "let _ = 3;");
-        assert!(!outside(&longer, &same, &["basic"]));
+        assert!(outside(&longer, &same, &["basic"]));
+        let wider = longer.replace("let _ = 2;", "let _ = 200;");
+        assert!(outside(&longer, &wider, &["basic"]));
         assert!(outside(
             &longer.replace("line!()", "4"),
             &same.replace("line!()", "4"),
@@ -748,6 +809,13 @@ pub fn basic() -> u32 {
                 "{asking}"
             );
         }
+        // A caller's location is asked for somewhere: a change of code that is left
+        // out after it, or of the same length, moves no token that is kept.
+        let tracked = "#[track_caller]\npub fn checked() {}\n#[cfg(feature = \"extra\")]\nfn off() -> u8 { 41 }\npub fn after() {}\n";
+        let edited = tracked.replace("41", "42");
+        assert!(same_build(&edited, &off(&edited), tracked, &off(tracked)));
+        let longer = tracked.replace("fn off() -> u8 { 41 }", "fn off() -> u8 {\n    41\n}");
+        assert!(!same_build(&longer, &off(&longer), tracked, &off(tracked)));
         // On one line, what is left out before it moves the column.
         let base =
             "#[cfg(feature = \"extra\")] const OFF: u32 = 1; pub const N: u32 = column!();\n";

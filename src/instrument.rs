@@ -1823,11 +1823,18 @@ pub(crate) fn same_tokens(a: &str, b: &str) -> Option<bool> {
                     let bang =
                         matches!(trees.peek(), Some(TokenTree::Punct(p)) if p.as_char() == '!')
                             .then(|| trees.next());
-                    let is_doc = plain
-                        && matches!(trees.peek(), Some(TokenTree::Group(group))
+                    // Given to a macro, an attribute written out is a token it may
+                    // match on; a doc comment there is still prose (the documentation
+                    // of what a macro makes).
+                    let is_doc = matches!(trees.peek(), Some(TokenTree::Group(group))
                         if group.delimiter() == proc_macro2::Delimiter::Bracket
                             && matches!(group.stream().into_iter().next(),
-                                Some(TokenTree::Ident(name)) if name == "doc"));
+                                Some(TokenTree::Ident(name)) if name == "doc")
+                            && (plain
+                                || group
+                                    .span()
+                                    .source_text()
+                                    .is_some_and(|written| written.starts_with('/'))));
                     if is_doc {
                         trees.next();
                         continue;
@@ -3001,7 +3008,6 @@ mod tests {
                 r#"const T: &str = stringify!(#[doc = "old"]);"#,
                 r#"const T: &str = stringify!(#[doc = "new"]);"#,
             ),
-            ("m! { /// old\n fn f() {} }", "m! { /// new\n fn f() {} }"),
             (
                 "macro_rules! m { (#[doc = \"old\"]) => {1}; }",
                 "macro_rules! m { (#[doc = \"new\"]) => {1}; }",
@@ -3013,6 +3019,20 @@ mod tests {
         ] {
             assert_eq!(same_tokens(one, other), Some(false), "{one}");
             assert_eq!(same_tokens(one, one), Some(true), "{one}");
+        }
+        // A doc comment there is still prose: the documentation of what the macro makes.
+        for (one, other) in [
+            ("m! { /// old\n fn f() {} }", "m! { /// new\n fn f() {} }"),
+            (
+                "bitflags! { /** old */ struct F: u8 { /// a\n const A = 1; } }",
+                "bitflags! { /** new */ struct F: u8 { /// b\n const A = 1; } }",
+            ),
+            (
+                "macro_rules! m { () => { /// old\n fn f() {} }; }",
+                "macro_rules! m { () => { /// new\n fn f() {} }; }",
+            ),
+        ] {
+            assert_eq!(same_tokens(one, other), Some(true), "{one}");
         }
         // A `!` that is no call, and code after a macro, are plain again.
         assert_eq!(

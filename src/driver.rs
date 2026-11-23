@@ -654,10 +654,11 @@ fn configuration_names_a_feature(dir: &Path, cargo_home: Option<PathBuf>) -> boo
 /// Whether the compiler may be told of features that cargo does not report
 /// (`RUSTFLAGS='--cfg feature="x"'`).
 fn features_from_flags(flags: impl IntoIterator<Item = Option<std::ffi::OsString>>) -> bool {
-    flags
-        .into_iter()
-        .flatten()
-        .any(|value| value.to_string_lossy().contains("feature"))
+    flags.into_iter().flatten().any(|value| {
+        // `--cfg feature="x"`, not `-C target-feature=+x`.
+        let value = value.to_string_lossy();
+        value.contains("cfg") && value.replace("target-feature", "").contains("feature")
+    })
 }
 
 impl BuiltSources {
@@ -5943,21 +5944,34 @@ fn run_package(
                     .iter()
                     .map(|(file, changes)| reverts::all_undone(&file.original, changes))
                     .collect();
+                let same = |file: &SourceFile, a: &str, b: &str| match (
+                    built_sources.left_out_of(file, a),
+                    built_sources.left_out_of(file, b),
+                ) {
+                    (Some(off_a), Some(off_b)) => reverts::same_build(a, &off_a, b, &off_b),
+                    _ => false,
+                };
                 // Never the program that is there: in some file it has to be another.
                 let another = whole.as_ref().is_none_or(|texts| {
-                    changed.iter().zip(texts).any(|((file, _), text)| {
-                        match (
-                            built_sources.left_out_of(file, text),
-                            built_sources.left_out_of(file, &file.original),
-                        ) {
-                            (Some(then), Some(now)) => {
-                                !reverts::same_build(&file.original, &now, text, &then)
-                            }
-                            _ => true,
-                        }
+                    changed
+                        .iter()
+                        .zip(texts)
+                        .any(|((file, _), text)| !same(file, text, &file.original))
+                });
+                // And what is left out has to count: another program with it undone
+                // too than with the other changes alone.
+                let left_out_matter = whole.as_ref().is_none_or(|texts| {
+                    changed.iter().zip(texts).any(|((file, changes), text)| {
+                        let tried: Vec<reverts::Change> = changes
+                            .iter()
+                            .filter(|change| !change.outside)
+                            .cloned()
+                            .collect();
+                        reverts::all_undone(&file.original, &tried)
+                            .is_none_or(|without| !same(file, text, &without))
                     })
                 });
-                if stuck_files > 0 || another {
+                if another && (stuck_files > 0 || (with_left_out && left_out_matter)) {
                     let outcome = match &whole {
                         Some(texts) => {
                             let edits: Vec<(&SourceFile, &str)> = changed
@@ -6684,6 +6698,15 @@ mod tests {
             flag("-C opt-level=1\u{1f}--cfg\u{1f}feature=\"x\"")
         ]));
         assert!(!features_from_flags([flag("-C debuginfo=0"), None]));
+        assert!(!features_from_flags([flag(
+            "-C target-feature=+crt-static"
+        )]));
+        assert!(!features_from_flags([flag(
+            "--cfg tokio_unstable -C target-feature=+avx2"
+        )]));
+        assert!(features_from_flags([flag(
+            "-C target-feature=+avx2 --cfg feature=\"x\""
+        )]));
         assert!(!features_from_flags([None, None, None]));
     }
     use crate::trace::UNKNOWN_TEST;
