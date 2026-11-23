@@ -1744,6 +1744,29 @@ pub(crate) fn inactive_ranges(
         visit_expr_loop, visit::visit_expr_loop, syn::ExprLoop;
         visit_expr_unsafe, visit::visit_expr_unsafe, syn::ExprUnsafe;
         visit_expr_binary, visit::visit_expr_binary, syn::ExprBinary;
+        visit_expr_lit, visit::visit_expr_lit, syn::ExprLit;
+        visit_expr_path, visit::visit_expr_path, syn::ExprPath;
+        visit_expr_array, visit::visit_expr_array, syn::ExprArray;
+        visit_expr_tuple, visit::visit_expr_tuple, syn::ExprTuple;
+        visit_expr_reference, visit::visit_expr_reference, syn::ExprReference;
+        visit_expr_unary, visit::visit_expr_unary, syn::ExprUnary;
+        visit_expr_field, visit::visit_expr_field, syn::ExprField;
+        visit_expr_index, visit::visit_expr_index, syn::ExprIndex;
+        visit_expr_cast, visit::visit_expr_cast, syn::ExprCast;
+        visit_expr_closure, visit::visit_expr_closure, syn::ExprClosure;
+        visit_expr_struct, visit::visit_expr_struct, syn::ExprStruct;
+        visit_expr_repeat, visit::visit_expr_repeat, syn::ExprRepeat;
+        visit_expr_range, visit::visit_expr_range, syn::ExprRange;
+        visit_expr_paren, visit::visit_expr_paren, syn::ExprParen;
+        visit_expr_try, visit::visit_expr_try, syn::ExprTry;
+        visit_expr_await, visit::visit_expr_await, syn::ExprAwait;
+        visit_expr_break, visit::visit_expr_break, syn::ExprBreak;
+        visit_expr_continue, visit::visit_expr_continue, syn::ExprContinue;
+        visit_expr_let, visit::visit_expr_let, syn::ExprLet;
+        visit_expr_async, visit::visit_expr_async, syn::ExprAsync;
+        visit_expr_const, visit::visit_expr_const, syn::ExprConst;
+        visit_expr_yield, visit::visit_expr_yield, syn::ExprYield;
+        visit_expr_try_block, visit::visit_expr_try_block, syn::ExprTryBlock;
     }
     if cfg_is_off(&file.attrs, features) {
         return vec![(0, source.len())];
@@ -1936,9 +1959,14 @@ fn same_tokens_of(a: &str, b: &str, holes: bool) -> Option<bool> {
                     // The name of a macro that is being defined.
                     called = was_called;
                     let name = name.to_string();
-                    // Not a keyword, and not the name of a lifetime or a label
-                    // (`&'a (u8,)`, `break 'outer (1,)`).
-                    callable = !was_ticked && !KEYWORDS.contains(&name.as_str());
+                    // Not a keyword, not the name of a lifetime or a label
+                    // (`&'a (u8,)`, `break 'outer (1,)`), and not what stands for
+                    // code that is left out (a statement before a tuple). After `fn`
+                    // come parameters: the type of a function.
+                    callable = name == "fn"
+                        || (!was_ticked
+                            && !KEYWORDS.contains(&name.as_str())
+                            && !(holes && name == LEFT_OUT));
                     out.push(name);
                 }
                 other => out.push(other.to_string()),
@@ -3165,6 +3193,7 @@ mod tests {
                 "fn f(a: u8,) { g(a); s.h(a) }",
             ),
             ("const A: [u8; 2] = [1, 2];", "const A: [u8; 2] = [1, 2,];"),
+            ("type Hook = fn(u8);", "type Hook = fn(u8,);"),
             (
                 "fn f(n: u8) -> u8 { match n { 1 => 2, _ => 0 } }",
                 "fn f(n: u8) -> u8 { match n { 1 => 2, _ => 0, } }",
@@ -3218,6 +3247,15 @@ mod tests {
             Some(false)
         );
         let same_tokens = same_built_tokens;
+        // What stands for code that is left out is not the name of a call: a tuple
+        // of one after it keeps its comma.
+        assert_eq!(
+            same_tokens(
+                &format!("fn f() -> impl Sized {{ {LEFT_OUT} (1u8,) }}"),
+                &format!("fn f() -> impl Sized {{ {LEFT_OUT} (1u8) }}")
+            ),
+            Some(false)
+        );
         // What a build leaves out goes with a comma of its own, wherever it stands.
         let hole = LEFT_OUT;
         for with in [
@@ -3354,6 +3392,24 @@ mod tests {
         ] {
             assert!(left_out(off), "{off}");
         }
+        // An element of an array, an argument, a value in brackets: any expression.
+        let listed = r#"
+            pub const FORMATS: &[&str] = &["json", #[cfg(feature = "extra")] "yaml", #[cfg(feature = "basic")] "toml"];
+            fn f() -> u8 { g(1, #[cfg(feature = "extra")] 2) }
+        "#;
+        let listed_file = parse_source(listed).unwrap();
+        let listed_ranges = inactive_ranges(listed, &listed_file, &on);
+        let texts: Vec<&str> = listed_ranges
+            .iter()
+            .map(|(from, to)| &listed[*from..*to])
+            .collect();
+        assert_eq!(
+            texts,
+            [
+                "#[cfg(feature = \"extra\")] \"yaml\"",
+                "#[cfg(feature = \"extra\")] 2"
+            ]
+        );
         // A variant of an enum and a field of a struct, which a feature may add.
         let shapes = r#"
             pub enum Format { Json, #[cfg(feature = "extra")] Yaml, #[cfg(feature = "basic")] Toml }

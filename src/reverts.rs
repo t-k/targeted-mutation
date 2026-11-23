@@ -1017,6 +1017,16 @@ pub fn basic() -> u32 {
             gated,
             &settled(gated)
         ));
+        // An entry of an array that is left out, and a tuple of one after a statement
+        // that is: the first is the same build, the second another program.
+        let plain = "pub const FORMATS: &[&str] = &[\"json\"];\n";
+        let more =
+            "pub const FORMATS: &[&str] = &[\"json\", #[cfg(feature = \"extra\")] \"yaml\"];\n";
+        assert!(same_build(more, &off(more), plain, &off(plain)));
+        let one =
+            "fn f() -> impl Sized {\n    #[cfg(feature = \"extra\")]\n    trace();\n    (1u8)\n}\n";
+        let tuple = one.replace("(1u8)", "(1u8,)");
+        assert!(!same_build(&tuple, &off(&tuple), one, &off(one)));
         // A call that is left out goes with its semicolon.
         let plain = "fn f() {\n    a();\n    b();\n}\n";
         let extra = "fn f() {\n    a();\n    #[cfg(feature = \"extra\")]\n    enable_extra();\n    b();\n}\n";
