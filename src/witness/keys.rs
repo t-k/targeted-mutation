@@ -729,7 +729,16 @@ mod tests {
             "{}",
             all[1].0
         );
-        for literal in ["\"{a\"", "\"a}\"", "\"\\u{12\"", "{a}", "\"", "\"{a b}\""] {
+        for literal in [
+            "\"{a\"",
+            "\"a}\"",
+            "\"\\u{12\"",
+            "{a}",
+            "\"",
+            "\"{a b}\"",
+            // A text is between two quotes: not one with something after the second.
+            "\"{a}\"x",
+        ] {
             assert!(placeholders(literal).is_none(), "{literal}");
         }
         assert_eq!(placeholders("\"\"").map(|found| found.len()), Some(0));

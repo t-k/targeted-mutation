@@ -119,8 +119,9 @@ fn scenario(test: &Test<'_>, before: &str, call: String, after: &str) -> Scenari
 /// the other, is taken: not what is in a loop or a branch, which may run never or often.
 fn looks(stmt: &syn::Stmt) -> bool {
     match stmt {
-        syn::Stmt::Macro(stmt) => stmt.attrs.is_empty() && assertion(&stmt.mac),
-        syn::Stmt::Expr(Expr::Macro(expr), _) => expr.attrs.is_empty() && assertion(&expr.mac),
+        // Which macros are assertions is for `Calls` to say.
+        syn::Stmt::Macro(stmt) => stmt.attrs.is_empty(),
+        syn::Stmt::Expr(Expr::Macro(expr), _) => expr.attrs.is_empty(),
         syn::Stmt::Local(local) => {
             local.attrs.is_empty()
                 && local
@@ -165,12 +166,7 @@ fn callable(function: &ItemFn) -> bool {
     let signature = &function.sig;
     super::simple::supports(function)
         && signature.constness.is_none()
-        && signature.variadic.is_none()
         && matches!(&signature.output, ReturnType::Type(_, ty) if !unit_or_never(ty))
-        && signature
-            .inputs
-            .iter()
-            .all(|input| matches!(input, syn::FnArg::Typed(_)))
 }
 
 fn unit_or_never(ty: &syn::Type) -> bool {
@@ -270,12 +266,12 @@ impl<'ast> Visit<'ast> for Calls<'_> {
             if !asserted {
                 continue;
             }
-            // One side of an `assert_eq!` is pinned down already, and so is what an
-            // `assert!` takes as it is or negated: a mutant that passes the test
-            // returns that very value.
+            // One side of an `assert_eq!` is pinned down already, negated or not, and so
+            // is what an `assert!` takes as it is or negated: a mutant that passes the
+            // test returns that very value.
             let pinned = match arg {
                 _ if differs => false,
-                Expr::Unary(not) if !compares && matches!(not.op, syn::UnOp::Not(_)) => {
+                Expr::Unary(not) if matches!(not.op, syn::UnOp::Not(_)) => {
                     matches!(not.expr.as_ref(), Expr::Call(call) if self.call(call).is_some())
                 }
                 Expr::Call(call) => self.call(call).is_some(),
@@ -446,6 +442,95 @@ mod tests {
             found("assert_ne!(other((1)), 2); assert_ne!(other(-1i32 as u32), 2);"),
             ["other((1))"]
         );
+    }
+
+    #[test]
+    fn each_rule_leaves_out_what_it_is_for() {
+        let none = [] as [&str; 0];
+        // A statement that is not always part of the test, and one that may leave it.
+        assert_eq!(
+            found_in("#[cfg(unix)] assert_ne!(bucket(3), \"none\");"),
+            none
+        );
+        assert_eq!(
+            found_in("#[cfg(unix)] assert_ne!(bucket(3), \"none\")"),
+            none
+        );
+        assert_eq!(
+            found_in("let Some(n) = Some(bucket(3).len()) else { return; };"),
+            none
+        );
+        assert_eq!(found_in("let n = Some(bucket(3).len());"), ["bucket(3)"]);
+        // Only an assertion is known to evaluate what it is given, once and in order.
+        assert_eq!(found_in("let all = vec![bucket(3).len()];"), none);
+        assert_eq!(found_in("matches!(bucket(3).len(), 3);"), none);
+        // A name bound anywhere in a pattern.
+        assert_eq!(
+            found_in("let whole @ bucket = size; assert_ne!(bucket(\"3\"), 4);"),
+            none
+        );
+        // Arguments: a negated number is a literal and a negated flag is computed, a
+        // reference is one to a literal, and there are as many as the function takes.
+        assert_eq!(found_in("assert!(size(!1) > 0);"), none);
+        assert_eq!(
+            found_in("let text = \"a\"; assert!(size(&text) > 0);"),
+            none
+        );
+        assert_eq!(found_in("assert!(size(&mut \"a\") > 0);"), none);
+        assert_eq!(found_in("assert!(size(&\"a\") > 0);"), ["size(&\"a\")"]);
+        assert_eq!(found_in("assert_ne!(bucket(3, 4), \"none\");"), none);
+        assert_eq!(found_in("assert_ne!(bucket(), \"none\");"), none);
+        // A call with an attribute may not be there at all.
+        assert_eq!(
+            found_in("assert_ne!(#[cfg(unix)] bucket(3), \"none\");"),
+            none
+        );
+        // The call is a line of the report: not more than a hundred characters.
+        let long = |length: usize| format!("size(\"{}\")", "é".repeat(length - 8));
+        assert_eq!(
+            found_in(&format!("assert!({} > 0);", long(100))),
+            [long(100)]
+        );
+        assert_eq!(found_in(&format!("assert!({} > 0);", long(101))), none);
+        // Both sides of a comparison are looked at, of either kind and either name, and
+        // nothing after them.
+        for (assertion, found) in [
+            ("debug_assert_eq!(bucket(3), \"few\");", vec![]),
+            ("debug_assert_eq!(1, bucket(3).len());", vec!["bucket(3)"]),
+            ("assert_eq!(1, bucket(3).len());", vec!["bucket(3)"]),
+            ("assert_ne!(\"none\", bucket(3));", vec!["bucket(3)"]),
+            ("debug_assert_ne!(\"none\", bucket(3));", vec!["bucket(3)"]),
+            (
+                "assert_ne!(size(\"a\"), 2, bucket(3).len());",
+                vec!["size(\"a\")"],
+            ),
+            (
+                "assert_eq!(size(\"a\") + 1, 2, bucket(3).len());",
+                vec!["size(\"a\")"],
+            ),
+            (
+                "assert!(size(\"a\") > 0, bucket(3).len());",
+                vec!["size(\"a\")"],
+            ),
+            // What is negated is pinned down like what is not, where it is compared
+            // and where it is asserted; another operator leaves the call to be seen.
+            ("assert_eq!(!bucket(3), 1);", vec![]),
+            ("assert!(!bucket(3));", vec![]),
+            ("assert!(-bucket(3));", vec!["bucket(3)"]),
+            ("assert_ne!(!bucket(3), 1);", vec!["bucket(3)"]),
+        ] {
+            assert_eq!(found_in(assertion), found, "{assertion}");
+        }
+    }
+
+    #[test]
+    fn a_test_with_parameters_or_one_that_is_async_is_not_asked() {
+        for test in [
+            "#[test] fn t(n: u8) { assert_ne!(bucket(3), \"none\"); }",
+            "#[test] async fn t() { assert_ne!(bucket(3), \"none\"); }",
+        ] {
+            assert_eq!(calls(&format!("{BUCKET}{test}")), [], "{test}");
+        }
     }
 
     fn found_in(test: &str) -> Vec<String> {

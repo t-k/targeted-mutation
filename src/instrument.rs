@@ -3540,6 +3540,15 @@ mod tests {
         ] {
             assert_eq!(same_tokens(&with, "enum E { A, B }"), Some(true), "{with}");
         }
+        // The last of a list that is left out goes with the comma before it, also in
+        // parentheses that are a tuple.
+        assert_eq!(
+            same_tokens(
+                &format!("const T: (u8, u8) = (1, {hole});"),
+                "const T: (u8, u8) = (1);"
+            ),
+            Some(true)
+        );
         // An arm in braces has no comma of its own: the one before it is another arm's.
         assert_eq!(
             same_tokens(

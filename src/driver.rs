@@ -6724,6 +6724,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn a_target_is_selected_by_the_first_of_its_kinds() {
+        let target = |kinds: &[&str]| Target {
+            name: "tool".to_string(),
+            kind: kinds.iter().map(|kind| kind.to_string()).collect(),
+            src_path: PathBuf::from("src/lib.rs"),
+            test: true,
+            doctest: false,
+            required_features: vec![],
+        };
+        assert_eq!(
+            target(&["lib", "example"]).test_build_arg(),
+            Some(("--lib", None))
+        );
+        assert_eq!(
+            target(&["example", "lib"]).test_build_arg(),
+            Some(("--example", Some("tool")))
+        );
+        assert_eq!(target(&[]).test_build_arg(), None);
+    }
+
+    #[test]
     fn code_is_left_out_only_where_every_build_leaves_it_out() {
         // One build with the feature and one without: what asks for it and what asks
         // for its absence are each built by one of them.
