@@ -659,6 +659,22 @@ impl Reach {
         (effective > 0).then(|| Reach::Multiples(1 << effective))
     }
 
+    /// The least and the greatest value the expression can be within `low..=high` (the
+    /// values of its type); `None` when there is none.
+    pub fn within(self, low: i128, high: i128) -> Option<(i128, i128)> {
+        let least = if self.holds(low) {
+            low
+        } else {
+            self.next_above(low)?
+        };
+        let greatest = if self.holds(high) {
+            high
+        } else {
+            self.next_below(high)?
+        };
+        (least <= greatest).then_some((least, greatest))
+    }
+
     /// The numbers the expression lies between, where it has such bounds.
     pub fn interval(self) -> Option<(i128, i128)> {
         match self {
@@ -1281,6 +1297,22 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn the_ends_of_what_an_expression_can_be_in_its_type() {
+        for reach in REACHES {
+            for (low, high) in [(0, 255), (-128, 127), (0, 0), (3, 3), (5, 9)] {
+                let all: Vec<i128> = (low..=high).filter(|v| reach.holds(*v)).collect();
+                assert_eq!(
+                    reach.within(low, high),
+                    all.first().copied().zip(all.last().copied()),
+                    "{reach:?} in {low}..={high}"
+                );
+            }
+        }
+        // `x << 1` of a byte is 254 at most: `< 255` has no other outcome.
+        assert_eq!(Reach::Multiples(2).within(0, 255), Some((0, 254)));
     }
 
     #[test]

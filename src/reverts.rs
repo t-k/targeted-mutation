@@ -19,6 +19,9 @@ pub(crate) struct Change {
     /// it: the old lines, with the lines of the tests as they are now.
     pub range: (usize, usize),
     pub put_back: String,
+    /// Set by who asks: the change is of code the build leaves out now and undone. It
+    /// is not tried alone, and still goes back with the others.
+    pub outside: bool,
 }
 
 impl Change {
@@ -57,27 +60,78 @@ impl Change {
         let Some(off_then) = off_then else {
             return false;
         };
+        let (from, to) = self.range;
+        // Lines that come or go move the lines after them, which code that is built
+        // may ask for.
+        let lines = |text: &str| text.matches('\n').count();
+        if lines(&current[from..to]) != lines(&self.put_back) && current.contains("line!") {
+            return false;
+        }
         // The code of a side, without the line end and the spacing around it: an item
         // ends at its last token.
         let code = |text: &str, at: usize| {
             let spacing = text.len() - text.trim_start().len();
             (at + spacing, at + text.trim_end().len())
         };
-        // A side with no code is a place: lines were added there, or taken from it.
-        let (from, to) = self.range;
         let inside = |ranges: &[(usize, usize)], (first, last): (usize, usize)| {
-            ranges.iter().any(|(start, end)| {
-                if first < last {
-                    *start <= first && last <= *end
-                } else {
-                    *start <= from && from < *end
-                }
-            })
+            ranges
+                .iter()
+                .any(|(start, end)| *start <= first && last <= *end)
         };
-        let now = code(&current[from..to], from);
+        // The place of a side that has no code is in code that is left out.
+        let place = |ranges: &[(usize, usize)]| {
+            ranges
+                .iter()
+                .any(|(start, end)| *start < from && from < *end)
+        };
+        // A side that is whole items that are left out, one after the other: with or
+        // without them the build is the same.
+        let whole = |ranges: &[(usize, usize)], text: &str, (first, last): (usize, usize)| {
+            let mut at = first;
+            while at < last {
+                let Some((_, end)) = ranges
+                    .iter()
+                    .find(|(start, end)| *start == at && *end <= last)
+                else {
+                    return false;
+                };
+                at = *end + (text[*end - first..].len() - text[*end - first..].trim_start().len());
+            }
+            first < last
+        };
+        let now_text = &current[from..to];
+        let now = code(now_text, from);
         let then = code(&self.put_back, from);
-        (now.0 < now.1 || then.0 < then.1) && inside(off_now, now) && inside(off_then, then)
+        match (now.0 < now.1, then.0 < then.1) {
+            (true, true) => inside(off_now, now) && inside(off_then, then),
+            (true, false) => {
+                whole(off_now, now_text.trim_start(), now)
+                    || (inside(off_now, now) && place(off_then))
+            }
+            (false, true) => {
+                whole(off_then, self.put_back.trim_start(), then)
+                    || (inside(off_then, then) && place(off_now))
+            }
+            (false, false) => false,
+        }
     }
+}
+
+/// The ranges, each to the end of its last line when only a comment follows there: the
+/// comment after a test is of the test's line.
+fn with_trailing_comments(text: &str, ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    ranges
+        .into_iter()
+        .map(|(start, end)| {
+            let rest = text[end..].lines().next().unwrap_or("");
+            let after = rest.trim_start();
+            if after.starts_with("//") {
+                (start, end + rest.len())
+            } else {
+                (start, end)
+            }
+        })
+        .collect()
 }
 
 /// What a hunk of a file changes.
@@ -97,7 +151,7 @@ fn classify(current: &str, hunks: &[Hunk]) -> Vec<(Hunk, Kind)> {
     let Ok(parsed) = instrument::parse_source(current) else {
         return vec![];
     };
-    let tests_now = instrument::test_only_ranges(current, &parsed);
+    let tests_now = with_trailing_comments(current, instrument::test_only_ranges(current, &parsed));
     let lines = current.matches('\n').count() + 1;
     let mut ordered: Vec<&Hunk> = hunks.iter().collect();
     ordered.sort_by_key(|hunk| (hunk.start, hunk.count));
@@ -131,9 +185,9 @@ fn classify(current: &str, hunks: &[Hunk]) -> Vec<(Hunk, Kind)> {
         let undone_parsed = instrument::parse_source(&undone).ok();
         let (new_from, new_to) = trimmed(&current[from..to], from);
         let (old_from, old_to) = trimmed(&hunk.old, from);
-        let tests_then = undone_parsed
-            .as_ref()
-            .map(|parsed| instrument::test_only_ranges(&undone, parsed));
+        let tests_then = undone_parsed.as_ref().map(|parsed| {
+            with_trailing_comments(&undone, instrument::test_only_ranges(&undone, parsed))
+        });
         let new_empty = new_from >= new_to;
         let old_empty = old_from >= old_to;
         if new_empty && old_empty {
@@ -202,6 +256,7 @@ fn classify(current: &str, hunks: &[Hunk]) -> Vec<(Hunk, Kind)> {
             undone: undone_parsed.map(|_| undone),
             range: (from, to),
             put_back,
+            outside: false,
         }));
     }
     found
@@ -584,6 +639,52 @@ pub fn basic() -> u32 {
         // What the build was before is not known: tried.
         let found = between(code, &body);
         assert!(!found[0].outside_the_build(&body, &[(0, body.len())], None));
+    }
+
+    #[test]
+    fn a_comment_after_a_test_is_of_the_line_of_the_test() {
+        let old =
+            "pub const X: u32 = 41;\n#[test] fn check() { assert_eq!(X, 41); } // regression\n";
+        let new = old.replace("41", "42");
+        let found = between(old, &new);
+        assert_eq!(found.len(), 1, "{found:?}");
+        // The constant goes back, the test and its comment stay.
+        assert_eq!(
+            found[0].undone.as_deref(),
+            Some(new.replace("X: u32 = 42", "X: u32 = 41").as_str())
+        );
+    }
+
+    #[test]
+    fn whole_items_that_are_left_out_change_nothing_and_lines_may() {
+        let base = "pub fn kept() -> u32 { 1 }\n";
+        let item = "\n#[cfg(feature = \"extra\")]\npub const X: u32 = 42;\n";
+        // An item that is left out, new at the end of the file or between others, one
+        // or two of them, and the same taken away.
+        for added in [
+            format!("{base}{item}"),
+            format!("{base}{item}{item}"),
+            format!("{item}{base}"),
+        ] {
+            assert!(outside(base, &added, &["basic"]), "{added}");
+            assert!(outside(&added, base, &["basic"]), "{added}");
+            assert!(!outside(base, &added, &["extra"]), "{added}");
+        }
+        // With an item that is built among them, it is a change.
+        let mixed = format!("{base}{item}pub fn more() {{}}\n");
+        assert!(!outside(base, &mixed, &["basic"]));
+        // Lines that move what `line!` gives are a change of what is built.
+        let counted = "#[cfg(feature = \"extra\")]\nfn off() {\n}\npub const N: u32 = line!();\n";
+        let longer = counted.replace("fn off() {\n", "fn off() {\n    let _ = 2;\n");
+        assert!(!outside(counted, &longer, &["basic"]));
+        assert!(outside(
+            &counted.replace("line!()", "4"),
+            &longer.replace("line!()", "4"),
+            &["basic"]
+        ));
+        // As many lines as before move nothing.
+        let same = longer.replace("let _ = 2;", "let _ = 3;");
+        assert!(outside(&longer, &same, &["basic"]));
     }
 
     #[test]

@@ -26,6 +26,11 @@ pub fn is_exactly_one(flags: u8) -> bool {
     flags & 0b1100 == 1
 }
 
+/// Twice a byte is 254 at most: there is no other outcome.
+pub fn doubles_within_a_byte(n: u8) -> bool {
+    n << 1 < 255
+}
+
 /// A rate in eighths, with a multiplication of its own: times eight it is any number.
 pub struct Eighths(pub u32);
 
@@ -55,6 +60,8 @@ mod tests {
         assert!(is_marked(0b1000));
         assert!(has_a_last_digit(7));
         assert!(!is_exactly_one(0b0100));
+        assert!(doubles_within_a_byte(0));
+        assert!(doubles_within_a_byte(127));
         assert!(!is_rated(Eighths(16)));
         assert!(is_rated(Eighths(24)));
     }

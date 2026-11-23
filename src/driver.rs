@@ -613,9 +613,37 @@ fn artifact_inputs(artifact: &Path, root: &Path, copy: &Path) -> BTreeSet<PathBu
 #[derive(Default)]
 struct BuiltSources {
     files: BTreeMap<PathBuf, BTreeSet<PathBuf>>,
-    /// The features a root file was built with in any of its builds. A root without an
-    /// entry was built by a cargo that did not say.
-    features: BTreeMap<PathBuf, BTreeSet<String>>,
+    /// The features a root file was built with, build by build (a host and a target
+    /// build may differ). A root without an entry was built by a cargo that did not
+    /// say, or with flags that may turn features on behind cargo's back.
+    features: BTreeMap<PathBuf, Vec<BTreeSet<String>>>,
+}
+
+/// The ranges that every build leaves out: those of one build that lie within a range
+/// of each of the others. With no build, nothing is known to be left out.
+fn left_out_of_all(per_build: &[Vec<(usize, usize)>]) -> Vec<(usize, usize)> {
+    let mut all: Vec<(usize, usize)> = per_build
+        .iter()
+        .flatten()
+        .filter(|(from, to)| {
+            per_build
+                .iter()
+                .all(|ranges| ranges.iter().any(|(start, end)| start <= from && to <= end))
+        })
+        .copied()
+        .collect();
+    all.sort_unstable();
+    all.dedup();
+    all
+}
+
+/// Whether the compiler may be told of features that cargo does not report
+/// (`RUSTFLAGS='--cfg feature="x"'`).
+fn features_from_flags(flags: impl IntoIterator<Item = Option<std::ffi::OsString>>) -> bool {
+    flags
+        .into_iter()
+        .flatten()
+        .any(|value| value.to_string_lossy().contains("feature"))
 }
 
 impl BuiltSources {
@@ -625,12 +653,20 @@ impl BuiltSources {
         copy: &Path,
     ) -> Self {
         let mut built = Self::default();
-        for (root, features) in features {
-            built
-                .features
-                .entry(root.clone())
-                .or_default()
-                .extend(features.iter().cloned());
+        let by_flags = features_from_flags(
+            [
+                "RUSTFLAGS",
+                "CARGO_ENCODED_RUSTFLAGS",
+                "CARGO_BUILD_RUSTFLAGS",
+            ]
+            .map(std::env::var_os),
+        );
+        for (root, features) in features.iter().filter(|_| !by_flags) {
+            let set: BTreeSet<String> = features.iter().cloned().collect();
+            let sets = built.features.entry(root.clone()).or_default();
+            if !sets.contains(&set) {
+                sets.push(set);
+            }
         }
         for (root, artifacts) in artifacts {
             if !root.starts_with(copy) {
@@ -668,7 +704,7 @@ impl BuiltSources {
     /// The same for another text of the file (a change undone). `None` when that is
     /// not Rust, or a build did not say its features: nothing is known then.
     fn left_out_of(&self, source: &SourceFile, text: &str) -> Option<Vec<(usize, usize)>> {
-        let mut features = BTreeSet::new();
+        let mut builds: Vec<&BTreeSet<String>> = vec![];
         for root in &source.owners {
             if !self
                 .files
@@ -677,11 +713,14 @@ impl BuiltSources {
             {
                 continue;
             }
-            features.extend(self.features.get(root)?.iter().cloned());
+            builds.extend(self.features.get(root)?);
         }
-        instrument::parse_source(text)
-            .map(|parsed| instrument::inactive_ranges(text, &parsed, &features))
-            .ok()
+        let parsed = instrument::parse_source(text).ok()?;
+        let per_build: Vec<Vec<(usize, usize)>> = builds
+            .iter()
+            .map(|features| instrument::inactive_ranges(text, &parsed, features))
+            .collect();
+        Some(left_out_of_all(&per_build))
     }
 }
 
@@ -2983,7 +3022,12 @@ impl Session {
                 for bin in &self.binaries {
                     merged.merge(&bin.trace.merged(id));
                 }
-                let bounds = self.binaries.iter().find_map(|b| b.trace.bounds.get(&id));
+                // The types of the operands, where every binary that recorded them
+                // agrees (a type can be another under `cfg(test)`).
+                let mut recorded = self.binaries.iter().filter_map(|b| b.trace.bounds.get(&id));
+                let bounds = recorded
+                    .next()
+                    .filter(|first| recorded.all(|other| other == *first));
                 // Compared with a number, what cannot be every number has a gap only
                 // where a value it can be lies between the values the tests gave it,
                 // and another outcome only if a value it can be gives one.
@@ -3007,11 +3051,27 @@ impl Session {
                         )?,
                         None => reach,
                     };
-                    primitive(from, to).then_some((reach, number, is_rhs))
+                    // A literal past the largest value of the type is another number
+                    // there (`255i8` is -1 where that is allowed): nothing is read from it.
+                    let fits = |value: i128| {
+                        bounds.is_none_or(|b| value <= if is_rhs { b.lhs.1 } else { b.rhs.1 })
+                    };
+                    let (plan::Reach::Multiples(value)
+                    | plan::Reach::Bits(value)
+                    | plan::Reach::Below(value)) = reach;
+                    (fits(value) && primitive(from, to)).then_some((reach, number, is_rhs))
                 });
                 let mut domain = domain_of(*literal, bounds);
-                if let Some((reach, number, is_rhs)) = against
-                    && let Some((low, high)) = reach.interval()
+                // Between the least and the greatest value it can be: by what it is
+                // (a mask, a remainder), or within its type (the multiples).
+                let ends = against.and_then(|(reach, _, is_rhs)| {
+                    reach.interval().or_else(|| {
+                        let (low, high) = bounds.map(|b| if is_rhs { b.lhs } else { b.rhs })?;
+                        reach.within(low, high)
+                    })
+                });
+                if let Some((_, number, is_rhs)) = against
+                    && let Some((low, high)) = ends
                     && let (Some(a), Some(b)) = if is_rhs {
                         (low.checked_sub(number), high.checked_sub(number))
                     } else {
@@ -5662,16 +5722,19 @@ fn run_package(
                 // program with its change undone: nothing to try.
                 if options.rebuild || options.source_only {
                     let left_out = built_sources.left_out(file);
-                    let before = changes.len();
-                    changes.retain(|change| {
+                    for change in &mut changes {
                         // Undone it may be built: a `cfg` that changed decides that.
                         let then = change
                             .undone
                             .as_deref()
                             .and_then(|undone| built_sources.left_out_of(file, undone));
-                        !change.outside_the_build(&file.original, &left_out, then.as_deref())
-                    });
-                    not_built_changes.set(not_built_changes.get() + before - changes.len());
+                        change.outside =
+                            change.outside_the_build(&file.original, &left_out, then.as_deref());
+                    }
+                    not_built_changes.set(
+                        not_built_changes.get()
+                            + changes.iter().filter(|change| change.outside).count(),
+                    );
                 }
                 (!changes.is_empty()).then_some((file, changes))
             })
@@ -5679,7 +5742,11 @@ fn run_package(
         let not_built_changes = not_built_changes.get();
         report.mutants_not_evaluated += not_built_changes;
         report.mutants_not_compiled += not_built_changes;
-        let total: usize = changed.iter().map(|(_, changes)| changes.len()).sum();
+        // Those are not tried alone, and still go back with the others.
+        let total: usize = changed
+            .iter()
+            .map(|(_, changes)| changes.iter().filter(|change| !change.outside).count())
+            .sum();
         // A change of the program and its tests in lines that cannot be told apart
         // would be undone with the tests: nothing is said of it.
         let mixed: usize = files
@@ -5772,7 +5839,8 @@ fn run_package(
             let mut stuck_files = 0;
             for (file, changes) in &changed {
                 let mut stuck = false;
-                for change in changes {
+                let alone = changes.iter().filter(|change| !change.outside).count();
+                for change in changes.iter().filter(|change| !change.outside) {
                     let outcome = match &change.undone {
                         Some(text) => undone(&[(file, text.as_str())])?,
                         None => None,
@@ -5780,7 +5848,9 @@ fn run_package(
                     stuck |= outcome.is_none();
                     judged(outcome, place(file, change), change.describe());
                 }
-                if stuck && changes.len() > 1 {
+                // Also where a change that is left out now may be built with another
+                // undone (a `cfg` that changed along with the code under it).
+                if alone > 0 && (stuck || alone < changes.len()) && changes.len() > 1 {
                     let whole = reverts::all_undone(&file.original, changes);
                     let outcome = match &whole {
                         Some(text) => undone(&[(file, text.as_str())])?,
@@ -6455,6 +6525,40 @@ fn describe_effects(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn code_is_left_out_only_where_every_build_leaves_it_out() {
+        // One build with the feature and one without: what asks for it and what asks
+        // for its absence are each built by one of them.
+        let with = vec![(10, 20)];
+        let without = vec![(30, 40)];
+        assert_eq!(left_out_of_all(&[with.clone(), without.clone()]), []);
+        assert_eq!(left_out_of_all(&[with.clone(), with.clone()]), [(10, 20)]);
+        assert_eq!(left_out_of_all(std::slice::from_ref(&with)), [(10, 20)]);
+        // An item one build leaves out inside a module the other leaves out.
+        assert_eq!(
+            left_out_of_all(&[vec![(0, 50)], vec![(10, 20)]]),
+            [(10, 20)]
+        );
+        assert_eq!(
+            left_out_of_all(&[vec![(0, 50), (60, 70)], vec![(10, 20), (60, 70)]]),
+            [(10, 20), (60, 70)]
+        );
+        assert_eq!(left_out_of_all(&[]), []);
+        assert_eq!(left_out_of_all(&[vec![], with]), []);
+    }
+
+    #[test]
+    fn flags_that_may_name_a_feature_make_the_features_unknown() {
+        let flag = |text: &str| Some(std::ffi::OsString::from(text));
+        assert!(features_from_flags([flag("--cfg feature=\"extra\"")]));
+        assert!(features_from_flags([
+            None,
+            flag("-C opt-level=1\u{1f}--cfg\u{1f}feature=\"x\"")
+        ]));
+        assert!(!features_from_flags([flag("-C debuginfo=0"), None]));
+        assert!(!features_from_flags([None, None, None]));
+    }
     use crate::trace::UNKNOWN_TEST;
 
     #[test]

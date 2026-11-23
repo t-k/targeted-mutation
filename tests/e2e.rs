@@ -4051,6 +4051,45 @@ fn code_a_feature_leaves_out_is_not_a_survivor_when_built_one_by_one() {
         undone[0]["survivors"][0],
         "with the code as it was: `#[cfg(feature = \"basic\")]`"
     );
+    // A `cfg` reworded together with the code under it: that code is left out now and
+    // with its own change undone, but not with the `cfg` undone. Neither goes back
+    // alone; all together they are the program as it was, which the test passes too.
+    fs::write(&path, &source).unwrap();
+    append(
+        &path,
+        "\n#[cfg(feature = \"basic\")]\nfn old() -> u32 {\n    1\n}\n\n\
+         pub fn value() -> u32 {\n    old()\n}\n\n\
+         #[test]\nfn positive() {\n    assert!(value() > 0);\n}\n",
+    );
+    git_output(&dir, &["add", "-A"]);
+    let base = git_output(&dir, &["write-tree"]);
+    let with_value = fs::read_to_string(&path).unwrap();
+    fs::write(
+        &path,
+        with_value
+            .replace(
+                "#[cfg(feature = \"basic\")]\nfn old() -> u32 {\n    1\n}",
+                "#[cfg(feature = \"extra\")]\nfn old() -> u32 {\n    missing()\n}",
+            )
+            .replace("    old()\n", "    2\n"),
+    )
+    .unwrap();
+    let run = tmt(&dir, &["--json", "--quiet", "--rebuild", "--since", &base]);
+    let since: Value = serde_json::from_str(&run.stdout)
+        .unwrap_or_else(|e| panic!("{e}: {}{}", run.stdout, run.stderr));
+    let undone: Vec<&str> = since["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| !f["change_since"].is_null())
+        .map(|f| f["survivors"][0].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        undone,
+        ["with all 3 changes to this file undone"],
+        "{since:#}"
+    );
+    assert_eq!(run.code, 2, "{since:#}");
     fs::write(&path, &source).unwrap();
 
     // With the feature the same code is judged, and found far from its limit.
