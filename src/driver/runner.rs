@@ -71,6 +71,9 @@ pub(super) fn explicit_timeout_conflict(
     timeout.filter(|&limit| entire_runner && baseline >= limit)
 }
 
+pub(super) type FilteredTimings =
+    std::sync::Mutex<BTreeMap<(usize, Vec<String>), std::sync::Arc<std::sync::OnceLock<Duration>>>>;
+
 pub(super) struct TestBinary {
     pub(super) name: String,
     /// Directory the tests run in: their package's, as under `cargo test`.
@@ -92,8 +95,7 @@ pub(super) struct TestBinary {
     pub(super) timeout: Option<Duration>,
     pub(super) wrapper_grace: Duration,
     pub(super) report_slow: bool,
-    pub(super) filtered_timings:
-        std::sync::Mutex<BTreeMap<Vec<String>, std::sync::Arc<std::sync::OnceLock<Duration>>>>,
+    pub(super) filtered_timings: FilteredTimings,
     pub(super) trace: Trace,
     pub(super) effects_baseline: std::sync::OnceLock<propagation::BaselineIndex>,
 }
@@ -154,12 +156,17 @@ impl TestBinary {
         {
             return self.mutant_limit(baseline);
         }
+        let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
+        let threads = test_threads(cores, sharing);
         let timed = {
             let mut groups = self
                 .filtered_timings
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            groups.entry(filter.to_vec()).or_default().clone()
+            groups
+                .entry((threads, filter.to_vec()))
+                .or_default()
+                .clone()
         };
         let timing = *timed.get_or_init(|| {
             let untraced = self.baseline;

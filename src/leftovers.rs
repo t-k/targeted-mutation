@@ -198,7 +198,9 @@ fn sweep(path: &Path) -> Swept {
             }
             if stop_verified(pid, path) {
                 stopped.insert(pid);
-                if parent == Some(me) {
+                if subreaper {
+                    // Under PID 1 or a subreaper, a stopped descendant whose own parent
+                    // is also being stopped may be reparented to `me` after this check.
                     reparented_stopped.insert(pid);
                 }
             }
@@ -235,8 +237,8 @@ fn reap_stopped(pids: &mut BTreeSet<u32>) {
     pids.retain(|&pid| !reap_child(pid));
 }
 
-/// Non-blocking `waitpid(pid, WNOHANG)` for a single stopped reparented orphan.
-/// Returns `true` once the child has been reaped or no longer exists (`ECHILD`).
+/// Non-blocking `waitpid(pid, WNOHANG)` for a single stopped orphan under PID 1/subreaper.
+/// Returns `true` once the process has been reaped or has exited under another parent.
 #[cfg(unix)]
 fn reap_child(pid: u32) -> bool {
     unsafe extern "C" {
@@ -247,17 +249,44 @@ fn reap_child(pid: u32) -> bool {
         ) -> std::ffi::c_int;
     }
     const WNOHANG: std::ffi::c_int = 1;
-    let Ok(pid) = std::ffi::c_int::try_from(pid) else {
+    let Ok(raw_pid) = std::ffi::c_int::try_from(pid) else {
         return true;
     };
-    if pid <= 1 {
+    if raw_pid <= 1 {
+        return true;
+    }
+    if ACTIVE_CHILDREN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .contains(&pid)
+    {
         return true;
     }
     let mut status: std::ffi::c_int = 0;
     // SAFETY: `waitpid` with a specific `pid > 1` and `WNOHANG` never blocks and never
     // reaps any unrelated active runner child.
-    let rc = unsafe { waitpid(pid, &mut status, WNOHANG) };
-    rc > 0 || (rc < 0 && io::Error::last_os_error().raw_os_error() != Some(4 /* EINTR */))
+    let rc = unsafe { waitpid(raw_pid, &mut status, WNOHANG) };
+    if rc > 0 {
+        return true;
+    }
+    if rc == 0 {
+        return false;
+    }
+    // `ECHILD`: either already reaped by another parent, or a grandchild not yet
+    // reparented to `me` while its intermediate parent is still exiting.
+    let errno = io::Error::last_os_error().raw_os_error();
+    if errno == Some(4 /* EINTR */) {
+        return false;
+    }
+    parent_of(pid).is_none()
+}
+
+/// Only fall back from `pidfd_open` to PID-based signalling when the kernel does not
+/// implement `pidfd_open` (`ENOSYS`). Other errors (`EMFILE`, `EPERM`, `ESRCH`) fail
+/// closed rather than re-opening a PID-reuse race.
+#[cfg(any(test, target_os = "linux"))]
+fn should_fallback_from_pidfd(errno: Option<i32>) -> bool {
+    errno == Some(38 /* ENOSYS */)
 }
 
 /// Stops `pid` only after re-verifying that the exact same process still holds `path`.
@@ -304,7 +333,10 @@ fn stop_verified(pid: u32, path: &Path) -> bool {
         };
         return rc == 0;
     }
-    // Fallback for kernels older than 5.3 without `pidfd_open` (`ENOSYS` = 38).
+    // Fallback strictly for kernels older than 5.3 without `pidfd_open` (`ENOSYS`).
+    if !should_fallback_from_pidfd(io::Error::last_os_error().raw_os_error()) {
+        return false;
+    }
     let before = start_token(pid);
     let still_holds = before.is_some() && holds_path_linux(pid, wanted);
     let after = if still_holds { start_token(pid) } else { None };
@@ -823,6 +855,10 @@ mod tests {
         assert!(!can_stop_verified(None, true, Some("t1")));
         assert!(!can_stop_verified(Some("t1"), true, None));
         assert!(!can_stop_verified(None, true, None));
+        assert!(should_fallback_from_pidfd(Some(38)));
+        assert!(!should_fallback_from_pidfd(Some(24)));
+        assert!(!should_fallback_from_pidfd(Some(1)));
+        assert!(!should_fallback_from_pidfd(None));
 
         let child = Command::new("true")
             .stdin(Stdio::null())

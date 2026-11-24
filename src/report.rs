@@ -1503,6 +1503,11 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
                     "audit: recorded once more, `{}` did not pass: its tests do not always do the same\n",
                     binary.binary
                 ));
+            } else if binary.rerun_failed {
+                out.push_str(&format!(
+                    "audit: recorded once more, `{}` did not pass and differs in {} records: its tests do not always do the same\n",
+                    binary.binary, binary.records
+                ));
             } else {
                 out.push_str(&format!(
                     "audit: recorded once more, `{}` differs in {} records: its tests do not always do the same\n",
@@ -3173,11 +3178,27 @@ mod tests {
                         records: 0,
                         rerun_failed: true,
                     },
+                    TraceDifference {
+                        binary: "flaky-diff".into(),
+                        records: 2,
+                        rerun_failed: true,
+                    },
                 ],
             }),
             ..Report::default()
         };
         assert!(report.has_gaps());
+        let text = render_text(&report, false);
+        assert!(
+            text.contains("`flaky` did not pass: its tests do not always do the same"),
+            "{text}"
+        );
+        assert!(
+            text.contains(
+                "`flaky-diff` did not pass and differs in 2 records: its tests do not always do the same"
+            ),
+            "{text}"
+        );
         let sarif: serde_json::Value = serde_json::from_str(&render_sarif(&report)).unwrap();
         let results = sarif["runs"][0]["results"].as_array().unwrap();
         let rules: Vec<_> = results
@@ -3192,6 +3213,7 @@ mod tests {
                 ("audit-disagreement", "error"),
                 ("audit-disagreement", "error"),
                 ("audit-disagreement", "error"),
+                ("audit-disagreement", "error"),
             ]
         );
         assert!(
@@ -3201,6 +3223,14 @@ mod tests {
                 .contains("did not pass"),
             "{}",
             results[4]
+        );
+        assert!(
+            results[5]["message"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("did not pass and differed in 2 records"),
+            "{}",
+            results[5]
         );
         assert!(sarif["runs"][0]["properties"].get("audit").is_some());
     }
