@@ -14,7 +14,7 @@
 //! What this does not see: a process that closes the files it was given (a daemon that
 //! detaches properly, a child of Python's `subprocess`, which closes them by default).
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, VecDeque};
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -38,7 +38,7 @@ static ACTIVE_CHILDREN: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
 /// Stopped orphans under PID 1/subreaper whose reparenting took longer than `REAP_WAIT`,
 /// carried over to subsequent sweeps so only verified stopped targets are ever reaped.
 #[cfg(unix)]
-static PENDING_REAP: Mutex<Vec<StoppedTarget>> = Mutex::new(Vec::new());
+static PENDING_REAP: Mutex<VecDeque<StoppedTarget>> = Mutex::new(VecDeque::new());
 
 /// How long those who have the file are stopped again and again before giving up.
 const PATIENCE: Duration = Duration::from_secs(5);
@@ -177,7 +177,7 @@ fn sweep(path: &Path) -> Swept {
     let subreaper = is_subreaper(me);
     if subreaper {
         let mut carried = PENDING_REAP.lock().unwrap_or_else(|e| e.into_inner());
-        reap_stopped(&mut carried);
+        reap_stopped_queue(&mut carried);
     }
     loop {
         match held(path) {
@@ -301,12 +301,13 @@ fn sweep(path: &Path) -> Swept {
     }
     if subreaper && !reparented_stopped.is_empty() {
         let mut carried = PENDING_REAP.lock().unwrap_or_else(|e| e.into_inner());
-        reap_stopped(&mut carried);
+        reap_stopped_queue(&mut carried);
         const MAX_PENDING_REAP: usize = 256;
         for target in reparented_stopped {
-            if carried.len() < MAX_PENDING_REAP {
-                carried.push(target);
+            if carried.len() >= MAX_PENDING_REAP {
+                carried.pop_front();
             }
+            carried.push_back(target);
         }
     }
     swept.stopped = stopped.len();
@@ -323,6 +324,18 @@ fn can_stop_verified(before: Option<&str>, still_holds: bool, after: Option<&str
 #[cfg(unix)]
 fn reap_stopped(targets: &mut Vec<StoppedTarget>) {
     targets.retain(|target| !reap_target(target));
+}
+
+#[cfg(unix)]
+fn reap_stopped_queue(targets: &mut VecDeque<StoppedTarget>) {
+    targets.retain(|target| !reap_target(target));
+}
+
+/// On Linux 5.3, `pidfd_open` exists while `waitid(P_PIDFD, ...)` was added in Linux 5.4
+/// and returns `EINVAL` on 5.3; fall back to synchronized `start_token` + `waitpid`.
+#[cfg(any(test, target_os = "linux"))]
+fn should_fallback_from_waitid_pidfd(errno: Option<i32>) -> bool {
+    errno == Some(22 /* EINVAL */)
 }
 
 /// Reaps a single stopped orphan without ever touching active sibling runner children.
@@ -375,8 +388,11 @@ fn reap_target(target: &StoppedTarget) -> bool {
         if errno == Some(4 /* EINTR */) {
             return false;
         }
-        // `ECHILD`: either reaped by another parent or not yet reparented to `me`.
-        return parent_of(target.pid).is_none();
+        if !should_fallback_from_waitid_pidfd(errno) {
+            // `ECHILD`: either reaped by another parent or not yet reparented to `me`.
+            return parent_of(target.pid).is_none();
+        }
+        // Linux 5.3 (`EINVAL`): fall through to the synchronized `start_token` + `waitpid` path.
     }
 
     unsafe extern "C" {
@@ -461,6 +477,9 @@ fn stop_verified(pid: u32, path: &Path) -> Option<StoppedTarget> {
         if !holds_path_linux(pid, wanted) {
             return None;
         }
+        // Capture `start_token` before signaling so Linux 5.3 (`waitid(P_PIDFD)` -> `EINVAL`)
+        // can safely fall back to synchronized `waitpid` without PID-reuse races.
+        let start = start_token(pid);
         // SAFETY: `pidfd_send_signal` targets the pinned process description; if the
         // process exited and the PID was recycled, the kernel returns `ESRCH`.
         let rc = unsafe {
@@ -474,7 +493,7 @@ fn stop_verified(pid: u32, path: &Path) -> Option<StoppedTarget> {
         };
         return (rc == 0).then_some(StoppedTarget {
             pid,
-            start: None,
+            start,
             pidfd: Some(pidfd),
         });
     }
@@ -1072,6 +1091,9 @@ mod tests {
         assert!(!should_fallback_from_pidfd(Some(24)));
         assert!(!should_fallback_from_pidfd(Some(1)));
         assert!(!should_fallback_from_pidfd(None));
+        assert!(should_fallback_from_waitid_pidfd(Some(22)));
+        assert!(!should_fallback_from_waitid_pidfd(Some(10)));
+        assert!(!should_fallback_from_waitid_pidfd(None));
         assert!(!stop(u32::MAX - 7));
 
         let child = Command::new("true")
