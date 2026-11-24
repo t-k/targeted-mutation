@@ -2313,9 +2313,11 @@ fn run_package(
             // All files together: where a file's changes do not build even together,
             // and where code that is left out changed, which may count only with the
             // changes of another file undone.
-            let with_left_out = changed
-                .iter()
-                .any(|(_, changes)| changes.iter().any(|change| change.outside));
+            let with_left_out = changed.iter().any(|(_, changes)| {
+                changes
+                    .iter()
+                    .any(|change| !change.is_subhunk() && change.outside)
+            });
             if (stuck_files > 0 || with_left_out) && changed.len() > 1 {
                 let whole: Option<Vec<String>> = changed
                     .iter()

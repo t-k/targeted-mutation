@@ -601,25 +601,46 @@ fn token_sig(text: &str) -> String {
     parts.join(" ")
 }
 
-fn multiset_added_indices(old_sigs: &[String], new_sigs: &[String]) -> Option<Vec<usize>> {
-    let mut remaining: HashMap<&str, usize> = HashMap::new();
-    for sig in old_sigs {
-        *remaining.entry(sig.as_str()).or_insert(0) += 1;
+/// Matches `old_sigs` as an in-order subsequence of `new_sigs` and returns the indices in
+/// `new_sigs` that were added. Returns `None` if `old_sigs` is not a subsequence or if the
+/// subsequence alignment is ambiguous (leftmost and rightmost matches disagree), so existing
+/// elements are never misclassified as newly added.
+fn subsequence_added_indices(old_sigs: &[String], new_sigs: &[String]) -> Option<Vec<usize>> {
+    if old_sigs.is_empty() {
+        return Some((0..new_sigs.len()).collect());
     }
-    let mut added = Vec::new();
-    for (idx, sig) in new_sigs.iter().enumerate() {
-        if let Some(count) = remaining.get_mut(sig.as_str())
-            && *count > 0
-        {
-            *count -= 1;
-            continue;
-        }
-        added.push(idx);
-    }
-    if remaining.values().any(|&count| count > 0) {
+    if old_sigs.len() > new_sigs.len() {
         return None;
     }
-    Some(added)
+    let mut left_matched = Vec::with_capacity(old_sigs.len());
+    let mut oi = 0;
+    for (ni, sig) in new_sigs.iter().enumerate() {
+        if oi < old_sigs.len() && sig == &old_sigs[oi] {
+            left_matched.push(ni);
+            oi += 1;
+        }
+    }
+    if oi != old_sigs.len() {
+        return None;
+    }
+    let mut right_matched = Vec::with_capacity(old_sigs.len());
+    let mut oi = old_sigs.len();
+    for (ni, sig) in new_sigs.iter().enumerate().rev() {
+        if oi > 0 && sig == &old_sigs[oi - 1] {
+            right_matched.push(ni);
+            oi -= 1;
+        }
+    }
+    right_matched.reverse();
+    if left_matched != right_matched {
+        return None;
+    }
+    let matched: HashSet<usize> = left_matched.into_iter().collect();
+    Some(
+        (0..new_sigs.len())
+            .filter(|i| !matched.contains(i))
+            .collect(),
+    )
 }
 
 fn span_range(source: &str, span: proc_macro2::Span) -> Option<(usize, usize)> {
@@ -629,6 +650,10 @@ fn span_range(source: &str, span: proc_macro2::Span) -> Option<(usize, usize)> {
 
 fn overlaps(range: (usize, usize), window: (usize, usize)) -> bool {
     range.0 < window.1 && window.0 < range.1
+}
+
+fn contained_in(range: (usize, usize), window: (usize, usize)) -> bool {
+    window.0 <= range.0 && range.1 <= window.1
 }
 
 fn touches_any(range: (usize, usize), blocked: &[(usize, usize)]) -> bool {
@@ -641,6 +666,51 @@ fn needs_separator_space(source: &str, del_start: usize, del_end: usize) -> bool
     let glues =
         |c: char| !c.is_whitespace() && !matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';');
     before.is_some_and(glues) && after.is_some_and(glues)
+}
+
+fn expr_attrs(expr: &syn::Expr) -> &[syn::Attribute] {
+    match expr {
+        syn::Expr::Array(e) => &e.attrs,
+        syn::Expr::Assign(e) => &e.attrs,
+        syn::Expr::Async(e) => &e.attrs,
+        syn::Expr::Await(e) => &e.attrs,
+        syn::Expr::Binary(e) => &e.attrs,
+        syn::Expr::Block(e) => &e.attrs,
+        syn::Expr::Break(e) => &e.attrs,
+        syn::Expr::Call(e) => &e.attrs,
+        syn::Expr::Cast(e) => &e.attrs,
+        syn::Expr::Closure(e) => &e.attrs,
+        syn::Expr::Const(e) => &e.attrs,
+        syn::Expr::Continue(e) => &e.attrs,
+        syn::Expr::Field(e) => &e.attrs,
+        syn::Expr::ForLoop(e) => &e.attrs,
+        syn::Expr::Group(e) => &e.attrs,
+        syn::Expr::If(e) => &e.attrs,
+        syn::Expr::Index(e) => &e.attrs,
+        syn::Expr::Infer(e) => &e.attrs,
+        syn::Expr::Let(e) => &e.attrs,
+        syn::Expr::Lit(e) => &e.attrs,
+        syn::Expr::Loop(e) => &e.attrs,
+        syn::Expr::Macro(e) => &e.attrs,
+        syn::Expr::Match(e) => &e.attrs,
+        syn::Expr::MethodCall(e) => &e.attrs,
+        syn::Expr::Paren(e) => &e.attrs,
+        syn::Expr::Path(e) => &e.attrs,
+        syn::Expr::Range(e) => &e.attrs,
+        syn::Expr::RawAddr(e) => &e.attrs,
+        syn::Expr::Reference(e) => &e.attrs,
+        syn::Expr::Repeat(e) => &e.attrs,
+        syn::Expr::Return(e) => &e.attrs,
+        syn::Expr::Struct(e) => &e.attrs,
+        syn::Expr::Try(e) => &e.attrs,
+        syn::Expr::TryBlock(e) => &e.attrs,
+        syn::Expr::Tuple(e) => &e.attrs,
+        syn::Expr::Unary(e) => &e.attrs,
+        syn::Expr::Unsafe(e) => &e.attrs,
+        syn::Expr::While(e) => &e.attrs,
+        syn::Expr::Yield(e) => &e.attrs,
+        _ => &[],
+    }
 }
 
 fn deletable_subhunk_stmt(stmt: &syn::Stmt, is_last: bool) -> bool {
@@ -660,23 +730,25 @@ fn stmt_has_skip_or_test(stmt: &syn::Stmt) -> bool {
     let attrs: &[syn::Attribute] = match stmt {
         syn::Stmt::Local(l) => &l.attrs,
         syn::Stmt::Macro(m) => &m.attrs,
-        syn::Stmt::Expr(expr, _) => match expr {
-            syn::Expr::Call(e) => &e.attrs,
-            syn::Expr::MethodCall(e) => &e.attrs,
-            syn::Expr::Assign(e) => &e.attrs,
-            syn::Expr::Binary(e) => &e.attrs,
-            syn::Expr::If(e) => &e.attrs,
-            syn::Expr::Match(e) => &e.attrs,
-            syn::Expr::Block(e) => &e.attrs,
-            syn::Expr::Try(e) => &e.attrs,
-            syn::Expr::Await(e) => &e.attrs,
-            syn::Expr::Return(e) => &e.attrs,
-            syn::Expr::Macro(e) => &e.attrs,
-            _ => &[],
-        },
+        syn::Stmt::Expr(expr, _) => expr_attrs(expr),
         syn::Stmt::Item(_) => return true,
     };
     instrument::is_test_only(attrs) || instrument::is_skipped(attrs)
+}
+
+fn field_identity(source: &str, field: &syn::FieldValue) -> (String, String) {
+    let name = match &field.member {
+        syn::Member::Named(id) => id.to_string(),
+        syn::Member::Unnamed(idx) => idx.index.to_string(),
+    };
+    let mut cfgs: Vec<String> = field
+        .attrs
+        .iter()
+        .filter(|attr| attr.path().is_ident("cfg") || attr.path().is_ident("cfg_attr"))
+        .filter_map(|attr| span_range(source, attr.span()).map(|(s, e)| token_sig(&source[s..e])))
+        .collect();
+    cfgs.sort();
+    (name, cfgs.join(";"))
 }
 
 struct OldLogical {
@@ -686,7 +758,7 @@ struct OldLogical {
 
 struct OldStruct {
     path_sig: String,
-    fields: HashSet<String>,
+    fields: HashSet<(String, String)>,
 }
 
 #[derive(Default)]
@@ -700,6 +772,7 @@ struct OldCollector<'a> {
     source: &'a str,
     window: (usize, usize),
     scope: Vec<String>,
+    block_counters: Vec<usize>,
     in_logical: Option<LogicalOp>,
     found: OldStructures,
 }
@@ -710,13 +783,19 @@ impl<'a> OldCollector<'a> {
     }
 
     fn record_single_value_expr(&mut self, expr: &syn::Expr) {
+        if instrument::is_test_only(expr_attrs(expr)) || instrument::is_skipped(expr_attrs(expr)) {
+            return;
+        }
         if let Some(range) = span_range(self.source, expr.span())
             && overlaps(range, self.window)
             && !matches!(
                 expr,
                 syn::Expr::Binary(bin) if logical_op(&bin.op).is_some()
             )
-            && !matches!(expr, syn::Expr::Block(_) | syn::Expr::Struct(_))
+            && !matches!(
+                expr,
+                syn::Expr::Block(_) | syn::Expr::Struct(_) | syn::Expr::Return(_)
+            )
         {
             self.found
                 .logicals
@@ -736,7 +815,9 @@ impl<'ast> Visit<'ast> for OldCollector<'_> {
             return;
         }
         self.scope.push(format!("mod:{}", node.ident));
+        self.block_counters.push(0);
         visit::visit_item_mod(self, node);
+        self.block_counters.pop();
         self.scope.pop();
     }
 
@@ -748,7 +829,9 @@ impl<'ast> Visit<'ast> for OldCollector<'_> {
             .map(|(s, e)| token_sig(&self.source[s..e]))
             .unwrap_or_default();
         self.scope.push(format!("impl:{ty}"));
+        self.block_counters.push(0);
         visit::visit_item_impl(self, node);
+        self.block_counters.pop();
         self.scope.pop();
     }
 
@@ -757,7 +840,9 @@ impl<'ast> Visit<'ast> for OldCollector<'_> {
             return;
         }
         self.scope.push(format!("fn:{}", node.sig.ident));
+        self.block_counters.push(0);
         visit::visit_item_fn(self, node);
+        self.block_counters.pop();
         self.scope.pop();
     }
 
@@ -766,7 +851,9 @@ impl<'ast> Visit<'ast> for OldCollector<'_> {
             return;
         }
         self.scope.push(format!("fn:{}", node.sig.ident));
+        self.block_counters.push(0);
         visit::visit_impl_item_fn(self, node);
+        self.block_counters.pop();
         self.scope.pop();
     }
 
@@ -775,11 +862,49 @@ impl<'ast> Visit<'ast> for OldCollector<'_> {
             return;
         }
         self.scope.push(format!("fn:{}", node.sig.ident));
+        self.block_counters.push(0);
         visit::visit_trait_item_fn(self, node);
+        self.block_counters.pop();
         self.scope.pop();
     }
 
+    fn visit_stmt(&mut self, node: &'ast syn::Stmt) {
+        if stmt_has_skip_or_test(node) {
+            return;
+        }
+        visit::visit_stmt(self, node);
+    }
+
+    fn visit_expr(&mut self, node: &'ast syn::Expr) {
+        let attrs = expr_attrs(node);
+        if instrument::is_test_only(attrs) || instrument::is_skipped(attrs) {
+            return;
+        }
+        visit::visit_expr(self, node);
+    }
+
+    fn visit_field_value(&mut self, node: &'ast syn::FieldValue) {
+        if instrument::is_test_only(&node.attrs) || instrument::is_skipped(&node.attrs) {
+            return;
+        }
+        visit::visit_field_value(self, node);
+    }
+
+    fn visit_arm(&mut self, node: &'ast syn::Arm) {
+        if instrument::is_test_only(&node.attrs) || instrument::is_skipped(&node.attrs) {
+            return;
+        }
+        visit::visit_arm(self, node);
+    }
+
     fn visit_block(&mut self, node: &'ast syn::Block) {
+        let idx = self.block_counters.last_mut().map_or(0, |c| {
+            let cur = *c;
+            *c += 1;
+            cur
+        });
+        self.scope.push(format!("b{idx}"));
+        self.block_counters.push(0);
         if let Some(range) = span_range(self.source, node.span())
             && overlaps(range, self.window)
         {
@@ -802,6 +927,8 @@ impl<'ast> Visit<'ast> for OldCollector<'_> {
             }
         }
         visit::visit_block(self, node);
+        self.block_counters.pop();
+        self.scope.pop();
     }
 
     fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
@@ -822,6 +949,9 @@ impl<'ast> Visit<'ast> for OldCollector<'_> {
     }
 
     fn visit_local(&mut self, node: &'ast syn::Local) {
+        if instrument::is_test_only(&node.attrs) || instrument::is_skipped(&node.attrs) {
+            return;
+        }
         if let Some(init) = &node.init {
             self.record_single_value_expr(&init.expr);
         }
@@ -875,10 +1005,7 @@ impl<'ast> Visit<'ast> for OldCollector<'_> {
             let fields = node
                 .fields
                 .iter()
-                .map(|f| match &f.member {
-                    syn::Member::Named(id) => id.to_string(),
-                    syn::Member::Unnamed(idx) => idx.index.to_string(),
-                })
+                .map(|f| field_identity(self.source, f))
                 .collect();
             self.found
                 .structs
@@ -893,22 +1020,43 @@ impl<'ast> Visit<'ast> for OldCollector<'_> {
     }
 }
 
+type DedupKey = (String, Option<Vec<(usize, usize)>>);
+
 struct SubhunkBuilder<'a> {
     current: &'a str,
     whole_undone: &'a str,
     whole: &'a Change,
     tests_now: &'a [(usize, usize)],
     has_old: bool,
+    asked: Asks,
     old: &'a OldStructures,
     scope: Vec<String>,
+    block_counters: Vec<usize>,
     in_logical: Option<LogicalOp>,
-    seen_sigs: HashSet<String>,
+    seen_keys: HashSet<DedupKey>,
     out: Vec<Change>,
 }
 
 impl<'a> SubhunkBuilder<'a> {
     fn key(&self) -> String {
         self.scope.join("::")
+    }
+
+    fn dedup_key(&self, text: &str) -> DedupKey {
+        let loc = if self.asked == Asks::Nothing {
+            None
+        } else {
+            places(text, &[], self.asked)
+        };
+        (token_sig(text), loc)
+    }
+
+    fn node_in_hunk(&self, anchor: (usize, usize)) -> bool {
+        if self.has_old {
+            overlaps(anchor, self.whole.range)
+        } else {
+            contained_in(anchor, self.whole.range)
+        }
     }
 
     fn try_emit(
@@ -943,13 +1091,21 @@ impl<'a> SubhunkBuilder<'a> {
         if instrument::parse_source(&candidate).is_err() {
             return;
         }
-        if instrument::same_tokens(self.current, &candidate) == Some(true)
-            || instrument::same_tokens(self.whole_undone, &candidate) == Some(true)
-        {
+        let same_as_current = if self.asked == Asks::Nothing {
+            instrument::same_tokens(self.current, &candidate) == Some(true)
+        } else {
+            same_build(self.current, &[], &candidate, &[])
+        };
+        let same_as_whole = if self.asked == Asks::Nothing {
+            instrument::same_tokens(self.whole_undone, &candidate) == Some(true)
+        } else {
+            same_build(self.whole_undone, &[], &candidate, &[])
+        };
+        if same_as_current || same_as_whole {
             return;
         }
-        let sig = token_sig(&candidate);
-        if !self.seen_sigs.insert(sig) {
+        let key = self.dedup_key(&candidate);
+        if !self.seen_keys.insert(key) {
             return;
         }
         let line = self.current[..anchor.0].matches('\n').count() + 1;
@@ -973,7 +1129,9 @@ impl<'ast> Visit<'ast> for SubhunkBuilder<'_> {
             return;
         }
         self.scope.push(format!("mod:{}", node.ident));
+        self.block_counters.push(0);
         visit::visit_item_mod(self, node);
+        self.block_counters.pop();
         self.scope.pop();
     }
 
@@ -985,7 +1143,9 @@ impl<'ast> Visit<'ast> for SubhunkBuilder<'_> {
             .map(|(s, e)| token_sig(&self.current[s..e]))
             .unwrap_or_default();
         self.scope.push(format!("impl:{ty}"));
+        self.block_counters.push(0);
         visit::visit_item_impl(self, node);
+        self.block_counters.pop();
         self.scope.pop();
     }
 
@@ -994,7 +1154,9 @@ impl<'ast> Visit<'ast> for SubhunkBuilder<'_> {
             return;
         }
         self.scope.push(format!("fn:{}", node.sig.ident));
+        self.block_counters.push(0);
         visit::visit_item_fn(self, node);
+        self.block_counters.pop();
         self.scope.pop();
     }
 
@@ -1003,7 +1165,9 @@ impl<'ast> Visit<'ast> for SubhunkBuilder<'_> {
             return;
         }
         self.scope.push(format!("fn:{}", node.sig.ident));
+        self.block_counters.push(0);
         visit::visit_impl_item_fn(self, node);
+        self.block_counters.pop();
         self.scope.pop();
     }
 
@@ -1012,8 +1176,46 @@ impl<'ast> Visit<'ast> for SubhunkBuilder<'_> {
             return;
         }
         self.scope.push(format!("fn:{}", node.sig.ident));
+        self.block_counters.push(0);
         visit::visit_trait_item_fn(self, node);
+        self.block_counters.pop();
         self.scope.pop();
+    }
+
+    fn visit_stmt(&mut self, node: &'ast syn::Stmt) {
+        if stmt_has_skip_or_test(node) {
+            return;
+        }
+        visit::visit_stmt(self, node);
+    }
+
+    fn visit_expr(&mut self, node: &'ast syn::Expr) {
+        let attrs = expr_attrs(node);
+        if instrument::is_test_only(attrs) || instrument::is_skipped(attrs) {
+            return;
+        }
+        visit::visit_expr(self, node);
+    }
+
+    fn visit_field_value(&mut self, node: &'ast syn::FieldValue) {
+        if instrument::is_test_only(&node.attrs) || instrument::is_skipped(&node.attrs) {
+            return;
+        }
+        visit::visit_field_value(self, node);
+    }
+
+    fn visit_local(&mut self, node: &'ast syn::Local) {
+        if instrument::is_test_only(&node.attrs) || instrument::is_skipped(&node.attrs) {
+            return;
+        }
+        visit::visit_local(self, node);
+    }
+
+    fn visit_arm(&mut self, node: &'ast syn::Arm) {
+        if instrument::is_test_only(&node.attrs) || instrument::is_skipped(&node.attrs) {
+            return;
+        }
+        visit::visit_arm(self, node);
     }
 
     fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
@@ -1047,7 +1249,7 @@ impl<'ast> Visit<'ast> for SubhunkBuilder<'_> {
                                 Some([old_expr])
                                     if old_expr.op.is_none() || old_expr.op == Some(op) =>
                                 {
-                                    multiset_added_indices(&old_expr.terms, &term_sigs)
+                                    subsequence_added_indices(&old_expr.terms, &term_sigs)
                                         .filter(|added| !added.is_empty())
                                 }
                                 _ => None,
@@ -1056,7 +1258,7 @@ impl<'ast> Visit<'ast> for SubhunkBuilder<'_> {
                         if let Some(indices) = added_indices {
                             for i in indices {
                                 let anchor = spans[i];
-                                if !overlaps(anchor, self.whole.range) {
+                                if !self.node_in_hunk(anchor) {
                                     continue;
                                 }
                                 let (del_start, del_end) = if i == 0 {
@@ -1115,17 +1317,14 @@ impl<'ast> Visit<'ast> for SubhunkBuilder<'_> {
                     {
                         continue;
                     }
-                    let name = match &field.member {
-                        syn::Member::Named(id) => id.to_string(),
-                        syn::Member::Unnamed(idx) => idx.index.to_string(),
-                    };
-                    if old_fields.contains(&name) {
+                    let id = field_identity(self.current, field);
+                    if old_fields.contains(&id) {
                         continue;
                     }
                     let Some((fs, fe)) = span_range(self.current, field.span()) else {
                         continue;
                     };
-                    if !overlaps((fs, fe), self.whole.range) {
+                    if !self.node_in_hunk((fs, fe)) {
                         continue;
                     }
                     let del_end = pair
@@ -1144,6 +1343,13 @@ impl<'ast> Visit<'ast> for SubhunkBuilder<'_> {
     }
 
     fn visit_block(&mut self, node: &'ast syn::Block) {
+        let idx = self.block_counters.last_mut().map_or(0, |c| {
+            let cur = *c;
+            *c += 1;
+            cur
+        });
+        self.scope.push(format!("b{idx}"));
+        self.block_counters.push(0);
         if let Some(range) = span_range(self.current, node.span())
             && overlaps(range, self.whole.range)
         {
@@ -1167,7 +1373,7 @@ impl<'ast> Visit<'ast> for SubhunkBuilder<'_> {
                 } else {
                     match self.old.blocks.get(&self.key()).map(Vec::as_slice) {
                         Some([old_sigs]) => {
-                            multiset_added_indices(old_sigs, &sigs).filter(|a| !a.is_empty())
+                            subsequence_added_indices(old_sigs, &sigs).filter(|a| !a.is_empty())
                         }
                         _ => None,
                     }
@@ -1175,7 +1381,7 @@ impl<'ast> Visit<'ast> for SubhunkBuilder<'_> {
                 if let Some(indices) = added_indices {
                     for i in indices {
                         let (anchor, _) = &candidates[i];
-                        if !overlaps(*anchor, self.whole.range) {
+                        if !self.node_in_hunk(*anchor) {
                             continue;
                         }
                         let desc = format!(
@@ -1188,6 +1394,8 @@ impl<'ast> Visit<'ast> for SubhunkBuilder<'_> {
             }
         }
         visit::visit_block(self, node);
+        self.block_counters.pop();
+        self.scope.pop();
     }
 }
 
@@ -1211,27 +1419,32 @@ fn subhunk_changes(
         source: undone_text,
         window: old_window,
         scope: Vec::new(),
+        block_counters: vec![0],
         in_logical: None,
         found: OldStructures::default(),
     };
     if has_old {
         old_collector.visit_file(undone_tree);
     }
-    let mut seen_sigs = HashSet::new();
-    seen_sigs.insert(token_sig(current));
-    seen_sigs.insert(token_sig(undone_text));
+    let asked = asks_where_it_is(current).max(asks_where_it_is(undone_text));
     let mut builder = SubhunkBuilder {
         current,
         whole_undone: undone_text,
         whole,
         tests_now,
         has_old,
+        asked,
         old: &old_collector.found,
         scope: Vec::new(),
+        block_counters: vec![0],
         in_logical: None,
-        seen_sigs,
+        seen_keys: HashSet::new(),
         out: Vec::new(),
     };
+    let cur_key = builder.dedup_key(current);
+    let undone_key = builder.dedup_key(undone_text);
+    builder.seen_keys.insert(cur_key);
+    builder.seen_keys.insert(undone_key);
     builder.visit_file(parsed);
     builder.out
 }
@@ -1996,5 +2209,132 @@ pub fn validate(x: i32) -> Result<i32, &'static str> {
             "without added statement `if x > 100 { return Err(\"big\"); }`"
         );
         assert_eq!(all_undone(new, &found).as_deref(), Some(old));
+    }
+
+    #[test]
+    fn subhunks_respect_containment_order_skip_attrs_nested_blocks_return_and_line_macros() {
+        // 1. Pure insertion inside an existing `if` must not emit a sub-hunk deleting the `if`.
+        let old_guard = "\
+pub fn f(denied: bool) {
+    if denied {
+        return;
+    }
+    work();
+}
+";
+        let new_guard = "\
+pub fn f(denied: bool) {
+    if denied {
+        audit();
+        return;
+    }
+    work();
+}
+";
+        let found = between(old_guard, new_guard);
+        assert!(
+            !found
+                .iter()
+                .any(|c| c.is_subhunk() && c.code.starts_with("if denied")),
+            "{found:?}"
+        );
+
+        // 2. Ordered subsequence matching: prepending `check() && extra()` before
+        // `gate() && check()` deletes only the prepended terms, never the existing trailing `check()`.
+        let old_seq = "pub fn f() -> bool {\n    gate() && check()\n}\n";
+        let new_seq = "pub fn f() -> bool {\n    check() && extra() && gate() && check()\n}\n";
+        let subs: Vec<_> = between(old_seq, new_seq)
+            .into_iter()
+            .filter(|c| c.is_subhunk())
+            .collect();
+        assert_eq!(subs.len(), 2, "{subs:?}");
+        assert_eq!(
+            subs[0].undone.as_deref(),
+            Some("pub fn f() -> bool {\n    extra() && gate() && check()\n}\n")
+        );
+        assert_eq!(
+            subs[1].undone.as_deref(),
+            Some("pub fn f() -> bool {\n    check() && gate() && check()\n}\n")
+        );
+
+        // 3. `#[cfg(test)]` block and `#[mutants::skip]` field/expr suppress descendants.
+        let old_cfg = "\
+pub fn f() {
+    #[cfg(test)]
+    {
+        keep();
+    }
+}
+";
+        let new_cfg = "\
+pub fn f() {
+    #[cfg(test)]
+    {
+        keep();
+        probe_a();
+        probe_b();
+    }
+}
+";
+        let cfg_subs: Vec<_> = between(old_cfg, new_cfg)
+            .into_iter()
+            .filter(|c| c.is_subhunk())
+            .collect();
+        assert!(cfg_subs.is_empty(), "{cfg_subs:?}");
+
+        let old_skip = "pub fn f(base: S) -> S {\n    S { ..base }\n}\n";
+        let new_skip =
+            "pub fn f(base: S) -> S {\n    S { #[mutants::skip] flag: a && b && c, ..base }\n}\n";
+        let skip_subs: Vec<_> = between(old_skip, new_skip)
+            .into_iter()
+            .filter(|c| c.is_subhunk())
+            .collect();
+        assert!(skip_subs.is_empty(), "{skip_subs:?}");
+
+        // 4. Nested block replacement decomposes added statements inside the inner `if`.
+        let old_nested = "pub fn f(ok: bool) {\n    if ok { foo(); }\n}\n";
+        let new_nested = "pub fn f(ok: bool) {\n    if ok { foo(); bar(); baz(); }\n}\n";
+        let nested_subs: Vec<_> = between(old_nested, new_nested)
+            .into_iter()
+            .filter(|c| c.is_subhunk())
+            .collect();
+        assert_eq!(nested_subs.len(), 2, "{nested_subs:?}");
+        assert_eq!(
+            nested_subs[0].describe(),
+            "without added statement `bar();`"
+        );
+        assert_eq!(
+            nested_subs[1].describe(),
+            "without added statement `baz();`"
+        );
+
+        // 5. Tail `return a` -> `return a && b && c` decomposes `b` and `c`.
+        let old_ret = "pub fn f(a: bool, b: bool, c: bool) -> bool {\n    return a\n}\n";
+        let new_ret = "pub fn f(a: bool, b: bool, c: bool) -> bool {\n    return a && b && c\n}\n";
+        let ret_subs: Vec<_> = between(old_ret, new_ret)
+            .into_iter()
+            .filter(|c| c.is_subhunk())
+            .collect();
+        assert_eq!(ret_subs.len(), 2, "{ret_subs:?}");
+
+        // 6. `line!()`-sensitive duplicates on different lines are both kept.
+        let old_line = "pub fn f() {\n    init();\n}\n";
+        let new_line = "pub fn f() {\n    init();\n    record(line!());\n    record(line!());\n}\n";
+        let line_subs: Vec<_> = between(old_line, new_line)
+            .into_iter()
+            .filter(|c| c.is_subhunk())
+            .collect();
+        assert_eq!(line_subs.len(), 2, "{line_subs:?}");
+        assert_ne!(line_subs[0].line, line_subs[1].line);
+
+        // 7. `#[cfg(...)]` struct field of the same name is treated as distinct.
+        let old_cfg_field =
+            "pub fn f(base: S) -> S {\n    S { #[cfg(not(feature = \"x\"))] a: 1, ..base }\n}\n";
+        let new_cfg_field = "pub fn f(base: S) -> S {\n    S { #[cfg(not(feature = \"x\"))] a: 1, #[cfg(feature = \"x\")] a: 2, b: 3, ..base }\n}\n";
+        let cfg_field_subs: Vec<_> = between(old_cfg_field, new_cfg_field)
+            .into_iter()
+            .filter(|c| c.is_subhunk())
+            .collect();
+        assert_eq!(cfg_field_subs.len(), 2, "{cfg_field_subs:?}");
     }
 }
