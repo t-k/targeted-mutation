@@ -4,19 +4,63 @@ use std::process::ExitCode;
 use clap::Parser;
 use targeted_mutation::{driver, report};
 
-#[derive(Clone, Copy, clap::ValueEnum)]
+const HEADING_TARGET: &str = "Target & Scope";
+const HEADING_MUTATION: &str = "Mutation Mode";
+const HEADING_TESTS: &str = "Test Execution & Selection";
+const HEADING_OUTPUT: &str = "Output & Baselines";
+const HEADING_BUILD: &str = "Performance & Cargo Build";
+const HEADING_WORK: &str = "Work Directory & Fixtures";
+
+const SHORT_EXAMPLES: &str = "\
+Examples:
+  cargo tmt                               Analyse the current package
+  cargo tmt --since main                  Analyse changes since `main`
+  cargo tmt --rebuild                     Also build source-only mutants and witnesses
+  cargo tmt --format sarif > tmt.sarif    Write SARIF 2.1.0 output
+
+Run `cargo tmt --help` for detailed option descriptions and exit codes.";
+
+const LONG_EXAMPLES: &str = "\
+Examples:
+  cargo tmt                               Analyse the current package
+  cargo tmt --since main                  Analyse changes since `main`
+  cargo tmt --rebuild                     Also build source-only mutants and witnesses
+  cargo tmt --workspace --format jsonl    Stream one JSON record per workspace member
+  cargo tmt --format sarif > tmt.sarif    Write SARIF 2.1.0 for code scanning
+  cargo tmt --source-only --shard 0/4     Run one shard in CI
+
+Exit codes:
+  0  No gaps found
+  1  Analysis or CLI error (e.g. baseline tests failed)
+  2  Test gaps, unstable predictions, or audit discrepancies found
+  3  Incomplete evaluation (no mutants executed, or source-only timeout/unevaluated)";
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
+enum OutputFormat {
+    /// Human-readable terminal report.
+    #[default]
+    Text,
+    /// Pretty-printed JSON report.
+    Json,
+    /// One compact JSON record per completed package (streamed).
+    Jsonl,
+    /// SARIF 2.1.0 for code scanning tools.
+    Sarif,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum Sharding {
     Slice,
     RoundRobin,
 }
 
-#[derive(Clone, Copy, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
 enum TimeoutRecheck {
     Serial,
     None,
 }
 
-#[derive(Clone, Copy, Default, clap::ValueEnum)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 enum TestTool {
     #[default]
     Cargo,
@@ -26,187 +70,414 @@ enum TestTool {
 /// Targeted mutation testing: finds the wrong implementations your tests would let
 /// through, and says which input or assertion would catch them.
 #[derive(Parser)]
-#[command(name = "cargo-tmt", bin_name = "cargo tmt", version)]
+#[command(
+    name = "cargo-tmt",
+    bin_name = "cargo tmt",
+    version,
+    after_help = SHORT_EXAMPLES,
+    after_long_help = LONG_EXAMPLES
+)]
 struct Cli {
-    /// Directory of the cargo package to analyse.
+    // ── Target & Scope ────────────────────────────────────────────────────────
+    /// Directory of the Cargo package or workspace to analyse.
     #[arg(default_value = ".")]
     dir: PathBuf,
+
     /// Directory of the Cargo package or workspace to analyse.
-    #[arg(short = 'd', long = "dir", conflicts_with = "dir")]
+    #[arg(
+        short = 'd',
+        long = "dir",
+        value_name = "DIR",
+        conflicts_with = "dir",
+        help_heading = HEADING_TARGET
+    )]
     directory: Option<PathBuf>,
-    /// Package to analyse, when the directory is a workspace (repeatable).
-    #[arg(short, long, value_delimiter = ',', conflicts_with = "workspace")]
+
+    /// Workspace member to analyse (repeatable or comma-separated).
+    #[arg(
+        short,
+        long,
+        value_name = "PACKAGE",
+        value_delimiter = ',',
+        conflicts_with = "workspace",
+        help_heading = HEADING_TARGET
+    )]
     package: Vec<String>,
+
     /// Analyse all workspace members.
-    #[arg(long)]
+    #[arg(long, help_heading = HEADING_TARGET)]
     workspace: bool,
-    /// List source candidates and their edits without building or running tests.
-    #[arg(long, conflicts_with_all = ["sarif", "baseline", "write_baseline"])]
-    list: bool,
-    /// Run the whole workspace's tests against every mutation.
-    #[arg(long, num_args = 0..=1, require_equals = true, default_missing_value = "true")]
-    test_workspace: Option<bool>,
-    /// Print the report as JSON.
-    #[arg(long)]
-    json: bool,
-    /// Emit one compact JSON report or error per completed package.
-    #[arg(long, conflicts_with_all = ["json", "sarif"])]
-    jsonl: bool,
-    /// Trust the trace: do not re-run tests against predicted survivors.
-    #[arg(long)]
-    no_verify: bool,
-    /// Directory for the working copy and its build (default: <target dir>/tmt).
-    #[arg(long, value_name = "DIR")]
-    work_dir: Option<PathBuf>,
-    /// Also run the doc tests. They are recompiled for every mutant they reach.
-    #[arg(long)]
-    doc: bool,
-    /// Copy files that git ignores as well (needed when the build reads generated,
-    /// untracked files). By default they are left out of the working copy.
-    #[arg(long)]
-    all_files: bool,
-    /// Reproduce the source Git index in an independent repository in the work copy.
-    #[arg(long)]
-    git_index: bool,
-    /// Copy a workspace-relative file or directory even when Git ignores it (repeatable).
-    #[arg(long, value_name = "PATH")]
-    copy_fixture: Vec<PathBuf>,
-    /// Omit this workspace-relative entry from an explicitly copied fixture (repeatable).
-    #[arg(long, value_name = "PATH", requires = "copy_fixture")]
-    copy_fixture_exclude: Vec<PathBuf>,
-    /// Stage workspace fixture FROM at path TO relative to the isolated Cargo output (repeatable).
-    #[arg(long, value_name = "FROM=TO")]
-    copy_output_fixture: Vec<targeted_mutation::output_fixture::Fixture>,
-    /// Save and reuse completed mutant outcomes in checkpoint.jsonl under the work directory.
-    #[arg(long, conflicts_with = "list")]
-    checkpoint: bool,
-    /// Mutants to run at the same time. Only raise it if the tests can run concurrently
-    /// with themselves (no fixed ports, no shared files).
-    #[arg(short, long, default_value_t = 1, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
-    jobs: u32,
-    /// Analyse only the code changed since this git revision, and untracked files.
-    #[arg(long, value_name = "REV")]
+
+    /// Analyse only code changed since this Git revision, plus untracked files.
+    #[arg(long, value_name = "REV", help_heading = HEADING_TARGET)]
     since: Option<String>,
-    /// Analyse only these lines: FILE:FROM-TO, FILE:LINE or FILE (relative to the package).
-    #[arg(long, value_name = "FILE:FROM-TO")]
+
+    /// Analyse only these lines: FILE:FROM-TO, FILE:LINE, or FILE (repeatable).
+    ///
+    /// Paths are relative to each analysed package.
+    #[arg(long, value_name = "FILE:FROM-TO", help_heading = HEADING_TARGET)]
     lines: Vec<String>,
-    /// Do not report the findings listed in this file.
-    #[arg(long, value_name = "FILE")]
-    baseline: Option<PathBuf>,
-    /// Write this run's findings to a file that later runs can use as --baseline.
-    #[arg(long, value_name = "FILE")]
-    write_baseline: Option<PathBuf>,
-    /// Also run the tests of this workspace package (repeatable).
-    #[arg(long, value_name = "PACKAGE")]
-    also_test: Vec<String>,
-    /// Also run the tests of every workspace package that depends on the analysed one.
-    #[arg(long)]
-    dependents: bool,
-    /// Do not trace surviving mutants to say what they change.
-    #[arg(long)]
-    no_effects: bool,
-    /// Also run mutants that need a build of their own and verify distinguishing inputs
-    /// for supported survivors. Slower than probes alone.
-    #[arg(long)]
+
+    // ── Mutation Mode ─────────────────────────────────────────────────────────
+    /// Also build source-only mutants and verify distinguishing witnesses (slower).
+    ///
+    /// Runs mutants that cannot be expressed as runtime probes (such as `const fn`,
+    /// `impl Iterator` bodies, and shared-target modules) and synthesizes concrete
+    /// distinguishing inputs or assertions for supported survivors.
+    #[arg(long, help_heading = HEADING_MUTATION)]
     rebuild: bool,
-    /// Also replace Result returns with Err(EXPR), using this Rust expression (repeatable).
-    #[arg(long = "error", value_name = "EXPR", allow_hyphen_values = true)]
-    error_values: Vec<String>,
-    /// Build every supported mutant in the selected source instead of using probes.
-    #[arg(long, conflicts_with_all = ["rebuild", "audit", "no_verify"])]
+
+    /// Build every supported mutant directly from source instead of using probes.
+    ///
+    /// Useful when tests spawn children that clear environment variables. Slower than
+    /// probes and omits trace-based input or assertion suggestions.
+    #[arg(
+        long,
+        conflicts_with_all = ["rebuild", "audit", "no_verify"],
+        help_heading = HEADING_MUTATION
+    )]
     source_only: bool,
-    /// Replace just the operator token, using Rust precedence for the new spelling.
-    #[arg(long, requires = "source_only")]
+
+    /// Preview source mutation candidates without building or running tests.
+    #[arg(
+        long,
+        conflicts_with_all = ["sarif", "baseline", "write_baseline"],
+        help_heading = HEADING_MUTATION
+    )]
+    list: bool,
+
+    /// Also replace `Result` returns with `Err(EXPR)` (repeatable).
+    ///
+    /// EXPR is Rust code evaluated in the function's scope (e.g. `"mutated".into()`).
+    #[arg(
+        long = "error",
+        value_name = "EXPR",
+        allow_hyphen_values = true,
+        help_heading = HEADING_MUTATION
+    )]
+    error_values: Vec<String>,
+
+    /// Replace only the operator token without parenthesizing operands (`--source-only`).
+    #[arg(long, requires = "source_only", help_heading = HEADING_MUTATION)]
     literal_operators: bool,
-    /// Select a zero-based source-only shard K/N.
-    #[arg(long, requires = "source_only", value_name = "K/N")]
+
+    /// Select zero-based source-only shard K/N (`--source-only`).
+    #[arg(
+        long,
+        requires = "source_only",
+        value_name = "K/N",
+        help_heading = HEADING_MUTATION
+    )]
     shard: Option<report::Shard>,
+
     /// Method for distributing candidates across shards (default: slice).
-    #[arg(long, requires = "shard", value_enum)]
+    #[arg(
+        long,
+        requires = "shard",
+        value_enum,
+        value_name = "METHOD",
+        help_heading = HEADING_MUTATION
+    )]
     sharding: Option<Sharding>,
-    /// Select the runner (nextest requires --source-only).
-    #[arg(long, value_enum, default_value = "cargo")]
+
+    /// Trust the trace without re-running tests against predicted survivors.
+    #[arg(long, help_heading = HEADING_MUTATION)]
+    no_verify: bool,
+
+    /// Skip effect tracing on surviving mutants.
+    #[arg(long, help_heading = HEADING_MUTATION)]
+    no_effects: bool,
+
+    /// Audit up to N survivors and probe mutants against full test runs.
+    ///
+    /// Re-runs up to N surviving mutants against every test binary, compares up to N
+    /// probe mutants against fresh source builds, and records tests a second time to
+    /// detect nondeterminism. Discrepancies exit with code 2.
+    #[arg(
+        long,
+        value_name = "N",
+        conflicts_with = "no_verify",
+        help_heading = HEADING_MUTATION
+    )]
+    audit: Option<usize>,
+
+    // ── Test Execution & Selection ────────────────────────────────────────────
+    /// Also run tests from this workspace package (repeatable).
+    #[arg(long, value_name = "PACKAGE", help_heading = HEADING_TESTS)]
+    also_test: Vec<String>,
+
+    /// Also run tests of every workspace package that depends on the analysed package.
+    #[arg(long, help_heading = HEADING_TESTS)]
+    dependents: bool,
+
+    /// Run tests from all workspace members against every mutation.
+    #[arg(
+        long,
+        value_name = "BOOL",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "true",
+        help_heading = HEADING_TESTS
+    )]
+    test_workspace: Option<bool>,
+
+    /// Also run doc tests (recompiled per reached mutant; slower).
+    #[arg(long, help_heading = HEADING_TESTS)]
+    doc: bool,
+
+    /// Test runner to use (`nextest` requires `--source-only`).
+    #[arg(
+        long,
+        value_enum,
+        value_name = "TOOL",
+        default_value = "cargo",
+        help_heading = HEADING_TESTS
+    )]
     test_tool: TestTool,
-    /// Nextest profile to use with --test-tool nextest.
-    #[arg(long, value_name = "PROFILE")]
+
+    /// Nextest profile to use with `--test-tool nextest`.
+    #[arg(long, value_name = "PROFILE", help_heading = HEADING_TESTS)]
     nextest_profile: Option<String>,
+
     /// Run one selected libtest test per process, including its child threads.
-    #[arg(long)]
+    #[arg(long, help_heading = HEADING_TESTS)]
     isolate_tests: bool,
-    /// Select these Cargo test artifact names for running and, where possible, for building (repeatable).
-    #[arg(long)]
+
+    /// Select Cargo test target names to run and build when possible (repeatable).
+    #[arg(long, value_name = "TARGET", help_heading = HEADING_TESTS)]
     test_target: Vec<String>,
-    /// Include these exact libtest names (repeatable).
-    #[arg(long)]
+
+    /// Include exact libtest test names (repeatable).
+    #[arg(long, value_name = "NAME", help_heading = HEADING_TESTS)]
     include_test: Vec<String>,
-    /// Exclude these exact libtest names (repeatable).
-    #[arg(long)]
+
+    /// Exclude exact libtest test names (repeatable).
+    #[arg(long, value_name = "NAME", help_heading = HEADING_TESTS)]
     exclude_test: Vec<String>,
-    /// Also allow tests marked #[ignore].
-    #[arg(long)]
+
+    /// Also run tests marked `#[ignore]`.
+    #[arg(long, help_heading = HEADING_TESTS)]
     include_ignored: bool,
-    /// Executable in the workspace copy to invoke with the test binary and its arguments.
-    #[arg(long, value_name = "PATH")]
+
+    /// Workspace-relative wrapper executable invoked with each test binary and its args.
+    #[arg(long, value_name = "PATH", help_heading = HEADING_TESTS)]
     test_wrapper: Option<PathBuf>,
-    /// Build the tests at this optimisation level (0 to 3) instead of the profile's own.
-    /// The probes cost next to nothing in optimised code, which pays off when tests
-    /// spend their time in loops; the build takes longer, and the tests no longer run
-    /// exactly as `cargo test` builds them.
-    #[arg(long, value_name = "N", value_parser = clap::value_parser!(u8).range(0..=3))]
-    opt_level: Option<u8>,
-    /// Time allowed for each test runner under a mutant, in seconds.
-    #[arg(long, value_name = "SECONDS", value_parser = clap::value_parser!(u64).range(1..))]
-    timeout: Option<u64>,
-    /// Concurrent isolated baselines (default: one).
-    #[arg(long, value_name = "N", default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..))]
-    baseline_jobs: u32,
-    /// Retry timeouts from parallel mutation workers in isolation.
-    #[arg(long, value_enum, default_value = "serial")]
-    timeout_recheck: TimeoutRecheck,
-    /// Seconds for a test wrapper to clean up after timeout on Unix. Zero kills immediately.
+
+    /// Seconds for `--test-wrapper` to clean up after timeout on Unix (0 kills immediately).
     #[arg(
         long,
         value_name = "SECONDS",
         default_value_t = 2,
-        requires = "test_wrapper"
+        requires = "test_wrapper",
+        help_heading = HEADING_TESTS
     )]
     wrapper_grace: u64,
-    /// Features of the package to build with (as for `cargo test`; repeatable).
-    #[arg(long, short = 'F', value_name = "FEATURES", value_delimiter = ',')]
-    features: Vec<String>,
-    /// Build with all features.
-    #[arg(long, conflicts_with_all = ["features", "no_default_features"])]
-    all_features: bool,
-    /// Build without the default features.
-    #[arg(long)]
-    no_default_features: bool,
-    /// Do not let cargo change the lock file.
-    #[arg(long)]
-    locked: bool,
-    /// Check the run itself: run up to N of the surviving mutants once more against
-    /// every test (not only the ones chosen for them), and record the tests a second
-    /// time to see whether they do the same.
-    #[arg(long, value_name = "N", conflicts_with = "no_verify")]
-    audit: Option<usize>,
-    /// Print the report as SARIF 2.1.0.
-    #[arg(long, conflicts_with = "json")]
-    sarif: bool,
-    /// Also list the code that no test executes.
-    #[arg(long)]
+
+    // ── Output & Baselines ────────────────────────────────────────────────────
+    /// Output format: text, json, jsonl, or sarif [default: text].
+    #[arg(
+        long,
+        value_enum,
+        value_name = "FORMAT",
+        help_heading = HEADING_OUTPUT
+    )]
+    format: Option<OutputFormat>,
+
+    /// Also list mutation sites that no test executed.
+    #[arg(long, help_heading = HEADING_OUTPUT)]
     show_unreached: bool,
-    /// No progress output on stderr.
-    #[arg(short, long)]
+
+    /// Suppress progress output on stderr.
+    #[arg(short, long, help_heading = HEADING_OUTPUT)]
     quiet: bool,
+
+    /// Suppress findings already recorded in this baseline file.
+    #[arg(long, value_name = "FILE", help_heading = HEADING_OUTPUT)]
+    baseline: Option<PathBuf>,
+
+    /// Save this run's findings to a baseline file for future `--baseline` runs.
+    #[arg(long, value_name = "FILE", help_heading = HEADING_OUTPUT)]
+    write_baseline: Option<PathBuf>,
+
+    /// Shorthand for `--format json`.
+    #[arg(
+        long,
+        conflicts_with_all = ["format", "jsonl", "sarif"],
+        help_heading = HEADING_OUTPUT
+    )]
+    json: bool,
+
+    /// Shorthand for `--format jsonl`.
+    #[arg(
+        long,
+        conflicts_with_all = ["format", "json", "sarif"],
+        help_heading = HEADING_OUTPUT
+    )]
+    jsonl: bool,
+
+    /// Shorthand for `--format sarif`.
+    #[arg(
+        long,
+        conflicts_with_all = ["format", "json", "jsonl"],
+        help_heading = HEADING_OUTPUT
+    )]
+    sarif: bool,
+
+    // ── Performance & Cargo Build ─────────────────────────────────────────────
+    /// Mutants to run in parallel.
+    ///
+    /// Raise this only when tests can run concurrently with themselves (no fixed ports
+    /// or shared files).
+    #[arg(
+        short,
+        long,
+        default_value_t = 1,
+        value_name = "N",
+        value_parser = clap::value_parser!(u32).range(1..),
+        help_heading = HEADING_BUILD
+    )]
+    jobs: u32,
+
+    /// Concurrent isolated baseline tests.
+    #[arg(
+        long,
+        value_name = "N",
+        default_value_t = 1,
+        value_parser = clap::value_parser!(u32).range(1..),
+        help_heading = HEADING_BUILD
+    )]
+    baseline_jobs: u32,
+
+    /// Timeout per test runner invocation under a mutant, in seconds.
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        value_parser = clap::value_parser!(u64).range(1..),
+        help_heading = HEADING_BUILD
+    )]
+    timeout: Option<u64>,
+
+    /// Policy for rechecking timeouts from parallel mutation workers.
+    #[arg(
+        long,
+        value_enum,
+        value_name = "POLICY",
+        default_value = "serial",
+        help_heading = HEADING_BUILD
+    )]
+    timeout_recheck: TimeoutRecheck,
+
+    /// Save and resume completed mutant outcomes via `checkpoint.jsonl` in the work dir.
+    #[arg(long, conflicts_with = "list", help_heading = HEADING_BUILD)]
+    checkpoint: bool,
+
+    /// Override Cargo optimisation level for instrumented test builds (0 to 3).
+    ///
+    /// Probes have near-zero overhead when optimised, which helps loop-heavy tests, at
+    /// the cost of slower builds and tests differing from plain `cargo test`.
+    #[arg(
+        long,
+        value_name = "N",
+        value_parser = clap::value_parser!(u8).range(0..=3),
+        help_heading = HEADING_BUILD
+    )]
+    opt_level: Option<u8>,
+
+    /// Cargo features to enable, comma-separated (repeatable).
+    #[arg(
+        long,
+        short = 'F',
+        value_name = "FEATURES",
+        value_delimiter = ',',
+        help_heading = HEADING_BUILD
+    )]
+    features: Vec<String>,
+
+    /// Build with all Cargo features enabled.
+    #[arg(
+        long,
+        conflicts_with_all = ["features", "no_default_features"],
+        help_heading = HEADING_BUILD
+    )]
+    all_features: bool,
+
+    /// Build without default Cargo features.
+    #[arg(long, help_heading = HEADING_BUILD)]
+    no_default_features: bool,
+
+    /// Pass `--locked` to Cargo so `Cargo.lock` stays unchanged.
+    #[arg(long, help_heading = HEADING_BUILD)]
+    locked: bool,
+
+    // ── Work Directory & Fixtures ─────────────────────────────────────────────
+    /// Directory for the isolated working copy and build (default: `<target-dir>/tmt`).
+    #[arg(long, value_name = "DIR", help_heading = HEADING_WORK)]
+    work_dir: Option<PathBuf>,
+
+    /// Also copy gitignored files into the working copy.
+    ///
+    /// Needed when the build reads generated, untracked files. Git metadata,
+    /// `node_modules`, and build caches remain excluded by default.
+    #[arg(long, help_heading = HEADING_WORK)]
+    all_files: bool,
+
+    /// Create an independent Git index in the working copy for commands like `git ls-files`.
+    #[arg(long, help_heading = HEADING_WORK)]
+    git_index: bool,
+
+    /// Copy a workspace-relative path even if gitignored (repeatable).
+    #[arg(long, value_name = "PATH", help_heading = HEADING_WORK)]
+    copy_fixture: Vec<PathBuf>,
+
+    /// Exclude a workspace-relative path from `--copy-fixture` (repeatable).
+    #[arg(
+        long,
+        value_name = "PATH",
+        requires = "copy_fixture",
+        help_heading = HEADING_WORK
+    )]
+    copy_fixture_exclude: Vec<PathBuf>,
+
+    /// Stage workspace path FROM at TO relative to isolated Cargo output (repeatable).
+    #[arg(long, value_name = "FROM=TO", help_heading = HEADING_WORK)]
+    copy_output_fixture: Vec<targeted_mutation::output_fixture::Fixture>,
+}
+
+impl Cli {
+    fn output_format(&self) -> OutputFormat {
+        if let Some(format) = self.format {
+            format
+        } else if self.json {
+            OutputFormat::Json
+        } else if self.jsonl {
+            OutputFormat::Jsonl
+        } else if self.sarif {
+            OutputFormat::Sarif
+        } else {
+            OutputFormat::Text
+        }
+    }
+
+    fn validate(&self) -> Result<(), &'static str> {
+        if !matches!(self.test_tool, TestTool::Nextest) && self.nextest_profile.is_some() {
+            return Err("--nextest-profile requires --test-tool nextest");
+        }
+        if self.list && self.output_format() == OutputFormat::Sarif {
+            return Err("--list cannot be used with --format sarif");
+        }
+        Ok(())
+    }
 }
 
 /// Exit codes: 0 no gaps, 1 analysis failed, 2 gaps found, 3 incomplete evaluation.
 fn main() -> ExitCode {
     let cli = Cli::parse_from(arguments(std::env::args_os()));
-    let nextest = matches!(cli.test_tool, TestTool::Nextest);
-    if !nextest && cli.nextest_profile.is_some() {
-        eprintln!("tmt: --nextest-profile requires --test-tool nextest");
+    if let Err(message) = cli.validate() {
+        eprintln!("tmt: {message}");
         return ExitCode::FAILURE;
     }
+    let output_format = cli.output_format();
+    let nextest = matches!(cli.test_tool, TestTool::Nextest);
     let options = driver::Options {
         dir: cli.directory.unwrap_or(cli.dir),
         package: cli.package.first().cloned(),
@@ -262,7 +533,7 @@ fn main() -> ExitCode {
         checkpoint: cli.checkpoint,
         doc: cli.doc,
     };
-    if cli.jsonl {
+    if output_format == OutputFormat::Jsonl {
         return stream_reports(
             &options,
             &cli.package,
@@ -277,11 +548,11 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        return show_workspace(members, cli.json, cli.sarif, cli.show_unreached);
+        return show_workspace(members, output_format, cli.show_unreached);
     }
     match driver::run(&options) {
         Ok(result) => {
-            show_report(&result, cli.json, cli.sarif, cli.show_unreached);
+            show_report(&result, output_format, cli.show_unreached);
             ExitCode::from(report_exit(&result))
         }
         Err(err) => {
@@ -322,29 +593,33 @@ fn report_json(result: &report::Report) -> serde_json::Value {
     }
 }
 
-fn show_report(result: &report::Report, json: bool, sarif: bool, show_unreached: bool) {
-    if sarif {
-        println!("{}", report::render_sarif(result));
-    } else if json {
-        if result.mutants.is_some() {
-            println!("{:#}", report_json(result));
-        } else {
-            println!(
-                "{}",
-                serde_json::to_string_pretty(result).expect("report serialises")
-            );
+fn show_report(result: &report::Report, format: OutputFormat, show_unreached: bool) {
+    match format {
+        OutputFormat::Sarif => println!("{}", report::render_sarif(result)),
+        OutputFormat::Json => {
+            if result.mutants.is_some() {
+                println!("{:#}", report_json(result));
+            } else {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(result).expect("report serialises")
+                );
+            }
         }
-    } else if let Some(mutants) = &result.mutants {
-        println!("{}: {} source candidates", result.package, mutants.len());
-        for candidate in mutants {
-            let edit = &candidate.edits[0];
-            println!(
-                "{}:{}:{}: {} -> {}",
-                edit.file, edit.line, edit.column, candidate.what, candidate.into
-            );
+        OutputFormat::Text | OutputFormat::Jsonl => {
+            if let Some(mutants) = &result.mutants {
+                println!("{}: {} source candidates", result.package, mutants.len());
+                for candidate in mutants {
+                    let edit = &candidate.edits[0];
+                    println!(
+                        "{}:{}:{}: {} -> {}",
+                        edit.file, edit.line, edit.column, candidate.what, candidate.into
+                    );
+                }
+            } else {
+                print!("{}", report::render_text(result, show_unreached));
+            }
         }
-    } else {
-        print!("{}", report::render_text(result, show_unreached));
     }
 }
 
@@ -397,8 +672,7 @@ fn stream_reports(options: &driver::Options, packages: &[String], workspace: boo
 
 fn show_workspace(
     members: Vec<(String, anyhow::Result<report::Report>)>,
-    json: bool,
-    sarif: bool,
+    format: OutputFormat,
     show_unreached: bool,
 ) -> ExitCode {
     let mut reports = vec![];
@@ -414,23 +688,28 @@ fn show_workspace(
         }
     }
     let has_errors = !errors.is_empty();
-    if json {
-        let mut combined = serde_json::json!({});
-        combined["packages"] = serde_json::Value::Array(reports.iter().map(report_json).collect());
-        combined["errors"] = serde_json::Value::Array(errors);
-        println!("{combined:#}");
-    } else if sarif {
-        let failed: Vec<(String, String)> = errors
-            .iter()
-            .map(|error| {
-                let text = |key: &str| error[key].as_str().unwrap_or_default().to_string();
-                (text("package"), text("error"))
-            })
-            .collect();
-        println!("{:#}", report::workspace_sarif(&reports, &failed));
-    } else {
-        for result in &reports {
-            show_report(result, false, false, show_unreached);
+    match format {
+        OutputFormat::Json => {
+            let mut combined = serde_json::json!({});
+            combined["packages"] =
+                serde_json::Value::Array(reports.iter().map(report_json).collect());
+            combined["errors"] = serde_json::Value::Array(errors);
+            println!("{combined:#}");
+        }
+        OutputFormat::Sarif => {
+            let failed: Vec<(String, String)> = errors
+                .iter()
+                .map(|error| {
+                    let text = |key: &str| error[key].as_str().unwrap_or_default().to_string();
+                    (text("package"), text("error"))
+                })
+                .collect();
+            println!("{:#}", report::workspace_sarif(&reports, &failed));
+        }
+        OutputFormat::Text | OutputFormat::Jsonl => {
+            for result in &reports {
+                show_report(result, OutputFormat::Text, show_unreached);
+            }
         }
     }
     ExitCode::from(if has_errors {
@@ -460,6 +739,7 @@ fn arguments(given: impl IntoIterator<Item = std::ffi::OsString>) -> Vec<std::ff
 #[cfg(test)]
 mod tests {
     use super::*;
+    use clap::CommandFactory;
 
     fn given(args: &[&str]) -> Vec<String> {
         arguments(args.iter().map(std::ffi::OsString::from))
@@ -494,5 +774,117 @@ mod tests {
         let cli = Cli::parse_from(given(&["cargo-tmt", "tmt"]));
         assert_eq!(cli.dir, PathBuf::from("."));
         assert!(Cli::try_parse_from(given(&["cargo-tmt", "tmt", "--jobs", "0"])).is_err());
+    }
+
+    #[test]
+    fn output_format_supports_unified_option_and_legacy_shorthands() {
+        let default_cli = Cli::parse_from(given(&["cargo-tmt", "tmt"]));
+        assert_eq!(default_cli.output_format(), OutputFormat::Text);
+        assert!(default_cli.validate().is_ok());
+
+        for (args, expected) in [
+            (&["--format", "text"][..], OutputFormat::Text),
+            (&["--format", "json"][..], OutputFormat::Json),
+            (&["--format", "jsonl"][..], OutputFormat::Jsonl),
+            (&["--format", "sarif"][..], OutputFormat::Sarif),
+            (&["--json"][..], OutputFormat::Json),
+            (&["--jsonl"][..], OutputFormat::Jsonl),
+            (&["--sarif"][..], OutputFormat::Sarif),
+        ] {
+            let mut argv = vec!["cargo-tmt", "tmt"];
+            argv.extend_from_slice(args);
+            let cli = Cli::parse_from(given(&argv));
+            assert_eq!(cli.output_format(), expected, "for {args:?}");
+            assert!(cli.validate().is_ok(), "for {args:?}");
+        }
+
+        // Conflicting format combinations are rejected at parse time.
+        for bad in [
+            &["--format", "json", "--sarif"][..],
+            &["--format", "text", "--json"][..],
+            &["--format", "sarif", "--jsonl"][..],
+            &["--json", "--jsonl"][..],
+            &["--json", "--sarif"][..],
+            &["--list", "--sarif"][..],
+            &["--baseline-jobs", "0"][..],
+            &["--timeout", "0"][..],
+            &["--opt-level", "4"][..],
+        ] {
+            let mut argv = vec!["cargo-tmt", "tmt"];
+            argv.extend_from_slice(bad);
+            assert!(
+                Cli::try_parse_from(given(&argv)).is_err(),
+                "expected parse error for {bad:?}"
+            );
+        }
+
+        // Cross-option validation rejects `--list --format sarif` and stray `--nextest-profile`.
+        let list_sarif =
+            Cli::parse_from(given(&["cargo-tmt", "tmt", "--list", "--format", "sarif"]));
+        assert!(list_sarif.validate().is_err());
+
+        let stray_profile =
+            Cli::parse_from(given(&["cargo-tmt", "tmt", "--nextest-profile", "ci"]));
+        assert!(stray_profile.validate().is_err());
+
+        let valid_nextest = Cli::parse_from(given(&[
+            "cargo-tmt",
+            "tmt",
+            "--source-only",
+            "--test-tool",
+            "nextest",
+            "--nextest-profile",
+            "ci",
+        ]));
+        assert!(valid_nextest.validate().is_ok());
+    }
+
+    #[test]
+    fn cli_definition_and_grouped_help_are_valid() {
+        let mut cmd = Cli::command();
+        cmd.clone().debug_assert();
+
+        let long_help = cmd.render_long_help().to_string();
+        for heading in [
+            HEADING_TARGET,
+            HEADING_MUTATION,
+            HEADING_TESTS,
+            HEADING_OUTPUT,
+            HEADING_BUILD,
+            HEADING_WORK,
+        ] {
+            assert!(
+                long_help.contains(heading),
+                "missing heading `{heading}` in --help"
+            );
+        }
+        assert!(long_help.contains("--format <FORMAT>"));
+        assert!(long_help.contains("Examples:"));
+        assert!(long_help.contains("Exit codes:"));
+    }
+
+    #[test]
+    fn report_exit_returns_two_on_audit_discrepancies() {
+        let mut rep = report::Report {
+            package: "demo".to_string(),
+            ..Default::default()
+        };
+        assert_eq!(report_exit(&rep), 0);
+        rep.audit = Some(report::Audit {
+            sampled: 1,
+            survivors: 1,
+            not_audited: 0,
+            disagreements: vec![],
+            rebuilt: 0,
+            compared: 0,
+            not_compared: 0,
+            source_disagreements: vec![],
+            trace_differences: vec![report::TraceDifference {
+                binary: "demo".to_string(),
+                records: 0,
+                rerun_failed: true,
+            }],
+        });
+        assert_eq!(report_exit(&rep), 2);
     }
 }
