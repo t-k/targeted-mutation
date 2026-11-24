@@ -48,7 +48,8 @@ Init == /\ subreaper \in {FALSE, TRUE}
         /\ stopped = {}
         /\ forks = 0
 
-\* Matches `is_left_candidate(pid, me, parent, active_child, subreaper)` in `src/leftovers.rs`.
+\* Matches `is_left_candidate(pid, me, parent, active_child, subreaper)` in `src/leftovers.rs`
+\* (`pid != me` holds by construction because `"me" \notin AllProcs`).
 IsLeftCandidate(p) ==
     /\ parent[p] # "none"
     /\ (parent[p] # "me" \/ (subreaper /\ p \notin active))

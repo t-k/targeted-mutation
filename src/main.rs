@@ -33,7 +33,7 @@ Exit codes:
   0  No gaps found
   1  Analysis or CLI error (invalid arguments or baseline tests failed)
   2  Test gaps, unstable predictions, or audit discrepancies found
-  3  Incomplete evaluation (no mutants executed, or source-only timeout/unevaluated)";
+  3  Incomplete evaluation (unconfirmed timeouts, no mutants executed, or source-only timeout/unevaluated)";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 enum OutputFormat {
@@ -838,7 +838,12 @@ mod tests {
 
     #[test]
     fn parse_cli_exits_one_on_errors_and_zero_on_help_or_version() {
-        for ok_exit in [&["-h"][..], &["--help"][..], &["-V"][..]] {
+        for ok_exit in [
+            &["-h"][..],
+            &["--help"][..],
+            &["-V"][..],
+            &["--version"][..],
+        ] {
             let mut argv = vec!["cargo-tmt", "tmt"];
             argv.extend_from_slice(ok_exit);
             assert_eq!(
@@ -1003,5 +1008,7 @@ mod tests {
             }],
         });
         assert_eq!(report_exit(&rep), 2);
+        rep.timeout_rechecks.unconfirmed = 1;
+        assert_eq!(report_exit(&rep), 3);
     }
 }
