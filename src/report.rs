@@ -422,10 +422,16 @@ impl Report {
         });
     }
 
-    /// Whether the run found something to act on: a gap, or a prediction that did not
-    /// hold (which means the report cannot be trusted as it stands).
+    /// Whether the run found something to act on: a gap, an unstable prediction, or an
+    /// audit discrepancy (which means the report cannot be trusted as it stands).
     pub fn has_gaps(&self) -> bool {
-        !self.findings.is_empty() || !self.unstable.is_empty()
+        !self.findings.is_empty()
+            || !self.unstable.is_empty()
+            || self.audit.as_ref().is_some_and(|audit| {
+                !audit.disagreements.is_empty()
+                    || !audit.source_disagreements.is_empty()
+                    || !audit.trace_differences.is_empty()
+            })
     }
 }
 
@@ -1028,7 +1034,9 @@ fn sarif_tool() -> serde_json::Value {
             { "id": "input-gap", "shortDescription": { "text": "No test input tells this mutant from the original" } },
             { "id": "assertion-gap", "shortDescription": { "text": "Tests run the mutated code and still pass" } },
             { "id": "survivor", "shortDescription": { "text": "A mutant built on its own passes every test; why is not known" } },
-            { "id": "unstable-prediction", "shortDescription": { "text": "A predicted survivor failed when re-run; tests may be non-deterministic" } }
+            { "id": "unstable-prediction", "shortDescription": { "text": "A predicted survivor failed when re-run; tests may be non-deterministic" } },
+            { "id": "weakened-test", "shortDescription": { "text": "Tests since the base revision stopped catching a mutant in unchanged code" } },
+            { "id": "audit-disagreement", "shortDescription": { "text": "Audit found a mismatch between selective/probe results and full/source execution" } }
         ]
     } })
 }
@@ -1088,10 +1096,86 @@ fn sarif_run(report: &Report) -> serde_json::Value {
             }]
         }));
     }
+    for at in &report.weakened {
+        results.push(serde_json::json!({
+            "ruleId": "weakened-test",
+            "level": "warning",
+            "message": {
+                "text": format!(
+                    "`{}`: mutant in unchanged code now survives after test changes",
+                    at.code
+                )
+            },
+            "locations": [{
+                "physicalLocation": {
+                    "artifactLocation": { "uri": sarif_uri(prefix, &at.file) },
+                    "region": { "startLine": at.line, "startColumn": at.column }
+                }
+            }]
+        }));
+    }
+    if let Some(audit) = &report.audit {
+        for at in &audit.disagreements {
+            results.push(serde_json::json!({
+                "ruleId": "audit-disagreement",
+                "level": "error",
+                "message": {
+                    "text": format!(
+                        "`{}`: survived selective tests, but failed when audited against all tests",
+                        at.code
+                    )
+                },
+                "locations": [{
+                    "physicalLocation": {
+                        "artifactLocation": { "uri": sarif_uri(prefix, &at.file) },
+                        "region": { "startLine": at.line, "startColumn": at.column }
+                    }
+                }]
+            }));
+        }
+        for diff in &audit.source_disagreements {
+            results.push(serde_json::json!({
+                "ruleId": "audit-disagreement",
+                "level": "error",
+                "message": {
+                    "text": format!(
+                        "`{}` ({}): {} as a probe, {} built from source",
+                        diff.at.code, diff.mutant, diff.as_probe, diff.built
+                    )
+                },
+                "locations": [{
+                    "physicalLocation": {
+                        "artifactLocation": { "uri": sarif_uri(prefix, &diff.at.file) },
+                        "region": { "startLine": diff.at.line, "startColumn": diff.at.column }
+                    }
+                }]
+            }));
+        }
+        for diff in &audit.trace_differences {
+            results.push(serde_json::json!({
+                "ruleId": "audit-disagreement",
+                "level": "error",
+                "message": {
+                    "text": format!(
+                        "audit trace for `{}` differed between two runs ({} records)",
+                        diff.binary, diff.records
+                    )
+                }
+            }));
+        }
+    }
+    let mut properties = serde_json::json!({
+        "analysis": report.analysis,
+        "evaluation": report.evaluation,
+        "skipped": report.skipped,
+    });
+    if let Some(audit) = &report.audit {
+        properties["audit"] = serde_json::json!(audit);
+    }
     let mut run = serde_json::json!({
         "tool": sarif_tool(),
         // What was looked at: a run of a part says nothing about the rest.
-        "properties": { "analysis": report.analysis, "evaluation": report.evaluation, "skipped": report.skipped },
+        "properties": properties,
     });
     run["results"] = serde_json::Value::Array(results);
     run
@@ -2408,7 +2492,7 @@ mod tests {
         let rules = sarif["runs"][0]["tool"]["driver"]["rules"]
             .as_array()
             .unwrap();
-        assert_eq!(rules.len(), 4);
+        assert_eq!(rules.len(), 6);
     }
 
     #[test]
@@ -3029,5 +3113,57 @@ mod tests {
             results[0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
             "src/lib.rs"
         );
+    }
+
+    #[test]
+    fn sarif_emits_weakened_and_audit_disagreements_and_has_gaps() {
+        let loc = Location {
+            file: "src/lib.rs".into(),
+            line: 20,
+            column: 9,
+            code: "x > 0".into(),
+            ..Location::default()
+        };
+        let report = Report {
+            package: "demo".into(),
+            weakened: vec![loc.clone()],
+            audit: Some(Audit {
+                survivors: 1,
+                sampled: 1,
+                disagreements: vec![loc.clone()],
+                not_audited: 0,
+                rebuilt: 1,
+                compared: 1,
+                not_compared: 0,
+                source_disagreements: vec![SourceDisagreement {
+                    at: loc,
+                    mutant: "`x >= 0`".into(),
+                    as_probe: "passes".into(),
+                    built: "fails".into(),
+                }],
+                trace_differences: vec![TraceDifference {
+                    binary: "unit".into(),
+                    records: 3,
+                }],
+            }),
+            ..Report::default()
+        };
+        assert!(report.has_gaps());
+        let sarif: serde_json::Value = serde_json::from_str(&render_sarif(&report)).unwrap();
+        let results = sarif["runs"][0]["results"].as_array().unwrap();
+        let rules: Vec<_> = results
+            .iter()
+            .map(|r| (r["ruleId"].as_str().unwrap(), r["level"].as_str().unwrap()))
+            .collect();
+        assert_eq!(
+            rules,
+            [
+                ("weakened-test", "warning"),
+                ("audit-disagreement", "error"),
+                ("audit-disagreement", "error"),
+                ("audit-disagreement", "error"),
+            ]
+        );
+        assert!(sarif["runs"][0]["properties"].get("audit").is_some());
     }
 }

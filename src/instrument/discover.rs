@@ -342,6 +342,9 @@ fn arith_op(op: &syn::BinOp) -> Option<(ArithOp, bool)> {
 /// `v[i] += 1` and `f().x += 1` are not instrumented as operators (they can still be
 /// deleted as statements).
 fn is_plain_place(expr: &syn::Expr) -> bool {
+    if has_conditional_or_skip_attr(expr) {
+        return false;
+    }
     match expr {
         syn::Expr::Path(e) => e.attrs.is_empty(),
         syn::Expr::Field(e) => is_plain_place(&e.base),
@@ -462,14 +465,44 @@ fn int_literal(expr: &syn::Expr) -> Option<i128> {
     }
 }
 
+/// Whether an expression (or its leftmost place/receiver where `syn` attaches statement
+/// attributes such as `#[cfg(feature = "x")] x += 1;`) carries a conditional compilation
+/// or skip attribute that could erase the expression and leave an empty statement guard.
+fn has_conditional_or_skip_attr(expr: &syn::Expr) -> bool {
+    let attrs_block = |attrs: &[syn::Attribute]| {
+        is_test_only(attrs)
+            || is_skipped(attrs)
+            || attrs
+                .iter()
+                .any(|attr| attr.path().is_ident("cfg") || attr.path().is_ident("cfg_attr"))
+    };
+    match expr {
+        syn::Expr::Path(e) => attrs_block(&e.attrs),
+        syn::Expr::Field(e) => attrs_block(&e.attrs) || has_conditional_or_skip_attr(&e.base),
+        syn::Expr::Index(e) => attrs_block(&e.attrs) || has_conditional_or_skip_attr(&e.expr),
+        syn::Expr::Unary(e) => attrs_block(&e.attrs) || has_conditional_or_skip_attr(&e.expr),
+        syn::Expr::Paren(e) => attrs_block(&e.attrs) || has_conditional_or_skip_attr(&e.expr),
+        syn::Expr::Group(e) => attrs_block(&e.attrs) || has_conditional_or_skip_attr(&e.expr),
+        syn::Expr::Call(e) => attrs_block(&e.attrs) || has_conditional_or_skip_attr(&e.func),
+        syn::Expr::MethodCall(e) => {
+            attrs_block(&e.attrs) || has_conditional_or_skip_attr(&e.receiver)
+        }
+        _ => false,
+    }
+}
+
 /// Statements whose removal is a plausible bug: a forgotten call, check or update.
 fn deletable(expr: &syn::Expr) -> bool {
     match expr {
         syn::Expr::Call(e) => e.attrs.is_empty(),
         syn::Expr::MethodCall(e) => e.attrs.is_empty(),
-        syn::Expr::Assign(e) => e.attrs.is_empty(),
+        syn::Expr::Assign(e) => e.attrs.is_empty() && !has_conditional_or_skip_attr(&e.left),
         // An attribute in front of `a += 1` belongs to `a`, never to the operation.
-        syn::Expr::Binary(e) => is_assign_op(&e.op),
+        // Allow harmless lint attributes (`#[allow(..)]`), but never wrap `#[cfg(..)]`
+        // or `#[mutants::skip]` whose removal would leave an empty statement guard.
+        syn::Expr::Binary(e) => {
+            is_assign_op(&e.op) && e.attrs.is_empty() && !has_conditional_or_skip_attr(&e.left)
+        }
         syn::Expr::Try(e) => e.attrs.is_empty() && deletable_call(&e.expr),
         syn::Expr::Await(e) => e.attrs.is_empty() && deletable_call(&e.base),
         _ => false,
@@ -1051,7 +1084,9 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             match base {
                 base if is_plain_place(base) => Some(format!("({written})")),
                 syn::Expr::Call(call)
-                    if call.args.is_empty() && matches!(*call.func, syn::Expr::Path(_)) =>
+                    if call.attrs.is_empty()
+                        && call.args.is_empty()
+                        && matches!(*call.func, syn::Expr::Path(_)) =>
                 {
                     let (from, to) = self.range(node.path.span())?;
                     Some(format!("({} {{ ..{written} }})", &self.source[from..to]))

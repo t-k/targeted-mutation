@@ -635,7 +635,7 @@ impl Session {
                 bin,
                 filter.as_deref(),
                 &[("TMT_MUTANT", &spec)],
-                bin.filtered_limit(filter.as_deref(), false),
+                bin.filtered_limit(filter.as_deref(), false, sharing),
                 RunOutput::FirstFailure,
                 sharing,
             )?;
@@ -684,7 +684,7 @@ impl Session {
                 bin,
                 filter.as_deref(),
                 &[("TMT_MUTANT", &spec), ("TMT_TRACE", &trace_env)],
-                bin.filtered_limit(filter.as_deref(), true),
+                bin.filtered_limit(filter.as_deref(), true, sharing),
                 RunOutput::Quiet,
                 sharing,
             )?;
@@ -725,6 +725,13 @@ impl Session {
         {
             for (index, filter) in jobs.iter().flat_map(|job| &job.tests) {
                 self.binaries[*index].warn_timeout_conflict(filter.as_deref());
+            }
+        }
+        if workers > 1 {
+            // Measure unique slow filtered baselines serially before spawning parallel
+            // workers so timing runs are not distorted by concurrent CPU contention.
+            for (index, filter) in jobs.iter().flat_map(|job| &job.tests) {
+                self.binaries[*index].filtered_limit(filter.as_deref(), false, 1);
             }
         }
         let run = |index: usize, sharing| self.run_job(&jobs[index], sharing);

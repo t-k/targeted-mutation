@@ -235,16 +235,16 @@ fn mutant_timeout_uses_the_measured_filter_and_an_explicit_override_wins() {
     };
     // Whatever the run of `fast` took on this machine, it is less than the 70 seconds
     // of the whole binary: a bound in seconds would fail on a loaded machine.
-    assert!(bin.filtered_limit(Some(&["fast".to_string()]), false) < Duration::from_secs(355));
+    assert!(bin.filtered_limit(Some(&["fast".to_string()]), false, 1) < Duration::from_secs(355));
     assert_eq!(
-        bin.filtered_limit(Some(&["slow".to_string()]), false),
+        bin.filtered_limit(Some(&["slow".to_string()]), false, 1),
         Duration::from_secs(355)
     );
-    assert_eq!(bin.filtered_limit(None, false), Duration::from_secs(355));
+    assert_eq!(bin.filtered_limit(None, false, 1), Duration::from_secs(355));
     assert_eq!(bin.filtered_timings.lock().unwrap().len(), 2);
     bin.timeout = Some(Duration::from_secs(8));
     assert_eq!(
-        bin.filtered_limit(Some(&["fast".to_string()]), false),
+        bin.filtered_limit(Some(&["fast".to_string()]), false, 1),
         Duration::from_secs(8)
     );
     fs::remove_dir_all(dir).unwrap();
@@ -2271,25 +2271,25 @@ fn a_filter_is_timed_only_for_a_slow_libtest_binary_without_a_given_limit() {
     // A limit that was given is the limit: nothing is run to find one.
     let given = binary(slow, Some(Duration::from_secs(8)));
     assert_eq!(
-        given.filtered_limit(Some(&fast), false),
+        given.filtered_limit(Some(&fast), false, 1),
         Duration::from_secs(8)
     );
     assert_eq!(timed(&given), 0);
     // Tests that are fast as a whole are not timed again in parts.
     let quick = binary(Duration::from_secs(1), None);
     assert_eq!(
-        quick.filtered_limit(Some(&fast), false),
+        quick.filtered_limit(Some(&fast), false, 1),
         Duration::from_secs(10)
     );
     assert_eq!(timed(&quick), 0);
     // From two seconds on they are.
     let at_the_threshold = binary(SLOW_TRACE, None);
-    at_the_threshold.filtered_limit(Some(&fast), false);
+    at_the_threshold.filtered_limit(Some(&fast), false, 1);
     assert_eq!(timed(&at_the_threshold), 1);
     // A runner that is not the libtest binary itself cannot be asked for a part.
     let one_by_one = isolated(binary(slow, None));
     assert_eq!(
-        one_by_one.filtered_limit(Some(&fast), false),
+        one_by_one.filtered_limit(Some(&fast), false, 1),
         Duration::from_secs(355)
     );
     assert_eq!(timed(&one_by_one), 0);
@@ -2297,7 +2297,7 @@ fn a_filter_is_timed_only_for_a_slow_libtest_binary_without_a_given_limit() {
     let whole = binary(slow, None);
     for filter in [&[][..], &all[..]] {
         assert_eq!(
-            whole.filtered_limit(Some(filter), false),
+            whole.filtered_limit(Some(filter), false, 1),
             Duration::from_secs(355),
             "{filter:?}"
         );

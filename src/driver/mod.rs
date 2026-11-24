@@ -426,6 +426,13 @@ fn run_package(
     if options.doc && selection.enabled() {
         bail!("--doc cannot be combined with isolated test selection");
     }
+    if options.source_only && options.jobs > 1 {
+        eprintln!(
+            "tmt: warning: --source-only runs mutants serially in one working copy; ignoring --jobs {}",
+            options.jobs
+        );
+    }
+    let effective_jobs = if options.source_only { 1 } else { options.jobs };
     let note = |text: &str| {
         if options.progress {
             eprintln!("tmt: {text}");
@@ -1394,7 +1401,7 @@ fn run_package(
         // the checkpoint, never the Cargo event payload.
         let settings = serde_json::json!({
             "build_scripts": build_inputs,
-            "analysis": &report.analysis, "package": &package.name, "jobs": options.jobs,
+            "analysis": &report.analysis, "package": &package.name, "jobs": effective_jobs,
             "verify": options.verify, "audit": options.audit, "effects": options.effects,
             "all_files": options.all_files, "build_scope": build_scope,
             "runners": runners.iter().map(|(name, runner, cwd)| (name, runner.executable(), cwd)).collect::<Vec<_>>()
@@ -1588,7 +1595,7 @@ fn run_package(
             serde_json::json!({
                 "package": &package.name, "analysis": &report.analysis,
                 "runners": session.binaries.iter().map(|bin| &bin.name).collect::<Vec<_>>(),
-                "jobs": options.jobs, "tool_version": env!("CARGO_PKG_VERSION")
+                "jobs": effective_jobs, "tool_version": env!("CARGO_PKG_VERSION")
             }),
         )?;
     }

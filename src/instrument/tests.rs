@@ -886,6 +886,28 @@ fn attributes_const_methods_and_let_on_the_right() {
     );
     let found = found(src, 0).unwrap().sites;
     syn::parse_file(&render(src, &found, &all).text).expect("instrumented source parses");
+
+    // Conditional or skip attributes on assignments attach to the left operand in syn 2
+    // and must not produce an empty `if live(id) {}` statement wrapper.
+    let guarded = r#"
+        fn g(s: &mut S, x: &mut u32) {
+            #[cfg(feature = "off")]
+            s.total += 1;
+            #[mutants::skip]
+            *x = 2;
+            #[cfg_attr(test, allow(unused))]
+            *x += 3;
+            s.plain();
+        }
+    "#;
+    let guarded_stmts: Vec<String> = discover(guarded, 0)
+        .unwrap()
+        .sites
+        .into_iter()
+        .filter(|s| s.kind == SiteKind::Stmt)
+        .map(|s| s.text)
+        .collect();
+    assert_eq!(guarded_stmts, ["s.plain();"]);
 }
 
 #[test]

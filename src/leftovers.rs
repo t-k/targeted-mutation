@@ -14,6 +14,7 @@
 //! What this does not see: a process that closes the files it was given (a daemon that
 //! detaches properly, a child of Python's `subprocess`, which closes them by default).
 
+use std::collections::BTreeSet;
 use std::fs::{self, File};
 use std::io;
 use std::path::{Path, PathBuf};
@@ -31,6 +32,9 @@ pub(crate) static NOT_STOPPED: AtomicUsize = AtomicUsize::new(0);
 /// file of this process, the file of another run included; it must be gone before that
 /// other run is over and asks who has its file.
 static STARTING: Mutex<()> = Mutex::new(());
+/// Direct child PIDs of active `Watch` runs, so a subreaper/PID-1 process can tell its
+/// still-running sibling children apart from reparented orphans.
+static ACTIVE_CHILDREN: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
 
 /// How long those who have the file are stopped again and again before giving up.
 const PATIENCE: Duration = Duration::from_secs(5);
@@ -50,6 +54,7 @@ pub(crate) struct Swept {
 pub(crate) struct Watch {
     path: PathBuf,
     started: bool,
+    child_pid: Option<u32>,
 }
 
 impl Watch {
@@ -58,6 +63,16 @@ impl Watch {
         Self {
             path,
             started: false,
+            child_pid: None,
+        }
+    }
+
+    fn clear_active_child(&mut self) {
+        if let Some(pid) = self.child_pid.take() {
+            ACTIVE_CHILDREN
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&pid);
         }
     }
 
@@ -83,6 +98,14 @@ impl Watch {
             file
         };
         let child = command.spawn();
+        if let Ok(ref spawned) = child {
+            let pid = spawned.id();
+            self.child_pid = Some(pid);
+            ACTIVE_CHILDREN
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .insert(pid);
+        }
         // This process lets go: from here on only the run and what it started hold it.
         #[cfg(unix)]
         drop(file);
@@ -92,7 +115,8 @@ impl Watch {
     }
 
     /// Stops whoever still has the file, unless they are to be left, and removes it.
-    pub(crate) fn finish(self, leave: bool) -> Swept {
+    pub(crate) fn finish(mut self, leave: bool) -> Swept {
+        self.clear_active_child();
         // tmt:ignore a run that was not given the file holds no lock: the sweep finds it free at once
         let swept = if self.started && !leave {
             sweep(&self.path)
@@ -101,6 +125,12 @@ impl Watch {
         };
         let _ = fs::remove_file(&self.path);
         swept
+    }
+}
+
+impl Drop for Watch {
+    fn drop(&mut self) {
+        self.clear_active_child();
     }
 }
 
@@ -147,8 +177,22 @@ fn sweep(path: &Path) -> Swept {
             swept.left = true;
             break;
         };
-        for pid in holders {
-            if is_left(pid, std::process::id(), parent_of(pid)) {
+        let me = std::process::id();
+        let subreaper = is_subreaper(me);
+        let candidates: Vec<(u32, Option<String>)> = holders
+            .into_iter()
+            .map(|pid| (pid, start_token(pid)))
+            .collect();
+        for (pid, observed_start) in candidates {
+            let active_child = ACTIVE_CHILDREN
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .contains(&pid);
+            if is_left_candidate(pid, me, parent_of(pid), active_child, subreaper)
+                && observed_start
+                    .as_deref()
+                    .is_none_or(|expected| start_token(pid).as_deref() == Some(expected))
+            {
                 stop(pid);
                 stopped.insert(pid);
             }
@@ -169,10 +213,73 @@ fn sweep(path: &Path) -> Swept {
 ///
 /// Not this process, and not a child of it: such a child is another command of this
 /// process on its way from `fork` to `exec`, where it lets go of the file by itself. (The
-/// run itself was a child too, and has been collected by now.) A process whose parent
-/// cannot be told has just ended.
+/// run itself was a child too, and has been collected by now.) When this process is PID 1
+/// or a subreaper, reparented orphans also report `parent == me`, so active sibling
+/// children are excluded via `ACTIVE_CHILDREN` instead of skipping every `parent == me`.
+/// A process whose parent cannot be told has just ended.
+#[cfg(test)]
 fn is_left(pid: u32, me: u32, parent: Option<u32>) -> bool {
-    pid != me && parent.is_some_and(|parent| parent != me)
+    is_left_candidate(pid, me, parent, false, false)
+}
+
+fn is_left_candidate(
+    pid: u32,
+    me: u32,
+    parent: Option<u32>,
+    active_child: bool,
+    subreaper: bool,
+) -> bool {
+    pid != me && parent.is_some_and(|parent| parent != me || (subreaper && !active_child))
+}
+
+#[cfg(target_os = "linux")]
+fn is_subreaper(me: u32) -> bool {
+    if me == 1 {
+        return true;
+    }
+    const PR_GET_CHILD_SUBREAPER: std::ffi::c_int = 37;
+    unsafe extern "C" {
+        fn prctl(
+            option: std::ffi::c_int,
+            arg2: *mut std::ffi::c_int,
+            arg3: std::ffi::c_ulong,
+            arg4: std::ffi::c_ulong,
+            arg5: std::ffi::c_ulong,
+        ) -> std::ffi::c_int;
+    }
+    let mut flag: std::ffi::c_int = 0;
+    // SAFETY: `PR_GET_CHILD_SUBREAPER` writes a single `c_int` to `flag`.
+    unsafe { prctl(PR_GET_CHILD_SUBREAPER, &mut flag, 0, 0, 0) == 0 && flag != 0 }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn is_subreaper(me: u32) -> bool {
+    me == 1
+}
+
+#[cfg(target_os = "linux")]
+fn start_token(pid: u32) -> Option<String> {
+    let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    start_in_stat(&stat).map(str::to_owned)
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn start_in_stat(stat: &str) -> Option<&str> {
+    let after_name = &stat[stat.rfind(')')? + 1..];
+    // Field 22 in `/proc/<pid>/stat` (starttime) is index 19 after `state` (field 3).
+    after_name.split_whitespace().nth(19)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn start_token(pid: u32) -> Option<String> {
+    let listed = Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .ok()?;
+    let text = String::from_utf8_lossy(&listed.stdout).trim().to_owned();
+    (!text.is_empty()).then_some(text)
 }
 
 #[cfg(target_os = "linux")]
@@ -531,5 +638,25 @@ mod tests {
             [120, 77, 2, 4000000000]
         );
         assert!(pids("").is_empty());
+    }
+
+    #[test]
+    fn subreaper_stops_reparented_orphans_but_not_active_children() {
+        // Under PID 1 or a subreaper, an orphan reparented to `me` (not an active child)
+        // is swept, while an active sibling child is never stopped.
+        assert!(is_left_candidate(40, 1, Some(1), false, true));
+        assert!(!is_left_candidate(40, 1, Some(1), true, true));
+        assert!(!is_left_candidate(1, 1, Some(0), false, true));
+        assert!(!is_left_candidate(40, 7, Some(7), false, false));
+        assert!(is_left_candidate(40, 7, Some(7), false, true));
+    }
+
+    #[test]
+    fn start_token_parses_stat_and_matches_live_process() {
+        let stat = "12 (a) b) S 7 12 12 0 -1 4194304 1 0 0 0 0 0 0 0 20 0 1 0 987654 0 0";
+        assert_eq!(start_in_stat(stat), Some("987654"));
+        assert_eq!(start_in_stat("12 (sh) S 7"), None);
+        assert!(start_token(std::process::id()).is_some());
+        assert_eq!(start_token(u32::MAX - 7), None);
     }
 }

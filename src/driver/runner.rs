@@ -138,7 +138,12 @@ impl TestBinary {
         });
     }
 
-    pub(super) fn filtered_limit(&self, filter: Option<&[String]>, traced: bool) -> Duration {
+    pub(super) fn filtered_limit(
+        &self,
+        filter: Option<&[String]>,
+        traced: bool,
+        sharing: usize,
+    ) -> Duration {
         let baseline = if traced { self.traced } else { self.baseline };
         let Some(filter) =
             filter.filter(|names| !names.is_empty() && names.len() < self.tests.len())
@@ -150,7 +155,10 @@ impl TestBinary {
             return self.mutant_limit(baseline);
         }
         let timed = {
-            let mut groups = self.filtered_timings.lock().unwrap();
+            let mut groups = self
+                .filtered_timings
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             groups.entry(filter.to_vec()).or_default().clone()
         };
         let timing = *timed.get_or_init(|| {
@@ -158,7 +166,14 @@ impl TestBinary {
             let started = Instant::now();
             // One measured group is shared by all jobs with this exact filter.
             // A failing or inconclusive timing run keeps the conservative limit.
-            match run_binary(self, Some(filter), &[], untraced, RunOutput::Quiet, 1) {
+            match run_binary(
+                self,
+                Some(filter),
+                &[],
+                untraced,
+                RunOutput::Quiet,
+                sharing.max(1),
+            ) {
                 Ok(Outcome::Pass) => started.elapsed(),
                 _ => untraced,
             }
