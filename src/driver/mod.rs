@@ -2186,7 +2186,11 @@ fn run_package(
         }
         if !(options.rebuild || options.source_only) {
             report.mutants_not_built += total;
-        } else if total > 0 || changed.iter().any(|(_, changes)| changes.len() > 1) {
+        } else if total > 0
+            || changed.iter().any(|(_, changes)| {
+                changes.iter().filter(|change| !change.is_subhunk()).count() > 1
+            })
+        {
             // Also with nothing to try alone: several changes of code that is left out
             // may be a change of the build together.
             session.note(&format!(
@@ -2253,13 +2257,19 @@ fn run_package(
             let mut stuck_files = 0;
             for (file, changes) in &changed {
                 let mut stuck = false;
-                let alone = changes.iter().filter(|change| !change.outside).count();
+                let whole_total = changes.iter().filter(|change| !change.is_subhunk()).count();
+                let whole_alone = changes
+                    .iter()
+                    .filter(|change| !change.is_subhunk() && !change.outside)
+                    .count();
                 for change in changes.iter().filter(|change| !change.outside) {
                     let outcome = match &change.undone {
                         Some(text) => undone(&[(file, text.as_str())])?,
                         None => None,
                     };
-                    stuck |= outcome.is_none();
+                    if !change.is_subhunk() {
+                        stuck |= outcome.is_none();
+                    }
                     judged(outcome, place(file, change), change.describe());
                 }
                 // All together: where one does not build alone, and where what is left
@@ -2273,7 +2283,7 @@ fn run_package(
                     .filter(|change| !change.outside)
                     .cloned()
                     .collect();
-                let left_out_matter = alone < changes.len()
+                let left_out_matter = whole_alone < whole_total
                     && match (&whole, reverts::all_undone(&file.original, &tried)) {
                         (Some(all), Some(without)) => !same(all, &without),
                         _ => true,
@@ -2282,16 +2292,20 @@ fn run_package(
                 let another = whole
                     .as_deref()
                     .is_none_or(|all| !same(all, &file.original));
-                if changes.len() > 1 && another && (stuck || left_out_matter) {
+                if whole_total > 1 && another && (stuck || left_out_matter) {
                     let outcome = match &whole {
                         Some(text) => undone(&[(file, text.as_str())])?,
                         None => None,
                     };
                     stuck = outcome.is_none();
+                    let first_whole = changes
+                        .iter()
+                        .find(|change| !change.is_subhunk())
+                        .unwrap_or(&changes[0]);
                     judged(
                         outcome,
-                        place(file, &changes[0]),
-                        format!("with all {} changes to this file undone", changes.len()),
+                        place(file, first_whole),
+                        format!("with all {whole_total} changes to this file undone"),
                     );
                 }
                 stuck_files += usize::from(stuck);

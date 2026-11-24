@@ -2,10 +2,19 @@
 //! was before, put back where the new code is. Tests that still pass do not tell the
 //! change from what was there.
 
+use std::collections::{HashMap, HashSet};
+
+use proc_macro2::TokenTree;
+use syn::spanned::Spanned;
+use syn::visit::{self, Visit};
+
 use crate::instrument;
 use crate::scope::{self, Hunk};
 
-/// One hunk of a file that is worth undoing.
+/// Cap AST sub-hunks per diff hunk to avoid quadratic rebuild blowup on giant new files.
+const MAX_SUBHUNKS_PER_HUNK: usize = 16;
+
+/// One hunk (or AST sub-hunk) of a file that is worth undoing.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Change {
     pub hunk: Hunk,
@@ -22,11 +31,21 @@ pub(crate) struct Change {
     /// Set by who asks: the change is of code the build leaves out now and undone. It
     /// is not tried alone, and still goes back with the others.
     pub outside: bool,
+    /// When `Some`, this change is an AST sub-hunk decomposed from a larger hunk, holding
+    /// the human-readable description for findings.
+    pub subhunk: Option<String>,
 }
 
 impl Change {
+    pub fn is_subhunk(&self) -> bool {
+        self.subhunk.is_some()
+    }
+
     /// What the mutant is, in the words of a finding.
     pub fn describe(&self) -> String {
+        if let Some(description) = &self.subhunk {
+            return description.clone();
+        }
         let old = self.hunk.old.trim();
         let new_lines = self.hunk.count;
         match (old.is_empty(), new_lines) {
@@ -403,15 +422,33 @@ fn classify(current: &str, hunks: &[Hunk]) -> Vec<(Hunk, Kind)> {
             .unwrap_or("");
         // What stands between the text before the change and the text after it.
         let put_back = undone[from..undone.len() - (current.len() - to)].to_string();
-        kind(Kind::Program(Change {
+        let undone_for_subhunks = undone_parsed.as_ref().map(|tree| (undone.as_str(), tree));
+        let whole = Change {
             hunk: hunk.clone(),
             line,
             code: crate::report::one_line(code_line.trim()),
-            undone: undone_parsed.map(|_| undone),
+            undone: undone_parsed.as_ref().map(|_| undone.clone()),
             range: (from, to),
             put_back,
             outside: false,
-        }));
+            subhunk: None,
+        };
+        let subhunks = if let Some((undone_text, undone_tree)) = undone_for_subhunks {
+            subhunk_changes(
+                current,
+                &parsed,
+                &tests_now,
+                undone_text,
+                undone_tree,
+                &whole,
+            )
+        } else {
+            vec![]
+        };
+        kind(Kind::Program(whole));
+        for sub in subhunks {
+            kind(Kind::Program(sub));
+        }
     }
     found
 }
@@ -485,9 +522,13 @@ pub(crate) fn test_hunks(current: &str, hunks: &[Hunk]) -> Vec<Hunk> {
 }
 
 /// The file with all of these changes undone; `None` when that is not Rust.
+/// Sub-hunks are skipped because their ranges overlap the whole hunks they were split from.
 pub(crate) fn all_undone(current: &str, changes: &[Change]) -> Option<String> {
     // Each as it is undone alone: the tests stay as they are, here too.
-    let mut ordered: Vec<&Change> = changes.iter().collect();
+    let mut ordered: Vec<&Change> = changes
+        .iter()
+        .filter(|change| !change.is_subhunk())
+        .collect();
     ordered.sort_by_key(|change| std::cmp::Reverse(change.range));
     let mut undone = current.to_string();
     let mut before = current.len();
@@ -500,6 +541,699 @@ pub(crate) fn all_undone(current: &str, changes: &[Change]) -> Option<String> {
         before = from;
     }
     instrument::parse_source(&undone).ok().map(|_| undone)
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LogicalOp {
+    And,
+    Or,
+}
+
+fn logical_op(op: &syn::BinOp) -> Option<LogicalOp> {
+    match op {
+        syn::BinOp::And(_) => Some(LogicalOp::And),
+        syn::BinOp::Or(_) => Some(LogicalOp::Or),
+        _ => None,
+    }
+}
+
+fn flatten_logical<'a>(expr: &'a syn::Expr, op: LogicalOp, out: &mut Vec<&'a syn::Expr>) {
+    if let syn::Expr::Binary(bin) = expr
+        && logical_op(&bin.op) == Some(op)
+    {
+        flatten_logical(&bin.left, op, out);
+        flatten_logical(&bin.right, op, out);
+    } else {
+        out.push(expr);
+    }
+}
+
+fn token_sig(text: &str) -> String {
+    fn push_stream(stream: proc_macro2::TokenStream, out: &mut Vec<String>) {
+        for tree in stream {
+            match tree {
+                TokenTree::Group(group) => {
+                    let (open, close) = match group.delimiter() {
+                        proc_macro2::Delimiter::Parenthesis => ("(", ")"),
+                        proc_macro2::Delimiter::Brace => ("{", "}"),
+                        proc_macro2::Delimiter::Bracket => ("[", "]"),
+                        proc_macro2::Delimiter::None => ("", ""),
+                    };
+                    if !open.is_empty() {
+                        out.push(open.to_string());
+                    }
+                    push_stream(group.stream(), out);
+                    if !close.is_empty() {
+                        out.push(close.to_string());
+                    }
+                }
+                TokenTree::Ident(ident) => out.push(ident.to_string()),
+                TokenTree::Punct(punct) => out.push(punct.as_char().to_string()),
+                TokenTree::Literal(lit) => out.push(lit.to_string()),
+            }
+        }
+    }
+    let Ok(stream) = text.parse::<proc_macro2::TokenStream>() else {
+        return text.trim().to_string();
+    };
+    let mut parts = Vec::new();
+    push_stream(stream, &mut parts);
+    parts.join(" ")
+}
+
+fn multiset_added_indices(old_sigs: &[String], new_sigs: &[String]) -> Option<Vec<usize>> {
+    let mut remaining: HashMap<&str, usize> = HashMap::new();
+    for sig in old_sigs {
+        *remaining.entry(sig.as_str()).or_insert(0) += 1;
+    }
+    let mut added = Vec::new();
+    for (idx, sig) in new_sigs.iter().enumerate() {
+        if let Some(count) = remaining.get_mut(sig.as_str())
+            && *count > 0
+        {
+            *count -= 1;
+            continue;
+        }
+        added.push(idx);
+    }
+    if remaining.values().any(|&count| count > 0) {
+        return None;
+    }
+    Some(added)
+}
+
+fn span_range(source: &str, span: proc_macro2::Span) -> Option<(usize, usize)> {
+    let range = span.byte_range();
+    (!range.is_empty() && source.get(range.clone()).is_some()).then_some((range.start, range.end))
+}
+
+fn overlaps(range: (usize, usize), window: (usize, usize)) -> bool {
+    range.0 < window.1 && window.0 < range.1
+}
+
+fn touches_any(range: (usize, usize), blocked: &[(usize, usize)]) -> bool {
+    blocked.iter().any(|&b| overlaps(range, b))
+}
+
+fn needs_separator_space(source: &str, del_start: usize, del_end: usize) -> bool {
+    let before = source[..del_start].chars().next_back();
+    let after = source[del_end..].chars().next();
+    let glues =
+        |c: char| !c.is_whitespace() && !matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';');
+    before.is_some_and(glues) && after.is_some_and(glues)
+}
+
+fn deletable_subhunk_stmt(stmt: &syn::Stmt, is_last: bool) -> bool {
+    match stmt {
+        syn::Stmt::Expr(expr, Some(_)) => {
+            !matches!(expr, syn::Expr::Let(_)) && !stmt_has_skip_or_test(stmt)
+        }
+        syn::Stmt::Expr(syn::Expr::If(if_expr), None) => {
+            !is_last && if_expr.else_branch.is_none() && !stmt_has_skip_or_test(stmt)
+        }
+        syn::Stmt::Macro(m) => m.semi_token.is_some() && !stmt_has_skip_or_test(stmt),
+        _ => false,
+    }
+}
+
+fn stmt_has_skip_or_test(stmt: &syn::Stmt) -> bool {
+    let attrs: &[syn::Attribute] = match stmt {
+        syn::Stmt::Local(l) => &l.attrs,
+        syn::Stmt::Macro(m) => &m.attrs,
+        syn::Stmt::Expr(expr, _) => match expr {
+            syn::Expr::Call(e) => &e.attrs,
+            syn::Expr::MethodCall(e) => &e.attrs,
+            syn::Expr::Assign(e) => &e.attrs,
+            syn::Expr::Binary(e) => &e.attrs,
+            syn::Expr::If(e) => &e.attrs,
+            syn::Expr::Match(e) => &e.attrs,
+            syn::Expr::Block(e) => &e.attrs,
+            syn::Expr::Try(e) => &e.attrs,
+            syn::Expr::Await(e) => &e.attrs,
+            syn::Expr::Return(e) => &e.attrs,
+            syn::Expr::Macro(e) => &e.attrs,
+            _ => &[],
+        },
+        syn::Stmt::Item(_) => return true,
+    };
+    instrument::is_test_only(attrs) || instrument::is_skipped(attrs)
+}
+
+struct OldLogical {
+    op: Option<LogicalOp>,
+    terms: Vec<String>,
+}
+
+struct OldStruct {
+    path_sig: String,
+    fields: HashSet<String>,
+}
+
+#[derive(Default)]
+struct OldStructures {
+    logicals: HashMap<String, Vec<OldLogical>>,
+    structs: HashMap<String, Vec<OldStruct>>,
+    blocks: HashMap<String, Vec<Vec<String>>>,
+}
+
+struct OldCollector<'a> {
+    source: &'a str,
+    window: (usize, usize),
+    scope: Vec<String>,
+    in_logical: Option<LogicalOp>,
+    found: OldStructures,
+}
+
+impl<'a> OldCollector<'a> {
+    fn key(&self) -> String {
+        self.scope.join("::")
+    }
+
+    fn record_single_value_expr(&mut self, expr: &syn::Expr) {
+        if let Some(range) = span_range(self.source, expr.span())
+            && overlaps(range, self.window)
+            && !matches!(
+                expr,
+                syn::Expr::Binary(bin) if logical_op(&bin.op).is_some()
+            )
+            && !matches!(expr, syn::Expr::Block(_) | syn::Expr::Struct(_))
+        {
+            self.found
+                .logicals
+                .entry(self.key())
+                .or_default()
+                .push(OldLogical {
+                    op: None,
+                    terms: vec![token_sig(&self.source[range.0..range.1])],
+                });
+        }
+    }
+}
+
+impl<'ast> Visit<'ast> for OldCollector<'_> {
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        if instrument::is_test_only(&node.attrs) || instrument::is_skipped(&node.attrs) {
+            return;
+        }
+        self.scope.push(format!("mod:{}", node.ident));
+        visit::visit_item_mod(self, node);
+        self.scope.pop();
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        if instrument::is_test_only(&node.attrs) || instrument::is_skipped(&node.attrs) {
+            return;
+        }
+        let ty = span_range(self.source, node.self_ty.span())
+            .map(|(s, e)| token_sig(&self.source[s..e]))
+            .unwrap_or_default();
+        self.scope.push(format!("impl:{ty}"));
+        visit::visit_item_impl(self, node);
+        self.scope.pop();
+    }
+
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        if instrument::is_test_only(&node.attrs) || instrument::is_skipped(&node.attrs) {
+            return;
+        }
+        self.scope.push(format!("fn:{}", node.sig.ident));
+        visit::visit_item_fn(self, node);
+        self.scope.pop();
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        if instrument::is_test_only(&node.attrs) || instrument::is_skipped(&node.attrs) {
+            return;
+        }
+        self.scope.push(format!("fn:{}", node.sig.ident));
+        visit::visit_impl_item_fn(self, node);
+        self.scope.pop();
+    }
+
+    fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
+        if instrument::is_test_only(&node.attrs) || instrument::is_skipped(&node.attrs) {
+            return;
+        }
+        self.scope.push(format!("fn:{}", node.sig.ident));
+        visit::visit_trait_item_fn(self, node);
+        self.scope.pop();
+    }
+
+    fn visit_block(&mut self, node: &'ast syn::Block) {
+        if let Some(range) = span_range(self.source, node.span())
+            && overlaps(range, self.window)
+        {
+            let sigs: Vec<String> = node
+                .stmts
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, stmt)| {
+                    let is_last = idx + 1 == node.stmts.len();
+                    if !deletable_subhunk_stmt(stmt, is_last) {
+                        return None;
+                    }
+                    let (s, e) = span_range(self.source, stmt.span())?;
+                    Some(token_sig(&self.source[s..e]))
+                })
+                .collect();
+            self.found.blocks.entry(self.key()).or_default().push(sigs);
+            if let Some(syn::Stmt::Expr(tail, None)) = node.stmts.last() {
+                self.record_single_value_expr(tail);
+            }
+        }
+        visit::visit_block(self, node);
+    }
+
+    fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
+        self.record_single_value_expr(&node.cond);
+        visit::visit_expr_if(self, node);
+    }
+
+    fn visit_expr_while(&mut self, node: &'ast syn::ExprWhile) {
+        self.record_single_value_expr(&node.cond);
+        visit::visit_expr_while(self, node);
+    }
+
+    fn visit_expr_return(&mut self, node: &'ast syn::ExprReturn) {
+        if let Some(expr) = &node.expr {
+            self.record_single_value_expr(expr);
+        }
+        visit::visit_expr_return(self, node);
+    }
+
+    fn visit_local(&mut self, node: &'ast syn::Local) {
+        if let Some(init) = &node.init {
+            self.record_single_value_expr(&init.expr);
+        }
+        visit::visit_local(self, node);
+    }
+
+    fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
+        let prev = self.in_logical;
+        if let Some(op) = logical_op(&node.op) {
+            if prev != Some(op)
+                && let Some(range) = span_range(self.source, node.span())
+                && overlaps(range, self.window)
+            {
+                let expr = syn::Expr::Binary(node.clone());
+                let mut terms = Vec::new();
+                flatten_logical(&expr, op, &mut terms);
+                let term_sigs: Option<Vec<String>> = terms
+                    .iter()
+                    .map(|t| {
+                        span_range(self.source, t.span())
+                            .map(|(s, e)| token_sig(&self.source[s..e]))
+                    })
+                    .collect();
+                if let Some(term_sigs) = term_sigs {
+                    self.found
+                        .logicals
+                        .entry(self.key())
+                        .or_default()
+                        .push(OldLogical {
+                            op: Some(op),
+                            terms: term_sigs,
+                        });
+                }
+            }
+            self.in_logical = Some(op);
+            visit::visit_expr_binary(self, node);
+            self.in_logical = prev;
+        } else {
+            self.in_logical = None;
+            visit::visit_expr_binary(self, node);
+            self.in_logical = prev;
+        }
+    }
+
+    fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
+        if node.rest.is_some()
+            && let Some(range) = span_range(self.source, node.span())
+            && overlaps(range, self.window)
+            && let Some((ps, pe)) = span_range(self.source, node.path.span())
+        {
+            let fields = node
+                .fields
+                .iter()
+                .map(|f| match &f.member {
+                    syn::Member::Named(id) => id.to_string(),
+                    syn::Member::Unnamed(idx) => idx.index.to_string(),
+                })
+                .collect();
+            self.found
+                .structs
+                .entry(self.key())
+                .or_default()
+                .push(OldStruct {
+                    path_sig: token_sig(&self.source[ps..pe]),
+                    fields,
+                });
+        }
+        visit::visit_expr_struct(self, node);
+    }
+}
+
+struct SubhunkBuilder<'a> {
+    current: &'a str,
+    whole_undone: &'a str,
+    whole: &'a Change,
+    tests_now: &'a [(usize, usize)],
+    has_old: bool,
+    old: &'a OldStructures,
+    scope: Vec<String>,
+    in_logical: Option<LogicalOp>,
+    seen_sigs: HashSet<String>,
+    out: Vec<Change>,
+}
+
+impl<'a> SubhunkBuilder<'a> {
+    fn key(&self) -> String {
+        self.scope.join("::")
+    }
+
+    fn try_emit(
+        &mut self,
+        del_start: usize,
+        del_end: usize,
+        anchor: (usize, usize),
+        description: String,
+    ) {
+        if self.out.len() >= MAX_SUBHUNKS_PER_HUNK {
+            return;
+        }
+        if del_start >= del_end
+            || del_end > self.current.len()
+            || !self.current.is_char_boundary(del_start)
+            || !self.current.is_char_boundary(del_end)
+            || touches_any((del_start, del_end), self.tests_now)
+            || touches_any(anchor, self.tests_now)
+        {
+            return;
+        }
+        let put_back = if needs_separator_space(self.current, del_start, del_end) {
+            " ".to_string()
+        } else {
+            String::new()
+        };
+        let mut candidate =
+            String::with_capacity(self.current.len() - (del_end - del_start) + put_back.len());
+        candidate.push_str(&self.current[..del_start]);
+        candidate.push_str(&put_back);
+        candidate.push_str(&self.current[del_end..]);
+        if instrument::parse_source(&candidate).is_err() {
+            return;
+        }
+        if instrument::same_tokens(self.current, &candidate) == Some(true)
+            || instrument::same_tokens(self.whole_undone, &candidate) == Some(true)
+        {
+            return;
+        }
+        let sig = token_sig(&candidate);
+        if !self.seen_sigs.insert(sig) {
+            return;
+        }
+        let line = self.current[..anchor.0].matches('\n').count() + 1;
+        let code = crate::report::one_line(&self.current[anchor.0..anchor.1]);
+        self.out.push(Change {
+            hunk: self.whole.hunk.clone(),
+            line,
+            code,
+            undone: Some(candidate),
+            range: (del_start, del_end),
+            put_back,
+            outside: false,
+            subhunk: Some(description),
+        });
+    }
+}
+
+impl<'ast> Visit<'ast> for SubhunkBuilder<'_> {
+    fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+        if instrument::is_test_only(&node.attrs) || instrument::is_skipped(&node.attrs) {
+            return;
+        }
+        self.scope.push(format!("mod:{}", node.ident));
+        visit::visit_item_mod(self, node);
+        self.scope.pop();
+    }
+
+    fn visit_item_impl(&mut self, node: &'ast syn::ItemImpl) {
+        if instrument::is_test_only(&node.attrs) || instrument::is_skipped(&node.attrs) {
+            return;
+        }
+        let ty = span_range(self.current, node.self_ty.span())
+            .map(|(s, e)| token_sig(&self.current[s..e]))
+            .unwrap_or_default();
+        self.scope.push(format!("impl:{ty}"));
+        visit::visit_item_impl(self, node);
+        self.scope.pop();
+    }
+
+    fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
+        if instrument::is_test_only(&node.attrs) || instrument::is_skipped(&node.attrs) {
+            return;
+        }
+        self.scope.push(format!("fn:{}", node.sig.ident));
+        visit::visit_item_fn(self, node);
+        self.scope.pop();
+    }
+
+    fn visit_impl_item_fn(&mut self, node: &'ast syn::ImplItemFn) {
+        if instrument::is_test_only(&node.attrs) || instrument::is_skipped(&node.attrs) {
+            return;
+        }
+        self.scope.push(format!("fn:{}", node.sig.ident));
+        visit::visit_impl_item_fn(self, node);
+        self.scope.pop();
+    }
+
+    fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
+        if instrument::is_test_only(&node.attrs) || instrument::is_skipped(&node.attrs) {
+            return;
+        }
+        self.scope.push(format!("fn:{}", node.sig.ident));
+        visit::visit_trait_item_fn(self, node);
+        self.scope.pop();
+    }
+
+    fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
+        let prev = self.in_logical;
+        if let Some(op) = logical_op(&node.op) {
+            if prev != Some(op)
+                && let Some(range) = span_range(self.current, node.span())
+                && overlaps(range, self.whole.range)
+            {
+                let expr = syn::Expr::Binary(node.clone());
+                let mut terms = Vec::new();
+                flatten_logical(&expr, op, &mut terms);
+                let has_let = terms.iter().any(|t| matches!(t, syn::Expr::Let(_)));
+                if terms.len() >= 2 && !has_let {
+                    let spans: Option<Vec<(usize, usize)>> = terms
+                        .iter()
+                        .map(|t| span_range(self.current, t.span()))
+                        .collect();
+                    if let Some(spans) = spans
+                        && spans.windows(2).all(|w| w[0].1 <= w[1].0)
+                    {
+                        let term_sigs: Vec<String> = spans
+                            .iter()
+                            .map(|&(s, e)| token_sig(&self.current[s..e]))
+                            .collect();
+                        let added_indices = if !self.has_old {
+                            Some((0..terms.len()).collect::<Vec<_>>())
+                        } else {
+                            let old_list = self.old.logicals.get(&self.key());
+                            match old_list.map(Vec::as_slice) {
+                                Some([old_expr])
+                                    if old_expr.op.is_none() || old_expr.op == Some(op) =>
+                                {
+                                    multiset_added_indices(&old_expr.terms, &term_sigs)
+                                        .filter(|added| !added.is_empty())
+                                }
+                                _ => None,
+                            }
+                        };
+                        if let Some(indices) = added_indices {
+                            for i in indices {
+                                let anchor = spans[i];
+                                if !overlaps(anchor, self.whole.range) {
+                                    continue;
+                                }
+                                let (del_start, del_end) = if i == 0 {
+                                    (spans[0].0, spans[1].0)
+                                } else {
+                                    (spans[i - 1].1, spans[i].1)
+                                };
+                                let desc = format!(
+                                    "without added condition `{}`",
+                                    crate::report::one_line(&self.current[anchor.0..anchor.1])
+                                );
+                                self.try_emit(del_start, del_end, anchor, desc);
+                            }
+                        }
+                    }
+                }
+            }
+            self.in_logical = Some(op);
+            visit::visit_expr_binary(self, node);
+            self.in_logical = prev;
+        } else {
+            self.in_logical = None;
+            visit::visit_expr_binary(self, node);
+            self.in_logical = prev;
+        }
+    }
+
+    fn visit_expr_struct(&mut self, node: &'ast syn::ExprStruct) {
+        if node.rest.is_some()
+            && let Some(range) = span_range(self.current, node.span())
+            && overlaps(range, self.whole.range)
+            && let Some((ps, pe)) = span_range(self.current, node.path.span())
+        {
+            let path_sig = token_sig(&self.current[ps..pe]);
+            let old_fields = if !self.has_old {
+                Some(HashSet::new())
+            } else {
+                let matching: Vec<&OldStruct> = self
+                    .old
+                    .structs
+                    .get(&self.key())
+                    .into_iter()
+                    .flatten()
+                    .filter(|s| s.path_sig == path_sig)
+                    .collect();
+                match matching.as_slice() {
+                    [old_struct] => Some(old_struct.fields.clone()),
+                    _ => None,
+                }
+            };
+            if let Some(old_fields) = old_fields {
+                for pair in node.fields.pairs() {
+                    let field = pair.value();
+                    if instrument::is_test_only(&field.attrs)
+                        || instrument::is_skipped(&field.attrs)
+                    {
+                        continue;
+                    }
+                    let name = match &field.member {
+                        syn::Member::Named(id) => id.to_string(),
+                        syn::Member::Unnamed(idx) => idx.index.to_string(),
+                    };
+                    if old_fields.contains(&name) {
+                        continue;
+                    }
+                    let Some((fs, fe)) = span_range(self.current, field.span()) else {
+                        continue;
+                    };
+                    if !overlaps((fs, fe), self.whole.range) {
+                        continue;
+                    }
+                    let del_end = pair
+                        .punct()
+                        .and_then(|comma| span_range(self.current, comma.span()))
+                        .map_or(fe, |(_, ce)| ce);
+                    let desc = format!(
+                        "without added field `{}`",
+                        crate::report::one_line(&self.current[fs..fe])
+                    );
+                    self.try_emit(fs, del_end, (fs, fe), desc);
+                }
+            }
+        }
+        visit::visit_expr_struct(self, node);
+    }
+
+    fn visit_block(&mut self, node: &'ast syn::Block) {
+        if let Some(range) = span_range(self.current, node.span())
+            && overlaps(range, self.whole.range)
+        {
+            let candidates: Vec<((usize, usize), String)> = node
+                .stmts
+                .iter()
+                .enumerate()
+                .filter_map(|(idx, stmt)| {
+                    let is_last = idx + 1 == node.stmts.len();
+                    if !deletable_subhunk_stmt(stmt, is_last) {
+                        return None;
+                    }
+                    let (s, e) = span_range(self.current, stmt.span())?;
+                    Some(((s, e), token_sig(&self.current[s..e])))
+                })
+                .collect();
+            if candidates.len() >= 2 {
+                let sigs: Vec<String> = candidates.iter().map(|(_, sig)| sig.clone()).collect();
+                let added_indices = if !self.has_old {
+                    Some((0..candidates.len()).collect::<Vec<_>>())
+                } else {
+                    match self.old.blocks.get(&self.key()).map(Vec::as_slice) {
+                        Some([old_sigs]) => {
+                            multiset_added_indices(old_sigs, &sigs).filter(|a| !a.is_empty())
+                        }
+                        _ => None,
+                    }
+                };
+                if let Some(indices) = added_indices {
+                    for i in indices {
+                        let (anchor, _) = &candidates[i];
+                        if !overlaps(*anchor, self.whole.range) {
+                            continue;
+                        }
+                        let desc = format!(
+                            "without added statement `{}`",
+                            crate::report::one_line(&self.current[anchor.0..anchor.1])
+                        );
+                        self.try_emit(anchor.0, anchor.1, *anchor, desc);
+                    }
+                }
+            }
+        }
+        visit::visit_block(self, node);
+    }
+}
+
+/// Decomposes a multi-addition diff hunk into independent AST sub-hunk reverts:
+/// added `&&`/`||` terms, added struct literal fields (with `..base`), and added
+/// standalone statements.
+fn subhunk_changes(
+    current: &str,
+    parsed: &syn::File,
+    tests_now: &[(usize, usize)],
+    undone_text: &str,
+    undone_tree: &syn::File,
+    whole: &Change,
+) -> Vec<Change> {
+    if whole.range.0 >= whole.range.1 {
+        return vec![];
+    }
+    let has_old = !whole.put_back.trim().is_empty();
+    let old_window = (whole.range.0, whole.range.0 + whole.put_back.len());
+    let mut old_collector = OldCollector {
+        source: undone_text,
+        window: old_window,
+        scope: Vec::new(),
+        in_logical: None,
+        found: OldStructures::default(),
+    };
+    if has_old {
+        old_collector.visit_file(undone_tree);
+    }
+    let mut seen_sigs = HashSet::new();
+    seen_sigs.insert(token_sig(current));
+    seen_sigs.insert(token_sig(undone_text));
+    let mut builder = SubhunkBuilder {
+        current,
+        whole_undone: undone_text,
+        whole,
+        tests_now,
+        has_old,
+        old: &old_collector.found,
+        scope: Vec::new(),
+        in_logical: None,
+        seen_sigs,
+        out: Vec::new(),
+    };
+    builder.visit_file(parsed);
+    builder.out
 }
 
 #[cfg(test)]
@@ -1144,5 +1878,123 @@ pub fn basic() -> u32 {
         assert_eq!(all_undone(&new, &found).as_deref(), Some(OLD));
         // A file that is not Rust now has nothing to try.
         assert_eq!(changes("fn f( {", &[]), []);
+    }
+
+    #[test]
+    fn subhunks_decompose_added_logical_terms_without_duplicating_whole_hunk() {
+        let old = "\
+pub fn allow(a: bool, b: bool, c: bool) -> bool {
+    a
+}
+";
+        // Adding two terms yields whole hunk (`a`) plus two sub-hunks (`a && c`, `a && b`).
+        let new = "\
+pub fn allow(a: bool, b: bool, c: bool) -> bool {
+    a && b && c
+}
+";
+        let found = between(old, new);
+        let wholes: Vec<_> = found.iter().filter(|c| !c.is_subhunk()).collect();
+        let subs: Vec<_> = found.iter().filter(|c| c.is_subhunk()).collect();
+        assert_eq!(wholes.len(), 1, "{found:?}");
+        assert_eq!(subs.len(), 2, "{found:?}");
+        assert_eq!(subs[0].describe(), "without added condition `b`");
+        assert_eq!(
+            subs[0].undone.as_deref(),
+            Some("pub fn allow(a: bool, b: bool, c: bool) -> bool {\n    a && c\n}\n")
+        );
+        assert_eq!(subs[1].describe(), "without added condition `c`");
+        assert_eq!(
+            subs[1].undone.as_deref(),
+            Some("pub fn allow(a: bool, b: bool, c: bool) -> bool {\n    a && b\n}\n")
+        );
+        // `all_undone` ignores sub-hunks and restores the original file cleanly.
+        assert_eq!(all_undone(new, &found).as_deref(), Some(old));
+
+        // Adding only ONE term (`a` -> `a && b`) deduplicates against the whole hunk.
+        let one_added = "\
+pub fn allow(a: bool, b: bool, c: bool) -> bool {
+    a && b
+}
+";
+        let one_found = between(old, one_added);
+        assert_eq!(one_found.len(), 1, "{one_found:?}");
+        assert!(!one_found[0].is_subhunk());
+    }
+
+    #[test]
+    fn subhunks_decompose_added_struct_fields_with_base_only() {
+        let old = "\
+#[derive(Default)]
+pub struct Cfg { pub a: u8, pub b: u8, pub c: u8 }
+pub fn make(base: Cfg) -> Cfg {
+    Cfg { a: 1, ..base }
+}
+";
+        let new = "\
+#[derive(Default)]
+pub struct Cfg { pub a: u8, pub b: u8, pub c: u8 }
+pub fn make(base: Cfg) -> Cfg {
+    Cfg { a: 1, b: 2, c: 3, ..base }
+}
+";
+        let found = between(old, new);
+        let subs: Vec<_> = found.iter().filter(|c| c.is_subhunk()).collect();
+        assert_eq!(subs.len(), 2, "{found:?}");
+        assert_eq!(subs[0].describe(), "without added field `b: 2`");
+        assert_eq!(subs[1].describe(), "without added field `c: 3`");
+        assert!(
+            subs[0]
+                .undone
+                .as_deref()
+                .unwrap()
+                .contains("a: 1,  c: 3, ..base")
+                || subs[0]
+                    .undone
+                    .as_deref()
+                    .unwrap()
+                    .contains("a: 1, c: 3, ..base")
+        );
+        assert!(
+            subs[1]
+                .undone
+                .as_deref()
+                .unwrap()
+                .contains("a: 1, b: 2,  ..base")
+                || subs[1]
+                    .undone
+                    .as_deref()
+                    .unwrap()
+                    .contains("a: 1, b: 2, ..base")
+        );
+        assert_eq!(all_undone(new, &found).as_deref(), Some(old));
+    }
+
+    #[test]
+    fn subhunks_decompose_added_guard_and_call_statements() {
+        let old = "\
+pub fn validate(x: i32) -> Result<i32, &'static str> {
+    Ok(x)
+}
+";
+        let new = "\
+pub fn validate(x: i32) -> Result<i32, &'static str> {
+    if x < 0 { return Err(\"neg\"); }
+    if x > 100 { return Err(\"big\"); }
+    Ok(x)
+}
+";
+        let found = between(old, new);
+        let subs: Vec<_> = found.iter().filter(|c| c.is_subhunk()).collect();
+        assert_eq!(subs.len(), 2, "{found:?}");
+        assert_eq!(
+            subs[0].describe(),
+            "without added statement `if x < 0 { return Err(\"neg\"); }`"
+        );
+        assert_eq!(
+            subs[1].describe(),
+            "without added statement `if x > 100 { return Err(\"big\"); }`"
+        );
+        assert_eq!(all_undone(new, &found).as_deref(), Some(old));
     }
 }

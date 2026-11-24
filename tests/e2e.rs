@@ -5642,3 +5642,105 @@ mod tests {
         "{rebuilt:#}"
     );
 }
+
+#[test]
+fn since_subhunk_undo_catches_untested_condition_inside_tested_hunk() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("since-subhunk-undo");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"since-subhunk\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub fn allow(is_member: bool, _is_active: bool, _is_verified: bool) -> bool {
+    is_member
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checks_member_and_active() {
+        assert!(allow(true, true, true));
+        assert!(!allow(false, true, true));
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let git = |args: &[&str]| {
+        let out = Command::new("git")
+            .current_dir(&dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .args(args)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&out.stderr)
+        );
+    };
+    git(&["init", "-q"]);
+    git(&["config", "user.name", "tmt-test"]);
+    git(&["config", "user.email", "tmt-test@example.com"]);
+    git(&["add", "."]);
+    git(&["commit", "-q", "-m", "initial"]);
+
+    // Add TWO conditions (`&& is_active && is_verified`), but tests only check `is_active`.
+    // Reverting the whole hunk fails tests (killed by `is_active`), while the AST sub-hunk
+    // removing only `is_verified` survives as an UNTESTED CHANGE.
+    fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub fn allow(is_member: bool, is_active: bool, is_verified: bool) -> bool {
+    is_member && is_active && is_verified
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checks_member_and_active() {
+        assert!(allow(true, true, true));
+        assert!(!allow(false, true, true));
+        assert!(!allow(true, false, true));
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let run = tmt(
+        &dir,
+        &["--json", "--quiet", "--source-only", "--since", "HEAD"],
+    );
+    assert_eq!(run.code, 2, "{}", run.stderr);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    let untested: Vec<_> = findings(&report, "survivor")
+        .into_iter()
+        .filter(|f| f["change_since"].is_string())
+        .collect();
+    assert!(
+        untested.iter().any(|f| strings(&f["survivors"])
+            .iter()
+            .any(|s| s.contains("without added condition `is_verified`"))),
+        "{report:#}"
+    );
+    // Whole hunk and `is_active` sub-hunk are killed by `assert!(!allow(true, false, true))`.
+    assert!(
+        !untested.iter().any(|f| strings(&f["survivors"])
+            .iter()
+            .any(|s| s.contains("without added condition `is_active`"))),
+        "{report:#}"
+    );
+}
