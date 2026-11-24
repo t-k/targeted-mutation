@@ -4010,7 +4010,7 @@ fn the_last_round_of_a_loop_is_the_nearest_value() {
     assert_eq!(optimised["analysis"]["opt_level"], 2);
     assert_eq!(but_how(optimised), but_how(report));
     let bad = tmt(&dir, &["--quiet", "--opt-level", "4"]);
-    assert_eq!(bad.code, 2, "{}", bad.stderr);
+    assert_eq!(bad.code, 1, "{}", bad.stderr);
     assert!(bad.stderr.contains("--opt-level"), "{}", bad.stderr);
 }
 
