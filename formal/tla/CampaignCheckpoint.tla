@@ -107,6 +107,21 @@ FinishCampaign ==
     /\ complete' = TRUE
     /\ UNCHANGED <<identities, committed, tail, active, done, before, reused, exact>>
 
+\* A run can finish without marking the campaign complete when some phase left
+\* unevaluated (`Unable`) candidates unrecorded so a later run retries them.
+LeavePartial ==
+    /\ running
+    /\ tail = NoTail
+    /\ active # done
+    /\ running' = FALSE
+    /\ active' = {}
+    /\ done' = {}
+    /\ before' = Empty
+    /\ reused' = Empty
+    /\ exact' = {}
+    /\ complete' = FALSE
+    /\ UNCHANGED <<identities, committed, tail>>
+
 Next ==
     \/ Start
     \/ \E p \in Phases, ctx \in Contexts : Begin(p, ctx)
@@ -116,6 +131,7 @@ Next ==
     \/ Recover
     \/ \E p \in Phases : FinishPhase(p)
     \/ FinishCampaign
+    \/ LeavePartial
 
 Spec == Init /\ [][Next]_vars
 

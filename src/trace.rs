@@ -1156,4 +1156,14 @@ mod tests {
         .join()
         .unwrap();
     }
+
+    #[test]
+    fn float_min_max_distinguishes_signed_zeros_and_nan() {
+        assert!(tmt_rt::float_min_max_same(1.5, 1.5));
+        assert!(tmt_rt::float_min_max_same(0.0, 0.0));
+        assert!(tmt_rt::float_min_max_same(-0.0, -0.0));
+        assert!(!tmt_rt::float_min_max_same(-0.0, 0.0));
+        assert!(!tmt_rt::float_min_max_same(f64::NAN, f64::NAN));
+        assert!(!tmt_rt::float_min_max_same(f64::NAN, 1.0));
+    }
 }

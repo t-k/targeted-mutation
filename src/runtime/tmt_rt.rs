@@ -451,7 +451,7 @@ const MODE_ONE: u8 = 3;
 /// Most probes are asked most of the time: a run with a mutant concerns one site.
 #[inline(always)]
 pub fn idle(site: u32) -> bool {
-    match MODE.load(Atomic::Relaxed) {
+    match MODE.load(Atomic::Acquire) {
         MODE_IDLE => true,
         MODE_ONE => TARGET.load(Atomic::Relaxed) != site,
         MODE_ALL => false,
@@ -506,7 +506,7 @@ fn state() -> &'static State {
         if let Some((site, _)) = state.mutant {
             TARGET.store(site, Atomic::Relaxed);
         }
-        MODE.store(mode_of(&state), Atomic::Relaxed);
+        MODE.store(mode_of(&state), Atomic::Release);
         if state.tracer.is_some() {
             // For the threads that never end (a pool that lives as long as the process).
             // Without this thread their backlog is still written whenever a thread ends.
@@ -1220,9 +1220,7 @@ macro_rules! tmt_arith_any {
             fn $method(&self, site: u32) -> L::Output {
                 let (a, b) = self.take();
                 if !idle(site) {
-                    if !idle(site) {
-            record_bits(b'A', site, ARITH_OPAQUE);
-        }
+                    record_bits(b'A', site, ARITH_OPAQUE);
                 }
                 std::ops::$bound::$call(a, b)
             }
@@ -1253,9 +1251,7 @@ macro_rules! tmt_assign_any {
             fn $method(&self, site: u32) {
                 let (l, r) = self.take();
                 if !idle(site) {
-                    if !idle(site) {
-            record_bits(b'A', site, ARITH_OPAQUE);
-        }
+                    record_bits(b'A', site, ARITH_OPAQUE);
                 }
                 std::ops::$bound::$call(l, r)
             }
@@ -1290,8 +1286,12 @@ pub trait NotPrim {
 }
 
 impl NotPrim for Un<bool> {
+    #[inline(always)]
     fn tmt_not(&self, site: u32) -> bool {
         let value = self.0.take().expect("the operand is taken once");
+        if idle(site) {
+            return !value;
+        }
         if mutant_at(site) == Some(Mutant::DropNot) {
             return value;
         }
@@ -1363,8 +1363,12 @@ macro_rules! tmt_ranges {
     ($($t:ty)*) => {$(
         impl RangePrim for Ar<$t, $t> {
             type T = $t;
+            #[inline(always)]
             fn tmt_range(&self, site: u32) -> std::ops::Range<$t> {
                 let (a, b) = self.take();
+                if idle(site) {
+                    return a..b;
+                }
                 if mutant_at(site) == Some(Mutant::RangeEnd) {
                     // At the top of the type there is no "one more", and no range of this
                     // kind that includes the end. The driver does not run this mutant
@@ -1379,8 +1383,12 @@ macro_rules! tmt_ranges {
                 record_bits(b'R', site, if b == <$t>::MAX { 1 | RANGE_AT_TOP } else { 1 });
                 a..b
             }
+            #[inline(always)]
             fn tmt_range_inclusive(&self, site: u32) -> std::ops::RangeInclusive<$t> {
                 let (a, b) = self.take();
+                if idle(site) {
+                    return a..=b;
+                }
                 if mutant_at(site) == Some(Mutant::RangeEnd) {
                     return match b.checked_sub(1) {
                         Some(end) => a..=end,
@@ -1432,10 +1440,14 @@ pub trait MinMaxPrim {
     fn tmt_other(&self, site: u32) -> bool;
 }
 
-macro_rules! tmt_min_max {
+macro_rules! tmt_min_max_ints {
     ($($t:ty)*) => {$(
         impl<'a> MinMaxPrim for Mm<'a, $t, $t> {
+            #[inline(always)]
             fn tmt_other(&self, site: u32) -> bool {
+                if idle(site) {
+                    return false;
+                }
                 if mutant_at(site) == Some(Mutant::MinMax) {
                     return true;
                 }
@@ -1445,7 +1457,32 @@ macro_rules! tmt_min_max {
         }
     )*};
 }
-tmt_min_max!(i8 i16 i32 i64 isize u8 u16 u32 u64 usize f32 f64);
+tmt_min_max_ints!(i8 i16 i32 i64 isize u8 u16 u32 u64 usize);
+
+pub fn float_min_max_same(a: f64, b: f64) -> bool {
+    !a.is_nan() && a.to_bits() == b.to_bits()
+}
+
+macro_rules! tmt_min_max_floats {
+    ($($t:ty)*) => {$(
+        impl<'a> MinMaxPrim for Mm<'a, $t, $t> {
+            #[inline(always)]
+            fn tmt_other(&self, site: u32) -> bool {
+                if idle(site) {
+                    return false;
+                }
+                if mutant_at(site) == Some(Mutant::MinMax) {
+                    return true;
+                }
+                // `-0.0.max(0.0)` and `-0.0.min(0.0)` differ in sign bit; NaN is kept on the safe side.
+                let same = float_min_max_same(*self.0 as f64, *self.1 as f64);
+                record_bits(b'A', site, if same { ARITH_SAME } else { ARITH_DIFFERS });
+                false
+            }
+        }
+    )*};
+}
+tmt_min_max_floats!(f32 f64);
 
 /// `max` / `min` of anything else: never the other one.
 pub trait AnyMinMax {
@@ -1495,16 +1532,18 @@ impl<T> EndOf<T> {
     /// name (one a trait of the crate adds to `Vec`): where it did not return the very
     /// element the standard library gives, nothing is known about its other end, and
     /// nothing is mutated.
+    #[inline(always)]
     pub fn tmt_end_seen(&self, site: u32, got: &Option<&T>) {
+        if idle(site) {
+            return;
+        }
         let same = match (self.end, got) {
             (None, None) => true,
             (Some(ours), Some(theirs)) => std::ptr::eq(ours, *theirs),
             _ => false,
         };
         if self.fixed || !same {
-            if !idle(site) {
-                record_bits(b'A', site, ARITH_OPAQUE);
-            }
+            record_bits(b'A', site, ARITH_OPAQUE);
         } else {
             record_bits(
                 b'A',
@@ -1523,7 +1562,11 @@ macro_rules! tmt_ends {
     ($([$($generics:tt)*] $t:ty, $elem:ty, $fixed:expr;)*) => {$(
         impl<'a, $($generics)*> SliceEnd for Ends<'a, $t> {
             type Elem = $elem;
+            #[inline(always)]
             fn tmt_other_end(&self, site: u32, first: bool) -> End<EndOf<$elem>> {
+                if idle(site) {
+                    return End::Same(EndOf { len: 0, end: None, fixed: false });
+                }
                 let all: &$t = self.0;
                 let fixed: bool = $fixed;
                 if !fixed && mutant_at(site) == Some(Mutant::OtherEnd) {

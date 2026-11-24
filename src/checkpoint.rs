@@ -311,6 +311,21 @@ impl Checkpoint {
     pub(crate) fn finish(&self) -> Result<()> {
         self.lock()?.append(Event::CampaignCompleted)
     }
+
+    pub(crate) fn finish_if_complete(&self) -> Result<bool> {
+        let mut log = self.lock()?;
+        log.state.running()?;
+        if !log
+            .state
+            .active
+            .iter()
+            .all(|name| log.state.phases[name].complete)
+        {
+            return Ok(false);
+        }
+        log.append(Event::CampaignCompleted)?;
+        Ok(true)
+    }
 }
 
 impl Phase<'_> {
@@ -349,6 +364,17 @@ impl Phase<'_> {
         self.lock()?.append(Event::PhaseCompleted {
             phase: self.phase.clone(),
         })
+    }
+
+    pub(crate) fn finish_if_complete(&self) -> Result<bool> {
+        let mut log = self.lock()?;
+        if log.state.phase(&self.phase)?.pending() > 0 {
+            return Ok(false);
+        }
+        log.append(Event::PhaseCompleted {
+            phase: self.phase.clone(),
+        })?;
+        Ok(true)
     }
 }
 
@@ -807,5 +833,32 @@ mod tests {
             assert!(format!("{error:#}").contains(expected), "{error:#}");
             assert_eq!(fs::read_to_string(&path).unwrap(), rows);
         }
+    }
+
+    #[test]
+    fn partial_phase_leaves_checkpoint_resumable_until_all_candidates_finish() {
+        let dir = Scratch::new();
+        let path = dir.path();
+        let keys = || vec!["a".to_string(), "b".to_string()];
+
+        // First run records candidate 0 and leaves candidate 1 unrecorded (e.g. Outcome::Unable).
+        let log = Checkpoint::open(&path).unwrap();
+        log.start("ctx", json!({})).unwrap();
+        let phase = log.begin("source", "phase-ctx", keys()).unwrap();
+        phase.record(0, &1u8).unwrap();
+        assert!(!phase.finish_if_complete().unwrap());
+        assert!(!log.finish_if_complete().unwrap());
+        drop(phase);
+        drop(log);
+
+        // Reopening resumes candidate 0 and lets candidate 1 complete the phase and campaign.
+        let log = Checkpoint::open(&path).unwrap();
+        log.start("ctx", json!({})).unwrap();
+        let phase = log.begin("source", "phase-ctx", keys()).unwrap();
+        assert_eq!(phase.get::<u8>(0).unwrap(), Some(1));
+        assert_eq!(phase.get::<u8>(1).unwrap(), None);
+        phase.record(1, &2u8).unwrap();
+        assert!(phase.finish_if_complete().unwrap());
+        assert!(log.finish_if_complete().unwrap());
     }
 }

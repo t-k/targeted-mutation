@@ -1825,6 +1825,7 @@ mod tests {
             kind: SiteKind::Not {
                 bang: (0, 1),
                 operand: "is_ready(x)".into(),
+                needs_space: false,
             },
             ..assign.clone()
         };

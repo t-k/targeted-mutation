@@ -46,27 +46,59 @@ impl Scope {
     pub fn from_diff(diff: &str) -> Scope {
         let mut scope = Scope::default();
         let mut file: Option<String> = None;
-        for line in diff.lines() {
+        let lines: Vec<&str> = diff.lines().collect();
+        let mut i = 0;
+        let (mut old_left, mut new_left) = (0usize, 0usize);
+        while i < lines.len() {
+            let line = lines[i];
+            if old_left + new_left > 0 {
+                // Hand-written diffs without full body lines may move straight to the next
+                // file header (`diff --git`, or `--- ` / `+++ ` followed by `@@ `). Real
+                // `git diff -U0` hunk lines always begin with `-`, `+`, or `\`, never `@@ `.
+                let starts_next_file = line.starts_with("diff --git ")
+                    || (line.starts_with("--- ")
+                        && lines
+                            .get(i + 1)
+                            .is_some_and(|next| next.starts_with("+++ "))
+                        && lines
+                            .get(i + 2)
+                            .is_none_or(|after| after.starts_with("@@ ")));
+                if starts_next_file {
+                    old_left = 0;
+                    new_left = 0;
+                } else if line.starts_with('\\') {
+                    i += 1;
+                    continue;
+                } else if line.starts_with('-') && old_left > 0 {
+                    old_left -= 1;
+                    i += 1;
+                    continue;
+                } else if line.starts_with('+') && new_left > 0 {
+                    new_left -= 1;
+                    i += 1;
+                    continue;
+                } else {
+                    old_left = 0;
+                    new_left = 0;
+                }
+            }
             if let Some(path) = line.strip_prefix("+++ ") {
                 // `+++ b/path`, or `+++ /dev/null` for a deleted file.
                 file = new_path(path);
-            } else if line.starts_with("@@ ")
-                && let Some(file) = &file
-                && let Some(added) = line.split(' ').find_map(|part| part.strip_prefix('+'))
-            {
-                let (start, count) = added.split_once(',').unwrap_or((added, "1"));
-                let (Ok(start), Ok(count)) = (start.parse::<usize>(), count.parse::<usize>())
-                else {
-                    continue;
-                };
-                let range = if count == 0 {
-                    // `+N,0`: lines were removed after line N.
-                    (start.max(1), start + 1)
-                } else {
-                    (start, start + count - 1)
-                };
-                scope.add(file, range);
+            } else if let Some((old_count, start, count)) = hunk_header(line) {
+                old_left = old_count;
+                new_left = count;
+                if let Some(file) = &file {
+                    let range = if count == 0 {
+                        // `+N,0`: lines were removed after line N.
+                        (start.max(1), start + 1)
+                    } else {
+                        (start, start + count - 1)
+                    };
+                    scope.add(file, range);
+                }
             }
+            i += 1;
         }
         scope
     }
@@ -731,5 +763,26 @@ new file mode 100644
             [0, 1, 2, 4, 5, 6, 7, 99].map(|o| line_of(source, o)),
             [1, 1, 2, 2, 3, 4, 4, 4]
         );
+    }
+
+    #[test]
+    fn from_diff_ignores_plus_markers_inside_hunk_body() {
+        let diff = "\
+diff --git a/src/a.rs b/src/a.rs
+--- a/src/a.rs
++++ b/src/a.rs
+@@ -2,0 +3,3 @@
++let header = \"++\";
++++ /dev/null
++++ b/src/hijacked.rs
+@@ -10 +13 @@
+-old
++new
+";
+        let scope = Scope::from_diff(diff);
+        assert_eq!(scope.files().collect::<Vec<_>>(), ["src/a.rs"]);
+        assert!(scope.touches("src/a.rs", 3, 5));
+        assert!(scope.touches("src/a.rs", 13, 13));
+        assert!(!scope.touches("src/hijacked.rs", 1, 100));
     }
 }

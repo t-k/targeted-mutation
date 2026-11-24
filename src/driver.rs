@@ -1256,22 +1256,27 @@ fn copy_entry(
         let Ok(target) = src.canonicalize() else {
             return Ok(()); // dangling
         };
+        if skip(&target) {
+            return Ok(());
+        }
         if target.is_dir() {
             let contains_link = src
                 .parent()
                 .is_some_and(|dir| dir.canonicalize().is_ok_and(|dir| dir.starts_with(&target)));
-            if !target.starts_with(workspace) || contains_link || skip(&target) {
+            if !target.starts_with(workspace) || contains_link {
                 return Ok(());
             }
             return copy_tree(&target, dst, workspace, skip, state);
         }
-        sync_file(&target, dst, state)?;
+        if target.is_file() {
+            sync_file(&target, dst, state)?;
+        }
     } else if kind.is_dir() {
         // Build output and other caches (cargo marks its target directories this way).
         if !src.join("CACHEDIR.TAG").exists() {
             copy_tree(src, dst, workspace, skip, state)?;
         }
-    } else {
+    } else if kind.is_file() {
         sync_file(src, dst, state)?;
     }
     Ok(())
@@ -1315,6 +1320,49 @@ fn fixture_relative(path: &Path) -> Result<PathBuf> {
         );
     }
     Ok(relative)
+}
+
+fn wrapper_relative(path: &Path) -> Result<PathBuf> {
+    use std::path::Component;
+    let raw = path.to_string_lossy();
+    if raw.bytes().any(|b| b < 0x20 || b == 0x7f) {
+        bail!(
+            "--test-wrapper must not contain control characters: {}",
+            path.display()
+        );
+    }
+    let relative = path
+        .components()
+        .filter(|part| *part != Component::CurDir)
+        .collect::<PathBuf>();
+    if relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|part| !matches!(part, Component::Normal(_)))
+    {
+        bail!(
+            "--test-wrapper must be a path inside the workspace: {}",
+            path.display()
+        );
+    }
+    Ok(relative)
+}
+
+/// Whether re-running a surviving mutant against all tests proved the selective run missed a kill.
+/// An unevaluated run or an unconfirmed parallel timeout is not evidence of disagreement.
+fn audit_all_tests_disagrees(again: &JobResult) -> bool {
+    again.survived.is_none() && !again.unable && !again.unconfirmed_timeout
+}
+
+/// Compares a probe job verdict with its source-built twin.
+/// Returns `None` when either side cannot be judged, or `Some(disagrees)`.
+fn audit_source_comparison(probe: &JobResult, built: Option<Outcome>) -> Option<bool> {
+    if probe.unable || probe.unconfirmed_timeout {
+        return None;
+    }
+    let built = built.filter(|outcome| *outcome != Outcome::Unable)?;
+    let as_probe = probe.survived.is_some();
+    Some((built == Outcome::Pass) != as_probe)
 }
 
 fn fixture_exclusions(
@@ -2020,12 +2068,14 @@ fn run_binary(
     })();
     // tmt:ignore only Windows needs the file closed before the mark is removed, and these tests are for Unix
     drop(output_to_watch);
-    // The run is over, whichever way: what it started and did not stop is stopped now.
-    leftovers::count(&watch.finish(leftovers::leave()));
+    // Stop the runner before sweeping leftovers so a live child is never still holding
+    // the watch lock when the sweep begins.
     if result.is_err() {
         kill(&mut child);
         let _ = release_mark(&unable_mark);
     }
+    // The run is over, whichever way: what it started and did not stop is stopped now.
+    leftovers::count(&watch.finish(leftovers::leave()));
     let outcome = result?;
 
     // Whatever the tests made of it, a run that left the mark was not the mutant's. The
@@ -2092,14 +2142,18 @@ fn stop_nextest(child: &mut std::process::Child, grace: Duration) {
             }
         }
     };
-    if wait(child, Duration::ZERO) {
-        return;
-    }
     let group = child.id();
-    // Snapshot the owned groups while the parent exists. A wrapper can exit
-    // before its independently grouped children are reparented and stopped.
+    // Snapshot the owned groups before checking whether the parent has already exited.
+    // A wrapper can exit before its independently grouped children are reparented and stopped.
     #[cfg(unix)]
     let mut owned = owned_test_processes(group);
+    if wait(child, Duration::ZERO) {
+        #[cfg(unix)]
+        for surviving in surviving_groups(&owned, &test_processes()) {
+            kill_test_group(surviving);
+        }
+        return;
+    }
     signal_test_group(group, 15);
     let mut reaped = wait(child, grace);
     if !reaped {
@@ -2215,13 +2269,19 @@ fn kill_test_group(id: u32) {
 }
 
 fn signal_test_group(id: u32, signal: i32) {
+    // Never signal group 0 (this process's own group) or 1 (init).
+    if id <= 1 {
+        return;
+    }
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     {
         unsafe extern "C" {
             fn killpg(group: std::ffi::c_int, signal: std::ffi::c_int) -> std::ffi::c_int;
         }
-        if let Ok(group) = std::ffi::c_int::try_from(id) {
-            // SAFETY: the argument is the child PID used to create its own test group.
+        if let Ok(group) = std::ffi::c_int::try_from(id)
+            && group > 1
+        {
+            // SAFETY: the argument is the child PID (> 1) used to create its own test group.
             unsafe { killpg(group, signal) };
         }
     }
@@ -4762,17 +4822,8 @@ fn run_package(
         .wrapper
         .as_ref()
         .map(|path| {
-            if path.is_absolute()
-                || path
-                    .components()
-                    .any(|c| matches!(c, std::path::Component::ParentDir))
-            {
-                bail!(
-                    "--test-wrapper must be a path inside the workspace: {}",
-                    path.display()
-                );
-            }
-            let copied = copy.join(path);
+            let relative = wrapper_relative(path)?;
+            let copied = copy.join(&relative);
             if !copied.is_file() {
                 bail!(
                     "test wrapper is missing from the work copy: {}",
@@ -5285,7 +5336,7 @@ fn run_package(
             audit_checkpoint.as_ref(),
         )?) {
             report.timeout_rechecks.include(&again);
-            if again.survived.is_none() {
+            if audit_all_tests_disagrees(&again) {
                 // The verdict of all tests is the one that counts.
                 results[*job] = again;
                 let site = files
@@ -5788,20 +5839,23 @@ fn run_package(
                         let Some(audit) = report.audit.as_mut() else {
                             continue;
                         };
-                        // What does not build, and what the probe could not be, says nothing.
-                        let comparable = outcome.filter(|_| !results[*job].unable);
-                        match comparable {
-                            Some(_) => audit.compared += 1,
+                        // What does not build, what could not be evaluated, and an unconfirmed
+                        // parallel timeout say nothing about agreement between probe and source.
+                        match audit_source_comparison(&results[*job], outcome) {
+                            Some(disagrees) => {
+                                audit.compared += 1;
+                                if disagrees {
+                                    let verdict =
+                                        |passes: bool| if passes { "passes" } else { "fails" };
+                                    audit.source_disagreements.push(report::SourceDisagreement {
+                                        at: report::location(&file.display, site),
+                                        mutant: report::describe(site, mutation_of(site, mutant)),
+                                        as_probe: verdict(as_probe).to_string(),
+                                        built: verdict(!as_probe).to_string(),
+                                    });
+                                }
+                            }
                             None => audit.not_compared += 1,
-                        }
-                        if comparable.is_some_and(|built| (built == Outcome::Pass) != as_probe) {
-                            let verdict = |passes: bool| if passes { "passes" } else { "fails" };
-                            audit.source_disagreements.push(report::SourceDisagreement {
-                                at: report::location(&file.display, site),
-                                mutant: report::describe(site, mutation_of(site, mutant)),
-                                as_probe: verdict(as_probe).to_string(),
-                                built: verdict(!as_probe).to_string(),
-                            });
                         }
                         continue;
                     }
@@ -5835,7 +5889,7 @@ fn run_package(
             },
         )?;
         if let Some(phase) = &source_checkpoint {
-            phase.finish()?;
+            phase.finish_if_complete()?;
         }
         report.findings.extend(
             survivors
@@ -6544,7 +6598,7 @@ fn run_package(
         .retain(|finding| !known.as_ref().is_some_and(|known| known.knows(finding)));
     report.suppressed = before - report.findings.len();
     if let Some(checkpoint) = &checkpoint {
-        checkpoint.finish()?;
+        checkpoint.finish_if_complete()?;
     }
     Ok(report)
 }
@@ -9535,5 +9589,214 @@ fn main() {
             checkpoint.finish().unwrap();
         }
         fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_entry_pict_table() {
+        use std::os::unix::fs::symlink;
+
+        let dir = scratch("copy-entry-pict");
+        let workspace = dir.join("ws");
+        let outside = dir.join("outside");
+        let copy = dir.join("copy");
+        fs::create_dir_all(&workspace).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::create_dir_all(&copy).unwrap();
+        let ws_canon = workspace.canonicalize().unwrap();
+
+        let rows = [
+            ("symlink", "file", "outside", "no", true),
+            ("symlink", "file", "inside", "yes", false),
+            ("symlink", "dir", "outside", "no", false),
+            ("symlink", "dir", "inside", "no", true),
+            ("symlink", "special", "inside", "no", false),
+            ("special", "none", "inside", "no", false),
+            ("file", "none", "inside", "no", true),
+            ("symlink", "file", "inside", "no", true),
+            ("symlink", "dir", "outside", "yes", false),
+            ("dir", "none", "inside", "yes", true),
+            ("symlink", "special", "outside", "no", false),
+            ("symlink", "dir", "inside", "yes", false),
+            ("symlink", "dangling", "inside", "no", false),
+            ("dir", "none", "inside", "no", true),
+            ("file", "none", "inside", "yes", true),
+            ("symlink", "file", "outside", "yes", false),
+        ];
+
+        for (index, (entry_kind, target_kind, location, skipped, should_copy)) in
+            rows.into_iter().enumerate()
+        {
+            let case_ws = workspace.join(format!("case-{index}"));
+            let case_out = outside.join(format!("case-{index}"));
+            let case_dst = copy.join(format!("case-{index}"));
+            fs::create_dir_all(&case_ws).unwrap();
+            fs::create_dir_all(&case_out).unwrap();
+            let src = case_ws.join("entry");
+            let mut skip_target = None;
+
+            match entry_kind {
+                "file" => fs::write(&src, "plain").unwrap(),
+                "dir" => {
+                    fs::create_dir_all(&src).unwrap();
+                    fs::write(src.join("inner.txt"), "inner").unwrap();
+                }
+                "special" => {
+                    let status = Command::new("mkfifo").arg(&src).status().unwrap();
+                    assert!(status.success());
+                }
+                "symlink" => {
+                    let base = if location == "outside" {
+                        &case_out
+                    } else {
+                        &case_ws
+                    };
+                    let target = base.join("target");
+                    match target_kind {
+                        "file" => fs::write(&target, "linked").unwrap(),
+                        "dir" => {
+                            fs::create_dir_all(&target).unwrap();
+                            fs::write(target.join("inner.txt"), "inner").unwrap();
+                        }
+                        "special" => {
+                            let status = Command::new("mkfifo").arg(&target).status().unwrap();
+                            assert!(status.success());
+                        }
+                        "dangling" => {}
+                        other => panic!("unexpected target_kind {other}"),
+                    }
+                    if skipped == "yes" && target_kind != "dangling" {
+                        skip_target = Some(target.canonicalize().unwrap());
+                    }
+                    symlink(&target, &src).unwrap();
+                }
+                other => panic!("unexpected entry_kind {other}"),
+            }
+
+            fs::create_dir_all(&case_dst).unwrap();
+            let state = WorkCopy::open(&case_dst, &case_dst);
+            let dst = case_dst.join("entry");
+            let skip = |path: &Path| skip_target.as_ref().is_some_and(|blocked| blocked == path);
+            copy_entry(&src, &dst, &ws_canon, &skip, &state).unwrap();
+            assert_eq!(
+                dst.exists(),
+                should_copy,
+                "row {index}: {entry_kind}/{target_kind}/{location}/{skipped}"
+            );
+        }
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn audit_verdict_pict_table() {
+        let rows = [
+            ("pass", "unable", "source_twin"),
+            ("fail", "unable", "source_twin"),
+            ("unconfirmed_timeout", "pass", "source_twin"),
+            ("pass", "fail", "source_twin"),
+            ("pass", "unable", "all_tests"),
+            ("pass", "fail", "all_tests"),
+            ("pass", "pass", "all_tests"),
+            ("fail", "pass", "source_twin"),
+            ("fail", "fail", "source_twin"),
+            ("fail", "timeout", "all_tests"),
+            ("unconfirmed_timeout", "timeout", "source_twin"),
+            ("pass", "pass", "source_twin"),
+            ("unable", "unable", "all_tests"),
+            ("unable", "timeout", "all_tests"),
+            ("fail", "timeout", "source_twin"),
+            ("unable", "fail", "all_tests"),
+            ("unable", "fail", "source_twin"),
+            ("unconfirmed_timeout", "unable", "all_tests"),
+            ("pass", "timeout", "source_twin"),
+            ("unable", "pass", "source_twin"),
+            ("unable", "unviable", "source_twin"),
+            ("unable", "unable", "source_twin"),
+            ("pass", "timeout", "all_tests"),
+            ("fail", "fail", "all_tests"),
+            ("fail", "pass", "all_tests"),
+            ("unconfirmed_timeout", "fail", "all_tests"),
+            ("unconfirmed_timeout", "unviable", "source_twin"),
+            ("unconfirmed_timeout", "pass", "all_tests"),
+            ("pass", "unviable", "source_twin"),
+            ("unconfirmed_timeout", "timeout", "all_tests"),
+            ("unconfirmed_timeout", "fail", "source_twin"),
+            ("fail", "unable", "all_tests"),
+            ("unable", "timeout", "source_twin"),
+            ("fail", "unviable", "source_twin"),
+            ("unconfirmed_timeout", "unable", "source_twin"),
+            ("unable", "pass", "all_tests"),
+        ];
+        let job_of = |state: &str| JobResult {
+            first_pass_timeout: false,
+            unconfirmed_timeout: state == "unconfirmed_timeout",
+            survived: (state == "pass").then(|| vec!["bin".to_string()]),
+            timed_out: state == "unconfirmed_timeout",
+            unable: state == "unable",
+        };
+        let outcome_of = |outcome: &str| match outcome {
+            "unviable" => None,
+            "pass" => Some(Outcome::Pass),
+            "fail" => Some(Outcome::Fail),
+            "timeout" => Some(Outcome::Timeout),
+            "unable" => Some(Outcome::Unable),
+            other => panic!("unexpected outcome {other}"),
+        };
+        for (probe_state, built_outcome, mode) in rows {
+            let probe = job_of(probe_state);
+            match mode {
+                "all_tests" => {
+                    let again = JobResult {
+                        first_pass_timeout: false,
+                        unconfirmed_timeout: false,
+                        survived: (built_outcome == "pass").then(|| vec!["bin".to_string()]),
+                        timed_out: built_outcome == "timeout",
+                        unable: built_outcome == "unable",
+                    };
+                    let expected = matches!(built_outcome, "fail" | "timeout");
+                    assert_eq!(
+                        audit_all_tests_disagrees(&again),
+                        expected,
+                        "{probe_state}/{built_outcome}/{mode}"
+                    );
+                }
+                "source_twin" => {
+                    let built = outcome_of(built_outcome);
+                    let expected = if matches!(probe_state, "unable" | "unconfirmed_timeout")
+                        || matches!(built_outcome, "unviable" | "unable")
+                    {
+                        None
+                    } else {
+                        Some((built_outcome == "pass") != (probe_state == "pass"))
+                    };
+                    assert_eq!(
+                        audit_source_comparison(&probe, built),
+                        expected,
+                        "{probe_state}/{built_outcome}/{mode}"
+                    );
+                }
+                other => panic!("unexpected mode {other}"),
+            }
+        }
+        assert!(!audit_all_tests_disagrees(&job_of("unconfirmed_timeout")));
+    }
+
+    #[test]
+    fn wrapper_relative_rejects_escape_and_control_characters() {
+        assert_eq!(
+            wrapper_relative(Path::new("./scripts/wrap.sh")).unwrap(),
+            PathBuf::from("scripts/wrap.sh")
+        );
+        for bad in [
+            "",
+            ".",
+            "../wrap.sh",
+            "a/../wrap.sh",
+            "/usr/bin/env",
+            "scripts/wrap\0.sh",
+            "scripts/wrap\n.sh",
+        ] {
+            assert!(wrapper_relative(Path::new(bad)).is_err(), "{bad:?}");
+        }
     }
 }

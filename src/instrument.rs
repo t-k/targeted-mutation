@@ -61,6 +61,8 @@ pub enum SiteKind {
         /// Byte range of the `!` and whatever separates it from the operand.
         bang: (usize, usize),
         operand: String,
+        /// Deleting `!` would glue the preceding and following tokens (`return!x`).
+        needs_space: bool,
     },
     /// The result of a function whose exits reach the probe. The site's range is the
     /// inside of the body's braces and its text is the function signature.
@@ -116,6 +118,8 @@ pub enum SiteKind {
         operand: String,
         /// The operand is a literal: its type is whatever the context asks for.
         literal: bool,
+        /// Deleting `-` would glue the preceding and following tokens (`return-1`).
+        needs_space: bool,
     },
     /// The guard of a match arm: replaced by `true` or `false`.
     Guard {
@@ -401,18 +405,32 @@ struct Finder<'s> {
 impl Finder<'_> {
     /// Registers the sites of a function as a whole: its result (for `bool` and
     /// `Option<T>`), and its body replaced by each value its return type suggests.
-    fn function_sites(&mut self, sig: &syn::Signature, body: &syn::Block) {
+    fn function_sites(
+        &mut self,
+        attrs: &[syn::Attribute],
+        sig: &syn::Signature,
+        body: &syn::Block,
+    ) {
         if body.stmts.is_empty() {
             return;
         }
         let braces = body.brace_token.span;
-        let (Some((_, start)), Some((end, _)), Some((sig_start, sig_end))) = (
+        let (Some((_, mut start)), Some((end, _)), Some((sig_start, sig_end))) = (
             self.range(braces.open()),
             self.range(braces.close()),
             self.range(sig.span()),
         ) else {
             return;
         };
+        // Inner attributes (`#![allow(...)]`) must stay at the very start of the body block,
+        // before any statement inserted by a Body or Return probe.
+        for attr in attrs {
+            if matches!(attr.style, syn::AttrStyle::Inner(_))
+                && let Some((_, attr_end)) = self.range(attr.span())
+            {
+                start = start.max(attr_end);
+            }
+        }
         if !in_order(start, end) {
             return;
         }
@@ -1227,8 +1245,24 @@ pub fn source_mutants(site: &Site) -> Vec<SourceMutant> {
                 })
                 .collect()
         }
-        SiteKind::Not { bang, .. } => vec![change(bang.0, bang.1, String::new(), "!", "")],
-        SiteKind::Neg { minus, .. } => vec![change(minus.0, minus.1, String::new(), "-", "")],
+        SiteKind::Not {
+            bang, needs_space, ..
+        } => vec![change(
+            bang.0,
+            bang.1,
+            if *needs_space { " " } else { "" }.to_string(),
+            "!",
+            "",
+        )],
+        SiteKind::Neg {
+            minus, needs_space, ..
+        } => vec![change(
+            minus.0,
+            minus.1,
+            if *needs_space { " " } else { "" }.to_string(),
+            "-",
+            "",
+        )],
         SiteKind::Body { value, .. } => {
             vec![change(
                 site.start,
@@ -2184,7 +2218,14 @@ fn same_tokens_of(a: &str, b: &str, holes: bool) -> Option<bool> {
             if items.peek().is_some_and(|next| next == "," || next == ";") {
                 items.next();
             } else if items.peek().is_none() && kept.last().is_some_and(|last| last == ",") {
-                kept.pop();
+                // Keep the sole comma of a single-element tuple `(1, #[cfg(off)] 2)`:
+                // dropping it would turn `(1,)` into the parenthesised expression `(1)`.
+                let single_tuple =
+                    matches!(list, Some((proc_macro2::Delimiter::Parenthesis, false)))
+                        && kept.iter().filter(|token| *token == ",").count() == 1;
+                if !single_tuple {
+                    kept.pop();
+                }
             }
         }
         // A comma after the last of a list says nothing: of braces and brackets, and of
@@ -2412,7 +2453,7 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             // Nothing in a `const fn` can ask at run time which mutant is on.
             let constant = node.sig.constness.is_some() as usize;
             self.const_depth += constant;
-            self.function_sites(&node.sig, &node.block);
+            self.function_sites(&node.attrs, &node.sig, &node.block);
             visit::visit_item_fn(self, node);
             self.const_depth -= constant;
         }
@@ -2423,7 +2464,7 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             // Nothing in a `const fn` can ask at run time which mutant is on.
             let constant = node.sig.constness.is_some() as usize;
             self.const_depth += constant;
-            self.function_sites(&node.sig, &node.block);
+            self.function_sites(&node.attrs, &node.sig, &node.block);
             visit::visit_impl_item_fn(self, node);
             self.const_depth -= constant;
         }
@@ -2434,7 +2475,7 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             let constant = node.sig.constness.is_some() as usize;
             self.const_depth += constant;
             if let Some(body) = &node.default {
-                self.function_sites(&node.sig, body);
+                self.function_sites(&node.attrs, &node.sig, body);
             }
             visit::visit_trait_item_fn(self, node);
             self.const_depth -= constant;
@@ -2769,6 +2810,12 @@ impl<'ast> Visit<'ast> for Finder<'_> {
     }
 
     fn visit_expr_unary(&mut self, node: &'ast syn::ExprUnary) {
+        let joins = |start: usize, operand_start: usize| {
+            let prev = self.source[..start].chars().next_back();
+            let next = self.source[operand_start..].chars().next();
+            let word_or_dash = |c: char| c.is_alphanumeric() || c == '_' || c == '-';
+            prev.is_some_and(word_or_dash) && next.is_some_and(word_or_dash)
+        };
         if let syn::UnOp::Not(bang) = &node.op
             && node.attrs.is_empty()
             && let (Some((start, _)), Some((operand_start, end))) =
@@ -2778,6 +2825,7 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             let kind = SiteKind::Not {
                 bang: (start, operand_start),
                 operand: self.source[operand_start..end].to_string(),
+                needs_space: joins(start, operand_start),
             };
             self.push(kind, start, end, bang.span());
         }
@@ -2800,6 +2848,7 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                     minus: (start, operand_start),
                     operand: self.source[operand_start..end].to_string(),
                     literal: matches!(*node.expr, syn::Expr::Lit(_)),
+                    needs_space: joins(start, operand_start),
                 };
                 self.push(kind, start, end, minus.span());
             }
@@ -3580,12 +3629,27 @@ mod tests {
         ] {
             assert_eq!(same_tokens(&with, "enum E { A, B }"), Some(true), "{with}");
         }
-        // The last of a list that is left out goes with the comma before it, also in
-        // parentheses that are a tuple.
+        // A left-out element in a tuple keeps the sole comma when only one element remains
+        // (because `(1, #[cfg(off)] 2)` is a 1-tuple `(1,)`, not `(1)`), and drops the comma
+        // when at least two elements remain.
         assert_eq!(
             same_tokens(
-                &format!("const T: (u8, u8) = (1, {hole});"),
-                "const T: (u8, u8) = (1);"
+                &format!("const T: (u8,) = (1, {hole});"),
+                "const T: (u8,) = (1,);"
+            ),
+            Some(true)
+        );
+        assert_eq!(
+            same_tokens(
+                &format!("const T: (u8,) = (1, {hole});"),
+                "const T: (u8,) = (1);"
+            ),
+            Some(false)
+        );
+        assert_eq!(
+            same_tokens(
+                &format!("const T: (u8, u8) = (1, 2, {hole});"),
+                "const T: (u8, u8) = (1, 2);"
             ),
             Some(true)
         );
@@ -6275,5 +6339,77 @@ mod tests {
             iterator_values(&function.sig.output),
             ["::core::iter::empty()"]
         );
+    }
+
+    #[test]
+    fn inner_attributes_stay_before_body_and_return_probes() {
+        let source = "\
+fn f(x: i32) -> bool {
+    #![allow(clippy::all)]
+    #![allow(dead_code)]
+    x > 0
+}
+";
+        let found = discover(source, 0).unwrap();
+        let rendered = render(source, &found.sites, &|_| true);
+        assert!(
+            syn::parse_file(&rendered.text).is_ok(),
+            "rendered source must parse:\n{}",
+            rendered.text
+        );
+        assert_eq!(
+            rendered.text.matches('\n').count(),
+            source.matches('\n').count()
+        );
+        let attr_pos = rendered.text.find("#![allow(dead_code)]").unwrap();
+        let probe_pos = rendered.text.find("__tmt_rt::").unwrap();
+        assert!(attr_pos < probe_pos, "{}", rendered.text);
+        for site in found
+            .sites
+            .iter()
+            .filter(|s| matches!(s.kind, SiteKind::Body { .. }))
+        {
+            for mutant in source_mutants(site) {
+                let mut text = source.to_string();
+                text.replace_range(mutant.start..mutant.end, &mutant.replacement);
+                assert!(
+                    syn::parse_file(&text).is_ok(),
+                    "body mutant failed:\n{text}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn same_built_tokens_keeps_single_element_tuple_comma_after_left_out_item() {
+        let single_tuple = format!("fn f() -> (i32,) {{ (1, {LEFT_OUT}) }}");
+        let plain_expr = "fn f() -> (i32,) { (1) }";
+        let explicit_tuple = "fn f() -> (i32,) { (1,) }";
+        assert_eq!(same_built_tokens(&single_tuple, plain_expr), Some(false));
+        assert_eq!(same_built_tokens(&single_tuple, explicit_tuple), Some(true));
+        // A two-element tuple losing its third item still has a comma separating elements.
+        let pair_with_cfg = format!("fn f() -> (i32, i32) {{ (1, 2, {LEFT_OUT}) }}");
+        let pair = "fn f() -> (i32, i32) { (1, 2) }";
+        assert_eq!(same_built_tokens(&pair_with_cfg, pair), Some(true));
+    }
+
+    #[test]
+    fn deleting_unary_operator_does_not_merge_adjacent_tokens() {
+        for source in [
+            "fn f(x: bool) -> bool { return!x; }",
+            "fn g() -> i32 { return-1; }",
+        ] {
+            let found = discover(source, 0).unwrap();
+            let unary = found
+                .sites
+                .iter()
+                .find(|s| matches!(s.kind, SiteKind::Not { .. } | SiteKind::Neg { .. }))
+                .expect("unary site");
+            for mutant in source_mutants(unary) {
+                let mut text = source.to_string();
+                text.replace_range(mutant.start..mutant.end, &mutant.replacement);
+                assert!(syn::parse_file(&text).is_ok(), "merged tokens:\n{text}");
+            }
+        }
     }
 }
