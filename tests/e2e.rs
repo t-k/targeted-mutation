@@ -5569,8 +5569,14 @@ mod tests {
 
     let (code, report) = json(&dir);
     assert_eq!(code, 2, "{report:#}");
-    // Custom types without alternate methods compile cleanly without needing probe skips.
+    // Custom types without alternate methods compile cleanly without needing probe skips,
+    // and are treated as opaque (never reported as unreached).
     assert_eq!(report["skipped_sites"].as_u64(), Some(0), "{report:#}");
+    assert_eq!(
+        report["unreached"].as_array().map(Vec::len),
+        Some(0),
+        "{report:#}"
+    );
     let input_gaps = findings(&report, "input_gap");
     let has_gap = |needle: &str| {
         input_gaps

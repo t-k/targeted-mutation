@@ -2241,12 +2241,15 @@ impl<'a, I: Iterator> QuantPrim<'a, I> for Qnt<'a, I> {
 impl<'r, 'a, I: ?Sized> AnyQuant<'a, I> for &'r Qnt<'a, I> {
     fn tmt_quant<P, R, G: FnOnce(&'a mut I, P) -> R>(
         &self,
-        _site: u32,
+        site: u32,
         _all: bool,
         pred: P,
         orig: G,
     ) -> R {
         let iter = self.take();
+        if !idle(site) {
+            record_bits(b'A', site, ARITH_OPAQUE);
+        }
         orig(iter, pred)
     }
 }

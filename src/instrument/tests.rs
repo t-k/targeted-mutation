@@ -3202,14 +3202,28 @@ fn dup_raw_str(s: &str) -> bool {
 fn dup_signed_zero(x: f64) -> bool {
     [0.0, -0.0].contains(&x)
 }
+fn dup_f32_rounding(x: f32) -> bool {
+    [16_777_216.0, 16_777_217.0].contains(&x)
+}
+fn panicking_clamp(x: i32, d: i32) -> i32 {
+    x.clamp(1 / d, 10)
+}
 "#;
     let found = discover(source, 0).unwrap();
-    // Impure clamp bounds go to rebuild_sites instead of probes.
+    // Impure or potentially panicking clamp bounds go to rebuild_sites instead of probes.
     assert!(
         !found
             .sites
             .iter()
             .any(|s| matches!(s.kind, SiteKind::Clamp { .. }))
+    );
+    assert_eq!(
+        found
+            .rebuild_sites
+            .iter()
+            .filter(|s| matches!(s.kind, SiteKind::Clamp { .. }))
+            .count(),
+        2
     );
     let clamp_site = found
         .rebuild_sites

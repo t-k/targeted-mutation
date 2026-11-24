@@ -1030,9 +1030,10 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                 close: (high_end, end),
             };
             // The probe evaluates both bounds before dropping one, whereas `.min(hi)` /
-            // `.max(lo)` skips the dropped bound. Route calls with potentially side-effecting
-            // bounds to source-built mutants so probes and builds never disagree.
-            if does_nothing_else(&node.args[0]) && does_nothing_else(&node.args[1]) {
+            // `.max(lo)` skips the dropped bound. Route calls whose bounds could panic or
+            // have side effects (calls, division, arithmetic overflow, indexing) to
+            // source-built mutants so probes and builds never disagree.
+            if is_infallible_bound(&node.args[0]) && is_infallible_bound(&node.args[1]) {
                 self.push(kind, start, end, node.receiver.span());
             } else {
                 let at = node.receiver.span().start();
@@ -1123,7 +1124,11 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                 .collect();
             if let Some(spans) = elem_spans {
                 let mut seen = HashSet::new();
-                let all_unique = keys.iter().all(|key| seen.insert(key.as_str()));
+                let all_unique = keys.iter().all(|(primary, secondary)| {
+                    let ok_primary = seen.insert(primary.as_str());
+                    let ok_secondary = secondary.as_deref().is_none_or(|k| seen.insert(k));
+                    ok_primary && ok_secondary
+                });
                 if all_unique && spans.windows(2).all(|w| in_order(w[0].1, w[1].0)) {
                     let elements = spans
                         .iter()
@@ -1576,7 +1581,35 @@ fn literal_array_receiver(mut expr: &syn::Expr) -> Option<&syn::ExprArray> {
     }
 }
 
-fn literal_key(mut expr: &syn::Expr) -> Option<String> {
+/// A clamp bound that cannot have side effects or panic (literals, negated literals, and
+/// plain paths/fields/derefs/references).
+fn is_infallible_bound(expr: &syn::Expr) -> bool {
+    if has_conditional_or_skip_attr(expr) {
+        return false;
+    }
+    match expr {
+        syn::Expr::Paren(e) => is_infallible_bound(&e.expr),
+        syn::Expr::Group(e) => is_infallible_bound(&e.expr),
+        syn::Expr::Lit(e) => e.attrs.is_empty(),
+        syn::Expr::Unary(syn::ExprUnary {
+            attrs,
+            op: syn::UnOp::Neg(_),
+            expr,
+        }) if attrs.is_empty() => matches!(expr.as_ref(), syn::Expr::Lit(_)),
+        syn::Expr::Reference(syn::ExprReference {
+            attrs,
+            mutability: None,
+            expr,
+            ..
+        }) if attrs.is_empty() => is_infallible_bound(expr),
+        other => is_plain_place(other),
+    }
+}
+
+/// Canonical value key(s) for a primitive literal element in `[lit1, lit2, ...].contains(&x)`.
+/// For unsuffixed floats, returns both `f64` and `f32` keys so values that round to the same
+/// `f32` (when inferred as `f32`) are treated as duplicates rather than equivalent mutants.
+fn literal_key(mut expr: &syn::Expr) -> Option<(String, Option<String>)> {
     while let syn::Expr::Paren(syn::ExprParen {
         attrs, expr: inner, ..
     })
@@ -1589,29 +1622,66 @@ fn literal_key(mut expr: &syn::Expr) -> Option<String> {
         }
         expr = inner;
     }
-    match expr {
-        syn::Expr::Lit(syn::ExprLit { attrs, lit }) if attrs.is_empty() => match lit {
-            syn::Lit::Int(n) => {
-                if let Ok(v) = n.base10_parse::<i128>() {
-                    Some(format!("int:{v}"))
+    let float_keys = |f: &syn::LitFloat, neg: bool| -> Option<(String, Option<String>)> {
+        let sign = if neg { -1.0 } else { 1.0 };
+        match f.suffix() {
+            "f32" => {
+                let v = f.base10_parse::<f32>().ok()? * sign as f32;
+                let bits = if v == 0.0 {
+                    0.0f32.to_bits()
                 } else {
-                    n.base10_parse::<u128>().ok().map(|v| format!("uint:{v}"))
-                }
+                    v.to_bits()
+                };
+                Some((format!("f32:{bits:08x}"), None))
             }
-            syn::Lit::Float(f) => f.base10_parse::<f64>().ok().map(|v| {
+            "f64" => {
+                let v = f.base10_parse::<f64>().ok()? * sign;
                 let bits = if v == 0.0 {
                     0.0f64.to_bits()
                 } else {
                     v.to_bits()
                 };
-                format!("float:{bits:016x}")
-            }),
-            syn::Lit::Str(s) => Some(format!("str:{}", s.value())),
-            syn::Lit::ByteStr(b) => Some(format!("bstr:{:?}", b.value())),
-            syn::Lit::CStr(c) => Some(format!("cstr:{:?}", c.value())),
-            syn::Lit::Char(c) => Some(format!("char:{}", c.value())),
-            syn::Lit::Byte(b) => Some(format!("byte:{}", b.value())),
-            syn::Lit::Bool(b) => Some(format!("bool:{}", b.value())),
+                Some((format!("f64:{bits:016x}"), None))
+            }
+            "" => {
+                let v64 = f.base10_parse::<f64>().ok()? * sign;
+                let bits64 = if v64 == 0.0 {
+                    0.0f64.to_bits()
+                } else {
+                    v64.to_bits()
+                };
+                let v32 = f.base10_parse::<f32>().ok()? * sign as f32;
+                let bits32 = if v32 == 0.0 {
+                    0.0f32.to_bits()
+                } else {
+                    v32.to_bits()
+                };
+                Some((
+                    format!("f64:{bits64:016x}"),
+                    Some(format!("f32:{bits32:08x}")),
+                ))
+            }
+            _ => None,
+        }
+    };
+    match expr {
+        syn::Expr::Lit(syn::ExprLit { attrs, lit }) if attrs.is_empty() => match lit {
+            syn::Lit::Int(n) => {
+                if let Ok(v) = n.base10_parse::<i128>() {
+                    Some((format!("int:{v}"), None))
+                } else {
+                    n.base10_parse::<u128>()
+                        .ok()
+                        .map(|v| (format!("uint:{v}"), None))
+                }
+            }
+            syn::Lit::Float(f) => float_keys(f, false),
+            syn::Lit::Str(s) => Some((format!("str:{}", s.value()), None)),
+            syn::Lit::ByteStr(b) => Some((format!("bstr:{:?}", b.value()), None)),
+            syn::Lit::CStr(c) => Some((format!("cstr:{:?}", c.value()), None)),
+            syn::Lit::Char(c) => Some((format!("char:{}", c.value()), None)),
+            syn::Lit::Byte(b) => Some((format!("byte:{}", b.value()), None)),
+            syn::Lit::Bool(b) => Some((format!("bool:{}", b.value()), None)),
             _ => None,
         },
         syn::Expr::Unary(syn::ExprUnary {
@@ -1626,19 +1696,11 @@ fn literal_key(mut expr: &syn::Expr) -> Option<String> {
                 .base10_parse::<i128>()
                 .ok()
                 .and_then(i128::checked_neg)
-                .map(|v| format!("int:{v}")),
+                .map(|v| (format!("int:{v}"), None)),
             syn::Expr::Lit(syn::ExprLit {
                 attrs,
                 lit: syn::Lit::Float(f),
-            }) if attrs.is_empty() => f.base10_parse::<f64>().ok().map(|v| {
-                let neg = -v;
-                let bits = if neg == 0.0 {
-                    0.0f64.to_bits()
-                } else {
-                    neg.to_bits()
-                };
-                format!("float:{bits:016x}")
-            }),
+            }) if attrs.is_empty() => float_keys(f, true),
             _ => None,
         },
         _ => None,

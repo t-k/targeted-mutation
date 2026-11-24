@@ -297,7 +297,6 @@ impl Session {
             SiteKind::Arm { .. } if reached() => reach_plan(Mutation::Delete),
             SiteKind::Arm { .. } => return Planned::Unreached,
             SiteKind::Quantifier { .. } if reached() => reach_plan(Mutation::QuantifierSwap),
-            SiteKind::Quantifier { .. } => return Planned::Unreached,
             SiteKind::LiteralSet { .. } => return Planned::Nothing,
             SiteKind::Not { .. } if reached() => reach_plan(Mutation::DropNot),
             // `a..=b` with `b` the largest value of its type is no range the probe could
@@ -312,9 +311,10 @@ impl Session {
                 }
                 reach_plan(Mutation::RangeEnd)
             }
-            // `!` on an integer or a user type is not negation of a condition, and a range
-            // of something other than integers has no "one more".
-            SiteKind::Not { .. } | SiteKind::Range { .. } => {
+            // `!` on an integer or a user type is not negation of a condition, a range of
+            // something other than integers has no "one more", and `.all`/`.any` on a
+            // non-`Iterator` type is opaque.
+            SiteKind::Not { .. } | SiteKind::Range { .. } | SiteKind::Quantifier { .. } => {
                 if self
                     .merged(|t| t.arith.get(&id), plan::ArithObs::merge)
                     .opaque

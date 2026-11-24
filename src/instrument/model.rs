@@ -259,7 +259,7 @@ impl RoundingOp {
                 "positive and not a whole number (e.g. 0.5)"
             }
             (RoundingOp::Floor, RoundingOp::Round) | (RoundingOp::Round, RoundingOp::Floor) => {
-                "a number that rounds up (e.g. 1.5 or -1.5)"
+                "a number that rounds up (e.g. 1.5 or -1.4)"
             }
             (RoundingOp::Ceil, RoundingOp::Round) | (RoundingOp::Round, RoundingOp::Ceil) => {
                 "a number that rounds down (e.g. 1.4 or -1.6)"
