@@ -488,16 +488,16 @@ fn parse_cli(given: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Cli,
     let cli = match Cli::try_parse_from(arguments(given)) {
         Ok(cli) => cli,
         Err(err) => {
+            if err.use_stderr() {
+                eprint!("{}", report::sanitize_terminal(&err.render().to_string()));
+                return Err(ExitCode::FAILURE);
+            }
             let _ = err.print();
-            return Err(if err.use_stderr() {
-                ExitCode::FAILURE
-            } else {
-                ExitCode::SUCCESS
-            });
+            return Err(ExitCode::SUCCESS);
         }
     };
     if let Err(err) = cli.validate() {
-        let _ = err.print();
+        eprint!("{}", report::sanitize_terminal(&err.render().to_string()));
         return Err(ExitCode::FAILURE);
     }
     Ok(cli)

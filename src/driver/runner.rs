@@ -134,7 +134,9 @@ impl TestBinary {
             if elapsed >= limit {
                 eprintln!(
                     "tmt: warning: unmutated baseline for `{}` {message} {:.3}s, meeting or exceeding --timeout {}",
-                    self.name, elapsed.as_secs_f64(), limit.as_secs()
+                    crate::report::sanitize_inline(&self.name),
+                    elapsed.as_secs_f64(),
+                    limit.as_secs()
                 );
             }
         });
@@ -502,8 +504,14 @@ pub(super) fn run_binary(
         {
             let selected = tests
                 .filter(|names| !names.is_empty())
-                .map(|names| names.join(", "))
-                .unwrap_or_else(|| bin.name.clone());
+                .map(|names| {
+                    names
+                        .iter()
+                        .map(|name| crate::report::sanitize_inline(name))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                })
+                .unwrap_or_else(|| crate::report::sanitize_inline(&bin.name));
             eprintln!(
                 "tmt: waiting for mutant tests `{selected}` (limit {:.2}s)",
                 timeout.as_secs_f64()

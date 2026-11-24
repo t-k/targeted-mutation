@@ -264,6 +264,10 @@ fn rust_field_segment(text: &str) -> Option<String> {
     if text.is_empty() || text.chars().any(char::is_whitespace) {
         return None;
     }
+    // `gen` is a reserved keyword in Rust 2024 that `syn` still parses as an identifier.
+    if text == "gen" {
+        return Some("r#gen".to_owned());
+    }
     if syn::parse_str::<syn::Ident>(text).is_ok() {
         return Some(text.to_owned());
     }
@@ -1197,6 +1201,13 @@ mod tests {
                 "Event { type: 2, label: \"ok\" }"
             ),
             Some((vec!["r#type".into()], "1".into(), "2".into()))
+        );
+        assert_eq!(
+            narrow_struct_field(
+                "Event { gen: 1, label: \"ok\" }",
+                "Event { gen: 2, label: \"ok\" }"
+            ),
+            Some((vec!["r#gen".into()], "1".into(), "2".into()))
         );
         assert_eq!(
             narrow_struct_field("Event { type: 1, 値: 10 }", "Event { type: 1, 値: 20 }"),
