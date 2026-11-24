@@ -5,6 +5,26 @@ All notable changes to `targeted-mutation` (`cargo tmt`) are documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.8.0] - 2026-11-25
+
+### Added
+
+- **Six value-aware targeted mutation rules**:
+  - `s.starts_with(p)` / `s.ends_with(p)` → `s.contains(p)` (provable `INPUT GAP` when no test passes a string containing `p` away from the start/end).
+  - `s.replace(a, b)` ↔ `s.replacen(a, b, 1)` (provable `INPUT GAP` when `a` never occurs more than once).
+  - `x.clamp(lo, hi)` → `x.min(hi)` (drop lower bound) and `x.max(lo)` (drop upper bound), with infallible-bound probe specialization, reversed/NaN panic tracking, and source-built fallback for potentially panicking or side-effecting bounds.
+  - `x.floor()` / `.ceil()` / `.round()` / `.trunc()` → two rounding-mode alternatives each (provable `INPUT GAP` with concrete distinguishing examples when observed inputs do not separate rounding modes).
+  - `iter.all(closure)` ↔ `iter.any(closure)` on `Iterator` receivers (using method auto-reborrow and `Iterator` autoref specialization so `&mut` iterators, `Copy` iterators, and non-`Iterator` custom types compile without skips).
+  - `[lit1, lit2, ...].contains(&x)` element pruning (source-built under `--rebuild` / `--source-only`), with canonical value deduplication (including `f32`/`f64`, hex/decimal, signed zero, and raw strings) and per-element survivor descriptions.
+- **AST sub-hunk undo for `--since`**:
+  - Decomposes multi-addition diff hunks into independent AST sub-hunk reverts for added `&&`/`||` terms, added struct literal fields (with `..base`), and added standalone statements, catching an untested clause inside an otherwise-tested hunk while preserving whole-hunk `all_undone` semantics, `#[cfg(test)]`/`#[mutants::skip]` guards, and `line!()`/`column!()`/`#[track_caller]` location sensitivity.
+- **Stronger-assertion struct field narrowing**:
+  - When a surviving mutant and the original return the same multi-field `Debug` struct differing on exactly one field (recursively, supporting nested structs, raw keywords like `r#type`/`r#gen`, and Unicode identifiers), compiler-verifies `&result.<path> == &(<value>)` and suggests `assert_eq!(call.<path>, <value>);` with `witness.field` populated in JSON (even when the struct does not implement `PartialEq`).
+- **JSON `schema_version: 1`**:
+  - Added top-level `schema_version: 1` (`report::SCHEMA_VERSION`) to single-package JSON reports, `--list --format json`, `--workspace --format json`, and every `--format jsonl` record (both success and error).
+- **Terminal control-character sanitization**:
+  - Sanitized untrusted project strings (paths, package names, source snippets, test names, witness output, CLI errors, and progress notes) across terminal stdout and stderr — stripping 7-bit/8-bit ANSI CSI/OSC/DCS/SOS/PM/APC/nF escape sequences, C0/C1/DEL control characters, Unicode BiDi override/isolate controls, and forged inline newlines — while keeping JSON, JSONL, and SARIF outputs lossless.
+
 ## [0.7.0] - 2026-11-24
 
 ### Added
@@ -96,6 +116,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - Initial public release of targeted mutation testing (`cargo tmt`) with runtime probes, interval-based input-gap planning, assertion-gap effect tracing, `--rebuild` witnesses, baselines, SARIF output, and formal Lean/PICT/TLA+ verification artifacts.
 
+[0.8.0]: https://github.com/t-k/targeted-mutation/compare/v0.7.0...v0.8.0
 [0.7.0]: https://github.com/t-k/targeted-mutation/compare/v0.6.0...v0.7.0
 [0.6.0]: https://github.com/t-k/targeted-mutation/compare/v0.5.3...v0.6.0
 [0.5.3]: https://github.com/t-k/targeted-mutation/compare/v0.5.2...v0.5.3

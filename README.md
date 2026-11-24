@@ -184,6 +184,12 @@ For each assertion gap, `cargo tmt` replays one surviving mutant with tracing on
 | `-> bool` / `-> Option<T>` normal exits | `true` / `false` (`bool`), `None` (`Option`) | function always returned that value |
 | `a.max(b)`, `a.min(b)` (numbers) | swapped `min` ↔ `max` | operands were equal in every test |
 | `v.first()`, `v.last()` (slice/`Vec`/array/`BTreeSet`) | swapped `first` ↔ `last` | no test passed more than one element |
+| `s.starts_with(p)`, `s.ends_with(p)` (`str`/`String`) | relaxed to `s.contains(p)` | no test passed a string containing `p` away from that end |
+| `s.replace(a, b)`, `s.replacen(a, b, 1)` (`str`/`String`) | swapped `replace` ↔ `replacen(..., 1)` | no test had `a` occur more than once |
+| `x.clamp(lo, hi)` (numbers) | `x.min(hi)` (drop lower), `x.max(lo)` (drop upper) | no test crossed that bound (impure/panicking bounds use `--rebuild`) |
+| `x.floor()`, `.ceil()`, `.round()`, `.trunc()` (floats) | two alternative rounding modes each | observed inputs gave the same rounded value under the alternative |
+| `iter.all(f)`, `iter.any(f)` (`Iterator` with closure) | swapped `all` ↔ `any` | always run |
+| `[lit1, lit2, ...].contains(&x)` (2–8 distinct literals) | one element removed at a time (`--rebuild` / `--source-only`) | source-built |
 | `a..b`, `a..=b` (integers) | inclusive ↔ exclusive end | always run |
 | `f(x);`, `check()?;`, `x += 1;`, `x = y;` | statement deleted | always run |
 
@@ -204,7 +210,7 @@ When `--rebuild` (or `--source-only`) finds a surviving mutant in a library file
 - **Integer rounding (`a * b / c`)**: trying `a / c * b` with the smallest non-multiple offset from an existing test call (`fixtures/rounding`).
 - **Composite keys (`format!` / tuples)**: omitting each argument to detect map keys that never collide in tests (`fixtures/keyed`).
 - **Paired endian codecs**: flipping byte order on both encode and decode to detect round-trip-only codec tests and suggest a fixed-bytes check.
-- **Stronger assertions on existing test calls**: replaying unpinned calls (`assert_ne!(bucket(3), "none")`, `assert!(total(&[1, 2]) > 0)`, `let` bindings, including `super::f(...)` in `mod tests`) in place inside a copy of the test to suggest exact `assert_eq!` values (`witness.in_test`, `in_test_line`, `in_test_column`).
+- **Stronger assertions on existing test calls**: replaying unpinned calls (`assert_ne!(bucket(3), "none")`, `assert!(total(&[1, 2]) > 0)`, `let` bindings, including `super::f(...)` in `mod tests`) in place inside a copy of the test to suggest exact `assert_eq!` values (`witness.in_test`, `in_test_line`, `in_test_column`). When both original and mutant return the same multi-field `Debug` struct differing on one field (recursively), `cargo tmt` narrows and compiler-verifies the assertion to that field (`assert_eq!(quote(200, 3).fee, 600);`, recorded in `witness.field`) even without `PartialEq`.
 
 <details>
 <summary>Details: witness fixture examples and in-place assertion replay rules</summary>
@@ -235,7 +241,7 @@ Pass `--since "$(git merge-base origin/main HEAD)"` to scope analysis to lines c
 
 #### Untested changes (`--since` + `--rebuild` / `--source-only`)
 
-Each diff hunk in production code is reverted to `REV`, built, and tested. If every test still passes, the tests cannot tell the new code from the old:
+Each diff hunk in production code is reverted to `REV`, built, and tested. Multi-addition hunks are also decomposed into independent AST sub-hunks (added `&&`/`||` conditions, added struct literal fields with `..base`, and added standalone statements), so an untested clause inside an otherwise-tested hunk is still caught. If every test still passes, the tests cannot tell the new code from the old:
 
 ```text
 $ cargo tmt --rebuild --since "$(git merge-base origin/main HEAD)"
@@ -366,6 +372,7 @@ Options are grouped into the same six workflow sections shown by `cargo tmt --he
 | `--baseline <FILE>` | Suppress findings already recorded in `FILE` |
 | `--write-baseline <FILE>` | Write this run's findings to `FILE` for future `--baseline` runs |
 
+- **JSON schema & terminal safety:** Single-package JSON, `--list --format json`, `--workspace --format json`, and every `--format jsonl` record include a top-level `"schema_version": 1`. Terminal text output and stderr diagnostics sanitize ANSI escape sequences, control characters, BiDi overrides, and embedded newlines from untrusted project strings while keeping JSON/JSONL/SARIF lossless.
 - **Inline suppressions:** Add `// tmt:ignore <reason>` on the line itself (applies to that line only) or on a standalone comment line directly above (applies to the next line).
 - **Stable baseline IDs:** Baseline v2 identifies findings by `(kind, file, item, code, occurrence)` without line numbers or mutant wording, so findings survive edits and moves (legacy fingerprint files are still read). Suppressed findings do not affect exit status.
 - **SARIF 2.1.0:** Emits repo-root-relative URIs, `partialFingerprints`, `properties.analysis` / `properties.audit`, and rules for input gaps, assertion gaps, survivors, unstable predictions, weakened tests, and audit disagreements. With `--workspace`, emits one run per package (`executionSuccessful: false` on member errors).
