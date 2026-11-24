@@ -82,8 +82,8 @@ struct Cli {
     checkpoint: bool,
     /// Mutants to run at the same time. Only raise it if the tests can run concurrently
     /// with themselves (no fixed ports, no shared files).
-    #[arg(short, long, default_value_t = 1, value_name = "N")]
-    jobs: usize,
+    #[arg(short, long, default_value_t = 1, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    jobs: u32,
     /// Analyse only the code changed since this git revision, and untracked files.
     #[arg(long, value_name = "REV")]
     since: Option<String>,
@@ -253,7 +253,7 @@ fn main() -> ExitCode {
             no_default_features: cli.no_default_features,
             locked: cli.locked,
         },
-        jobs: cli.jobs,
+        jobs: cli.jobs as usize,
         all_files: cli.all_files,
         git_index: cli.git_index,
         copy_fixtures: cli.copy_fixture,
@@ -493,5 +493,6 @@ mod tests {
         assert_eq!((cli.dir, cli.jobs), (PathBuf::from("crate"), 3));
         let cli = Cli::parse_from(given(&["cargo-tmt", "tmt"]));
         assert_eq!(cli.dir, PathBuf::from("."));
+        assert!(Cli::try_parse_from(given(&["cargo-tmt", "tmt", "--jobs", "0"])).is_err());
     }
 }

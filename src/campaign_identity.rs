@@ -90,7 +90,11 @@ pub(crate) fn compute(
         );
         frame(&mut hash, &output.stdout);
     }
-    hash_path(&mut hash, &std::env::current_exe()?)?;
+    let exe = std::env::current_exe()?;
+    hash_path(&mut hash, &exe)?;
+    if fs::symlink_metadata(&exe)?.is_symlink() {
+        hash_path(&mut hash, &exe.canonicalize()?)?;
+    }
     hash_path(&mut hash, copy).context("fingerprinting the working copy")?;
     for path in inputs {
         // Cargo's JSON can also list informational outputs absent on this host.

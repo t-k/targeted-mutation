@@ -189,12 +189,19 @@ pub(crate) fn stage(
     // A replaced file is no longer ours. Cargo can choose a different output
     // path in a later build, and tests may create files of their own.
     let mut previous = Ownership::new();
+    let mut previous_meta: BTreeMap<PathBuf, fs::Metadata> = BTreeMap::new();
+    let mut previous_folded: BTreeMap<String, Vec<PathBuf>> = BTreeMap::new();
     for (path, receipt) in &recorded {
         // What is no longer a file or a directory of ours, or is now behind something
         // that is not a directory, was replaced by somebody else: it is theirs.
         if let Place::Found(metadata) = output_place(&target, path)?
             && let Some(current) = receipt.check(&metadata)?
         {
+            previous_folded
+                .entry(path.to_string_lossy().to_lowercase())
+                .or_default()
+                .push(path.clone());
+            previous_meta.insert(path.clone(), metadata);
             previous.insert(path.clone(), current);
         }
     }
@@ -208,14 +215,35 @@ pub(crate) fn stage(
                 Kind::File => metadata.is_file(),
                 Kind::Directory => metadata.is_dir(),
             };
-            if !kind_matches || !shared_directory && !previous.contains_key(path) {
+            let exact_owned = previous.contains_key(path);
+            // On a case-insensitive filesystem, renaming a previously owned fixture to a
+            // different case (`debug/Data` -> `debug/data`) resolves to the old owned entry.
+            let case_owned = !exact_owned
+                && previous_folded
+                    .get(&path.to_string_lossy().to_lowercase())
+                    .is_some_and(|aliases| {
+                        aliases.iter().any(|old| {
+                            !plan.contains_key(old)
+                                && previous_meta.get(old).is_some_and(|old_meta| {
+                                    same_entry(
+                                        &target.join(old),
+                                        old_meta,
+                                        &target.join(path),
+                                        &metadata,
+                                    )
+                                })
+                        })
+                    });
+            let owned = exact_owned || case_owned;
+            if !kind_matches || (!shared_directory && !owned) {
                 bail!(
                     "output fixture destination already exists: {}",
                     path.display()
                 );
             }
             // Only a shared directory gets here without being ours: it was there before us.
-            if !previous.contains_key(path) {
+            // A case-renamed owned directory is re-created with its new spelling instead.
+            if !owned {
                 shared.insert(path.clone());
             }
         }
@@ -371,6 +399,25 @@ fn output_metadata(target: &Path, relative: &Path) -> Result<Option<fs::Metadata
             "output fixture destination crosses an unsafe path: {}",
             path.display()
         ),
+    }
+}
+
+fn same_entry(a_path: &Path, a: &fs::Metadata, b_path: &Path, b: &fs::Metadata) -> bool {
+    #[cfg(unix)]
+    {
+        let _ = (a_path, b_path);
+        use std::os::unix::fs::MetadataExt as _;
+        (a.dev(), a.ino()) == (b.dev(), b.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        a.is_file() == b.is_file()
+            && a.is_dir() == b.is_dir()
+            && a_path
+                .canonicalize()
+                .ok()
+                .zip(b_path.canonicalize().ok())
+                .is_some_and(|(a_real, b_real)| a_real == b_real)
     }
 }
 
@@ -1188,5 +1235,23 @@ mod tests {
         }
         fs::write(&record, r#"{"debug/asset":"directory"}"#).unwrap();
         tree.stage(&[]).unwrap();
+    }
+
+    #[test]
+    fn replacing_owned_fixture_with_different_case_succeeds() {
+        let tree = Tree::new();
+        fs::write(tree.workspace.join("asset"), "first").unwrap();
+        tree.stage(&[mapping("asset", "debug/Data")]).unwrap();
+        assert_eq!(
+            fs::read_to_string(tree.target.join("debug/Data")).unwrap(),
+            "first"
+        );
+
+        fs::write(tree.workspace.join("asset"), "second").unwrap();
+        tree.stage(&[mapping("asset", "debug/data")]).unwrap();
+        assert_eq!(
+            fs::read_to_string(tree.target.join("debug/data")).unwrap(),
+            "second"
+        );
     }
 }

@@ -143,6 +143,12 @@ pub fn hunks(diff: &str) -> Vec<Hunk> {
                     old_left -= 1;
                     new_left -= 1;
                 }
+                // `diff.suppressBlankEmpty=true` emits empty context lines without a leading space.
+                Some(b'\n' | b'\r') if old_left > 0 && new_left > 0 => {
+                    old.push_str(body);
+                    old_left -= 1;
+                    new_left -= 1;
+                }
                 _ => break,
             }
             if lines.peek().is_some_and(|next| next.starts_with('\\')) {
@@ -808,6 +814,39 @@ diff --git a/src/a.rs b/src/a.rs
         let parsed = hunks(&diff);
         assert_eq!(parsed.len(), 1, "{parsed:?}");
         assert_eq!(undo(new, &[&parsed[0]]).as_deref(), Some(old));
+
+        // `diff.suppressBlankEmpty=true` omits the leading space on blank context lines.
+        let old_blank = "line 1\n\nold tail\n";
+        let new_blank = "line 1 changed\n\n++ b/hijacked.rs\n";
+        std::fs::write(dir.join("c.rs"), old_blank).unwrap();
+        std::fs::write(dir.join("d.rs"), new_blank).unwrap();
+        let output = std::process::Command::new("git")
+            .current_dir(&dir)
+            .args([
+                "-c",
+                "diff.interHunkContext=10",
+                "-c",
+                "diff.suppressBlankEmpty=true",
+                "diff",
+                "--no-index",
+                "-U0",
+                "--no-color",
+                "--no-ext-diff",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                "c.rs",
+                "d.rs",
+            ])
+            .output()
+            .unwrap();
+        let diff = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            diff.contains("\n\n"),
+            "expected bare blank context line:\n{diff}"
+        );
+        let parsed = hunks(&diff);
+        assert_eq!(parsed.len(), 1, "{parsed:?}");
+        assert_eq!(undo(new_blank, &[&parsed[0]]).as_deref(), Some(old_blank));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 }

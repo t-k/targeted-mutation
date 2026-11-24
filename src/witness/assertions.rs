@@ -48,7 +48,9 @@ pub(crate) fn unpinned_calls(source: &str, file: &syn::File) -> Vec<CalledFuncti
     collect_tests(&file.items, "", None, &mut tests);
     let mut found: BTreeMap<&str, Vec<Scenario>> = BTreeMap::new();
     for test in tests.iter().filter(|test| plain(test.function)) {
-        let shadowed = bound_names(&test.function.block);
+        // Nested `fn` items are hoisted across the block, while `let` bindings take
+        // effect only after their initialiser (so `let f = f(3);` still finds `f(3)`).
+        let mut shadowed = item_fn_names(&test.function.block);
         let body = test.function.block.brace_token.span.open().byte_range().end;
         let end = test
             .function
@@ -58,33 +60,38 @@ pub(crate) fn unpinned_calls(source: &str, file: &syn::File) -> Vec<CalledFuncti
             .close()
             .byte_range()
             .start;
-        for stmt in test.function.block.stmts.iter().filter(|stmt| looks(stmt)) {
-            let mut calls = Calls {
-                source,
-                names: &functions,
-                found: vec![],
-            };
-            calls.visit_stmt(stmt);
-            for (name, call, at) in calls.found {
-                let (Some(before), Some(after)) =
-                    (source.get(body..at.start), source.get(at.end..end))
-                else {
-                    continue;
+        for stmt in &test.function.block.stmts {
+            if looks(stmt) {
+                let mut calls = Calls {
+                    source,
+                    names: &functions,
+                    found: vec![],
                 };
-                if shadowed.contains(name) {
-                    continue;
+                calls.visit_stmt(stmt);
+                for (name, call, at) in calls.found {
+                    let (Some(before), Some(after)) =
+                        (source.get(body..at.start), source.get(at.end..end))
+                    else {
+                        continue;
+                    };
+                    if shadowed.contains(name) {
+                        continue;
+                    }
+                    // The same call written twice is two calls: the test may get to one
+                    // and not to the other, or change something in between.
+                    let scenarios = found.entry(name).or_default();
+                    if scenarios.len() < MAX_CALLS {
+                        let line_start = source[..at.start].rfind('\n').map_or(0, |end| end + 1);
+                        let place = (
+                            source[..at.start].matches('\n').count() + 1,
+                            source[line_start..at.start].chars().count() + 1,
+                        );
+                        scenarios.push(scenario(test, before, call, after, place));
+                    }
                 }
-                // The same call written twice is two calls: the test may get to one
-                // and not to the other, or change something in between.
-                let scenarios = found.entry(name).or_default();
-                if scenarios.len() < MAX_CALLS {
-                    let line_start = source[..at.start].rfind('\n').map_or(0, |end| end + 1);
-                    let place = (
-                        source[..at.start].matches('\n').count() + 1,
-                        source[line_start..at.start].chars().count() + 1,
-                    );
-                    scenarios.push(scenario(test, before, call, after, place));
-                }
+            }
+            if let syn::Stmt::Local(local) = stmt {
+                collect_pat_idents(&local.pat, &mut shadowed);
             }
         }
     }
@@ -156,21 +163,26 @@ fn plain(test: &ItemFn) -> bool {
         && test.sig.asyncness.is_none()
 }
 
-/// The names a test binds itself: a call of such a name is not one of the file's function.
-fn bound_names(block: &syn::Block) -> BTreeSet<String> {
-    struct Bound(BTreeSet<String>);
-    impl<'ast> Visit<'ast> for Bound {
+/// Nested `fn` items declared in the block (visible throughout the block in Rust).
+fn item_fn_names(block: &syn::Block) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    for stmt in &block.stmts {
+        if let syn::Stmt::Item(Item::Fn(function)) = stmt {
+            names.insert(function.sig.ident.to_string());
+        }
+    }
+    names
+}
+
+fn collect_pat_idents(pat: &syn::Pat, names: &mut BTreeSet<String>) {
+    struct PatIdents<'a>(&'a mut BTreeSet<String>);
+    impl<'ast> Visit<'ast> for PatIdents<'_> {
         fn visit_pat_ident(&mut self, pat: &'ast syn::PatIdent) {
             self.0.insert(pat.ident.to_string());
             syn::visit::visit_pat_ident(self, pat);
         }
-        fn visit_item_fn(&mut self, function: &'ast ItemFn) {
-            self.0.insert(function.sig.ident.to_string());
-        }
     }
-    let mut bound = Bound(BTreeSet::new());
-    bound.visit_block(block);
-    bound.0
+    PatIdents(names).visit_pat(pat);
 }
 
 /// A function a test can call by its name alone and whose result can be looked at.
@@ -959,5 +971,23 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn let_shadowing_applies_only_after_its_initialiser() {
+        let source = "\
+fn bucket(n: i32) -> &'static str { if n > 0 { \"pos\" } else { \"neg\" } }
+
+#[test]
+fn rebinds_name() {
+    let bucket = bucket(3);
+    assert_ne!(bucket, \"none\");
+}
+";
+        let file = syn::parse_file(source).unwrap();
+        let found = unpinned_calls(source, &file);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].scenarios.len(), 1);
+        assert_eq!(found[0].scenarios[0].expression, "bucket(3)");
     }
 }

@@ -2622,6 +2622,7 @@ struct SharedWitness {
     value: String,
     name: String,
     tests: std::rc::Rc<[witness::Edit]>,
+    original_exe: PathBuf,
 }
 
 fn shared_witnesses(
@@ -2698,6 +2699,7 @@ fn shared_witnesses(
                     value,
                     name: name.clone(),
                     tests: tests.clone(),
+                    original_exe: exe.clone(),
                 });
             }
         }
@@ -4256,7 +4258,14 @@ fn run_package(
         if !selected_file && path != root_file {
             continue;
         }
-        let display = relative_source(&path, &package_dir).display().to_string();
+        let display = {
+            let text = relative_source(&path, &package_dir).display().to_string();
+            if cfg!(windows) {
+                text.replace('\\', "/")
+            } else {
+                text
+            }
+        };
         match instrument::parse_source(&original) {
             Ok(parsed) => {
                 let mut found =
@@ -5637,7 +5646,7 @@ fn run_package(
                 || not_evaluated.contains(&site.id)
         });
         for site in file.rebuild_sites.iter().chain(retried) {
-            let mutants = source_mutants(file, site, options.source_only);
+            let mutants = source_mutants(file, site, true);
             if build_regular_mutants {
                 built.extend(mutants.into_iter().filter_map(|mutant| {
                     let selected = in_shard(index);
@@ -6361,10 +6370,11 @@ fn run_package(
                             })
                         })
                         .flatten();
-                    // One look for a stronger assertion is enough for a finding. A rule
-                    // that knows the code has its own try beside it, and goes first.
+                    // One stronger assertion is enough for a finding, but wait until a
+                    // witness actually verifies before claiming it so later surviving
+                    // mutants on the same finding still get a turn if an earlier one fails.
                     let existing = existing
-                        .filter(|index| candidate.finding_at.is_none() || claimed.insert(*index));
+                        .filter(|index| candidate.finding_at.is_none() || !claimed.contains(index));
                     let scenarios: Vec<_> = candidate
                         .scenarios
                         .iter()
@@ -6461,6 +6471,12 @@ fn run_package(
             survivors.len(),
             |progress| -> Result<()> {
                 for (survivor, original) in survivors.into_iter().zip(originals) {
+                    if survivor.existing.is_some_and(|index| {
+                        survivor.candidate.finding_at.is_some() && claimed.contains(&index)
+                    }) {
+                        progress.complete(progress::Outcome::Unable);
+                        continue;
+                    }
                     let mut evidence = None;
                     let mut original = original;
                     for (scenario, baseline) in survivor.scenarios {
@@ -6488,6 +6504,23 @@ fn run_package(
                                     .ok()
                                     .flatten()
                                     && mutant.equals_expected == Some(false)
+                                    // Re-check the already-built original binary after the mutant
+                                    // run to reject monotonic external-state drift without rebuilding.
+                                    && observe_witness(
+                                        baseline,
+                                        shared.original_exe,
+                                        wrapper.as_deref(),
+                                        scenario,
+                                        &shared.name,
+                                        true,
+                                        in_root,
+                                    )
+                                    .ok()
+                                    .flatten()
+                                    .is_some_and(|rechecked| {
+                                        rechecked.equals_expected == Some(true)
+                                            && rechecked.value == shared.value
+                                    })
                                     && let Some(verified) =
                                         scenario.verified(shared.value, mutant.value)
                                 {
@@ -6543,6 +6576,9 @@ fn run_package(
                     if let Some(index) = survivor.existing {
                         if let Some(evidence) = evidence {
                             report.findings[index].set_witness(evidence);
+                            if survivor.candidate.finding_at.is_some() {
+                                claimed.insert(index);
+                            }
                         }
                     } else {
                         report.findings.push(Finding::Survivor {

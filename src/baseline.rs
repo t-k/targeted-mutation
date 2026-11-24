@@ -95,27 +95,151 @@ fn render(findings: &[Finding]) -> String {
     .expect("strings serialise")
 }
 
-/// Lines covered by a `// tmt:ignore` comment, with the reason given after it. The
-/// comment covers its own line and the next one, so it can sit above the code.
+/// Lines covered by a `// tmt:ignore` comment, with the reason given after it. A
+/// standalone comment line covers its own line and the next one (so it can sit above the
+/// code); an end-of-line comment covers only its own line.
 pub fn ignored_lines(source: &str) -> BTreeMap<usize, String> {
     let mut ignored = BTreeMap::new();
-    for (index, line) in source.lines().enumerate() {
-        let Some(comment) = line.find("//").map(|at| &line[at + 2..]) else {
-            continue;
-        };
-        let Some(rest) = comment.trim_start().strip_prefix("tmt:ignore") else {
-            continue;
-        };
-        // `tmt:ignored` is some other word, and `"http://tmt:ignore"` is not a comment.
-        if !(rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace() || c == ':')) {
+    let bytes = source.as_bytes();
+    let mut i = 0;
+    let mut line = 1usize;
+    let mut line_start = 0usize;
+    let mut block_depth = 0usize;
+    while i < bytes.len() {
+        if block_depth > 0 {
+            if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                block_depth += 1;
+                i += 2;
+            } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                block_depth -= 1;
+                i += 2;
+            } else {
+                if bytes[i] == b'\n' {
+                    line += 1;
+                    line_start = i + 1;
+                }
+                i += 1;
+            }
             continue;
         }
-        let rest = rest.trim_start_matches(':');
-        let reason = rest.trim().to_string();
-        ignored.insert(index + 1, reason.clone());
-        ignored.entry(index + 2).or_insert(reason);
+        match bytes[i] {
+            b'\n' => {
+                line += 1;
+                line_start = i + 1;
+                i += 1;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'/') => {
+                let comment_start = i + 2;
+                let mut end = comment_start;
+                while end < bytes.len() && bytes[end] != b'\n' {
+                    end += 1;
+                }
+                let comment = &source[comment_start..end];
+                if let Some(rest) = comment.trim_start().strip_prefix("tmt:ignore")
+                    && (rest.is_empty()
+                        || rest.starts_with(|c: char| c.is_whitespace() || c == ':'))
+                {
+                    let reason = rest.trim_start_matches(':').trim().to_string();
+                    let standalone = source[line_start..i].trim().is_empty();
+                    ignored.insert(line, reason.clone());
+                    if standalone {
+                        ignored.entry(line + 1).or_insert(reason);
+                    }
+                }
+                i = end;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                block_depth = 1;
+                i += 2;
+            }
+            // Raw strings: `r"..."`, `r#"..."#`, `br#"..."#`, `cr#"..."#`.
+            b'r' if raw_string_hashes(bytes, i).is_some() => {
+                let hashes = raw_string_hashes(bytes, i).unwrap();
+                i += 1 + hashes + 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\n' {
+                        line += 1;
+                        line_start = i + 1;
+                    }
+                    if bytes[i] == b'"'
+                        && bytes
+                            .get(i + 1..i + 1 + hashes)
+                            .is_some_and(|s| s.iter().all(|b| *b == b'#'))
+                    {
+                        i += 1 + hashes;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\\' {
+                        if bytes.get(i + 1) == Some(&b'\n') {
+                            line += 1;
+                            line_start = i + 2;
+                        }
+                        i = (i + 2).min(bytes.len());
+                        continue;
+                    }
+                    if bytes[i] == b'\n' {
+                        line += 1;
+                        line_start = i + 1;
+                    }
+                    if bytes[i] == b'"' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            // Character literals (`'"'`, `'\\'`, `'a'`); lifetimes (`'a`) have no closing `'`.
+            b'\'' => {
+                if bytes.get(i + 1) == Some(&b'\\') {
+                    // Escape char literal such as `'\''`, `'\"'`, `'\x7f'`, `'\u{...}'`.
+                    let mut j = i + 2;
+                    while j < bytes.len() && bytes[j] != b'\n' && bytes[j] != b'\'' {
+                        j += 1;
+                    }
+                    if bytes.get(j) == Some(&b'\'') {
+                        i = j + 1;
+                    } else {
+                        i += 1;
+                    }
+                } else if let Some(ch) = source[i + 1..].chars().next()
+                    && bytes.get(i + 1 + ch.len_utf8()) == Some(&b'\'')
+                {
+                    i += 1 + ch.len_utf8() + 1;
+                } else {
+                    i += 1;
+                }
+            }
+            _ => i += 1,
+        }
     }
     ignored
+}
+
+fn raw_string_hashes(bytes: &[u8], r_pos: usize) -> Option<usize> {
+    // Reject identifier suffixes like `str"..."` (except `br"` / `cr"`).
+    if r_pos > 0 {
+        let prev = bytes[r_pos - 1];
+        let is_prefix =
+            (prev == b'b' || prev == b'c') && (r_pos == 1 || !is_ident_byte(bytes[r_pos - 2]));
+        if is_ident_byte(prev) && !is_prefix {
+            return None;
+        }
+    }
+    let mut hashes = 0;
+    while bytes.get(r_pos + 1 + hashes) == Some(&b'#') {
+        hashes += 1;
+    }
+    (bytes.get(r_pos + 1 + hashes) == Some(&b'"')).then_some(hashes)
+}
+
+fn is_ident_byte(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_'
 }
 
 #[cfg(test)]
@@ -263,18 +387,24 @@ fn f() {
     let w = 4; // tmt:ignore: with a colon
     // tmt:ignored is another word
     // not tmt:ignore here? it is: tmt:ignore must start the comment
-    let url = \"http://tmt:ignore\";
+    let url = \"http://tmt:ignore reason\";
+    let ok = \"https://example.com\"; // tmt:ignore after url
+    let raw = r#\"// tmt:ignore inside raw string\"#;
+    /* // tmt:ignore inside block comment */
+    let ch = '\"'; // tmt:ignore after quote char
 }
 ";
         let ignored = ignored_lines(source);
         assert_eq!(
             ignored.keys().copied().collect::<Vec<_>>(),
-            [2, 3, 4, 5, 7, 8]
+            [2, 3, 4, 7, 11, 14]
         );
         assert_eq!(ignored[&7], "with a colon");
         assert_eq!(ignored[&2], "equivalent: both branches return the same");
         assert_eq!(ignored[&3], "equivalent: both branches return the same");
         assert_eq!(ignored[&4], "");
+        assert_eq!(ignored[&11], "after url");
+        assert_eq!(ignored[&14], "after quote char");
         assert!(ignored_lines("").is_empty());
     }
 }

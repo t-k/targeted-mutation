@@ -1018,7 +1018,8 @@ fn sarif_tool() -> serde_json::Value {
         "rules": [
             { "id": "input-gap", "shortDescription": { "text": "No test input tells this mutant from the original" } },
             { "id": "assertion-gap", "shortDescription": { "text": "Tests run the mutated code and still pass" } },
-            { "id": "survivor", "shortDescription": { "text": "A mutant built on its own passes every test; why is not known" } }
+            { "id": "survivor", "shortDescription": { "text": "A mutant built on its own passes every test; why is not known" } },
+            { "id": "unstable-prediction", "shortDescription": { "text": "A predicted survivor failed when re-run; tests may be non-deterministic" } }
         ]
     } })
 }
@@ -1034,7 +1035,7 @@ fn sarif_document(runs: Vec<serde_json::Value>) -> serde_json::Value {
 
 fn sarif_run(report: &Report) -> serde_json::Value {
     let prefix = report.analysis.package_path.as_str();
-    let results: Vec<serde_json::Value> = report
+    let mut results: Vec<serde_json::Value> = report
         .findings
         .iter()
         .map(|finding| {
@@ -1060,6 +1061,24 @@ fn sarif_run(report: &Report) -> serde_json::Value {
             })
         })
         .collect();
+    for at in &report.unstable {
+        results.push(serde_json::json!({
+            "ruleId": "unstable-prediction",
+            "level": "error",
+            "message": {
+                "text": format!(
+                    "`{}`: trace predicted a survivor, but the re-run failed (tests may not be deterministic)",
+                    at.code
+                )
+            },
+            "locations": [{
+                "physicalLocation": {
+                    "artifactLocation": { "uri": sarif_uri(prefix, &at.file) },
+                    "region": { "startLine": at.line, "startColumn": at.column }
+                }
+            }]
+        }));
+    }
     let mut run = serde_json::json!({
         "tool": sarif_tool(),
         // What was looked at: a run of a part says nothing about the rest.
@@ -2375,7 +2394,7 @@ mod tests {
         let rules = sarif["runs"][0]["tool"]["driver"]["rules"]
             .as_array()
             .unwrap();
-        assert_eq!(rules.len(), 3);
+        assert_eq!(rules.len(), 4);
     }
 
     #[test]
@@ -2972,5 +2991,29 @@ mod tests {
         assert!(!clean_text.contains("could not be judged"), "{clean_text}");
         let clean_value = serde_json::to_value(&report).unwrap();
         assert!(clean_value["audit"].get("not_audited").is_none());
+    }
+
+    #[test]
+    fn sarif_emits_unstable_predictions() {
+        let report = Report {
+            package: "demo".into(),
+            unstable: vec![Location {
+                file: "src/lib.rs".into(),
+                line: 12,
+                column: 5,
+                code: "age >= 18".into(),
+                ..Location::default()
+            }],
+            ..Report::default()
+        };
+        let sarif: serde_json::Value = serde_json::from_str(&render_sarif(&report)).unwrap();
+        let results = sarif["runs"][0]["results"].as_array().unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0]["ruleId"], "unstable-prediction");
+        assert_eq!(results[0]["level"], "error");
+        assert_eq!(
+            results[0]["locations"][0]["physicalLocation"]["artifactLocation"]["uri"],
+            "src/lib.rs"
+        );
     }
 }

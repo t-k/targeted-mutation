@@ -211,6 +211,13 @@ fn codec(function: &ItemFn) -> Option<(bool, Codec)> {
         return None;
     }
     let signature = &function.sig;
+    if !signature.generics.params.is_empty()
+        || signature.asyncness.is_some()
+        || signature.unsafety.is_some()
+        || signature.abi.is_some()
+    {
+        return None;
+    }
     let FnArg::Typed(input) = single_arg(&signature.inputs)? else {
         return None;
     };
@@ -1074,5 +1081,19 @@ mod tests {
                 "store.has(\"a\")"
             ]
         );
+    }
+
+    #[test]
+    fn async_unsafe_and_generic_codecs_are_skipped() {
+        for head in [
+            "async fn encode(x: u16) -> [u8; 2] { x.to_le_bytes() }",
+            "unsafe fn encode(x: u16) -> [u8; 2] { x.to_le_bytes() }",
+            "fn encode<T>(x: u16) -> [u8; 2] { x.to_le_bytes() }",
+        ] {
+            let source = format!(
+                "{head}\nfn decode(b: [u8; 2]) -> u16 {{ u16::from_le_bytes(b) }}\n#[test] fn rt() {{ assert_eq!(decode(encode(1)), 1); }}\n"
+            );
+            assert!(candidates(&source).is_empty(), "{source}");
+        }
     }
 }

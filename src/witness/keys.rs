@@ -8,7 +8,8 @@ use syn::{Expr, FnArg, Item, Pat, ReturnType, Stmt, Type};
 
 use syn::visit::Visit;
 
-use super::{Candidate, Edit, Scenario};
+use super::sequences::collect_tests;
+use super::{Candidate, Edit, Placement, Scenario};
 
 /// A placeholder of a format string, as a byte range of the literal's source text, and
 /// the parameter it shows: by name (`{name}`, `{name:>4}`) or the next argument (`{}`).
@@ -173,30 +174,28 @@ fn users<'a>(file: &'a syn::File, function: &syn::Ident, arity: usize) -> Vec<Us
     found
 }
 
-/// The calls of methods on local values in the tests: the statement that makes the
-/// value (`let mut labels = Labels::default();`) and each call with its arguments.
-#[derive(Default)]
-struct TestCalls<'a> {
-    in_test: bool,
-    /// `(receiver, the statement that makes it)` of the test being read.
-    made: Vec<(&'a syn::Ident, &'a syn::Local)>,
-    calls: Vec<(Option<&'a syn::Local>, &'a syn::ExprMethodCall)>,
+/// One method call observed in a test, whether directly in a statement or inside an assertion.
+struct RecordedCall {
+    made: Option<String>,
+    placement: Option<Placement>,
+    receiver: Option<String>,
+    method: String,
+    call_text: Option<String>,
+    /// Literal source text for each argument, or `None` when the argument is not a literal.
+    args: Vec<Option<String>>,
 }
 
-impl<'a> Visit<'a> for TestCalls<'a> {
-    fn visit_item_fn(&mut self, function: &'a syn::ItemFn) {
-        if function
-            .attrs
-            .iter()
-            .any(|attr| attr.path().is_ident("test"))
-        {
-            self.in_test = true;
-            self.made.clear();
-            self.visit_block(&function.block);
-            self.in_test = false;
-        }
-    }
+/// The calls of methods on local values in the tests: the statement that makes the
+/// value (`let mut labels = Labels::default();`) and each call with its arguments.
+struct TestCalls<'a> {
+    source: &'a str,
+    placement: Option<Placement>,
+    /// `(receiver, the statement text that makes it)` of the test being read.
+    made: Vec<(String, String)>,
+    calls: Vec<RecordedCall>,
+}
 
+impl<'a> Visit<'a> for TestCalls<'_> {
     fn visit_local(&mut self, local: &'a syn::Local) {
         if let Pat::Ident(name) = &local.pat
             && name.mutability.is_some()
@@ -204,30 +203,63 @@ impl<'a> Visit<'a> for TestCalls<'a> {
                 .init
                 .as_ref()
                 .is_some_and(|init| init.diverge.is_none())
+            && let Some(text) = self.source.get(local.span().byte_range())
         {
-            self.made.push((&name.ident, local));
+            self.made.push((name.ident.to_string(), text.to_owned()));
         }
         syn::visit::visit_local(self, local);
     }
 
     fn visit_expr_method_call(&mut self, call: &'a syn::ExprMethodCall) {
-        if self.in_test {
-            let made = super::path_ident(&call.receiver).and_then(|receiver| {
-                self.made
-                    .iter()
-                    .rev()
-                    .find(|(name, _)| *name == receiver)
-                    .map(|(_, local)| *local)
-            });
-            self.calls.push((made, call));
-        }
+        let receiver = super::path_ident(&call.receiver).map(ToString::to_string);
+        let made = receiver.as_deref().and_then(|name| {
+            self.made
+                .iter()
+                .rev()
+                .find(|(bound, _)| bound == name)
+                .map(|(_, local)| local.clone())
+        });
+        let args = call
+            .args
+            .iter()
+            .map(|arg| {
+                matches!(arg, Expr::Lit(_))
+                    .then(|| self.source.get(arg.span().byte_range()).map(str::to_owned))
+                    .flatten()
+            })
+            .collect();
+        self.calls.push(RecordedCall {
+            made,
+            placement: self.placement.clone(),
+            receiver,
+            method: call.method.to_string(),
+            call_text: self.source.get(call.span().byte_range()).map(str::to_owned),
+            args,
+        });
         syn::visit::visit_expr_method_call(self, call);
     }
 
     fn visit_macro(&mut self, mac: &'a syn::Macro) {
-        // The arguments of an assertion are not parsed by the visitor: what they call
-        // is found by its text below.
-        let _ = mac;
+        let is_assertion = [
+            "assert",
+            "assert_eq",
+            "assert_ne",
+            "debug_assert",
+            "debug_assert_eq",
+            "debug_assert_ne",
+        ]
+        .iter()
+        .any(|name| mac.path.is_ident(name));
+        if !is_assertion {
+            return;
+        }
+        if let Ok(args) = syn::punctuated::Punctuated::<Expr, syn::Token![,]>::parse_terminated
+            .parse2(mac.tokens.clone())
+        {
+            for arg in &args {
+                self.visit_expr(arg);
+            }
+        }
     }
 }
 
@@ -248,44 +280,59 @@ fn mixing(
     let reader = users
         .iter()
         .find(|user| !user.writes && user.parameters == arity)?;
-    let mut tests = TestCalls::default();
-    tests.visit_file(file);
-    let text = |expr: &Expr| source.get(expr.span().byte_range());
-    let literal = |expr: &Expr| matches!(expr, Expr::Lit(_)).then(|| text(expr)).flatten();
+    let mut test_fns = Vec::new();
+    collect_tests(&file.items, "", None, &mut test_fns);
+    let mut calls = Vec::new();
+    for test in test_fns {
+        let mut collector = TestCalls {
+            source,
+            placement: test.insertion.map(|offset| Placement {
+                offset,
+                module: test.module,
+            }),
+            made: Vec::new(),
+            calls: Vec::new(),
+        };
+        collector.visit_block(&test.function.block);
+        calls.extend(collector.calls);
+    }
+    let writer_name = writer.name.to_string();
+    let reader_name = reader.name.to_string();
     // A write on a value a test makes, with literals for the parts.
-    let (made, write, parts) = tests.calls.iter().find_map(|(made, call)| {
-        let made = (*made)?;
-        if call.method != *writer.name || call.args.len() != writer.parameters {
+    let (write_call, made, parts) = calls.iter().find_map(|call| {
+        let made = call.made.as_deref()?;
+        if call.method != writer_name || call.args.len() != writer.parameters {
             return None;
         }
         let parts = writer
             .parts
             .iter()
-            .map(|index| literal(&call.args[*index]))
+            .map(|index| call.args[*index].as_deref())
             .collect::<Option<Vec<_>>>()?;
-        Some((made, *call, parts))
+        Some((call, made, parts))
     })?;
     // Another value of the part: what any call of the two methods has there.
-    let other = tests.calls.iter().find_map(|(_, call)| {
-        let user = [writer, reader]
+    let other = calls.iter().find_map(|call| {
+        let user = [(&writer_name, writer), (&reader_name, reader)]
             .into_iter()
-            .find(|user| call.method == *user.name && call.args.len() == user.parameters)?;
-        literal(&call.args[user.parts[part]]).filter(|value| *value != parts[part])
+            .find(|(name, user)| call.method == **name && call.args.len() == user.parameters)
+            .map(|(_, user)| user)?;
+        call.args[user.parts[part]]
+            .as_deref()
+            .filter(|value| *value != parts[part])
     })?;
-    let receiver = super::path_ident(&write.receiver)?;
+    let receiver = write_call.receiver.as_deref()?;
+    let write_text = write_call.call_text.as_deref()?;
     let mut read = vec![""; arity];
     for (index, parameter) in reader.parts.iter().enumerate() {
         read[*parameter] = if index == part { other } else { parts[index] };
     }
-    let setup = format!(
-        "{} {};",
-        source.get(made.span().byte_range())?,
-        source.get(write.span().byte_range())?
-    );
+    let setup = format!("{made} {write_text};");
     Some(Scenario {
         expression: format!("{receiver}.{}({})", reader.name, read.join(", ")),
         assertion_prefix: setup.clone(),
         setup,
+        placement: write_call.placement.clone(),
         guidance: Some(format!(
             "The tests pass without `{part_name}` in the value; here {} and {other} meet in one place.",
             parts[part]
@@ -302,7 +349,11 @@ pub(super) fn discover(source: &str, file: &syn::File, out: &mut Vec<Candidate>)
             !["doc", "inline", "must_use"]
                 .iter()
                 .any(|name| attr.path().is_ident(name))
-        }) || !signature.generics.type_params().next().is_none()
+        }) || !signature
+            .generics
+            .params
+            .iter()
+            .all(|param| matches!(param, syn::GenericParam::Lifetime(_)))
             || signature.asyncness.is_some()
             || signature.unsafety.is_some()
             || signature.constness.is_some()
@@ -742,5 +793,30 @@ mod tests {
             assert!(placeholders(literal).is_none(), "{literal}");
         }
         assert_eq!(placeholders("\"\"").map(|found| found.len()), Some(0));
+    }
+
+    #[test]
+    fn const_generic_keys_are_skipped_and_mod_tests_placement_and_assert_reads_work() {
+        let const_generic =
+            r#"fn key<const N: usize>(a: &str, b: &str) -> String { format!("{a}:{b}") }"#;
+        assert!(mutants(const_generic).is_empty());
+
+        let source = format!(
+            "{STORE}\n#[cfg(test)]\nmod tests {{\n    use super::*;\n    #[test]\n    fn writes_and_asserts() {{\n        let mut labels = Labels::new();\n        labels.put(\"ja\", \"home\", \"x\");\n        assert_eq!(labels.get(\"en\", \"about\"), None);\n    }}\n}}\n"
+        );
+        let mut candidates = Vec::new();
+        discover(&source, &syn::parse_file(&source).unwrap(), &mut candidates);
+        assert_eq!(candidates.len(), 2);
+        assert_eq!(
+            candidates[0].scenarios[0].expression,
+            r#"labels.get("en", "home")"#
+        );
+        assert_eq!(
+            candidates[0].scenarios[0]
+                .placement
+                .as_ref()
+                .map(|p| p.module.as_str()),
+            Some("tests")
+        );
     }
 }
