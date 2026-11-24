@@ -1000,8 +1000,17 @@ pub fn workspace_sarif(reports: &[Report], failed: &[(String, String)]) -> impl 
 /// every byte that is not plainly allowed in one (a space, `#`, `%`, what is not ASCII)
 /// written as `%XX`.
 fn sarif_uri(prefix: &str, file: &str) -> String {
+    sarif_uri_for(prefix, file, cfg!(windows))
+}
+
+fn sarif_uri_for(prefix: &str, file: &str, backslash_is_separator: bool) -> String {
     let mut uri = String::new();
     for byte in prefix.bytes().chain(file.bytes()) {
+        let byte = if backslash_is_separator && byte == b'\\' {
+            b'/'
+        } else {
+            byte
+        };
         match byte {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' | b'/' => {
                 uri.push(byte as char)
@@ -2117,6 +2126,11 @@ mod tests {
             sarif["runs"][0]["results"][0]["locations"][0]["physicalLocation"]["artifactLocation"]
                 ["uri"],
             "my%20crate/src/a%20b.rs"
+        );
+        assert_eq!(sarif_uri_for("", r#"a\b"c.rs"#, false), "a%5Cb%22c.rs");
+        assert_eq!(
+            sarif_uri_for(r"crates\core\", r"src\lib.rs", true),
+            "crates/core/src/lib.rs"
         );
     }
 

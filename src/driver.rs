@@ -2628,6 +2628,10 @@ struct SavedExecutable {
 impl SavedExecutable {
     fn copy_from(exe: &Path) -> Result<Self> {
         static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        Self::copy_from_with_counter(exe, &NEXT)
+    }
+
+    fn copy_from_with_counter(exe: &Path, next: &std::sync::atomic::AtomicUsize) -> Result<Self> {
         let parent = exe
             .parent()
             .context("witness executable has no parent directory")?;
@@ -2635,16 +2639,43 @@ impl SavedExecutable {
             .file_name()
             .context("witness executable has no file name")?
             .to_string_lossy();
-        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let path = parent.join(format!("tmt-orig-{}-{id}-{name}", std::process::id()));
-        fs::copy(exe, &path).with_context(|| {
-            format!(
-                "preserving original witness binary {} at {}",
-                exe.display(),
-                path.display()
-            )
-        })?;
-        Ok(Self { path })
+        let mut input = fs::File::open(exe)
+            .with_context(|| format!("opening original witness binary {}", exe.display()))?;
+        let permissions = input.metadata()?.permissions();
+        for _ in 0..1024 {
+            let id = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let path = parent.join(format!("tmt-orig-{}-{id}-{name}", std::process::id()));
+            match fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&path)
+            {
+                Ok(mut output) => {
+                    // Own the newly created file immediately so any copy/chmod failure removes it.
+                    let saved = Self { path };
+                    std::io::copy(&mut input, &mut output).with_context(|| {
+                        format!(
+                            "preserving original witness binary {} at {}",
+                            exe.display(),
+                            saved.path.display()
+                        )
+                    })?;
+                    output.set_permissions(permissions)?;
+                    drop(output);
+                    return Ok(saved);
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => {
+                    return Err(err).with_context(|| {
+                        format!("creating preserved witness binary {}", path.display())
+                    });
+                }
+            }
+        }
+        anyhow::bail!(
+            "could not allocate a unique path to preserve witness binary {}",
+            exe.display()
+        )
     }
 }
 
@@ -4310,14 +4341,7 @@ fn run_package(
         if !selected_file && path != root_file {
             continue;
         }
-        let display = {
-            let text = relative_source(&path, &package_dir).display().to_string();
-            if cfg!(windows) {
-                text.replace('\\', "/")
-            } else {
-                text
-            }
-        };
+        let display = relative_source(&path, &package_dir).display().to_string();
         match instrument::parse_source(&original) {
             Ok(parsed) => {
                 let mut found =
@@ -10114,6 +10138,27 @@ mod tests {
             !saved_path.exists(),
             "preserved witness binary should be cleaned up on drop"
         );
+
+        // Colliding pre-existing files and symlinks at candidate backup paths must be preserved.
+        let pid = std::process::id();
+        let existing_file = root.join(format!("tmt-orig-{pid}-0-deps_test_bin"));
+        let symlink_target = root.join("keep_me");
+        let existing_link = root.join(format!("tmt-orig-{pid}-1-deps_test_bin"));
+        fs::write(&existing_file, "preexisting").unwrap();
+        fs::write(&symlink_target, "link-target").unwrap();
+        std::os::unix::fs::symlink(&symlink_target, &existing_link).unwrap();
+
+        let counter = std::sync::atomic::AtomicUsize::new(0);
+        let saved = SavedExecutable::copy_from_with_counter(&exe_path, &counter).unwrap();
+        let expected_slot = root.join(format!("tmt-orig-{pid}-2-deps_test_bin"));
+        assert_eq!(saved.path, expected_slot);
+        assert_eq!(fs::read_to_string(&existing_file).unwrap(), "preexisting");
+        assert_eq!(fs::read_to_string(&symlink_target).unwrap(), "link-target");
+        drop(saved);
+        assert!(!expected_slot.exists());
+        assert_eq!(fs::read_to_string(&existing_file).unwrap(), "preexisting");
+        assert_eq!(fs::read_to_string(&symlink_target).unwrap(), "link-target");
+
         let _ = fs::remove_dir_all(&root);
     }
 }
