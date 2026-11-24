@@ -3292,6 +3292,23 @@ fn mutation_of(site: &Site, mutant: &instrument::SourceMutant) -> Mutation {
         SiteKind::Not { .. } => Mutation::DropNot,
         SiteKind::Range { .. } => Mutation::RangeEnd,
         SiteKind::SliceEnd { .. } => Mutation::OtherEnd,
+        SiteKind::StrAffix { .. } => Mutation::StrContains,
+        SiteKind::StrReplace { .. } => Mutation::StrReplaceMultiplicity,
+        SiteKind::Clamp { .. } => {
+            if mutant.into.contains("lower") {
+                Mutation::ClampDropLower
+            } else {
+                Mutation::ClampDropUpper
+            }
+        }
+        SiteKind::Rounding { op, .. } => {
+            if mutant.into == op.alt1().name() {
+                Mutation::RoundAlt1
+            } else {
+                Mutation::RoundAlt2
+            }
+        }
+        SiteKind::Quantifier { .. } => Mutation::QuantifierSwap,
         // The other kinds have one mutant of the source: a statement, an arm, a field or
         // a minus that is not there, a body that is another.
         _ => Mutation::Delete,

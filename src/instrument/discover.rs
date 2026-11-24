@@ -13,7 +13,9 @@ use super::body_values::{
     body_values_with_errors, does_nothing_else, may_bypass_result_probe, tokens_of,
 };
 use super::cfg::{is_skipped, is_test_only};
-use super::model::{ArithOp, ArmGuard, Discovery, LiteralSide, NO_ID, Site, SiteKind, TestModule};
+use super::model::{
+    ArithOp, ArmGuard, Discovery, LiteralSide, NO_ID, RoundingOp, Site, SiteKind, TestModule,
+};
 
 /// Finds the sites in one source file, numbering them from `first_id`.
 pub fn discover(source: &str, first_id: u32) -> Result<Discovery> {
@@ -937,6 +939,203 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             };
             self.push(kind, start, end, node.receiver.span());
         }
+        if (name == "starts_with" || name == "ends_with")
+            && node.args.len() == 1
+            && node.turbofish.is_none()
+            && node.attrs.is_empty()
+            && let (
+                Some((start, receiver_end)),
+                Some(method),
+                Some((pat_start, pat_end)),
+                Some((_, end)),
+            ) = (
+                self.range(node.receiver.span()),
+                self.range(node.method.span()),
+                self.range(node.args[0].span()),
+                self.range(node.paren_token.span.close()),
+            )
+            && in_order(receiver_end, method.0)
+            && in_order(method.1, pat_start)
+            && in_order(pat_end, end)
+        {
+            let kind = SiteKind::StrAffix {
+                starts: name == "starts_with",
+                receiver: self.source[start..receiver_end].to_string(),
+                pattern: self.source[pat_start..pat_end].to_string(),
+                call: (receiver_end, pat_start),
+                close: (pat_end, end),
+                method,
+            };
+            self.push(kind, start, end, node.receiver.span());
+        }
+        if ((name == "replace" && node.args.len() == 2)
+            || (name == "replacen" && node.args.len() == 3 && is_int_one(&node.args[2])))
+            && node.turbofish.is_none()
+            && node.attrs.is_empty()
+            && let (
+                Some((start, receiver_end)),
+                Some(method),
+                Some((from_start, from_end)),
+                Some((to_start, to_end)),
+                Some((_, end)),
+            ) = (
+                self.range(node.receiver.span()),
+                self.range(node.method.span()),
+                self.range(node.args[0].span()),
+                self.range(node.args[1].span()),
+                self.range(node.paren_token.span.close()),
+            )
+            && in_order(receiver_end, method.0)
+            && in_order(method.1, from_start)
+            && in_order(from_end, to_start)
+            && in_order(to_end, end)
+        {
+            let kind = SiteKind::StrReplace {
+                replace_all: name == "replace",
+                receiver: self.source[start..receiver_end].to_string(),
+                from: self.source[from_start..from_end].to_string(),
+                to: self.source[to_start..to_end].to_string(),
+                call: (receiver_end, from_start),
+                comma: (from_end, to_start),
+                close: (to_end, end),
+                method,
+            };
+            self.push(kind, start, end, node.receiver.span());
+        }
+        if name == "clamp"
+            && node.args.len() == 2
+            && node.turbofish.is_none()
+            && node.attrs.is_empty()
+            && let (
+                Some((start, receiver_end)),
+                Some((low_start, low_end)),
+                Some((high_start, high_end)),
+                Some((_, end)),
+            ) = (
+                self.range(node.receiver.span()),
+                self.range(node.args[0].span()),
+                self.range(node.args[1].span()),
+                self.range(node.paren_token.span.close()),
+            )
+            && in_order(receiver_end, low_start)
+            && in_order(low_end, high_start)
+            && in_order(high_end, end)
+        {
+            let kind = SiteKind::Clamp {
+                receiver: self.source[start..receiver_end].to_string(),
+                low: self.source[low_start..low_end].to_string(),
+                high: self.source[high_start..high_end].to_string(),
+                call: (receiver_end, low_start),
+                comma: (low_end, high_start),
+                close: (high_end, end),
+            };
+            self.push(kind, start, end, node.receiver.span());
+        }
+        if let Some(op) = rounding_op(&name)
+            && node.args.is_empty()
+            && node.turbofish.is_none()
+            && node.attrs.is_empty()
+            && let (Some((start, receiver_end)), Some(method), Some((_, end))) = (
+                self.range(node.receiver.span()),
+                self.range(node.method.span()),
+                self.range(node.paren_token.span.close()),
+            )
+            && in_order(receiver_end, method.0)
+            && in_order(method.1, end)
+        {
+            let kind = SiteKind::Rounding {
+                op,
+                receiver: self.source[start..receiver_end].to_string(),
+                call: (receiver_end, end),
+                method,
+            };
+            self.push(kind, start, end, node.receiver.span());
+        }
+        if (name == "all" || name == "any")
+            && node.args.len() == 1
+            && matches!(&node.args[0], syn::Expr::Closure(_))
+            && node.turbofish.is_none()
+            && node.attrs.is_empty()
+            && let (
+                Some((start, receiver_end)),
+                Some(method),
+                Some((pred_start, pred_end)),
+                Some((_, end)),
+            ) = (
+                self.range(node.receiver.span()),
+                self.range(node.method.span()),
+                self.range(node.args[0].span()),
+                self.range(node.paren_token.span.close()),
+            )
+            && in_order(receiver_end, method.0)
+            && in_order(method.1, pred_start)
+            && in_order(pred_end, end)
+        {
+            let kind = SiteKind::Quantifier {
+                all: name == "all",
+                receiver: self.source[start..receiver_end].to_string(),
+                predicate: self.source[pred_start..pred_end].to_string(),
+                call: (receiver_end, pred_start),
+                close: (pred_end, end),
+                method,
+            };
+            self.push(kind, start, end, node.receiver.span());
+        }
+        if name == "contains"
+            && node.args.len() == 1
+            && node.turbofish.is_none()
+            && node.attrs.is_empty()
+            && let Some(array) = literal_array_receiver(&node.receiver)
+            && (2..=8).contains(&array.elems.len())
+            && array.elems.iter().all(is_primitive_literal)
+            && let (Some((start, receiver_end)), Some((arg_start, arg_end)), Some((_, end))) = (
+                self.range(node.receiver.span()),
+                self.range(node.args[0].span()),
+                self.range(node.paren_token.span.close()),
+            )
+            && in_order(receiver_end, arg_start)
+            && in_order(arg_end, end)
+        {
+            let elem_spans: Option<Vec<(usize, usize)>> = array
+                .elems
+                .iter()
+                .map(|elem| self.range(elem.span()))
+                .collect();
+            if let Some(spans) = elem_spans {
+                let mut seen = HashSet::new();
+                let all_unique = spans
+                    .iter()
+                    .all(|&(es, ee)| seen.insert(tokens_of(&self.source[es..ee])));
+                if all_unique && spans.windows(2).all(|w| in_order(w[0].1, w[1].0)) {
+                    let elements = spans
+                        .iter()
+                        .enumerate()
+                        .map(|(i, &(es, ee))| {
+                            let (rem_start, rem_end) = if i + 1 < spans.len() {
+                                (es, spans[i + 1].0)
+                            } else {
+                                (spans[i - 1].1, ee)
+                            };
+                            (self.source[es..ee].to_string(), rem_start, rem_end)
+                        })
+                        .collect();
+                    let at = node.receiver.span().start();
+                    self.found.rebuild_sites.push(Site {
+                        id: NO_ID,
+                        kind: SiteKind::LiteralSet {
+                            receiver: self.source[start..receiver_end].to_string(),
+                            argument: self.source[arg_start..arg_end].to_string(),
+                            elements,
+                        },
+                        line: at.line,
+                        column: at.column + 1,
+                        start,
+                        end,
+                        text: self.source[start..end].to_string(),
+                    });
+                }
+            }
+        }
         visit::visit_expr_method_call(self, node);
     }
 
@@ -1315,5 +1514,66 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             }
         }
         visit::visit_expr_binary(self, node);
+    }
+}
+
+fn rounding_op(name: &str) -> Option<RoundingOp> {
+    match name {
+        "floor" => Some(RoundingOp::Floor),
+        "ceil" => Some(RoundingOp::Ceil),
+        "round" => Some(RoundingOp::Round),
+        "trunc" => Some(RoundingOp::Trunc),
+        _ => None,
+    }
+}
+
+fn is_int_one(mut expr: &syn::Expr) -> bool {
+    while let syn::Expr::Paren(syn::ExprParen { expr: inner, .. })
+    | syn::Expr::Group(syn::ExprGroup { expr: inner, .. }) = expr
+    {
+        expr = inner;
+    }
+    matches!(
+        expr,
+        syn::Expr::Lit(syn::ExprLit {
+            attrs,
+            lit: syn::Lit::Int(n),
+        }) if attrs.is_empty() && n.base10_parse::<usize>().ok() == Some(1)
+    )
+}
+
+fn literal_array_receiver(mut expr: &syn::Expr) -> Option<&syn::ExprArray> {
+    loop {
+        match expr {
+            syn::Expr::Paren(syn::ExprParen { expr: inner, .. })
+            | syn::Expr::Group(syn::ExprGroup { expr: inner, .. }) => expr = inner,
+            syn::Expr::Reference(syn::ExprReference {
+                mutability: None,
+                expr: inner,
+                ..
+            }) => expr = inner,
+            syn::Expr::Array(array) if array.attrs.is_empty() => return Some(array),
+            _ => return None,
+        }
+    }
+}
+
+fn is_primitive_literal(expr: &syn::Expr) -> bool {
+    match expr {
+        syn::Expr::Lit(syn::ExprLit { attrs, lit }) if attrs.is_empty() => {
+            !matches!(lit, syn::Lit::Verbatim(_))
+        }
+        syn::Expr::Unary(syn::ExprUnary {
+            attrs,
+            op: syn::UnOp::Neg(_),
+            expr,
+        }) if attrs.is_empty() => matches!(
+            expr.as_ref(),
+            syn::Expr::Lit(syn::ExprLit {
+                attrs,
+                lit: syn::Lit::Int(_) | syn::Lit::Float(_),
+            }) if attrs.is_empty()
+        ),
+        _ => false,
     }
 }

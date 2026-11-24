@@ -80,6 +80,74 @@ pub enum SiteKind {
         /// Byte range of the method's name.
         method: (usize, usize),
     },
+    /// `receiver.starts_with(pattern)` or `.ends_with(pattern)`: relaxed to `.contains(pattern)`.
+    StrAffix {
+        starts: bool,
+        receiver: String,
+        pattern: String,
+        /// Byte range of `.starts_with(` (from receiver end to pattern start).
+        call: (usize, usize),
+        /// Byte range of the closing `)` (from pattern end to closing paren end).
+        close: (usize, usize),
+        /// Byte range of the method name.
+        method: (usize, usize),
+    },
+    /// `receiver.replace(from, to)` <-> `receiver.replacen(from, to, 1)`.
+    StrReplace {
+        /// `true` for `.replace(from, to)`, `false` for `.replacen(from, to, 1)`.
+        replace_all: bool,
+        receiver: String,
+        from: String,
+        to: String,
+        /// Byte range from receiver end to `from` start.
+        call: (usize, usize),
+        /// Byte range from `from` end to `to` start.
+        comma: (usize, usize),
+        /// Byte range from `to` end to closing `)` end (includes `, 1)` for `replacen`).
+        close: (usize, usize),
+        /// Byte range of the method name.
+        method: (usize, usize),
+    },
+    /// `receiver.clamp(low, high)`: drop lower bound (`.min(high)`) or upper bound (`.max(low)`).
+    Clamp {
+        receiver: String,
+        low: String,
+        high: String,
+        /// Byte range from receiver end to `low` start.
+        call: (usize, usize),
+        /// Byte range from `low` end to `high` start.
+        comma: (usize, usize),
+        /// Byte range from `high` end to closing `)` end.
+        close: (usize, usize),
+    },
+    /// `receiver.floor()` / `.ceil()` / `.round()` / `.trunc()` on floats.
+    Rounding {
+        op: RoundingOp,
+        receiver: String,
+        /// Byte range of `.floor()`.
+        call: (usize, usize),
+        /// Byte range of the method name.
+        method: (usize, usize),
+    },
+    /// `receiver.all(pred)` <-> `receiver.any(pred)` on an iterator with a closure predicate.
+    Quantifier {
+        all: bool,
+        receiver: String,
+        predicate: String,
+        /// Byte range from receiver end to predicate start.
+        call: (usize, usize),
+        /// Byte range from predicate end to closing `)` end.
+        close: (usize, usize),
+        /// Byte range of the method name.
+        method: (usize, usize),
+    },
+    /// `[lit1, lit2, ...].contains(&x)`: drop one literal element at a time (source-built).
+    LiteralSet {
+        receiver: String,
+        argument: String,
+        /// `(element text, removal start, removal end)` for each element.
+        elements: Vec<(String, usize, usize)>,
+    },
     /// `lhs..rhs` or `lhs..=rhs` on integers: the end moves by one.
     Range {
         inclusive: bool,
@@ -133,6 +201,75 @@ pub enum SiteKind {
         /// that expression always had is then the same program for the tests.
         sole_expr: Option<(usize, usize)>,
     },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RoundingOp {
+    Floor,
+    Ceil,
+    Round,
+    Trunc,
+}
+
+impl RoundingOp {
+    pub fn code(self) -> u8 {
+        match self {
+            RoundingOp::Floor => 0,
+            RoundingOp::Ceil => 1,
+            RoundingOp::Round => 2,
+            RoundingOp::Trunc => 3,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            RoundingOp::Floor => "floor",
+            RoundingOp::Ceil => "ceil",
+            RoundingOp::Round => "round",
+            RoundingOp::Trunc => "trunc",
+        }
+    }
+
+    pub fn alt1(self) -> RoundingOp {
+        match self {
+            RoundingOp::Floor => RoundingOp::Trunc,
+            RoundingOp::Ceil => RoundingOp::Floor,
+            RoundingOp::Round => RoundingOp::Floor,
+            RoundingOp::Trunc => RoundingOp::Floor,
+        }
+    }
+
+    pub fn alt2(self) -> RoundingOp {
+        match self {
+            RoundingOp::Floor => RoundingOp::Ceil,
+            RoundingOp::Ceil => RoundingOp::Trunc,
+            RoundingOp::Round => RoundingOp::Trunc,
+            RoundingOp::Trunc => RoundingOp::Round,
+        }
+    }
+
+    /// Concrete input description distinguishing `self` from `other`.
+    pub fn differs_for(self, other: RoundingOp) -> &'static str {
+        match (self, other) {
+            (RoundingOp::Floor, RoundingOp::Trunc) | (RoundingOp::Trunc, RoundingOp::Floor) => {
+                "negative and not a whole number (e.g. -0.5)"
+            }
+            (RoundingOp::Ceil, RoundingOp::Trunc) | (RoundingOp::Trunc, RoundingOp::Ceil) => {
+                "positive and not a whole number (e.g. 0.5)"
+            }
+            (RoundingOp::Floor, RoundingOp::Round) | (RoundingOp::Round, RoundingOp::Floor) => {
+                "a number that rounds up (e.g. 1.5 or -1.5)"
+            }
+            (RoundingOp::Ceil, RoundingOp::Round) | (RoundingOp::Round, RoundingOp::Ceil) => {
+                "a number that rounds down (e.g. 1.4 or -1.6)"
+            }
+            (RoundingOp::Round, RoundingOp::Trunc) | (RoundingOp::Trunc, RoundingOp::Round) => {
+                "a number that rounds away from zero (e.g. 1.5 or -1.6)"
+            }
+            _ => "not a whole number (e.g. 0.5)",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

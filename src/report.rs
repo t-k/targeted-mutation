@@ -583,6 +583,55 @@ pub fn describe(site: &Site, m: Mutation) -> String {
             let other = if *first { "last" } else { "first" };
             format!("`{}.{other}()`", one_line(receiver))
         }
+        SiteKind::StrAffix {
+            receiver, pattern, ..
+        } => format!("`{}.contains({})`", one_line(receiver), one_line(pattern)),
+        SiteKind::StrReplace {
+            replace_all,
+            receiver,
+            from,
+            to,
+            ..
+        } => {
+            let (r, f, t) = (one_line(receiver), one_line(from), one_line(to));
+            if *replace_all {
+                format!("`{r}.replacen({f}, {t}, 1)`")
+            } else {
+                format!("`{r}.replace({f}, {t})`")
+            }
+        }
+        SiteKind::Clamp {
+            receiver,
+            low,
+            high,
+            ..
+        } => match m {
+            Mutation::ClampDropLower => format!("`{}.min({})`", one_line(receiver), one_line(high)),
+            _ => format!("`{}.max({})`", one_line(receiver), one_line(low)),
+        },
+        SiteKind::Rounding { op, receiver, .. } => {
+            let alt = match m {
+                Mutation::RoundAlt2 => op.alt2(),
+                _ => op.alt1(),
+            };
+            format!("`{}.{}()`", one_line(receiver), alt.name())
+        }
+        SiteKind::Quantifier {
+            all,
+            receiver,
+            predicate,
+            ..
+        } => {
+            let other = if *all { "any" } else { "all" };
+            format!("`{}.{other}({})`", one_line(receiver), one_line(predicate))
+        }
+        SiteKind::LiteralSet {
+            receiver, argument, ..
+        } => format!(
+            "without a literal element in `{}.contains({})`",
+            one_line(receiver),
+            one_line(argument)
+        ),
         SiteKind::Logic { and, lhs, rhs, .. } => {
             let (lhs, rhs) = (one_line(lhs), one_line(rhs));
             match m {
@@ -871,6 +920,120 @@ pub fn min_max_gap_finding(file: &str, site: &Site, verified: bool) -> Option<Fi
             "`{}` different from `{}`",
             one_line(receiver),
             one_line(argument)
+        )],
+        observed: None,
+        verified,
+    })
+}
+
+/// Input gap at `s.starts_with(p)` / `s.ends_with(p)`: no test passed a string containing `p`
+/// away from the prefix/suffix position.
+pub fn str_affix_gap_finding(file: &str, site: &Site, verified: bool) -> Option<Finding> {
+    let SiteKind::StrAffix {
+        starts,
+        receiver,
+        pattern,
+        ..
+    } = &site.kind
+    else {
+        return None;
+    };
+    let where_else = if *starts { "start" } else { "end" };
+    Some(Finding::InputGap {
+        at: location(file, site),
+        survivors: vec![describe(site, Mutation::StrContains)],
+        survivor_count: 1,
+        add_tests: vec![format!(
+            "`{}` containing `{}` somewhere other than the {where_else}",
+            one_line(receiver),
+            one_line(pattern)
+        )],
+        observed: None,
+        verified,
+    })
+}
+
+/// Input gap at `s.replace(a, b)` / `s.replacen(a, b, 1)`: no test had `a` occur more than once.
+pub fn str_replace_gap_finding(file: &str, site: &Site, verified: bool) -> Option<Finding> {
+    let SiteKind::StrReplace { receiver, from, .. } = &site.kind else {
+        return None;
+    };
+    Some(Finding::InputGap {
+        at: location(file, site),
+        survivors: vec![describe(site, Mutation::StrReplaceMultiplicity)],
+        survivor_count: 1,
+        add_tests: vec![format!(
+            "`{}` containing `{}` more than once",
+            one_line(receiver),
+            one_line(from)
+        )],
+        observed: None,
+        verified,
+    })
+}
+
+/// Input gap at `x.clamp(lo, hi)`: no test crossed the dropped bound.
+pub fn clamp_gap_finding(
+    file: &str,
+    site: &Site,
+    mutation: Mutation,
+    verified: bool,
+) -> Option<Finding> {
+    let SiteKind::Clamp {
+        receiver,
+        low,
+        high,
+        ..
+    } = &site.kind
+    else {
+        return None;
+    };
+    let advice = if mutation == Mutation::ClampDropLower {
+        format!(
+            "`{}` below the lower clamp bound `{}`",
+            one_line(receiver),
+            one_line(low)
+        )
+    } else {
+        format!(
+            "`{}` above the upper clamp bound `{}`",
+            one_line(receiver),
+            one_line(high)
+        )
+    };
+    Some(Finding::InputGap {
+        at: location(file, site),
+        survivors: vec![describe(site, mutation)],
+        survivor_count: 1,
+        add_tests: vec![advice],
+        observed: None,
+        verified,
+    })
+}
+
+/// Input gap at `x.floor()` / `.ceil()` / `.round()` / `.trunc()`: no test distinguished the rounding mode.
+pub fn rounding_gap_finding(
+    file: &str,
+    site: &Site,
+    mutation: Mutation,
+    verified: bool,
+) -> Option<Finding> {
+    let SiteKind::Rounding { op, receiver, .. } = &site.kind else {
+        return None;
+    };
+    let alt = if mutation == Mutation::RoundAlt2 {
+        op.alt2()
+    } else {
+        op.alt1()
+    };
+    Some(Finding::InputGap {
+        at: location(file, site),
+        survivors: vec![describe(site, mutation)],
+        survivor_count: 1,
+        add_tests: vec![format!(
+            "`{}` that is {}",
+            one_line(receiver),
+            op.differs_for(alt)
         )],
         observed: None,
         verified,

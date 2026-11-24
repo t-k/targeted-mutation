@@ -268,6 +268,163 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                 });
                 (open, String::new())
             }
+            SiteKind::StrAffix {
+                starts,
+                call,
+                close,
+                ..
+            } => {
+                let same = if *starts { "starts_with" } else { "ends_with" };
+                edits.push(Edit {
+                    pos: call.0,
+                    end: call.1,
+                    phase: 1,
+                    order: 0,
+                    text: "), ".into(),
+                    site: site.id,
+                });
+                edits.push(Edit {
+                    pos: close.0,
+                    end: close.1,
+                    phase: 1,
+                    order: 0,
+                    text: format!(
+                        ") {{ (__tmt_a, __tmt_p) => {{ #[allow(unused_imports)] use {rt}::{{AnyStrAffix as _, StrAffixPrim as _}}; \
+                         if (&{rt}::Aff(__tmt_a, &__tmt_p)).tmt_str_affix({}u32, {starts}) {{ (*__tmt_a).contains(__tmt_p) }} else {{ (*__tmt_a).{same}(__tmt_p) }} }} }})",
+                        site.id
+                    ),
+                    site: site.id,
+                });
+                ("(match (&(".to_string(), String::new())
+            }
+            SiteKind::StrReplace {
+                replace_all,
+                call,
+                comma,
+                close,
+                ..
+            } => {
+                let (same_call, other_call) = if *replace_all {
+                    (
+                        "(*__tmt_a).replace(__tmt_f, __tmt_t)",
+                        "(*__tmt_a).replacen(__tmt_f, __tmt_t, 1)",
+                    )
+                } else {
+                    (
+                        "(*__tmt_a).replacen(__tmt_f, __tmt_t, 1)",
+                        "(*__tmt_a).replace(__tmt_f, __tmt_t)",
+                    )
+                };
+                edits.push(Edit {
+                    pos: call.0,
+                    end: call.1,
+                    phase: 1,
+                    order: 0,
+                    text: "), ".into(),
+                    site: site.id,
+                });
+                edits.push(Edit {
+                    pos: comma.0,
+                    end: comma.1,
+                    phase: 1,
+                    order: 0,
+                    text: ", ".into(),
+                    site: site.id,
+                });
+                edits.push(Edit {
+                    pos: close.0,
+                    end: close.1,
+                    phase: 1,
+                    order: 0,
+                    text: format!(
+                        ") {{ (__tmt_a, __tmt_f, __tmt_t) => {{ #[allow(unused_imports)] use {rt}::{{AnyStrReplace as _, StrReplacePrim as _}}; \
+                         if (&{rt}::Rep(__tmt_a, &__tmt_f, &__tmt_t)).tmt_str_replace({}u32, {replace_all}) {{ {other_call} }} else {{ {same_call} }} }} }})",
+                        site.id
+                    ),
+                    site: site.id,
+                });
+                ("(match (&(".to_string(), String::new())
+            }
+            SiteKind::Clamp {
+                call, comma, close, ..
+            } => {
+                edits.push(Edit {
+                    pos: call.0,
+                    end: call.1,
+                    phase: 1,
+                    order: 0,
+                    text: "), ".into(),
+                    site: site.id,
+                });
+                edits.push(Edit {
+                    pos: comma.0,
+                    end: comma.1,
+                    phase: 1,
+                    order: 0,
+                    text: ", ".into(),
+                    site: site.id,
+                });
+                edits.push(Edit {
+                    pos: close.0,
+                    end: close.1,
+                    phase: 1,
+                    order: 0,
+                    text: format!(
+                        ") {{ (__tmt_a, __tmt_lo, __tmt_hi) => {{ #[allow(unused_imports)] use {rt}::{{AnyClamp as _, ClampPrim as _}}; \
+                         match (&{rt}::Clp(__tmt_a, &__tmt_lo, &__tmt_hi)).tmt_clamp({}u32) {{ \
+                         1u8 => (*__tmt_a).min(__tmt_hi), 2u8 => (*__tmt_a).max(__tmt_lo), _ => (*__tmt_a).clamp(__tmt_lo, __tmt_hi) }} }} }})",
+                        site.id
+                    ),
+                    site: site.id,
+                });
+                ("(match (&(".to_string(), String::new())
+            }
+            SiteKind::Rounding { op, call, .. } => {
+                let same = op.name();
+                let alt1 = op.alt1().name();
+                let alt2 = op.alt2().name();
+                let op_code = op.code();
+                edits.push(Edit {
+                    pos: call.0,
+                    end: call.1,
+                    phase: 1,
+                    order: 0,
+                    text: format!(
+                        ")) {{ __tmt_a => {{ #[allow(unused_imports)] use {rt}::{{AnyRound as _, RoundPrim as _}}; \
+                         match (&{rt}::Rnd(__tmt_a)).tmt_round({}u32, {op_code}u8) {{ \
+                         1u8 => (*__tmt_a).{alt1}(), 2u8 => (*__tmt_a).{alt2}(), _ => (*__tmt_a).{same}() }} }} }})",
+                        site.id
+                    ),
+                    site: site.id,
+                });
+                ("(match (&(".to_string(), String::new())
+            }
+            SiteKind::Quantifier {
+                all, call, close, ..
+            } => {
+                let (same, other) = if *all { ("all", "any") } else { ("any", "all") };
+                edits.push(Edit {
+                    pos: call.0,
+                    end: call.1,
+                    phase: 1,
+                    order: 0,
+                    text: ", ".into(),
+                    site: site.id,
+                });
+                edits.push(Edit {
+                    pos: close.0,
+                    end: close.1,
+                    phase: 1,
+                    order: 0,
+                    text: format!(
+                        ") {{ (mut __tmt_i, __tmt_f) => {{ if {rt}::quant({}u32) {{ __tmt_i.{other}(__tmt_f) }} else {{ __tmt_i.{same}(__tmt_f) }} }} }})",
+                        site.id
+                    ),
+                    site: site.id,
+                });
+                ("(match (".to_string(), String::new())
+            }
+            SiteKind::LiteralSet { .. } => continue,
             SiteKind::Range { inclusive, gap, .. } => {
                 edits.push(Edit {
                     pos: gap.0,

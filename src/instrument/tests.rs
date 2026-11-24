@@ -1326,6 +1326,12 @@ fn labelled(src: &str) -> Vec<String> {
                 SiteKind::Return { .. } => "return",
                 SiteKind::MinMax { .. } => "minmax",
                 SiteKind::SliceEnd { .. } => "end",
+                SiteKind::StrAffix { .. } => "straffix",
+                SiteKind::StrReplace { .. } => "strreplace",
+                SiteKind::Clamp { .. } => "clamp",
+                SiteKind::Rounding { .. } => "rounding",
+                SiteKind::Quantifier { .. } => "quantifier",
+                SiteKind::LiteralSet { .. } => "literalset",
                 SiteKind::Range { .. } => "range",
                 SiteKind::Arm { .. } => "arm",
                 SiteKind::Stmt => "stmt",
@@ -3072,6 +3078,102 @@ fn deleting_unary_operator_does_not_merge_adjacent_tokens() {
             text.replace_range(mutant.start..mutant.end, &mutant.replacement);
             assert!(syn::parse_file(&text).is_ok(), "merged tokens:\n{text}");
             assert_eq!(same_tokens(&text, expected), Some(true), "{text}");
+        }
+    }
+}
+
+#[test]
+fn discovers_renders_and_mutates_value_aware_method_sites() {
+    let source = r#"
+pub fn checks(s: &str, x: i32, y: f64, xs: &[i32]) -> bool {
+    let a = s.starts_with("pre") && s.ends_with("suf");
+    let b = s.replace("a", "b");
+    let c = s.replacen("a", "b", 1);
+    let d = s.replacen("a", "b", 2);
+    let e = x.clamp(0, 100);
+    let f = y.floor() + y.ceil() + y.round() + y.trunc();
+    let g = xs.iter().all(|&n| n > 0) && xs.iter().any(|&n| n < 0);
+    let h = ["GET", "POST", "PUT"].contains(&s);
+    let _dup = ["a", "a"].contains(&s);
+    a && !b.is_empty() && !c.is_empty() && !d.is_empty() && e >= 0 && f >= 0.0 && g && h
+}
+"#;
+    let found = discover(source, 0).unwrap();
+    let has_kind = |pred: fn(&SiteKind) -> bool| found.sites.iter().any(|s| pred(&s.kind));
+    assert!(has_kind(|k| matches!(
+        k,
+        SiteKind::StrAffix { starts: true, .. }
+    )));
+    assert!(has_kind(|k| matches!(
+        k,
+        SiteKind::StrAffix { starts: false, .. }
+    )));
+    assert!(has_kind(|k| matches!(
+        k,
+        SiteKind::StrReplace {
+            replace_all: true,
+            ..
+        }
+    )));
+    assert!(has_kind(|k| matches!(
+        k,
+        SiteKind::StrReplace {
+            replace_all: false,
+            ..
+        }
+    )));
+    // `replacen(..., 2)` is not mutated to `replace`.
+    assert_eq!(
+        found
+            .sites
+            .iter()
+            .filter(|s| matches!(s.kind, SiteKind::StrReplace { .. }))
+            .count(),
+        2
+    );
+    assert!(has_kind(|k| matches!(k, SiteKind::Clamp { .. })));
+    assert_eq!(
+        found
+            .sites
+            .iter()
+            .filter(|s| matches!(s.kind, SiteKind::Rounding { .. }))
+            .count(),
+        4
+    );
+    assert_eq!(
+        found
+            .sites
+            .iter()
+            .filter(|s| matches!(s.kind, SiteKind::Quantifier { .. }))
+            .count(),
+        2
+    );
+    // LiteralSet goes to rebuild_sites and skips duplicate-element arrays.
+    let literal_sets: Vec<_> = found
+        .rebuild_sites
+        .iter()
+        .filter(|s| matches!(s.kind, SiteKind::LiteralSet { .. }))
+        .collect();
+    assert_eq!(literal_sets.len(), 1);
+    assert_eq!(source_mutants(literal_sets[0]).len(), 3);
+
+    // Rendered probes parse as valid Rust with identical line counts.
+    let rendered = render(source, &found.sites, &|_| true);
+    assert_eq!(
+        rendered.text.matches('\n').count(),
+        source.matches('\n').count()
+    );
+    assert!(syn::parse_file(&rendered.text).is_ok(), "{}", rendered.text);
+
+    // Every source mutant parses as valid Rust and preserves line counts.
+    for site in found.sites.iter().chain(&found.rebuild_sites) {
+        let mut mutants = source_mutants(site);
+        keep_line_ends(source, &mut mutants);
+        for mutant in mutants {
+            let mut text = source.to_string();
+            text.replace_range(mutant.start..mutant.end, &mutant.replacement);
+            assert_eq!(text.matches('\n').count(), source.matches('\n').count());
+            assert!(syn::parse_file(&text).is_ok(), "invalid mutant:\n{text}");
         }
     }
 }

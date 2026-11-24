@@ -226,6 +226,88 @@ pub fn source_mutants(site: &Site) -> Vec<SourceMutant> {
             };
             vec![change(method.0, method.1, to.to_string(), from, to)]
         }
+        SiteKind::StrAffix { starts, method, .. } => {
+            let from = if *starts { "starts_with" } else { "ends_with" };
+            vec![change(
+                method.0,
+                method.1,
+                "contains".into(),
+                from,
+                "contains",
+            )]
+        }
+        SiteKind::StrReplace {
+            replace_all,
+            from,
+            to,
+            method,
+            close,
+            ..
+        } => {
+            if *replace_all {
+                vec![change(
+                    method.0,
+                    close.1,
+                    format!("replacen({from}, {to}, 1)"),
+                    "replace",
+                    "replacen(..., 1)",
+                )]
+            } else {
+                vec![change(
+                    method.0,
+                    close.1,
+                    format!("replace({from}, {to})"),
+                    "replacen",
+                    "replace",
+                )]
+            }
+        }
+        SiteKind::Clamp {
+            low,
+            high,
+            call,
+            close,
+            ..
+        } => vec![
+            change(
+                call.0,
+                close.1,
+                format!(".min({high})"),
+                "clamp",
+                "min (drop lower)",
+            ),
+            change(
+                call.0,
+                close.1,
+                format!(".max({low})"),
+                "clamp",
+                "max (drop upper)",
+            ),
+        ],
+        SiteKind::Rounding { op, method, .. } => vec![
+            change(
+                method.0,
+                method.1,
+                op.alt1().name().into(),
+                op.name(),
+                op.alt1().name(),
+            ),
+            change(
+                method.0,
+                method.1,
+                op.alt2().name().into(),
+                op.name(),
+                op.alt2().name(),
+            ),
+        ],
+        SiteKind::Quantifier { all, method, .. } => {
+            let (from, to) = if *all { ("all", "any") } else { ("any", "all") };
+            vec![change(method.0, method.1, to.into(), from, to)]
+        }
+        SiteKind::LiteralSet { elements, .. } => elements
+            .iter()
+            .map(|(elem, start, end)| change(*start, *end, String::new(), "literal_set", elem))
+            .collect(),
         SiteKind::Return { .. } | SiteKind::MinMax { .. } => vec![],
     }
 }

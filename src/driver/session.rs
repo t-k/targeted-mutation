@@ -296,6 +296,9 @@ impl Session {
             }
             SiteKind::Arm { .. } if reached() => reach_plan(Mutation::Delete),
             SiteKind::Arm { .. } => return Planned::Unreached,
+            SiteKind::Quantifier { .. } if reached() => reach_plan(Mutation::QuantifierSwap),
+            SiteKind::Quantifier { .. } => return Planned::Unreached,
+            SiteKind::LiteralSet { .. } => return Planned::Nothing,
             SiteKind::Not { .. } if reached() => reach_plan(Mutation::DropNot),
             // `a..=b` with `b` the largest value of its type is no range the probe could
             // return in place of `a..b`: the mutant would run as the original and pass.
@@ -493,13 +496,32 @@ impl Session {
                     }),
                 }
             }
-            SiteKind::Arith { .. } | SiteKind::MinMax { .. } | SiteKind::SliceEnd { .. } => {
-                // `max` / `min` are recorded like an operator and its swap: they agree
-                // exactly when the operands are equal.
+            SiteKind::Arith { .. }
+            | SiteKind::MinMax { .. }
+            | SiteKind::SliceEnd { .. }
+            | SiteKind::StrAffix { .. }
+            | SiteKind::StrReplace { .. }
+            | SiteKind::Clamp { .. }
+            | SiteKind::Rounding { .. } => {
+                // `max` / `min` and other value-aware method probes share the 1- or 2-slot
+                // `ArithObs` recording protocol: they agree when the original and replacement
+                // compute identical values on every observed input.
                 let merged = self.merged(|t| t.arith.get(&id), plan::ArithObs::merge);
                 let mutations: Vec<(Mutation, plan::ArithObs)> = match &site.kind {
                     SiteKind::MinMax { .. } => vec![(Mutation::MinMax, merged)],
                     SiteKind::SliceEnd { .. } => vec![(Mutation::OtherEnd, merged)],
+                    SiteKind::StrAffix { .. } => vec![(Mutation::StrContains, merged)],
+                    SiteKind::StrReplace { .. } => {
+                        vec![(Mutation::StrReplaceMultiplicity, merged)]
+                    }
+                    SiteKind::Clamp { .. } => vec![
+                        (Mutation::ClampDropLower, merged),
+                        (Mutation::ClampDropUpper, merged.second()),
+                    ],
+                    SiteKind::Rounding { .. } => vec![
+                        (Mutation::RoundAlt1, merged),
+                        (Mutation::RoundAlt2, merged.second()),
+                    ],
                     SiteKind::Arith { op, assign, .. } if op.second(*assign).is_some() => vec![
                         (Mutation::ArithSwap, merged),
                         (Mutation::ArithSwap2, merged.second()),
@@ -508,7 +530,15 @@ impl Session {
                 };
                 // A `first()` that did not give the first element of the sequence is a
                 // method of another name's making: its `last()` is anyone's guess.
-                if matches!(site.kind, SiteKind::SliceEnd { .. }) && merged.opaque {
+                if matches!(
+                    site.kind,
+                    SiteKind::SliceEnd { .. }
+                        | SiteKind::StrAffix { .. }
+                        | SiteKind::StrReplace { .. }
+                        | SiteKind::Clamp { .. }
+                        | SiteKind::Rounding { .. }
+                ) && merged.opaque
+                {
                     return Planned::Nothing;
                 }
                 let (mut gaps, mut run) = (vec![], vec![]);
@@ -518,12 +548,24 @@ impl Session {
                         // Not numbers (`String + &str`, `Duration + Duration`): nothing to mutate.
                         plan::ArithPlan::Opaque => return Planned::Nothing,
                         plan::ArithPlan::NeverDiffers => {
-                            let finding = if mutation == Mutation::MinMax {
-                                report::min_max_gap_finding(file, site, verify)
-                            } else if mutation == Mutation::OtherEnd {
-                                report::slice_end_gap_finding(file, site, verify)
-                            } else {
-                                report::arith_gap_finding(file, site, mutation, verify)
+                            let finding = match mutation {
+                                Mutation::MinMax => report::min_max_gap_finding(file, site, verify),
+                                Mutation::OtherEnd => {
+                                    report::slice_end_gap_finding(file, site, verify)
+                                }
+                                Mutation::StrContains => {
+                                    report::str_affix_gap_finding(file, site, verify)
+                                }
+                                Mutation::StrReplaceMultiplicity => {
+                                    report::str_replace_gap_finding(file, site, verify)
+                                }
+                                Mutation::ClampDropLower | Mutation::ClampDropUpper => {
+                                    report::clamp_gap_finding(file, site, mutation, verify)
+                                }
+                                Mutation::RoundAlt1 | Mutation::RoundAlt2 => {
+                                    report::rounding_gap_finding(file, site, mutation, verify)
+                                }
+                                _ => report::arith_gap_finding(file, site, mutation, verify),
                             };
                             gaps.extend(finding.map(|finding| PlannedGap {
                                 finding,
@@ -543,7 +585,9 @@ impl Session {
                         tests_where(bin.trace.arith.get(&id), |obs| obs.infected_by(m))
                     }),
                     reaching: Box::new(move |bin| {
-                        tests_where(bin.trace.arith.get(&id), |obs| obs.same || obs.differs)
+                        tests_where(bin.trace.arith.get(&id), |obs| {
+                            obs.same || obs.differs || obs.same2 || obs.differs2
+                        })
                     }),
                 }
             }

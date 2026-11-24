@@ -95,6 +95,12 @@ fn keys_of(source: &str, site: &Site) -> Vec<Key> {
             SiteKind::Range { .. } => key("range", site.line, &mutant.what, &mutant.into),
             SiteKind::Stmt => key("statement", site.line, &site.text, ""),
             SiteKind::SliceEnd { .. } => key("end", site.line, &mutant.what, &mutant.into),
+            SiteKind::StrAffix { .. } => key("straffix", site.line, &mutant.what, &mutant.into),
+            SiteKind::StrReplace { .. } => key("strreplace", site.line, &mutant.what, &mutant.into),
+            SiteKind::Clamp { .. } => key("clamp", site.line, &mutant.what, &mutant.into),
+            SiteKind::Rounding { .. } => key("rounding", site.line, &mutant.what, &mutant.into),
+            SiteKind::Quantifier { .. } => key("quantifier", site.line, &mutant.what, &mutant.into),
+            SiteKind::LiteralSet { .. } => key("literalset", site.line, &mutant.what, &mutant.into),
             SiteKind::Return { .. } | SiteKind::MinMax { .. } => {
                 unreachable!("no source mutants")
             }

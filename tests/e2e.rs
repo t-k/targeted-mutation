@@ -5449,3 +5449,119 @@ fn slice_end_table() {
         assert!(left.is_empty(), "{}: {left:#?}", row.label);
     }
 }
+
+#[test]
+fn value_aware_method_rules_find_input_gaps_and_rebuild_literal_sets() {
+    let dir = fixture("eligibility", "value-aware-methods");
+    fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"value-aware\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub fn has_prefix(s: &str) -> bool {
+    s.starts_with("api/")
+}
+
+pub fn normalize_sep(s: &str) -> String {
+    s.replace("-", "_")
+}
+
+pub fn bounded(x: i32) -> i32 {
+    x.clamp(0, 100)
+}
+
+pub fn whole(x: f64) -> f64 {
+    x.floor()
+}
+
+pub fn all_positive(xs: &[i32]) -> bool {
+    xs.iter().all(|&x| x > 0)
+}
+
+pub fn allowed_method(m: &str) -> bool {
+    ["GET", "POST", "PUT"].contains(&m)
+}
+
+pub struct Custom(pub i32);
+impl Custom {
+    pub fn starts_with(&self, n: i32) -> bool { self.0 == n }
+    pub fn floor(&self) -> i32 { self.0 }
+    pub fn clamp(&self, lo: i32, hi: i32) -> i32 { self.0 + lo + hi }
+}
+
+pub fn uses_custom(c: &Custom) -> bool {
+    c.starts_with(1) && c.floor() == 1 && c.clamp(0, 0) == 1
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn covers_basics_without_edge_cases() {
+        assert!(has_prefix("api/users"));
+        assert!(!has_prefix("health"));
+        assert_eq!(normalize_sep("a-b"), "a_b");
+        assert_eq!(bounded(50), 50);
+        assert_eq!(whole(2.0), 2.0);
+        assert!(all_positive(&[1, 2, 3]));
+        assert!(allowed_method("GET"));
+        assert!(allowed_method("POST"));
+        assert!(!allowed_method("DELETE"));
+        assert!(uses_custom(&Custom(1)));
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let (code, report) = json(&dir);
+    assert_eq!(code, 2, "{report:#}");
+    let input_gaps = findings(&report, "input_gap");
+    let has_gap = |needle: &str| {
+        input_gaps
+            .iter()
+            .any(|f| strings(&f["survivors"]).iter().any(|s| s.contains(needle)))
+    };
+    assert!(has_gap("s.contains(\"api/\")"), "{report:#}");
+    assert!(has_gap("s.replacen(\"-\", \"_\", 1)"), "{report:#}");
+    assert!(has_gap("x.min(100)"), "{report:#}");
+    assert!(has_gap("x.max(0)"), "{report:#}");
+    assert!(has_gap("x.trunc()"), "{report:#}");
+    assert!(has_gap("x.ceil()"), "{report:#}");
+
+    let assertion_gaps = findings(&report, "assertion_gap");
+    assert!(
+        assertion_gaps.iter().any(|f| strings(&f["survivors"])
+            .iter()
+            .any(|s| s.contains("xs.iter().any(|&x| x > 0)"))),
+        "{report:#}"
+    );
+
+    // Custom non-std methods must not produce false findings or fail compilation.
+    assert!(
+        !report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| matches!(
+                f["code"].as_str().unwrap_or(""),
+                "c.starts_with(1)" | "c.floor()" | "c.clamp(0, 0)"
+            )),
+        "{report:#}"
+    );
+
+    // With --rebuild, dropping "PUT" from `["GET", "POST", "PUT"].contains(&m)` survives.
+    let run = tmt(
+        &dir,
+        &["--json", "--quiet", "--rebuild", "--lines", "src/lib.rs:23"],
+    );
+    assert_eq!(run.code, 2, "{}", run.stderr);
+    let rebuilt: Value = serde_json::from_str(&run.stdout).unwrap();
+    let survivors = findings(&rebuilt, "survivor");
+    assert_eq!(survivors.len(), 1, "{rebuilt:#}");
+}

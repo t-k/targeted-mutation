@@ -330,6 +330,20 @@ pub enum Mutation {
     MinMax,
     /// `v.first()` becomes `v.last()` and the other way round.
     OtherEnd,
+    /// `s.starts_with(p)` / `s.ends_with(p)` becomes `s.contains(p)`.
+    StrContains,
+    /// `s.replace(a, b)` becomes `s.replacen(a, b, 1)` and the other way round.
+    StrReplaceMultiplicity,
+    /// `x.clamp(lo, hi)` becomes `x.min(hi)` (drop lower bound).
+    ClampDropLower,
+    /// `x.clamp(lo, hi)` becomes `x.max(lo)` (drop upper bound).
+    ClampDropUpper,
+    /// First alternative rounding method (`floor`/`ceil`/`round`/`trunc`).
+    RoundAlt1,
+    /// Second alternative rounding method (`floor`/`ceil`/`round`/`trunc`).
+    RoundAlt2,
+    /// `iter.all(f)` <-> `iter.any(f)`.
+    QuantifierSwap,
 }
 
 impl Mutation {
@@ -351,6 +365,13 @@ impl Mutation {
             Mutation::RangeEnd => "rng".to_string(),
             Mutation::MinMax => "mmx".to_string(),
             Mutation::OtherEnd => "end".to_string(),
+            Mutation::StrContains => "stc".to_string(),
+            Mutation::StrReplaceMultiplicity => "srp".to_string(),
+            Mutation::ClampDropLower => "cll".to_string(),
+            Mutation::ClampDropUpper => "clu".to_string(),
+            Mutation::RoundAlt1 => "rd1".to_string(),
+            Mutation::RoundAlt2 => "rd2".to_string(),
+            Mutation::QuantifierSwap => "qsw".to_string(),
         }
     }
 }
@@ -980,7 +1001,10 @@ impl ArithObs {
 
     /// Whether mutation `m` computes another value in this test.
     pub fn infected_by(&self, m: Mutation) -> bool {
-        if m == Mutation::ArithSwap2 {
+        if matches!(
+            m,
+            Mutation::ArithSwap2 | Mutation::ClampDropUpper | Mutation::RoundAlt2
+        ) {
             self.differs2
         } else {
             self.differs
