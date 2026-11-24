@@ -8,7 +8,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::ops::Range;
 
-use syn::parse::Parser;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 use syn::{Expr, Item, ItemFn, ReturnType};
@@ -188,8 +187,7 @@ fn collect_pat_idents(pat: &syn::Pat, names: &mut BTreeSet<String>) {
 /// A function a test can call by its name alone and whose result can be looked at.
 fn callable(function: &ItemFn) -> bool {
     let signature = &function.sig;
-    super::simple::supports(function)
-        && signature.constness.is_none()
+    super::common::is_plain_fn(function, false)
         && matches!(&signature.output, ReturnType::Type(_, ty) if !unit_or_never(ty))
 }
 
@@ -328,9 +326,7 @@ impl<'ast> Visit<'ast> for Calls<'_> {
         if !assertion(mac) {
             return;
         }
-        let Ok(args) = syn::punctuated::Punctuated::<Expr, syn::Token![,]>::parse_terminated
-            .parse2(mac.tokens.clone())
-        else {
+        let Some(args) = super::common::parse_macro_exprs(mac) else {
             return;
         };
         let compares = mac.path.is_ident("assert_eq") || mac.path.is_ident("debug_assert_eq");

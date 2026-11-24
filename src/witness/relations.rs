@@ -144,52 +144,23 @@ pub(super) fn discover(source: &str, file: &syn::File, out: &mut Vec<Candidate>)
 }
 
 fn is_direct_function(function: &ItemFn) -> bool {
-    let signature = &function.sig;
-    signature.generics.params.is_empty()
-        && signature.asyncness.is_none()
-        && signature.unsafety.is_none()
-        && signature.constness.is_none()
-        && signature.abi.is_none()
-        && function.attrs.iter().all(|attr| {
-            ["doc", "inline", "must_use"]
-                .iter()
-                .any(|name| attr.path().is_ident(name))
-        })
+    super::common::is_plain_fn(function, false)
 }
 
 fn type_name(ty: &Type) -> Option<&Ident> {
-    let Type::Path(path) = ty else { return None };
-    if path.qself.is_some() {
-        return None;
-    }
-    path.path.get_ident()
+    super::common::type_name(ty)
 }
 
 fn binding(pattern: &Pat) -> Option<&Ident> {
-    let Pat::Ident(binding) = pattern else {
-        return None;
-    };
-    (binding.by_ref.is_none() && binding.subpat.is_none()).then_some(&binding.ident)
+    super::common::ident_binding(pattern)
 }
 
-fn unparen(mut expression: &Expr) -> &Expr {
-    loop {
-        expression = match expression {
-            Expr::Paren(paren) => &paren.expr,
-            Expr::Group(group) => &group.expr,
-            _ => return expression,
-        };
-    }
+fn unparen(expression: &Expr) -> &Expr {
+    super::common::unparen(expression)
 }
 
 fn path_name(expression: &Expr) -> Option<&Ident> {
-    let Expr::Path(path) = unparen(expression) else {
-        return None;
-    };
-    if path.qself.is_some() {
-        return None;
-    }
-    path.path.get_ident()
+    super::common::unparen_path_ident(expression)
 }
 
 fn parameters<'a>(

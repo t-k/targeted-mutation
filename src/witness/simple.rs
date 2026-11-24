@@ -7,6 +7,10 @@ use syn::spanned::Spanned;
 use syn::visit::Visit;
 use syn::{BinOp, Expr, FnArg, Item, ItemFn, Pat, ReturnType, Stmt, Type};
 
+use super::common::{
+    ident_binding, is_integer_type_name as is_integer, is_plain_fn, type_name, unparen,
+    unparen_path_ident as path,
+};
 use super::{Candidate, Edit, Scenario};
 
 pub(super) fn discover(
@@ -38,52 +42,18 @@ pub(super) fn discover(
 }
 
 pub(super) fn supports(function: &ItemFn) -> bool {
-    let signature = &function.sig;
-    signature.generics.params.is_empty()
-        && signature.asyncness.is_none()
-        && signature.unsafety.is_none()
-        && signature.abi.is_none()
-        && function.attrs.iter().all(|attr| {
-            ["doc", "inline", "must_use"]
-                .iter()
-                .any(|name| attr.path().is_ident(name))
-        })
+    is_plain_fn(function, true)
 }
 
 fn parameter(item: &FnArg) -> Option<(&syn::Ident, &Type)> {
     let FnArg::Typed(typed) = item else {
         return None;
     };
-    let Pat::Ident(binding) = typed.pat.as_ref() else {
-        return None;
-    };
-    (binding.by_ref.is_none() && binding.subpat.is_none()).then_some((&binding.ident, &typed.ty))
-}
-
-fn type_name(ty: &Type) -> Option<&syn::Ident> {
-    let Type::Path(named) = ty else { return None };
-    named.path.get_ident().filter(|_| named.qself.is_none())
+    Some((ident_binding(&typed.pat)?, &typed.ty))
 }
 
 fn returns(function: &ItemFn, name: &str) -> bool {
     matches!(&function.sig.output, ReturnType::Type(_, ty) if type_name(ty).is_some_and(|id| id == name))
-}
-
-fn is_integer(name: &syn::Ident) -> bool {
-    matches!(
-        name.to_string().as_str(),
-        "i8" | "i16"
-            | "i32"
-            | "i64"
-            | "i128"
-            | "isize"
-            | "u8"
-            | "u16"
-            | "u32"
-            | "u64"
-            | "u128"
-            | "usize"
-    )
 }
 
 fn tail(function: &ItemFn) -> Option<&Expr> {
@@ -91,20 +61,6 @@ fn tail(function: &ItemFn) -> Option<&Expr> {
         return None;
     };
     Some(expr)
-}
-
-fn unparen(mut expr: &Expr) -> &Expr {
-    while let Expr::Paren(paren) = expr {
-        expr = &paren.expr;
-    }
-    expr
-}
-
-fn path(expr: &Expr) -> Option<&syn::Ident> {
-    let Expr::Path(named) = unparen(expr) else {
-        return None;
-    };
-    named.path.get_ident().filter(|_| named.qself.is_none())
 }
 
 fn integer_literal(expr: &Expr) -> Option<&syn::LitInt> {

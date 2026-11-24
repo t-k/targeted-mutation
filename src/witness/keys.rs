@@ -2,7 +2,6 @@
 //! the value without one of them is what tests let through that never have two values
 //! in one place which differ in that parameter alone.
 
-use syn::parse::Parser;
 use syn::spanned::Spanned;
 use syn::{Expr, FnArg, Item, Pat, ReturnType, Stmt, Type};
 
@@ -253,9 +252,7 @@ impl<'a> Visit<'a> for TestCalls<'_> {
         if !is_assertion {
             return;
         }
-        if let Ok(args) = syn::punctuated::Punctuated::<Expr, syn::Token![,]>::parse_terminated
-            .parse2(mac.tokens.clone())
-        {
+        if let Some(args) = super::common::parse_macro_exprs(mac) {
             for arg in &args {
                 self.visit_expr(arg);
             }
@@ -404,10 +401,7 @@ pub(super) fn discover(source: &str, file: &syn::File, out: &mut Vec<Candidate>)
         };
         match body {
             Expr::Macro(call) if call.mac.path.is_ident("format") => {
-                let Ok(args) =
-                    syn::punctuated::Punctuated::<Expr, syn::Token![,]>::parse_terminated
-                        .parse2(call.mac.tokens.clone())
-                else {
+                let Some(args) = super::common::parse_macro_exprs(&call.mac) else {
                     continue;
                 };
                 let mut args = args.iter();

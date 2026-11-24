@@ -11,6 +11,7 @@ use syn::{Expr, FnArg, Item, ItemFn, Pat, Type};
 use crate::report::VerifiedWitness;
 
 mod assertions;
+mod common;
 mod keys;
 mod relations;
 mod rounding;
@@ -341,35 +342,18 @@ fn position_searches(source: &str, file: &syn::File) -> Vec<PositionSearch> {
 }
 
 fn binding(pattern: &Pat) -> Option<&syn::Ident> {
-    let Pat::Ident(binding) = pattern else {
-        return None;
-    };
-    (binding.by_ref.is_none() && binding.mutability.is_none() && binding.subpat.is_none())
-        .then_some(&binding.ident)
+    common::immutable_binding(pattern)
 }
 
 fn path_ident(expr: &Expr) -> Option<&syn::Ident> {
-    let Expr::Path(path) = expr else { return None };
-    path.qself
-        .is_none()
-        .then(|| path.path.get_ident())
-        .flatten()
+    common::path_ident(expr)
 }
 
 fn position_method(function: &ItemFn) -> Option<&syn::ExprMethodCall> {
-    let signature = &function.sig;
-    if function.attrs.iter().any(|attr| {
-        !["doc", "inline", "must_use"]
-            .iter()
-            .any(|name| attr.path().is_ident(name))
-    }) || !signature.generics.params.is_empty()
-        || signature.asyncness.is_some()
-        || signature.unsafety.is_some()
-        || signature.constness.is_some()
-        || signature.abi.is_some()
-    {
+    if !common::is_plain_fn(function, false) {
         return None;
     }
+    let signature = &function.sig;
     let [FnArg::Typed(values), FnArg::Typed(needle)] =
         signature.inputs.iter().collect::<Vec<_>>()[..]
     else {

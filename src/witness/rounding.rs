@@ -3,7 +3,6 @@
 
 use std::collections::BTreeMap;
 
-use syn::parse::Parser;
 use syn::spanned::Spanned;
 use syn::visit::Visit;
 use syn::{BinOp, Expr, FnArg, Item, ItemFn, Pat, Type};
@@ -149,8 +148,7 @@ impl<'ast> Visit<'ast> for Calls {
     fn visit_macro(&mut self, mac: &'ast syn::Macro) {
         let asserts = ["assert", "assert_eq", "assert_ne", "debug_assert_eq"];
         if asserts.iter().any(|name| mac.path.is_ident(name))
-            && let Ok(args) = syn::punctuated::Punctuated::<Expr, syn::Token![,]>::parse_terminated
-                .parse2(mac.tokens.clone())
+            && let Some(args) = super::common::parse_macro_exprs(mac)
         {
             for arg in &args {
                 self.visit_expr(arg);

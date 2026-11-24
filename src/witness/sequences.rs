@@ -3,7 +3,6 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use quote::ToTokens;
-use syn::parse::Parser as _;
 use syn::spanned::Spanned as _;
 use syn::visit::Visit;
 use syn::{Expr, ExprCall, FnArg, Item, ItemFn, Pat, Stmt, Type};
@@ -130,11 +129,7 @@ fn single_arg<T>(nodes: &syn::punctuated::Punctuated<T, syn::Token![,]>) -> Opti
 fn assert_eq_args(mac: &syn::Macro) -> Option<syn::punctuated::Punctuated<Expr, syn::Token![,]>> {
     mac.path
         .is_ident("assert_eq")
-        .then(|| {
-            syn::punctuated::Punctuated::<Expr, syn::Token![,]>::parse_terminated
-                .parse2(mac.tokens.clone())
-                .ok()
-        })
+        .then(|| super::common::parse_macro_exprs(mac))
         .flatten()
 }
 
@@ -148,13 +143,7 @@ fn statement_assertion(stmt: &Stmt) -> Option<syn::punctuated::Punctuated<Expr, 
 }
 
 fn primitive(ty: &Type) -> Option<&syn::Ident> {
-    let Type::Path(ty) = ty else {
-        return None;
-    };
-    if ty.qself.is_some() {
-        return None;
-    }
-    ty.path.get_ident()
+    super::common::type_name(ty)
 }
 
 fn return_type(signature: &syn::Signature) -> Option<&Type> {
