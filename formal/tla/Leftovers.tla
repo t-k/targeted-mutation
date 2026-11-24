@@ -10,124 +10,160 @@
 (*                                                                             *)
 (* Other commands of the tool that are between fork and exec while its handle  *)
 (* is open have a copy as well ("passing"). They are active children of the    *)
-(* tool, let go by themselves, and must never be stopped. Under PID 1 or a     *)
-(* subreaper, orphaned processes of the run may be reparented to the tool      *)
-(* ("reparented"); they are tracked separately from active sibling children    *)
-(* and are still stopped during the sweep.                                     *)
+(* tool (`parent = "me"` and registered in `active`), let go by themselves,    *)
+(* and must never be stopped. Under PID 1 or a subreaper (`subreaper = TRUE`), *)
+(* orphaned descendants of the run also report `parent = "me"` once their      *)
+(* parent exits, so `List` separates them from active sibling children using   *)
+(* the exact `is_left_candidate` predicate from `src/leftovers.rs`.            *)
 EXTENDS Naturals, FiniteSets
 
 CONSTANTS Procs,      \* processes the run may start, the run itself included
           Passing,    \* active sibling children of the tool (e.g. fork..exec)
           MaxForks    \* how many processes may be started after the run began
 
-VARIABLES phase,      \* "open", "running", "sweeping", "done"
-          has,        \* processes of the run that have the file
-          reparented, \* processes of the run reparented to the tool (subreaper/PID 1)
-          copies,     \* passing commands that have a copy
+AllProcs == Procs \cup Passing
+Parents == Procs \cup {"me", "other", "none"}
+
+VARIABLES subreaper,  \* whether this tool process is PID 1 or a subreaper
+          phase,      \* "open", "running", "sweeping", "done"
+          root,       \* initial direct child process started for the run (or "none")
+          has,        \* processes of the run that currently hold the file
+          copies,     \* active sibling children that temporarily hold a copy
+          parent,     \* current parent of every process in AllProcs
+          active,     \* ACTIVE_CHILDREN: live direct children owned by this tool
           listed,     \* the listing the sweep is working on
           stopped,    \* everything the sweep ever stopped
           forks       \* processes started so far
 
-vars == <<phase, has, reparented, copies, listed, stopped, forks>>
+vars == <<subreaper, phase, root, has, copies, parent, active, listed, stopped, forks>>
 
-Init == /\ phase = "open"
+Init == /\ subreaper \in {FALSE, TRUE}
+        /\ phase = "open"
+        /\ root = "none"
         /\ has = {}
-        /\ reparented = {}
         /\ copies = {}
+        /\ parent = [p \in AllProcs |-> "none"]
+        /\ active = {}
         /\ listed = {}
         /\ stopped = {}
         /\ forks = 0
 
-\* Another command of the tool forks while the handle is open.
+\* Matches `is_left_candidate(pid, me, parent, active_child, subreaper)` in `src/leftovers.rs`.
+IsLeftCandidate(p) ==
+    /\ parent[p] # "none"
+    /\ (parent[p] # "me" \/ (subreaper /\ p \notin active))
+
+\* Another command of the tool forks while the handle is open; `STARTING` synchronizes
+\* its registration in `active` (`ACTIVE_CHILDREN`) before any sweep inspects `active`.
 Pass(c) == /\ phase = "open"
            /\ c \notin copies
            /\ copies' = copies \cup {c}
-           /\ UNCHANGED <<phase, has, reparented, listed, stopped, forks>>
+           /\ parent' = [parent EXCEPT ![c] = "me"]
+           /\ active' = active \cup {c}
+           /\ UNCHANGED <<subreaper, phase, root, has, listed, stopped, forks>>
 
-\* It reaches its exec, or ends: the copy is closed.
+\* The sibling command reaches its exec, or ends: the copy is closed and unregistered.
 Let(c) == /\ c \in copies
           /\ copies' = copies \ {c}
-          /\ UNCHANGED <<phase, has, reparented, listed, stopped, forks>>
+          /\ parent' = [parent EXCEPT ![c] = "none"]
+          /\ active' = active \ {c}
+          /\ UNCHANGED <<subreaper, phase, root, has, listed, stopped, forks>>
 
-\* The run starts with the file, and the tool closes its handle.
+\* The run starts with the file, registers its root child in `active`, and closes our handle.
 Start(p) == /\ phase = "open"
+            /\ root' = p
             /\ has' = {p}
+            /\ parent' = [parent EXCEPT ![p] = "me"]
+            /\ active' = active \cup {p}
             /\ phase' = "running"
-            /\ UNCHANGED <<reparented, copies, listed, stopped, forks>>
+            /\ UNCHANGED <<subreaper, copies, listed, stopped, forks>>
 
-\* A process with the file starts another, which has it too.
+\* A process with the file starts another, which inherits the file with `p` as parent.
 Fork(p, q) == /\ phase \in {"running", "sweeping"}
               /\ p \in has
-              /\ q \notin has /\ q \notin stopped
+              /\ q \notin has /\ q \notin stopped /\ q # root
               /\ forks < MaxForks
               /\ has' = has \cup {q}
+              /\ parent' = [parent EXCEPT ![q] = p]
               /\ forks' = forks + 1
-              /\ UNCHANGED <<phase, reparented, copies, listed, stopped>>
+              /\ UNCHANGED <<subreaper, phase, root, copies, active, listed, stopped>>
 
-\* Under PID 1 or a subreaper, a descendant whose parent exited is reparented to the tool.
-Reparent(p) == /\ phase \in {"running", "sweeping"}
-               /\ p \in has /\ p \notin reparented
-               /\ reparented' = reparented \cup {p}
-               /\ UNCHANGED <<phase, has, copies, listed, stopped, forks>>
+\* Helper: when `p` exits, its living children in `has` are reparented to `"me"` under
+\* PID 1 / subreaper, or to `"other"` (init) otherwise.
+ReparentChildren(p) ==
+    [x \in AllProcs |->
+        IF x = p THEN "none"
+        ELSE IF x \in has /\ parent[x] = p THEN (IF subreaper THEN "me" ELSE "other")
+        ELSE parent[x]]
 
-\* A process ends by itself.
+\* A process ends by itself (reparenting any living children it spawned).
 Exit(p) == /\ phase \in {"running", "sweeping"}
            /\ p \in has
            /\ has' = has \ {p}
-           /\ reparented' = reparented \ {p}
-           /\ UNCHANGED <<phase, copies, listed, stopped, forks>>
+           /\ parent' = ReparentChildren(p)
+           /\ active' = active \ {p}
+           /\ UNCHANGED <<subreaper, phase, root, copies, listed, stopped, forks>>
 
-\* The run is over (collected by the tool): from here the tool sweeps.
+\* The run's direct child has ended and been collected (`Watch::finish` clears its active entry).
 RunOver == /\ phase = "running"
+           /\ root \notin has
            /\ phase' = "sweeping"
-           /\ UNCHANGED <<has, reparented, copies, listed, stopped, forks>>
+           /\ UNCHANGED <<subreaper, root, has, copies, parent, active, listed, stopped, forks>>
 
 \* The lock is free: nobody has the file.
 Free == /\ phase = "sweeping"
         /\ has = {} /\ copies = {}
         /\ phase' = "done"
-        /\ UNCHANGED <<has, reparented, copies, listed, stopped, forks>>
+        /\ UNCHANGED <<subreaper, root, has, copies, parent, active, listed, stopped, forks>>
 
-\* The lock is held: list who has the file, keeping reparented orphans while
-\* excluding active sibling children of the tool (`copies`).
+\* The lock is held: inspect EVERY holder (`has \cup copies`) and keep only those
+\* matching `IsLeftCandidate`, without consulting whether `p \in Procs` or `p \in Passing`.
 List == /\ phase = "sweeping"
         /\ has \cup copies # {}
         /\ listed = {}
-        /\ listed' = has
-        /\ UNCHANGED <<phase, has, reparented, copies, stopped, forks>>
+        /\ listed' = {p \in has \cup copies : IsLeftCandidate(p)}
+        /\ UNCHANGED <<subreaper, phase, root, has, copies, parent, active, stopped, forks>>
 
-\* Stop one of the listed. It may have ended since.
+\* Stop one of the listed. It may have ended since; if it had living children, they reparent.
 Stop(p) == /\ phase = "sweeping"
            /\ p \in listed
            /\ listed' = listed \ {p}
            /\ has' = has \ {p}
-           /\ reparented' = reparented \ {p}
+           /\ copies' = copies \ {p}
+           /\ parent' = ReparentChildren(p)
+           /\ active' = active \ {p}
            /\ stopped' = stopped \cup {p}
-           /\ UNCHANGED <<phase, copies, forks>>
+           /\ UNCHANGED <<subreaper, phase, root, forks>>
 
 Next == \/ \E c \in Passing : Pass(c) \/ Let(c)
-        \/ \E p \in Procs : Start(p) \/ Reparent(p) \/ Exit(p) \/ Stop(p)
+        \/ \E p \in Procs : Start(p) \/ Exit(p)
+        \/ \E p \in AllProcs : Stop(p)
         \/ \E p, q \in Procs : Fork(p, q)
         \/ RunOver \/ Free \/ List
         \/ (phase = "done" /\ UNCHANGED vars)
 
 Spec == /\ Init /\ [][Next]_vars
         /\ WF_vars(Free) /\ WF_vars(List)
-        /\ \A p \in Procs : WF_vars(Stop(p))
+        /\ \A p \in AllProcs : WF_vars(Stop(p))
         /\ \A c \in Passing : WF_vars(Let(c))
 
-TypeOK == /\ phase \in {"open", "running", "sweeping", "done"}
-          /\ has \subseteq Procs /\ reparented \subseteq has
+TypeOK == /\ subreaper \in {FALSE, TRUE}
+          /\ phase \in {"open", "running", "sweeping", "done"}
+          /\ root \in Procs \cup {"none"}
+          /\ has \subseteq Procs
           /\ copies \subseteq Passing
-          /\ listed \subseteq Procs /\ stopped \subseteq Procs
+          /\ parent \in [AllProcs -> Parents]
+          /\ active \subseteq AllProcs
+          /\ listed \subseteq AllProcs
+          /\ stopped \subseteq AllProcs
 
-\* A command of the tool is never stopped, and nothing is stopped before the run is over.
+\* An active sibling command of the tool is never stopped, and nothing is stopped before sweep.
 OnlyTheRuns == /\ stopped \cap Passing = {}
                /\ (phase \in {"open", "running"} => stopped = {})
 
-\* When the sweep says it is done, nobody has the file (including reparented orphans).
-DoneIsClean == phase = "done" => (has = {} /\ reparented = {} /\ copies = {})
+\* When the sweep says it is done, nobody has the file.
+DoneIsClean == phase = "done" => (has = {} /\ copies = {})
 
-\* A run that is over is cleaned up in the end (the number of forks is bounded).
+\* A run that is over is cleaned up in the end (even when orphans reparent to `"me"`).
 Cleans == (phase = "sweeping") ~> (phase = "done")
 =============================================================================

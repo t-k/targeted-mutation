@@ -31,7 +31,7 @@ Examples:
 
 Exit codes:
   0  No gaps found
-  1  Analysis or CLI error (e.g. baseline tests failed)
+  1  Analysis or CLI error (invalid arguments or baseline tests failed)
   2  Test gaps, unstable predictions, or audit discrepancies found
   3  Incomplete evaluation (no mutants executed, or source-only timeout/unevaluated)";
 
@@ -206,7 +206,7 @@ struct Cli {
     #[arg(long, value_name = "PACKAGE", help_heading = HEADING_TESTS)]
     also_test: Vec<String>,
 
-    /// Also run tests of every workspace package that depends on the analysed package.
+    /// Also run tests of workspace packages depending on this package.
     #[arg(long, help_heading = HEADING_TESTS)]
     dependents: bool,
 
@@ -225,7 +225,7 @@ struct Cli {
     #[arg(long, help_heading = HEADING_TESTS)]
     doc: bool,
 
-    /// Test runner to use (`nextest` requires `--source-only`).
+    /// Test runner (`nextest` requires `--source-only`).
     #[arg(
         long,
         value_enum,
@@ -235,15 +235,15 @@ struct Cli {
     )]
     test_tool: TestTool,
 
-    /// Nextest profile to use with `--test-tool nextest`.
+    /// Nextest profile for `--test-tool nextest`.
     #[arg(long, value_name = "PROFILE", help_heading = HEADING_TESTS)]
     nextest_profile: Option<String>,
 
-    /// Run one selected libtest test per process, including its child threads.
+    /// Run each selected libtest test in its own process.
     #[arg(long, help_heading = HEADING_TESTS)]
     isolate_tests: bool,
 
-    /// Select Cargo test target names to run and build when possible (repeatable).
+    /// Cargo test targets to run and build when possible (repeatable).
     #[arg(long, value_name = "TARGET", help_heading = HEADING_TESTS)]
     test_target: Vec<String>,
 
@@ -259,11 +259,11 @@ struct Cli {
     #[arg(long, help_heading = HEADING_TESTS)]
     include_ignored: bool,
 
-    /// Workspace-relative wrapper executable invoked with each test binary and its args.
+    /// Workspace-relative wrapper invoked with each test binary.
     #[arg(long, value_name = "PATH", help_heading = HEADING_TESTS)]
     test_wrapper: Option<PathBuf>,
 
-    /// Seconds for `--test-wrapper` to clean up after timeout on Unix (0 kills immediately).
+    /// Grace period for `--test-wrapper` on Unix timeout (0 kills immediately).
     #[arg(
         long,
         value_name = "SECONDS",
@@ -274,7 +274,7 @@ struct Cli {
     wrapper_grace: u64,
 
     // ── Output & Baselines ────────────────────────────────────────────────────
-    /// Output format: text, json, jsonl, or sarif [default: text].
+    /// Output format (default: text).
     #[arg(
         long,
         value_enum,
@@ -357,7 +357,7 @@ struct Cli {
     )]
     timeout: Option<u64>,
 
-    /// Policy for rechecking timeouts from parallel mutation workers.
+    /// Policy for rechecking parallel worker timeouts.
     #[arg(
         long,
         value_enum,
@@ -367,14 +367,15 @@ struct Cli {
     )]
     timeout_recheck: TimeoutRecheck,
 
-    /// Save and resume completed mutant outcomes via `checkpoint.jsonl` in the work dir.
+    /// Save and resume completed mutant outcomes via `checkpoint.jsonl`.
     #[arg(long, conflicts_with = "list", help_heading = HEADING_BUILD)]
     checkpoint: bool,
 
-    /// Override Cargo optimisation level for instrumented test builds (0 to 3).
+    /// Override Cargo optimisation level for test builds (0 to 3).
     ///
-    /// Probes have near-zero overhead when optimised, which helps loop-heavy tests, at
-    /// the cost of slower builds and tests differing from plain `cargo test`.
+    /// Applies to both probe and `--source-only` builds. Probes have near-zero overhead
+    /// when optimised, which helps loop-heavy tests, at the cost of slower builds and
+    /// tests differing from plain `cargo test`.
     #[arg(
         long,
         value_name = "N",
@@ -458,24 +459,56 @@ impl Cli {
         }
     }
 
-    fn validate(&self) -> Result<(), &'static str> {
+    fn validate(&self) -> Result<(), clap::Error> {
+        use clap::{CommandFactory, error::ErrorKind};
+
         if !matches!(self.test_tool, TestTool::Nextest) && self.nextest_profile.is_some() {
-            return Err("--nextest-profile requires --test-tool nextest");
+            return Err(Cli::command().error(
+                ErrorKind::MissingRequiredArgument,
+                "--nextest-profile requires --test-tool nextest",
+            ));
         }
         if self.list && self.output_format() == OutputFormat::Sarif {
-            return Err("--list cannot be used with --format sarif");
+            return Err(Cli::command().error(
+                ErrorKind::ArgumentConflict,
+                "the argument '--list' cannot be used with '--format sarif'",
+            ));
         }
         Ok(())
     }
 }
 
-/// Exit codes: 0 no gaps, 1 analysis failed, 2 gaps found, 3 incomplete evaluation.
-fn main() -> ExitCode {
-    let cli = Cli::parse_from(arguments(std::env::args_os()));
-    if let Err(message) = cli.validate() {
-        eprintln!("tmt: {message}");
-        return ExitCode::FAILURE;
+/// Parses and validates CLI arguments.
+///
+/// Help and version requests print to stdout and return `Err(ExitCode::SUCCESS)`.
+/// All argument parse and validation errors print to stderr and return
+/// `Err(ExitCode::FAILURE)` (exit code 1) so they are never confused with exit code 2
+/// (test gaps found).
+fn parse_cli(given: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Cli, ExitCode> {
+    let cli = match Cli::try_parse_from(arguments(given)) {
+        Ok(cli) => cli,
+        Err(err) => {
+            let _ = err.print();
+            return Err(if err.use_stderr() {
+                ExitCode::FAILURE
+            } else {
+                ExitCode::SUCCESS
+            });
+        }
+    };
+    if let Err(err) = cli.validate() {
+        let _ = err.print();
+        return Err(ExitCode::FAILURE);
     }
+    Ok(cli)
+}
+
+/// Exit codes: 0 no gaps, 1 analysis/CLI error, 2 gaps found, 3 incomplete evaluation.
+fn main() -> ExitCode {
+    let cli = match parse_cli(std::env::args_os()) {
+        Ok(cli) => cli,
+        Err(code) => return code,
+    };
     let output_format = cli.output_format();
     let nextest = matches!(cli.test_tool, TestTool::Nextest);
     let options = driver::Options {
@@ -606,7 +639,7 @@ fn show_report(result: &report::Report, format: OutputFormat, show_unreached: bo
                 );
             }
         }
-        OutputFormat::Text | OutputFormat::Jsonl => {
+        OutputFormat::Text => {
             if let Some(mutants) = &result.mutants {
                 println!("{}: {} source candidates", result.package, mutants.len());
                 for candidate in mutants {
@@ -620,6 +653,7 @@ fn show_report(result: &report::Report, format: OutputFormat, show_unreached: bo
                 print!("{}", report::render_text(result, show_unreached));
             }
         }
+        OutputFormat::Jsonl => unreachable!("jsonl output is streamed by stream_reports"),
     }
 }
 
@@ -706,11 +740,12 @@ fn show_workspace(
                 .collect();
             println!("{:#}", report::workspace_sarif(&reports, &failed));
         }
-        OutputFormat::Text | OutputFormat::Jsonl => {
+        OutputFormat::Text => {
             for result in &reports {
                 show_report(result, OutputFormat::Text, show_unreached);
             }
         }
+        OutputFormat::Jsonl => unreachable!("jsonl output is streamed by stream_reports"),
     }
     ExitCode::from(if has_errors {
         1
@@ -777,7 +812,7 @@ mod tests {
     }
 
     #[test]
-    fn output_format_supports_unified_option_and_legacy_shorthands() {
+    fn output_format_resolves_unified_option_and_legacy_shorthands() {
         let default_cli = Cli::parse_from(given(&["cargo-tmt", "tmt"]));
         assert_eq!(default_cli.output_format(), OutputFormat::Text);
         assert!(default_cli.validate().is_ok());
@@ -790,6 +825,8 @@ mod tests {
             (&["--json"][..], OutputFormat::Json),
             (&["--jsonl"][..], OutputFormat::Jsonl),
             (&["--sarif"][..], OutputFormat::Sarif),
+            (&["--list", "--format", "json"][..], OutputFormat::Json),
+            (&["--list", "--format", "jsonl"][..], OutputFormat::Jsonl),
         ] {
             let mut argv = vec!["cargo-tmt", "tmt"];
             argv.extend_from_slice(args);
@@ -797,46 +834,126 @@ mod tests {
             assert_eq!(cli.output_format(), expected, "for {args:?}");
             assert!(cli.validate().is_ok(), "for {args:?}");
         }
+    }
 
-        // Conflicting format combinations are rejected at parse time.
+    #[test]
+    fn parse_cli_exits_one_on_errors_and_zero_on_help_or_version() {
+        for ok_exit in [&["-h"][..], &["--help"][..], &["-V"][..]] {
+            let mut argv = vec!["cargo-tmt", "tmt"];
+            argv.extend_from_slice(ok_exit);
+            assert_eq!(
+                parse_cli(argv.iter().map(std::ffi::OsString::from)).err(),
+                Some(ExitCode::SUCCESS),
+                "expected exit 0 for {ok_exit:?}"
+            );
+        }
+
+        // Every parse error, value-range error, and cross-option validation error exits 1
+        // so CI never mistakes a CLI error for exit code 2 (test gaps found).
         for bad in [
+            &["--format", "xml"][..],
+            &["--bogus"][..],
             &["--format", "json", "--sarif"][..],
             &["--format", "text", "--json"][..],
             &["--format", "sarif", "--jsonl"][..],
             &["--json", "--jsonl"][..],
             &["--json", "--sarif"][..],
             &["--list", "--sarif"][..],
+            &["--list", "--format", "sarif"][..],
+            &["--nextest-profile", "ci"][..],
+            &["--jobs", "0"][..],
             &["--baseline-jobs", "0"][..],
             &["--timeout", "0"][..],
             &["--opt-level", "4"][..],
         ] {
             let mut argv = vec!["cargo-tmt", "tmt"];
             argv.extend_from_slice(bad);
-            assert!(
-                Cli::try_parse_from(given(&argv)).is_err(),
-                "expected parse error for {bad:?}"
+            assert_eq!(
+                parse_cli(argv.iter().map(std::ffi::OsString::from)).err(),
+                Some(ExitCode::FAILURE),
+                "expected exit 1 for {bad:?}"
             );
         }
 
-        // Cross-option validation rejects `--list --format sarif` and stray `--nextest-profile`.
-        let list_sarif =
-            Cli::parse_from(given(&["cargo-tmt", "tmt", "--list", "--format", "sarif"]));
-        assert!(list_sarif.validate().is_err());
+        let valid_nextest = parse_cli(
+            [
+                "cargo-tmt",
+                "tmt",
+                "--source-only",
+                "--test-tool",
+                "nextest",
+                "--nextest-profile",
+                "ci",
+            ]
+            .iter()
+            .map(std::ffi::OsString::from),
+        );
+        assert!(valid_nextest.is_ok());
+    }
 
-        let stray_profile =
-            Cli::parse_from(given(&["cargo-tmt", "tmt", "--nextest-profile", "ci"]));
-        assert!(stray_profile.validate().is_err());
-
-        let valid_nextest = Cli::parse_from(given(&[
-            "cargo-tmt",
-            "tmt",
-            "--source-only",
-            "--test-tool",
-            "nextest",
-            "--nextest-profile",
-            "ci",
-        ]));
-        assert!(valid_nextest.validate().is_ok());
+    #[test]
+    fn all_legacy_long_flags_remain_available() {
+        let cmd = Cli::command();
+        let longs: std::collections::BTreeSet<&str> = cmd
+            .get_arguments()
+            .filter_map(|arg| arg.get_long())
+            .collect();
+        for flag in [
+            "dir",
+            "package",
+            "workspace",
+            "list",
+            "test-workspace",
+            "json",
+            "jsonl",
+            "no-verify",
+            "work-dir",
+            "doc",
+            "all-files",
+            "git-index",
+            "copy-fixture",
+            "copy-fixture-exclude",
+            "copy-output-fixture",
+            "checkpoint",
+            "jobs",
+            "since",
+            "lines",
+            "baseline",
+            "write-baseline",
+            "also-test",
+            "dependents",
+            "no-effects",
+            "rebuild",
+            "error",
+            "source-only",
+            "literal-operators",
+            "shard",
+            "sharding",
+            "test-tool",
+            "nextest-profile",
+            "isolate-tests",
+            "test-target",
+            "include-test",
+            "exclude-test",
+            "include-ignored",
+            "test-wrapper",
+            "opt-level",
+            "timeout",
+            "baseline-jobs",
+            "timeout-recheck",
+            "wrapper-grace",
+            "features",
+            "all-features",
+            "no-default-features",
+            "locked",
+            "audit",
+            "sarif",
+            "show-unreached",
+            "quiet",
+            "format",
+        ] {
+            assert!(longs.contains(flag), "missing flag --{flag}");
+        }
     }
 
     #[test]
