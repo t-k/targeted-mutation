@@ -320,7 +320,7 @@ enum Kind {
     Nothing,
 }
 
-fn classify(current: &str, hunks: &[Hunk]) -> Vec<(Hunk, Kind)> {
+fn classify(current: &str, hunks: &[Hunk], include_subhunks: bool) -> Vec<(Hunk, Kind)> {
     let Ok(parsed) = instrument::parse_source(current) else {
         return vec![];
     };
@@ -433,18 +433,19 @@ fn classify(current: &str, hunks: &[Hunk]) -> Vec<(Hunk, Kind)> {
             outside: false,
             subhunk: None,
         };
-        let subhunks = if let Some((undone_text, undone_tree)) = undone_for_subhunks {
-            subhunk_changes(
-                current,
-                &parsed,
-                &tests_now,
-                undone_text,
-                undone_tree,
-                &whole,
-            )
-        } else {
-            vec![]
-        };
+        let subhunks =
+            if include_subhunks && let Some((undone_text, undone_tree)) = undone_for_subhunks {
+                subhunk_changes(
+                    current,
+                    &parsed,
+                    &tests_now,
+                    undone_text,
+                    undone_tree,
+                    &whole,
+                )
+            } else {
+                vec![]
+            };
         kind(Kind::Program(whole));
         for sub in subhunks {
             kind(Kind::Program(sub));
@@ -494,7 +495,7 @@ fn keep_tests(
 /// changes no token (comments, documentation, spacing), and one that only touches code
 /// of the tests. `current` is the file as it is now, and the hunks are of it.
 pub(crate) fn changes(current: &str, hunks: &[Hunk]) -> Vec<Change> {
-    classify(current, hunks)
+    classify(current, hunks, true)
         .into_iter()
         .filter_map(|(_, kind)| match kind {
             Kind::Program(change) => Some(change),
@@ -506,7 +507,7 @@ pub(crate) fn changes(current: &str, hunks: &[Hunk]) -> Vec<Change> {
 /// How many hunks of a file change the program and its tests in lines that cannot be
 /// told apart: nothing is said of them.
 pub(crate) fn mixed(current: &str, hunks: &[Hunk]) -> usize {
-    classify(current, hunks)
+    classify(current, hunks, false)
         .iter()
         .filter(|(_, kind)| matches!(kind, Kind::Mixed))
         .count()
@@ -514,10 +515,9 @@ pub(crate) fn mixed(current: &str, hunks: &[Hunk]) -> usize {
 
 /// The hunks of a file that change its tests and nothing else.
 pub(crate) fn test_hunks(current: &str, hunks: &[Hunk]) -> Vec<Hunk> {
-    classify(current, hunks)
+    classify(current, hunks, false)
         .into_iter()
-        .filter(|(_, kind)| matches!(kind, Kind::Tests))
-        .map(|(hunk, _)| hunk)
+        .filter_map(|(hunk, kind)| matches!(kind, Kind::Tests).then_some(hunk))
         .collect()
 }
 
@@ -713,6 +713,25 @@ fn expr_attrs(expr: &syn::Expr) -> &[syn::Attribute] {
     }
 }
 
+fn expr_has_skip_or_test(expr: &syn::Expr) -> bool {
+    let attrs = expr_attrs(expr);
+    if instrument::is_test_only(attrs) || instrument::is_skipped(attrs) {
+        return true;
+    }
+    match expr {
+        syn::Expr::Assign(e) => expr_has_skip_or_test(&e.left),
+        syn::Expr::Binary(e) => expr_has_skip_or_test(&e.left),
+        syn::Expr::Field(e) => expr_has_skip_or_test(&e.base),
+        syn::Expr::Index(e) => expr_has_skip_or_test(&e.expr),
+        syn::Expr::Unary(e) => expr_has_skip_or_test(&e.expr),
+        syn::Expr::Paren(e) => expr_has_skip_or_test(&e.expr),
+        syn::Expr::Group(e) => expr_has_skip_or_test(&e.expr),
+        syn::Expr::Call(e) => expr_has_skip_or_test(&e.func),
+        syn::Expr::MethodCall(e) => expr_has_skip_or_test(&e.receiver),
+        _ => false,
+    }
+}
+
 fn deletable_subhunk_stmt(stmt: &syn::Stmt, is_last: bool) -> bool {
     match stmt {
         syn::Stmt::Expr(expr, Some(_)) => {
@@ -727,13 +746,93 @@ fn deletable_subhunk_stmt(stmt: &syn::Stmt, is_last: bool) -> bool {
 }
 
 fn stmt_has_skip_or_test(stmt: &syn::Stmt) -> bool {
-    let attrs: &[syn::Attribute] = match stmt {
-        syn::Stmt::Local(l) => &l.attrs,
-        syn::Stmt::Macro(m) => &m.attrs,
-        syn::Stmt::Expr(expr, _) => expr_attrs(expr),
-        syn::Stmt::Item(_) => return true,
+    match stmt {
+        syn::Stmt::Local(l) => {
+            instrument::is_test_only(&l.attrs) || instrument::is_skipped(&l.attrs)
+        }
+        syn::Stmt::Macro(m) => {
+            instrument::is_test_only(&m.attrs) || instrument::is_skipped(&m.attrs)
+        }
+        syn::Stmt::Expr(expr, _) => expr_has_skip_or_test(expr),
+        syn::Stmt::Item(_) => true,
+    }
+}
+
+/// Collects byte ranges of all `#[cfg(test)]` / `#[mutants::skip]` subtrees in a file so
+/// sub-hunks never delete a parent node containing protected code.
+fn collect_blocked_ranges(
+    source: &str,
+    parsed: &syn::File,
+    tests_now: &[(usize, usize)],
+) -> Vec<(usize, usize)> {
+    struct Blocked<'a> {
+        source: &'a str,
+        ranges: Vec<(usize, usize)>,
+    }
+    impl<'ast> Visit<'ast> for Blocked<'_> {
+        fn visit_item(&mut self, node: &'ast syn::Item) {
+            let attrs: &[syn::Attribute] = match node {
+                syn::Item::Fn(i) => &i.attrs,
+                syn::Item::Mod(i) => &i.attrs,
+                syn::Item::Impl(i) => &i.attrs,
+                syn::Item::Const(i) => &i.attrs,
+                syn::Item::Static(i) => &i.attrs,
+                syn::Item::Struct(i) => &i.attrs,
+                syn::Item::Enum(i) => &i.attrs,
+                syn::Item::Trait(i) => &i.attrs,
+                _ => &[],
+            };
+            if instrument::is_test_only(attrs) || instrument::is_skipped(attrs) {
+                if let Some(r) = span_range(self.source, node.span()) {
+                    self.ranges.push(r);
+                }
+                return;
+            }
+            visit::visit_item(self, node);
+        }
+        fn visit_stmt(&mut self, node: &'ast syn::Stmt) {
+            if stmt_has_skip_or_test(node) {
+                if let Some(r) = span_range(self.source, node.span()) {
+                    self.ranges.push(r);
+                }
+                return;
+            }
+            visit::visit_stmt(self, node);
+        }
+        fn visit_expr(&mut self, node: &'ast syn::Expr) {
+            if expr_has_skip_or_test(node) {
+                if let Some(r) = span_range(self.source, node.span()) {
+                    self.ranges.push(r);
+                }
+                return;
+            }
+            visit::visit_expr(self, node);
+        }
+        fn visit_field_value(&mut self, node: &'ast syn::FieldValue) {
+            if instrument::is_test_only(&node.attrs) || instrument::is_skipped(&node.attrs) {
+                if let Some(r) = span_range(self.source, node.span()) {
+                    self.ranges.push(r);
+                }
+                return;
+            }
+            visit::visit_field_value(self, node);
+        }
+        fn visit_arm(&mut self, node: &'ast syn::Arm) {
+            if instrument::is_test_only(&node.attrs) || instrument::is_skipped(&node.attrs) {
+                if let Some(r) = span_range(self.source, node.span()) {
+                    self.ranges.push(r);
+                }
+                return;
+            }
+            visit::visit_arm(self, node);
+        }
+    }
+    let mut collector = Blocked {
+        source,
+        ranges: tests_now.to_vec(),
     };
-    instrument::is_test_only(attrs) || instrument::is_skipped(attrs)
+    collector.visit_file(parsed);
+    collector.ranges
 }
 
 fn field_identity(source: &str, field: &syn::FieldValue) -> (String, String) {
@@ -772,7 +871,6 @@ struct OldCollector<'a> {
     source: &'a str,
     window: (usize, usize),
     scope: Vec<String>,
-    block_counters: Vec<usize>,
     in_logical: Option<LogicalOp>,
     found: OldStructures,
 }
@@ -783,7 +881,7 @@ impl<'a> OldCollector<'a> {
     }
 
     fn record_single_value_expr(&mut self, expr: &syn::Expr) {
-        if instrument::is_test_only(expr_attrs(expr)) || instrument::is_skipped(expr_attrs(expr)) {
+        if expr_has_skip_or_test(expr) {
             return;
         }
         if let Some(range) = span_range(self.source, expr.span())
@@ -815,9 +913,7 @@ impl<'ast> Visit<'ast> for OldCollector<'_> {
             return;
         }
         self.scope.push(format!("mod:{}", node.ident));
-        self.block_counters.push(0);
         visit::visit_item_mod(self, node);
-        self.block_counters.pop();
         self.scope.pop();
     }
 
@@ -829,9 +925,7 @@ impl<'ast> Visit<'ast> for OldCollector<'_> {
             .map(|(s, e)| token_sig(&self.source[s..e]))
             .unwrap_or_default();
         self.scope.push(format!("impl:{ty}"));
-        self.block_counters.push(0);
         visit::visit_item_impl(self, node);
-        self.block_counters.pop();
         self.scope.pop();
     }
 
@@ -840,9 +934,7 @@ impl<'ast> Visit<'ast> for OldCollector<'_> {
             return;
         }
         self.scope.push(format!("fn:{}", node.sig.ident));
-        self.block_counters.push(0);
         visit::visit_item_fn(self, node);
-        self.block_counters.pop();
         self.scope.pop();
     }
 
@@ -851,9 +943,7 @@ impl<'ast> Visit<'ast> for OldCollector<'_> {
             return;
         }
         self.scope.push(format!("fn:{}", node.sig.ident));
-        self.block_counters.push(0);
         visit::visit_impl_item_fn(self, node);
-        self.block_counters.pop();
         self.scope.pop();
     }
 
@@ -862,9 +952,7 @@ impl<'ast> Visit<'ast> for OldCollector<'_> {
             return;
         }
         self.scope.push(format!("fn:{}", node.sig.ident));
-        self.block_counters.push(0);
         visit::visit_trait_item_fn(self, node);
-        self.block_counters.pop();
         self.scope.pop();
     }
 
@@ -876,11 +964,15 @@ impl<'ast> Visit<'ast> for OldCollector<'_> {
     }
 
     fn visit_expr(&mut self, node: &'ast syn::Expr) {
-        let attrs = expr_attrs(node);
-        if instrument::is_test_only(attrs) || instrument::is_skipped(attrs) {
+        if expr_has_skip_or_test(node) {
             return;
         }
+        let prev = self.in_logical;
+        if !matches!(node, syn::Expr::Binary(_)) {
+            self.in_logical = None;
+        }
         visit::visit_expr(self, node);
+        self.in_logical = prev;
     }
 
     fn visit_field_value(&mut self, node: &'ast syn::FieldValue) {
@@ -894,29 +986,26 @@ impl<'ast> Visit<'ast> for OldCollector<'_> {
         if instrument::is_test_only(&node.attrs) || instrument::is_skipped(&node.attrs) {
             return;
         }
+        let pat_sig = span_range(self.source, node.pat.span())
+            .map(|(s, e)| token_sig(&self.source[s..e]))
+            .unwrap_or_default();
+        self.scope.push(format!("arm:{pat_sig}"));
         visit::visit_arm(self, node);
+        self.scope.pop();
     }
 
     fn visit_block(&mut self, node: &'ast syn::Block) {
-        let idx = self.block_counters.last_mut().map_or(0, |c| {
-            let cur = *c;
-            *c += 1;
-            cur
-        });
-        self.scope.push(format!("b{idx}"));
-        self.block_counters.push(0);
+        let prev_logical = self.in_logical;
+        self.in_logical = None;
         if let Some(range) = span_range(self.source, node.span())
             && overlaps(range, self.window)
         {
+            // Collect ALL statements in the block for subsequence matching so a statement
+            // moving from tail to non-tail is never misclassified as newly added.
             let sigs: Vec<String> = node
                 .stmts
                 .iter()
-                .enumerate()
-                .filter_map(|(idx, stmt)| {
-                    let is_last = idx + 1 == node.stmts.len();
-                    if !deletable_subhunk_stmt(stmt, is_last) {
-                        return None;
-                    }
+                .filter_map(|stmt| {
                     let (s, e) = span_range(self.source, stmt.span())?;
                     Some(token_sig(&self.source[s..e]))
                 })
@@ -927,18 +1016,62 @@ impl<'ast> Visit<'ast> for OldCollector<'_> {
             }
         }
         visit::visit_block(self, node);
-        self.block_counters.pop();
-        self.scope.pop();
+        self.in_logical = prev_logical;
     }
 
     fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
         self.record_single_value_expr(&node.cond);
-        visit::visit_expr_if(self, node);
+        self.visit_expr(&node.cond);
+        let cond_sig = span_range(self.source, node.cond.span())
+            .map(|(s, e)| token_sig(&self.source[s..e]))
+            .unwrap_or_default();
+        self.scope.push(format!("if_then:{cond_sig}"));
+        self.visit_block(&node.then_branch);
+        self.scope.pop();
+        if let Some((_, else_branch)) = &node.else_branch {
+            self.scope.push(format!("if_else:{cond_sig}"));
+            self.visit_expr(else_branch);
+            self.scope.pop();
+        }
     }
 
     fn visit_expr_while(&mut self, node: &'ast syn::ExprWhile) {
         self.record_single_value_expr(&node.cond);
-        visit::visit_expr_while(self, node);
+        self.visit_expr(&node.cond);
+        let cond_sig = span_range(self.source, node.cond.span())
+            .map(|(s, e)| token_sig(&self.source[s..e]))
+            .unwrap_or_default();
+        self.scope.push(format!("while:{cond_sig}"));
+        self.visit_block(&node.body);
+        self.scope.pop();
+    }
+
+    fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
+        self.visit_expr(&node.expr);
+        let sig = span_range(self.source, node.expr.span())
+            .map(|(s, e)| token_sig(&self.source[s..e]))
+            .unwrap_or_default();
+        self.scope.push(format!("for:{sig}"));
+        self.visit_block(&node.body);
+        self.scope.pop();
+    }
+
+    fn visit_expr_loop(&mut self, node: &'ast syn::ExprLoop) {
+        self.scope.push("loop".to_string());
+        self.visit_block(&node.body);
+        self.scope.pop();
+    }
+
+    fn visit_expr_block(&mut self, node: &'ast syn::ExprBlock) {
+        self.scope.push("expr_block".to_string());
+        self.visit_block(&node.block);
+        self.scope.pop();
+    }
+
+    fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {
+        self.scope.push("closure".to_string());
+        visit::visit_expr_closure(self, node);
+        self.scope.pop();
     }
 
     fn visit_expr_return(&mut self, node: &'ast syn::ExprReturn) {
@@ -1026,12 +1159,11 @@ struct SubhunkBuilder<'a> {
     current: &'a str,
     whole_undone: &'a str,
     whole: &'a Change,
-    tests_now: &'a [(usize, usize)],
+    blocked_now: &'a [(usize, usize)],
     has_old: bool,
     asked: Asks,
     old: &'a OldStructures,
     scope: Vec<String>,
-    block_counters: Vec<usize>,
     in_logical: Option<LogicalOp>,
     seen_keys: HashSet<DedupKey>,
     out: Vec<Change>,
@@ -1073,8 +1205,8 @@ impl<'a> SubhunkBuilder<'a> {
             || del_end > self.current.len()
             || !self.current.is_char_boundary(del_start)
             || !self.current.is_char_boundary(del_end)
-            || touches_any((del_start, del_end), self.tests_now)
-            || touches_any(anchor, self.tests_now)
+            || touches_any((del_start, del_end), self.blocked_now)
+            || touches_any(anchor, self.blocked_now)
         {
             return;
         }
@@ -1129,9 +1261,7 @@ impl<'ast> Visit<'ast> for SubhunkBuilder<'_> {
             return;
         }
         self.scope.push(format!("mod:{}", node.ident));
-        self.block_counters.push(0);
         visit::visit_item_mod(self, node);
-        self.block_counters.pop();
         self.scope.pop();
     }
 
@@ -1143,9 +1273,7 @@ impl<'ast> Visit<'ast> for SubhunkBuilder<'_> {
             .map(|(s, e)| token_sig(&self.current[s..e]))
             .unwrap_or_default();
         self.scope.push(format!("impl:{ty}"));
-        self.block_counters.push(0);
         visit::visit_item_impl(self, node);
-        self.block_counters.pop();
         self.scope.pop();
     }
 
@@ -1154,9 +1282,7 @@ impl<'ast> Visit<'ast> for SubhunkBuilder<'_> {
             return;
         }
         self.scope.push(format!("fn:{}", node.sig.ident));
-        self.block_counters.push(0);
         visit::visit_item_fn(self, node);
-        self.block_counters.pop();
         self.scope.pop();
     }
 
@@ -1165,9 +1291,7 @@ impl<'ast> Visit<'ast> for SubhunkBuilder<'_> {
             return;
         }
         self.scope.push(format!("fn:{}", node.sig.ident));
-        self.block_counters.push(0);
         visit::visit_impl_item_fn(self, node);
-        self.block_counters.pop();
         self.scope.pop();
     }
 
@@ -1176,9 +1300,7 @@ impl<'ast> Visit<'ast> for SubhunkBuilder<'_> {
             return;
         }
         self.scope.push(format!("fn:{}", node.sig.ident));
-        self.block_counters.push(0);
         visit::visit_trait_item_fn(self, node);
-        self.block_counters.pop();
         self.scope.pop();
     }
 
@@ -1190,11 +1312,15 @@ impl<'ast> Visit<'ast> for SubhunkBuilder<'_> {
     }
 
     fn visit_expr(&mut self, node: &'ast syn::Expr) {
-        let attrs = expr_attrs(node);
-        if instrument::is_test_only(attrs) || instrument::is_skipped(attrs) {
+        if expr_has_skip_or_test(node) {
             return;
         }
+        let prev = self.in_logical;
+        if !matches!(node, syn::Expr::Binary(_)) {
+            self.in_logical = None;
+        }
         visit::visit_expr(self, node);
+        self.in_logical = prev;
     }
 
     fn visit_field_value(&mut self, node: &'ast syn::FieldValue) {
@@ -1215,7 +1341,65 @@ impl<'ast> Visit<'ast> for SubhunkBuilder<'_> {
         if instrument::is_test_only(&node.attrs) || instrument::is_skipped(&node.attrs) {
             return;
         }
+        let pat_sig = span_range(self.current, node.pat.span())
+            .map(|(s, e)| token_sig(&self.current[s..e]))
+            .unwrap_or_default();
+        self.scope.push(format!("arm:{pat_sig}"));
         visit::visit_arm(self, node);
+        self.scope.pop();
+    }
+
+    fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
+        self.visit_expr(&node.cond);
+        let cond_sig = span_range(self.current, node.cond.span())
+            .map(|(s, e)| token_sig(&self.current[s..e]))
+            .unwrap_or_default();
+        self.scope.push(format!("if_then:{cond_sig}"));
+        self.visit_block(&node.then_branch);
+        self.scope.pop();
+        if let Some((_, else_branch)) = &node.else_branch {
+            self.scope.push(format!("if_else:{cond_sig}"));
+            self.visit_expr(else_branch);
+            self.scope.pop();
+        }
+    }
+
+    fn visit_expr_while(&mut self, node: &'ast syn::ExprWhile) {
+        self.visit_expr(&node.cond);
+        let cond_sig = span_range(self.current, node.cond.span())
+            .map(|(s, e)| token_sig(&self.current[s..e]))
+            .unwrap_or_default();
+        self.scope.push(format!("while:{cond_sig}"));
+        self.visit_block(&node.body);
+        self.scope.pop();
+    }
+
+    fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
+        self.visit_expr(&node.expr);
+        let sig = span_range(self.current, node.expr.span())
+            .map(|(s, e)| token_sig(&self.current[s..e]))
+            .unwrap_or_default();
+        self.scope.push(format!("for:{sig}"));
+        self.visit_block(&node.body);
+        self.scope.pop();
+    }
+
+    fn visit_expr_loop(&mut self, node: &'ast syn::ExprLoop) {
+        self.scope.push("loop".to_string());
+        self.visit_block(&node.body);
+        self.scope.pop();
+    }
+
+    fn visit_expr_block(&mut self, node: &'ast syn::ExprBlock) {
+        self.scope.push("expr_block".to_string());
+        self.visit_block(&node.block);
+        self.scope.pop();
+    }
+
+    fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {
+        self.scope.push("closure".to_string());
+        visit::visit_expr_closure(self, node);
+        self.scope.pop();
     }
 
     fn visit_expr_binary(&mut self, node: &'ast syn::ExprBinary) {
@@ -1293,6 +1477,11 @@ impl<'ast> Visit<'ast> for SubhunkBuilder<'_> {
             && let Some((ps, pe)) = span_range(self.current, node.path.span())
         {
             let path_sig = token_sig(&self.current[ps..pe]);
+            let new_field_ids: HashSet<(String, String)> = node
+                .fields
+                .iter()
+                .map(|f| field_identity(self.current, f))
+                .collect();
             let old_fields = if !self.has_old {
                 Some(HashSet::new())
             } else {
@@ -1304,8 +1493,12 @@ impl<'ast> Visit<'ast> for SubhunkBuilder<'_> {
                     .flatten()
                     .filter(|s| s.path_sig == path_sig)
                     .collect();
+                // Only decompose when every previously present field (including its `cfg`
+                // attributes) is still present, so rewriting a field's `cfg` never deletes it.
                 match matching.as_slice() {
-                    [old_struct] => Some(old_struct.fields.clone()),
+                    [old_struct] if old_struct.fields.is_subset(&new_field_ids) => {
+                        Some(old_struct.fields.clone())
+                    }
                     _ => None,
                 }
             };
@@ -1343,33 +1536,30 @@ impl<'ast> Visit<'ast> for SubhunkBuilder<'_> {
     }
 
     fn visit_block(&mut self, node: &'ast syn::Block) {
-        let idx = self.block_counters.last_mut().map_or(0, |c| {
-            let cur = *c;
-            *c += 1;
-            cur
-        });
-        self.scope.push(format!("b{idx}"));
-        self.block_counters.push(0);
+        let prev_logical = self.in_logical;
+        self.in_logical = None;
         if let Some(range) = span_range(self.current, node.span())
             && overlaps(range, self.whole.range)
         {
-            let candidates: Vec<((usize, usize), String)> = node
+            // Match all statements in order first, then check deletability only on the added ones.
+            let stmts_info: Vec<_> = node
                 .stmts
                 .iter()
                 .enumerate()
-                .filter_map(|(idx, stmt)| {
+                .map(|(idx, stmt)| {
                     let is_last = idx + 1 == node.stmts.len();
-                    if !deletable_subhunk_stmt(stmt, is_last) {
-                        return None;
-                    }
-                    let (s, e) = span_range(self.current, stmt.span())?;
-                    Some(((s, e), token_sig(&self.current[s..e])))
+                    let range = span_range(self.current, stmt.span());
+                    let sig = range
+                        .map(|(s, e)| token_sig(&self.current[s..e]))
+                        .unwrap_or_default();
+                    let can_delete = deletable_subhunk_stmt(stmt, is_last);
+                    (range, sig, can_delete)
                 })
                 .collect();
-            if candidates.len() >= 2 {
-                let sigs: Vec<String> = candidates.iter().map(|(_, sig)| sig.clone()).collect();
+            if stmts_info.iter().filter(|(_, _, del)| *del).count() >= 2 {
+                let sigs: Vec<String> = stmts_info.iter().map(|(_, sig, _)| sig.clone()).collect();
                 let added_indices = if !self.has_old {
-                    Some((0..candidates.len()).collect::<Vec<_>>())
+                    Some((0..stmts_info.len()).collect::<Vec<_>>())
                 } else {
                     match self.old.blocks.get(&self.key()).map(Vec::as_slice) {
                         Some([old_sigs]) => {
@@ -1380,22 +1570,23 @@ impl<'ast> Visit<'ast> for SubhunkBuilder<'_> {
                 };
                 if let Some(indices) = added_indices {
                     for i in indices {
-                        let (anchor, _) = &candidates[i];
-                        if !self.node_in_hunk(*anchor) {
+                        let (Some(anchor), _, true) = stmts_info[i] else {
+                            continue;
+                        };
+                        if !self.node_in_hunk(anchor) {
                             continue;
                         }
                         let desc = format!(
                             "without added statement `{}`",
                             crate::report::one_line(&self.current[anchor.0..anchor.1])
                         );
-                        self.try_emit(anchor.0, anchor.1, *anchor, desc);
+                        self.try_emit(anchor.0, anchor.1, anchor, desc);
                     }
                 }
             }
         }
         visit::visit_block(self, node);
-        self.block_counters.pop();
-        self.scope.pop();
+        self.in_logical = prev_logical;
     }
 }
 
@@ -1413,13 +1604,13 @@ fn subhunk_changes(
     if whole.range.0 >= whole.range.1 {
         return vec![];
     }
+    let blocked_now = collect_blocked_ranges(current, parsed, tests_now);
     let has_old = !whole.put_back.trim().is_empty();
     let old_window = (whole.range.0, whole.range.0 + whole.put_back.len());
     let mut old_collector = OldCollector {
         source: undone_text,
         window: old_window,
         scope: Vec::new(),
-        block_counters: vec![0],
         in_logical: None,
         found: OldStructures::default(),
     };
@@ -1431,12 +1622,11 @@ fn subhunk_changes(
         current,
         whole_undone: undone_text,
         whole,
-        tests_now,
+        blocked_now: &blocked_now,
         has_old,
         asked,
         old: &old_collector.found,
         scope: Vec::new(),
-        block_counters: vec![0],
         in_logical: None,
         seen_keys: HashSet::new(),
         out: Vec::new(),
@@ -2336,5 +2526,65 @@ pub fn f() {
             .filter(|c| c.is_subhunk())
             .collect();
         assert_eq!(cfg_field_subs.len(), 2, "{cfg_field_subs:?}");
+
+        // 8. Rewriting an existing field's `cfg` does not delete that field.
+        let old_cfg_rw = "pub fn f(base: S) -> S {\n    S { #[cfg(all())] a: 1, ..base }\n}\n";
+        let new_cfg_rw = "pub fn f(base: S) -> S {\n    S { #[cfg(not(any()))] a: 1, ..base }\n}\n";
+        let rw_subs: Vec<_> = between(old_cfg_rw, new_cfg_rw)
+            .into_iter()
+            .filter(|c| c.is_subhunk())
+            .collect();
+        assert!(rw_subs.is_empty(), "{rw_subs:?}");
+
+        // 9. Tail `if` moving to non-tail when a statement is appended must not delete the `if`.
+        let old_tail = "pub fn f(flag: bool) {\n    if flag { audit(); }\n}\n";
+        let new_tail = "pub fn f(flag: bool) {\n    if flag { audit(); } work();\n}\n";
+        let tail_subs: Vec<_> = between(old_tail, new_tail)
+            .into_iter()
+            .filter(|c| c.is_subhunk())
+            .collect();
+        assert!(
+            !tail_subs.iter().any(|c| c.code.starts_with("if flag")),
+            "{tail_subs:?}"
+        );
+
+        // 10. Prepending a sibling `if` must not misalign existing `if` blocks.
+        let old_sib = "pub fn f(p: bool, q: bool) {\n    if p { a(); b(); } if q { a(); }\n}\n";
+        let new_sib = "pub fn f(p: bool, q: bool, r: bool) {\n    if r { c(); } if p { a(); b(); } if q { a(); }\n}\n";
+        let sib_subs: Vec<_> = between(old_sib, new_sib)
+            .into_iter()
+            .filter(|c| c.is_subhunk())
+            .collect();
+        assert!(!sib_subs.iter().any(|c| c.code == "b();"), "{sib_subs:?}");
+
+        // 11. `#[cfg(test)]` on compound assignment suppresses RHS block, and `#[mutants::skip]`
+        // inside a parent statement suppresses deleting that parent statement.
+        let old_assign = "pub fn f(x: &mut i32) {\n    #[cfg(test)] x += { init(); 1 };\n}\n";
+        let new_assign = "pub fn f(x: &mut i32) {\n    #[cfg(test)] x += {\n        init();\n        probe_a();\n        probe_b();\n        1\n    };\n}\n";
+        let assign_subs: Vec<_> = between(old_assign, new_assign)
+            .into_iter()
+            .filter(|c| c.is_subhunk())
+            .collect();
+        assert!(assign_subs.is_empty(), "{assign_subs:?}");
+
+        let old_prot = "pub fn f() {\n    init();\n}\n";
+        let new_prot = "pub fn f(c: bool) {\n    init();\n    if c { #[mutants::skip] protected(); }\n    extra();\n}\n";
+        let prot_subs: Vec<_> = between(old_prot, new_prot)
+            .into_iter()
+            .filter(|c| c.is_subhunk())
+            .collect();
+        assert!(
+            !prot_subs.iter().any(|c| c.code.contains("protected")),
+            "{prot_subs:?}"
+        );
+
+        // 12. Same logical operator nested inside a block resets `in_logical`.
+        let old_inner = "pub fn f(a: bool, b: bool) -> bool {\n    a && {\n        b\n    }\n}\n";
+        let new_inner = "pub fn f(a: bool, b: bool, c: bool, d: bool) -> bool {\n    a && {\n        b\n        && c\n        && d\n    }\n}\n";
+        let inner_subs: Vec<_> = between(old_inner, new_inner)
+            .into_iter()
+            .filter(|c| c.is_subhunk())
+            .collect();
+        assert_eq!(inner_subs.len(), 2, "{inner_subs:?}");
     }
 }
