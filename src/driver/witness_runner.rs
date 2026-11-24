@@ -260,6 +260,7 @@ impl SavedExecutable {
 
 impl Drop for SavedExecutable {
     fn drop(&mut self) {
+        #[cfg(windows)]
         if let Err(err) = fs::remove_file(&self.path)
             && err.kind() == std::io::ErrorKind::PermissionDenied
             && let Ok(mut perms) = fs::metadata(&self.path).map(|m| m.permissions())
@@ -269,6 +270,8 @@ impl Drop for SavedExecutable {
             let _ = fs::set_permissions(&self.path, perms);
             let _ = fs::remove_file(&self.path);
         }
+        #[cfg(not(windows))]
+        let _ = fs::remove_file(&self.path);
     }
 }
 

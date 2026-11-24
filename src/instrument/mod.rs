@@ -24,9 +24,8 @@ pub(crate) use cfg::{
     settled_cfg_attributes, test_only_ranges,
 };
 pub use discover::discover;
-#[cfg(test)]
-use discover::discover_with_errors;
-pub(crate) use discover::{discover_parsed, parse_source};
+#[allow(unused_imports)]
+pub(crate) use discover::{discover_parsed, discover_with_errors, parse_source};
 pub(crate) use items::ItemIndex;
 pub use items::{NamedItem, enclosing_item, named_items, offset_of};
 pub use model::{

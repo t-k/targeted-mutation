@@ -3246,3 +3246,19 @@ fn shared_witness_preserves_original_binary_across_mutant_overwrite() {
 
     let _ = fs::remove_dir_all(&root);
 }
+
+#[test]
+fn workspace_report_prefix_preserves_literal_backslashes_on_unix_and_keeps_crate_api() {
+    let found = crate::instrument::discover_with_errors("fn f() -> bool { true }", 0, &[]).unwrap();
+    assert!(!found.sites.is_empty());
+    assert_eq!(workspace_report_prefix(Path::new("")), "");
+    assert_eq!(
+        workspace_report_prefix(Path::new("crates/core")),
+        "crates/core/"
+    );
+    #[cfg(unix)]
+    assert_eq!(
+        workspace_report_prefix(Path::new(r"crates/a\b")),
+        r"crates/a\b/"
+    );
+}

@@ -941,18 +941,8 @@ fn run_package(
     if report_path.is_empty()
         && batch.is_some()
         && let Ok(relative) = package_path.strip_prefix(&workspace)
-        && !relative.as_os_str().is_empty()
     {
-        let parts: Vec<_> = relative
-            .components()
-            .filter_map(|part| match part {
-                std::path::Component::Normal(name) => Some(name.to_string_lossy()),
-                _ => None,
-            })
-            .collect();
-        if !parts.is_empty() {
-            report_path = format!("{}/", parts.join("/"));
-        }
+        report_path = workspace_report_prefix(relative);
     }
     let mut report = Report {
         package: package.name.clone(),
@@ -3084,6 +3074,21 @@ fn run_package(
         checkpoint.finish_if_complete()?;
     }
     Ok(report)
+}
+
+fn workspace_report_prefix(relative: &Path) -> String {
+    let parts: Vec<_> = relative
+        .components()
+        .filter_map(|part| match part {
+            std::path::Component::Normal(name) => Some(name.to_string_lossy()),
+            _ => None,
+        })
+        .collect();
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!("{}/", parts.join("/"))
+    }
 }
 
 /// Where a directory is in its git repository: `crates/core/`, or nothing at the top
