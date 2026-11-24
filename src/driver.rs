@@ -2563,6 +2563,7 @@ fn stronger_assertions<'a>(
                 .get(site.start..site.end)
                 .map_or(0, |text| text.matches('\n').count());
             let mut mutants = instrument::source_mutants(site);
+            mutants.extend(instrument::source_boundary_mutant(site));
             instrument::keep_line_ends(original, &mut mutants);
             for mutant in mutants {
                 // A comparison is planned in other words than it is written in: the
@@ -2618,11 +2619,46 @@ struct WitnessSurvivor<'a> {
     scenarios: Vec<(&'a witness::Scenario, &'a TestBinary)>,
 }
 
+/// A private copy of the shared original witness binary so compiling a mutant into the
+/// same Cargo target directory cannot overwrite the binary needed for post-mutant re-checks.
+struct SavedExecutable {
+    path: PathBuf,
+}
+
+impl SavedExecutable {
+    fn copy_from(exe: &Path) -> Result<Self> {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let parent = exe
+            .parent()
+            .context("witness executable has no parent directory")?;
+        let name = exe
+            .file_name()
+            .context("witness executable has no file name")?
+            .to_string_lossy();
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = parent.join(format!("tmt-orig-{}-{id}-{name}", std::process::id()));
+        fs::copy(exe, &path).with_context(|| {
+            format!(
+                "preserving original witness binary {} at {}",
+                exe.display(),
+                path.display()
+            )
+        })?;
+        Ok(Self { path })
+    }
+}
+
+impl Drop for SavedExecutable {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.path);
+    }
+}
+
 struct SharedWitness {
     value: String,
     name: String,
     tests: std::rc::Rc<[witness::Edit]>,
-    original_exe: PathBuf,
+    original_exe: std::rc::Rc<SavedExecutable>,
 }
 
 fn shared_witnesses(
@@ -2688,9 +2724,25 @@ fn shared_witnesses(
             note("shared witness build failed, trying inputs individually");
             continue;
         };
+        let saved = match SavedExecutable::copy_from(&exe) {
+            Ok(saved) => std::rc::Rc::new(saved),
+            Err(err) => {
+                note(&format!(
+                    "could not preserve shared witness binary, trying inputs individually: {err:#}"
+                ));
+                continue;
+            }
+        };
         for (index, scenario, runner, name, value) in observed {
-            let checked =
-                observe_witness(runner, exe.clone(), wrapper, scenario, name, true, in_root);
+            let checked = observe_witness(
+                runner,
+                saved.path.clone(),
+                wrapper,
+                scenario,
+                name,
+                true,
+                in_root,
+            );
             if checked.is_ok_and(|value_read| {
                 value_read
                     .is_some_and(|read| read.equals_expected == Some(true) && read.value == value)
@@ -2699,7 +2751,7 @@ fn shared_witnesses(
                     value,
                     name: name.clone(),
                     tests: tests.clone(),
-                    original_exe: exe.clone(),
+                    original_exe: saved.clone(),
                 });
             }
         }
@@ -6504,11 +6556,11 @@ fn run_package(
                                     .ok()
                                     .flatten()
                                     && mutant.equals_expected == Some(false)
-                                    // Re-check the already-built original binary after the mutant
+                                    // Re-check the preserved original binary after the mutant
                                     // run to reject monotonic external-state drift without rebuilding.
                                     && observe_witness(
                                         baseline,
-                                        shared.original_exe,
+                                        shared.original_exe.path.clone(),
                                         wrapper.as_deref(),
                                         scenario,
                                         &shared.name,
@@ -9891,5 +9943,177 @@ fn main() {
         ] {
             assert!(wrapper_relative(Path::new(bad)).is_err(), "{bad:?}");
         }
+    }
+
+    #[test]
+    fn stronger_assertions_includes_boundary_mutants() {
+        let source = "\
+pub fn is_adult(age: u32) -> bool {
+    age >= 18
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checks_only_above_boundary() {
+        let _ = is_adult(18);
+        assert!(is_adult(20));
+    }
+}
+";
+        let parsed = syn::parse_file(source).unwrap();
+        let found = instrument::discover(source, 0).unwrap();
+        assert!(!found.sites.is_empty());
+        let candidates = stronger_assertions(
+            source,
+            &parsed,
+            found.sites.iter().chain(&found.rebuild_sites),
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|c| c.description.contains("age > 18")),
+            "expected strict boundary candidate `age > 18`, got: {:?}",
+            candidates
+                .iter()
+                .map(|c| c.description.as_str())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_witness_preserves_original_binary_across_mutant_overwrite() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let root = std::env::temp_dir().join(format!("tmt-shared-witness-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        let marks = root.join("marks");
+        fs::create_dir_all(&marks).unwrap();
+        let exe_path = root.join("deps_test_bin");
+        let write_script = |body: &str| {
+            fs::write(&exe_path, body).unwrap();
+            fs::set_permissions(&exe_path, fs::Permissions::from_mode(0o755)).unwrap();
+        };
+
+        let baseline = TestBinary {
+            name: "unit".into(),
+            cwd: root.clone(),
+            marks: marks.clone(),
+            git_ceiling: root.clone(),
+            work_lock: None,
+            tests: BTreeSet::new(),
+            runner: Runner::Isolated {
+                exe: exe_path.clone(),
+                test: "unit".into(),
+                ignored: false,
+                wrapper: None,
+            },
+            baseline: Duration::from_millis(50),
+            untraced_baseline: None,
+            timeout_diagnostic: std::sync::Once::new(),
+            traced: Duration::ZERO,
+            timeout: Some(Duration::from_secs(5)),
+            wrapper_grace: Duration::from_millis(100),
+            report_slow: false,
+            filtered_timings: Default::default(),
+            trace: Trace::default(),
+            effects_baseline: std::sync::OnceLock::new(),
+        };
+
+        let mut scenario = witness::Scenario::default();
+        scenario.expression = "f(1)".into();
+        let make_candidate = || witness::Candidate {
+            edits: vec![],
+            scope: 1..=1,
+            signature_lines: vec![1],
+            description: "m".into(),
+            existing: false,
+            advice: None,
+            file: PathBuf::from("src/lib.rs"),
+            scenarios: vec![scenario.clone()],
+            finding_at: None,
+        };
+        let c1 = make_candidate();
+        let c2 = make_candidate();
+        let survivors = vec![
+            WitnessSurvivor {
+                candidate: &c1,
+                at: report::Location::default(),
+                existing: None,
+                scenarios: vec![(&c1.scenarios[0], &baseline)],
+            },
+            WitnessSurvivor {
+                candidate: &c2,
+                at: report::Location::default(),
+                existing: None,
+                scenarios: vec![(&c2.scenarios[0], &baseline)],
+            },
+        ];
+
+        let build_count = std::cell::Cell::new(0usize);
+        let originals = shared_witnesses(
+            "fn f(x: i32) -> i32 { x }\n",
+            &survivors,
+            None,
+            true,
+            |_edits| {
+                let n = build_count.get();
+                build_count.set(n + 1);
+                if n == 0 {
+                    write_script("#!/bin/sh\nprintf '42\\n' >> \"$TMT_WITNESS_OUTPUT\"\n");
+                } else {
+                    write_script("#!/bin/sh\nprintf '42\\ttrue\\n' >> \"$TMT_WITNESS_OUTPUT\"\n");
+                }
+                Ok(Some(exe_path.clone()))
+            },
+            |_| {},
+        )
+        .unwrap();
+
+        let shared = originals[0].as_ref().expect("shared witness");
+        let saved_path = shared.original_exe.path.clone();
+        assert_ne!(saved_path, exe_path);
+        assert!(saved_path.exists());
+
+        // Simulate Cargo overwriting the exact same output path when building a mutant.
+        write_script("#!/bin/sh\nprintf '99\\tfalse\\n' >> \"$TMT_WITNESS_OUTPUT\"\n");
+
+        let mutant = observe_witness(
+            &baseline,
+            exe_path.clone(),
+            None,
+            &c1.scenarios[0],
+            &shared.name,
+            true,
+            true,
+        )
+        .unwrap()
+        .expect("mutant observation");
+        assert_eq!(mutant.value, "99");
+        assert_eq!(mutant.equals_expected, Some(false));
+
+        let rechecked = observe_witness(
+            &baseline,
+            saved_path.clone(),
+            None,
+            &c1.scenarios[0],
+            &shared.name,
+            true,
+            true,
+        )
+        .unwrap()
+        .expect("preserved original observation");
+        assert_eq!(rechecked.value, "42");
+        assert_eq!(rechecked.equals_expected, Some(true));
+
+        drop(originals);
+        assert!(
+            !saved_path.exists(),
+            "preserved witness binary should be cleaned up on drop"
+        );
+        let _ = fs::remove_dir_all(&root);
     }
 }

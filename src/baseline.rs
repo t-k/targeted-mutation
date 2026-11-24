@@ -194,11 +194,13 @@ pub fn ignored_lines(source: &str) -> BTreeMap<usize, String> {
                     i += 1;
                 }
             }
-            // Character literals (`'"'`, `'\\'`, `'a'`); lifetimes (`'a`) have no closing `'`.
+            // Character literals (`'"'`, `'\\'`, `'\''`, `'a'`); lifetimes (`'a`) have no closing `'`.
             b'\'' => {
-                if bytes.get(i + 1) == Some(&b'\\') {
-                    // Escape char literal such as `'\''`, `'\"'`, `'\x7f'`, `'\u{...}'`.
-                    let mut j = i + 2;
+                if bytes.get(i + 1) == Some(&b'\\') && bytes.get(i + 2).is_some_and(|&b| b != b'\n')
+                {
+                    // Escape char literal such as `'\''`, `'\"'`, `'\\'`, `'\x7f'`, `'\u{...}'`.
+                    // Start after the escaped byte so `'\''` does not close on the escaped quote.
+                    let mut j = i + 3;
                     while j < bytes.len() && bytes[j] != b'\n' && bytes[j] != b'\'' {
                         j += 1;
                     }
@@ -392,12 +394,15 @@ fn f() {
     let raw = r#\"// tmt:ignore inside raw string\"#;
     /* // tmt:ignore inside block comment */
     let ch = '\"'; // tmt:ignore after quote char
+    let quotes = ['\\'', '\"'];
+    let fake = \"// tmt:ignore fake after escaped quote\";
+    let real = 5; // tmt:ignore after escaped quote
 }
 ";
         let ignored = ignored_lines(source);
         assert_eq!(
             ignored.keys().copied().collect::<Vec<_>>(),
-            [2, 3, 4, 7, 11, 14]
+            [2, 3, 4, 7, 11, 14, 17]
         );
         assert_eq!(ignored[&7], "with a colon");
         assert_eq!(ignored[&2], "equivalent: both branches return the same");
@@ -405,6 +410,7 @@ fn f() {
         assert_eq!(ignored[&4], "");
         assert_eq!(ignored[&11], "after url");
         assert_eq!(ignored[&14], "after quote char");
+        assert_eq!(ignored[&17], "after escaped quote");
         assert!(ignored_lines("").is_empty());
     }
 }

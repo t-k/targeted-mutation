@@ -218,22 +218,20 @@ pub(crate) fn stage(
             let exact_owned = previous.contains_key(path);
             // On a case-insensitive filesystem, renaming a previously owned fixture to a
             // different case (`debug/Data` -> `debug/data`) resolves to the old owned entry.
-            let case_owned = !exact_owned
-                && previous_folded
-                    .get(&path.to_string_lossy().to_lowercase())
-                    .is_some_and(|aliases| {
-                        aliases.iter().any(|old| {
-                            !plan.contains_key(old)
-                                && previous_meta.get(old).is_some_and(|old_meta| {
-                                    same_entry(
-                                        &target.join(old),
-                                        old_meta,
-                                        &target.join(path),
-                                        &metadata,
-                                    )
-                                })
-                        })
-                    });
+            let mut case_owned = false;
+            if !exact_owned
+                && let Some(aliases) = previous_folded.get(&path.to_string_lossy().to_lowercase())
+            {
+                for old in aliases {
+                    if !plan.contains_key(old)
+                        && let Some(old_meta) = previous_meta.get(old)
+                        && same_directory_entry(&target, old, old_meta, path, &metadata)?
+                    {
+                        case_owned = true;
+                        break;
+                    }
+                }
+            }
             let owned = exact_owned || case_owned;
             if !kind_matches || (!shared_directory && !owned) {
                 bail!(
@@ -400,6 +398,49 @@ fn output_metadata(target: &Path, relative: &Path) -> Result<Option<fs::Metadata
             path.display()
         ),
     }
+}
+
+fn same_directory_entry(
+    target: &Path,
+    old: &Path,
+    old_meta: &fs::Metadata,
+    new: &Path,
+    new_meta: &fs::Metadata,
+) -> Result<bool> {
+    if !same_entry(&target.join(old), old_meta, &target.join(new), new_meta) {
+        return Ok(false);
+    }
+    // A hard link on a case-sensitive filesystem shares the same inode as the owned
+    // entry, but appears as a distinct directory entry in its parent directory.
+    let old_parts: Vec<_> = old.components().collect();
+    let new_parts: Vec<_> = new.components().collect();
+    if old_parts.len() != new_parts.len() {
+        return Ok(false);
+    }
+    let mut parent = target.to_path_buf();
+    for (old_part, new_part) in old_parts.into_iter().zip(new_parts) {
+        if old_part != new_part {
+            let old_name = old_part.as_os_str();
+            let new_name = new_part.as_os_str();
+            let mut has_old = false;
+            let mut has_new = false;
+            for entry in fs::read_dir(&parent)
+                .with_context(|| format!("reading directory {}", parent.display()))?
+            {
+                let name = entry?.file_name();
+                if name == old_name {
+                    has_old = true;
+                } else if name == new_name {
+                    has_new = true;
+                }
+                if has_old && has_new {
+                    return Ok(false);
+                }
+            }
+        }
+        parent.push(old_part);
+    }
+    Ok(true)
 }
 
 fn same_entry(a_path: &Path, a: &fs::Metadata, b_path: &Path, b: &fs::Metadata) -> bool {
@@ -1253,5 +1294,39 @@ mod tests {
             fs::read_to_string(tree.target.join("debug/data")).unwrap(),
             "second"
         );
+    }
+
+    #[test]
+    fn hard_link_is_not_treated_as_same_directory_entry() {
+        let tree = Tree::new();
+        fs::write(tree.workspace.join("asset"), "first").unwrap();
+        tree.stage(&[mapping("asset", "debug/Data")]).unwrap();
+        let owned = tree.target.join("debug/Data");
+        let sibling_link = tree.target.join("debug/alias");
+        fs::hard_link(&owned, &sibling_link).unwrap();
+        assert!(
+            !same_directory_entry(
+                &tree.target,
+                Path::new("debug/Data"),
+                &fs::symlink_metadata(&owned).unwrap(),
+                Path::new("debug/alias"),
+                &fs::symlink_metadata(&sibling_link).unwrap(),
+            )
+            .unwrap()
+        );
+
+        // On case-sensitive filesystems, an unowned hard link with a case-differing name
+        // must be rejected as an existing destination and preserved.
+        let lower = tree.target.join("debug/data");
+        if fs::hard_link(&owned, &lower).is_ok() {
+            fs::write(tree.workspace.join("asset"), "second").unwrap();
+            let err = tree.stage(&[mapping("asset", "debug/data")]).unwrap_err();
+            assert!(
+                format!("{err:#}").contains("already exists"),
+                "unexpected error: {err:#}"
+            );
+            assert_eq!(fs::read_to_string(&owned).unwrap(), "first");
+            assert_eq!(fs::read_to_string(&lower).unwrap(), "first");
+        }
     }
 }
