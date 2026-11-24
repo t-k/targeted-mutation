@@ -391,7 +391,7 @@ fn run_package(
     let effective_jobs = if options.source_only { 1 } else { options.jobs };
     let note = |text: &str| {
         if options.progress {
-            eprintln!("tmt: {text}");
+            eprintln!("tmt: {}", report::sanitize_inline(text));
         }
     };
     let dir = options
@@ -1044,7 +1044,10 @@ fn run_package(
         for error in &build.errors {
             let blamed = blame_error(error, &files, &copy, &disabled);
             if std::env::var_os("TMT_DEBUG").is_some() {
-                eprintln!("tmt: debug: blaming {blamed:?} for\n{}", error.rendered);
+                eprintln!(
+                    "tmt: debug: blaming {blamed:?} for\n{}",
+                    report::sanitize_terminal(&error.rendered)
+                );
             }
             for id in blamed {
                 repairs
@@ -2792,7 +2795,10 @@ fn run_package(
                             else {
                                 return Ok(None);
                             };
-                            if mutant.equals_expected != Some(false) || value == mutant.value {
+                            if mutant.equals_expected != Some(false)
+                                || mutant.value != raw_mutant.value
+                                || value == mutant.value
+                            {
                                 return Ok(None);
                             }
                             let Some(checked) = observe(
@@ -2808,7 +2814,14 @@ fn run_package(
                             if checked.equals_expected != Some(true) || checked.value != value {
                                 return Ok(None);
                             }
-                            Ok(scenario.verified(value, mutant.value))
+                            Ok(
+                                scenario.verified_field(
+                                    value,
+                                    mutant.value,
+                                    field_path,
+                                    field_orig,
+                                ),
+                            )
                         })();
                         match distinction {
                             Ok(Some(mut verified)) => {

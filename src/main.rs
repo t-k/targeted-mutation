@@ -577,7 +577,10 @@ fn main() -> ExitCode {
         let members = match driver::run_packages(&options, &cli.package) {
             Ok(members) => members,
             Err(err) => {
-                eprintln!("tmt: error: {err:#}");
+                eprintln!(
+                    "tmt: error: {}",
+                    report::sanitize_terminal(&format!("{err:#}"))
+                );
                 return ExitCode::FAILURE;
             }
         };
@@ -589,7 +592,10 @@ fn main() -> ExitCode {
             ExitCode::from(report_exit(&result))
         }
         Err(err) => {
-            eprintln!("tmt: error: {err:#}");
+            eprintln!(
+                "tmt: error: {}",
+                report::sanitize_terminal(&format!("{err:#}"))
+            );
             ExitCode::FAILURE
         }
     }
@@ -714,7 +720,10 @@ fn stream_reports(options: &driver::Options, packages: &[String], workspace: boo
         )
     };
     if let Err(err) = result {
-        eprintln!("tmt: error: {err:#}");
+        eprintln!(
+            "tmt: error: {}",
+            report::sanitize_terminal(&format!("{err:#}"))
+        );
         return ExitCode::FAILURE;
     }
     ExitCode::from(status.1)
@@ -732,7 +741,11 @@ fn show_workspace(
             Ok(result) => reports.push(result),
             Err(err) => {
                 let message = format!("{err:#}");
-                eprintln!("tmt: {package}: {message}");
+                eprintln!(
+                    "tmt: {}: {}",
+                    report::sanitize_inline(&package),
+                    report::sanitize_terminal(&message)
+                );
                 errors.push(serde_json::json!({"package": package, "error": message}));
             }
         }

@@ -202,7 +202,7 @@ pub(super) struct SiteWork<'a> {
 impl Session {
     pub(super) fn note(&self, text: &str) {
         if self.progress {
-            eprintln!("tmt: {text}");
+            eprintln!("tmt: {}", report::sanitize_inline(text));
         }
     }
 

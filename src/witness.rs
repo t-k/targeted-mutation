@@ -170,16 +170,35 @@ fn {name}() {{
     }
 
     pub fn verified(&self, original: String, mutant: String) -> Option<VerifiedWitness> {
+        self.build_verified(original, mutant, None)
+    }
+
+    pub fn verified_field(
+        &self,
+        original: String,
+        mutant: String,
+        field_path: String,
+        expected_field: String,
+    ) -> Option<VerifiedWitness> {
+        if !is_expected_literal(&expected_field) {
+            return None;
+        }
+        self.build_verified(original, mutant, Some((field_path, expected_field)))
+    }
+
+    fn build_verified(
+        &self,
+        original: String,
+        mutant: String,
+        narrowed: Option<(String, String)>,
+    ) -> Option<VerifiedWitness> {
         (original != mutant).then(|| {
             let call = self
                 .expression
                 .strip_prefix("self::")
                 .unwrap_or(&self.expression);
-            let narrowed = narrow_struct_field(&original, &mutant)
-                .filter(|(_, field_orig, _)| is_expected_literal(field_orig));
             let (field, assert_stmt) = match narrowed {
-                Some((path, field_orig, _)) => {
-                    let field_path = path.join(".");
+                Some((field_path, field_orig)) => {
                     let target = format_field_target(call, &field_path);
                     (
                         Some(field_path),
@@ -238,23 +257,33 @@ fn format_field_target(call: &str, field_path: &str) -> String {
     }
 }
 
-fn is_plain_ident(text: &str) -> bool {
-    let mut chars = text.chars();
-    let Some(first) = chars.next() else {
-        return false;
-    };
-    if !(first.is_ascii_alphabetic() || first == '_') {
-        return false;
+/// Converts a `Debug` struct field name into a valid Rust field-access identifier segment.
+/// Supports Unicode identifiers and Rust keywords printed without `r#` by `#[derive(Debug)]`
+/// (e.g. `type` -> `r#type`).
+fn rust_field_segment(text: &str) -> Option<String> {
+    if text.is_empty() || text.chars().any(char::is_whitespace) {
+        return None;
     }
-    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
-        return false;
+    if syn::parse_str::<syn::Ident>(text).is_ok() {
+        return Some(text.to_owned());
     }
-    syn::parse_str::<syn::Ident>(text).is_ok()
+    let raw = format!("r#{text}");
+    if syn::parse_str::<syn::Ident>(&raw).is_ok() {
+        return Some(raw);
+    }
+    None
+}
+
+fn is_debug_type_name(text: &str) -> bool {
+    !text.is_empty()
+        && !text.chars().any(char::is_whitespace)
+        && (syn::parse_str::<syn::Ident>(text).is_ok()
+            || syn::parse_str::<syn::Ident>(&format!("r#{text}")).is_ok())
 }
 
 /// Parses a Rust `Debug` named struct (`TypeName { f1: v1, f2: v2 }`) with at least two
-/// distinct identifier fields. Returns `None` for non-structs, single-field structs,
-/// non-exhaustive `..` output, or malformed delimiters.
+/// distinct fields. Returns `None` for non-structs, single-field structs, non-exhaustive
+/// `..` output, or malformed/crossed delimiters.
 pub(crate) fn parse_debug_struct(text: &str) -> Option<(&str, Vec<(&str, &str)>)> {
     let trimmed = text.trim();
     let open = trimmed.find('{')?;
@@ -262,7 +291,7 @@ pub(crate) fn parse_debug_struct(text: &str) -> Option<(&str, Vec<(&str, &str)>)
         return None;
     }
     let name = trimmed[..open].trim();
-    if !is_plain_ident(name) {
+    if !is_debug_type_name(name) {
         return None;
     }
     let inner = trimmed[open + 1..trimmed.len() - 1].trim();
@@ -270,9 +299,7 @@ pub(crate) fn parse_debug_struct(text: &str) -> Option<(&str, Vec<(&str, &str)>)
         return None;
     }
     let mut parts = Vec::new();
-    let mut depth_paren = 0usize;
-    let mut depth_bracket = 0usize;
-    let mut depth_brace = 0usize;
+    let mut delims: Vec<u8> = Vec::new();
     let mut in_string = false;
     let mut in_char = false;
     let mut escaped = false;
@@ -306,13 +333,15 @@ pub(crate) fn parse_debug_struct(text: &str) -> Option<(&str, Vec<(&str, &str)>)
         match b {
             b'"' => in_string = true,
             b'\'' => in_char = true,
-            b'(' => depth_paren += 1,
-            b')' => depth_paren = depth_paren.checked_sub(1)?,
-            b'[' => depth_bracket += 1,
-            b']' => depth_bracket = depth_bracket.checked_sub(1)?,
-            b'{' => depth_brace += 1,
-            b'}' => depth_brace = depth_brace.checked_sub(1)?,
-            b',' if depth_paren == 0 && depth_bracket == 0 && depth_brace == 0 => {
+            b'(' => delims.push(b')'),
+            b'[' => delims.push(b']'),
+            b'{' => delims.push(b'}'),
+            b')' | b']' | b'}' => {
+                if delims.pop() != Some(b) {
+                    return None;
+                }
+            }
+            b',' if delims.is_empty() => {
                 parts.push(inner[start..i].trim());
                 start = i + 1;
             }
@@ -320,7 +349,7 @@ pub(crate) fn parse_debug_struct(text: &str) -> Option<(&str, Vec<(&str, &str)>)
         }
         i += 1;
     }
-    if in_string || in_char || depth_paren != 0 || depth_bracket != 0 || depth_brace != 0 {
+    if in_string || in_char || !delims.is_empty() {
         return None;
     }
     let tail = inner[start..].trim();
@@ -339,7 +368,11 @@ pub(crate) fn parse_debug_struct(text: &str) -> Option<(&str, Vec<(&str, &str)>)
         let (key, value) = part.split_once(':')?;
         let key = key.trim();
         let value = value.trim();
-        if !is_plain_ident(key) || value.is_empty() || !seen.insert(key) {
+        if key.is_empty()
+            || key.chars().any(char::is_whitespace)
+            || value.is_empty()
+            || !seen.insert(key)
+        {
             return None;
         }
         fields.push((key, value));
@@ -348,7 +381,8 @@ pub(crate) fn parse_debug_struct(text: &str) -> Option<(&str, Vec<(&str, &str)>)
 }
 
 /// When `original` and `mutant` are Debug-formatted named structs of the same type and field
-/// set that differ on exactly one field (recursively), returns `(field_path, orig_val, mut_val)`.
+/// set that differ on exactly one field (recursively), returns `(field_path, orig_val, mut_val)`
+/// where each path segment is a valid Rust field identifier (using `r#...` for keywords).
 pub(crate) fn narrow_struct_field(
     original: &str,
     mutant: &str,
@@ -370,17 +404,14 @@ pub(crate) fn narrow_struct_field(
         }
     }
     let (key, orig_val, mut_val) = differing?;
+    let segment = rust_field_segment(key)?;
     if let Some((mut deeper_path, deep_orig, deep_mut)) = narrow_struct_field(orig_val, mut_val) {
         let mut path = Vec::with_capacity(deeper_path.len() + 1);
-        path.push(key.to_owned());
+        path.push(segment);
         path.append(&mut deeper_path);
         Some((path, deep_orig, deep_mut))
     } else {
-        Some((
-            vec![key.to_owned()],
-            orig_val.to_owned(),
-            mut_val.to_owned(),
-        ))
+        Some((vec![segment], orig_val.to_owned(), mut_val.to_owned()))
     }
 }
 
@@ -1159,15 +1190,34 @@ mod tests {
             None
         );
 
-        // `Scenario::verified` formats narrowed assertion and populates `field`.
+        // Raw keyword fields (`r#type` printed as `type`), Unicode identifiers, and crossed delimiters.
+        assert_eq!(
+            narrow_struct_field(
+                "Event { type: 1, label: \"ok\" }",
+                "Event { type: 2, label: \"ok\" }"
+            ),
+            Some((vec!["r#type".into()], "1".into(), "2".into()))
+        );
+        assert_eq!(
+            narrow_struct_field("Event { type: 1, 値: 10 }", "Event { type: 1, 値: 20 }"),
+            Some((vec!["値".into()], "10".into(), "20".into()))
+        );
+        assert_eq!(
+            narrow_struct_field("Bad { a: ([)], b: 1 }", "Bad { a: ([)], b: 2 }"),
+            None
+        );
+
+        // `Scenario::verified_field` emits the exact verified field assertion.
         let scenario = Scenario {
             expression: "quote(200, 3)".into(),
             ..Scenario::default()
         };
         let witness = scenario
-            .verified(
+            .verified_field(
                 "Quote { subtotal: 200, fee: 600 }".into(),
                 "Quote { subtotal: 200, fee: 203 }".into(),
+                "fee".into(),
+                "600".into(),
             )
             .unwrap();
         assert_eq!(witness.field.as_deref(), Some("fee"));
@@ -1179,9 +1229,11 @@ mod tests {
             ..Scenario::default()
         };
         let witness = binary_scenario
-            .verified(
+            .verified_field(
                 "Quote { subtotal: 200, fee: 600 }".into(),
                 "Quote { subtotal: 200, fee: 203 }".into(),
+                "fee".into(),
+                "600".into(),
             )
             .unwrap();
         assert_eq!(witness.assertion, "assert_eq!((&quote(200, 3)).fee, 600);");

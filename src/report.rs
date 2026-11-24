@@ -1264,7 +1264,7 @@ fn sarif_run(report: &Report) -> serde_json::Value {
                 "ASSERTION GAP" => "assertion-gap",
                 _ => "survivor",
             };
-            let text = format!("`{}`: {}", at.code, finding_body(finding).join("; "));
+            let text = format!("`{}`: {}", at.code, finding_body(finding, false).join("; "));
             serde_json::json!({
                 "ruleId": rule,
                 "level": "warning",
@@ -1404,8 +1404,28 @@ fn list(items: &[String], limit: usize) -> String {
     }
 }
 
-/// The lines of one finding, without its header.
-fn finding_body(finding: &Finding) -> Vec<String> {
+/// The lines of one finding, without its header. When `sanitize` is true, each untrusted
+/// field is sanitized before being joined so an incomplete escape sequence in one field
+/// cannot swallow later fields on the same line.
+fn finding_body(finding: &Finding, sanitize: bool) -> Vec<String> {
+    let clean = |s: &str| {
+        if sanitize {
+            sanitize_inline(s)
+        } else {
+            s.to_string()
+        }
+    };
+    let clean_list = |items: &[String]| {
+        if sanitize {
+            items
+                .iter()
+                .map(|s| sanitize_inline(s))
+                .collect::<Vec<_>>()
+                .join(", ")
+        } else {
+            items.join(", ")
+        }
+    };
     let mut lines = vec![];
     match finding {
         Finding::InputGap {
@@ -1429,13 +1449,13 @@ fn finding_body(finding: &Finding) -> Vec<String> {
             };
             lines.push(format!(
                 "passes every test as: {}{more}  [{note}]",
-                survivors.join(", ")
+                clean_list(survivors)
             ));
-            lines.extend(observed.iter().cloned());
+            lines.extend(observed.iter().map(|s| clean(s)));
             lines.extend(
                 add_tests
                     .iter()
-                    .map(|test| format!("add a test with {test}")),
+                    .map(|test| format!("add a test with {}", clean(test))),
             );
         }
         Finding::AssertionGap {
@@ -1446,10 +1466,11 @@ fn finding_body(finding: &Finding) -> Vec<String> {
             witness,
             ..
         } => {
-            lines.push(format!("passes every test as: {}", survivors.join(", ")));
+            lines.push(format!("passes every test as: {}", clean_list(survivors)));
+            let shown_tests: Vec<String> = tests.iter().map(|t| clean(t)).collect();
             lines.push(format!(
                 "these tests run the changed code and still pass: {}",
-                list(tests, 5)
+                list(&shown_tests, 5)
             ));
             if effects.is_empty() {
                 lines.push("add an assertion on what this code is responsible for".to_string());
@@ -1458,13 +1479,14 @@ fn finding_body(finding: &Finding) -> Vec<String> {
                 // mutant" below can be tried.
                 if let (Some(followed), true) = (effects_of, survivors.len() > 1) {
                     lines.push(format!(
-                        "followed one of them through the tests: {followed}"
+                        "followed one of them through the tests: {}",
+                        clean(followed)
                     ));
                 }
-                lines.extend(effects.iter().cloned());
+                lines.extend(effects.iter().map(|s| clean(s)));
             }
             if let Some(witness) = witness {
-                lines.extend(witness_lines(witness));
+                lines.extend(witness_lines(witness, sanitize));
             }
         }
         Finding::Survivor {
@@ -1472,10 +1494,10 @@ fn finding_body(finding: &Finding) -> Vec<String> {
             change_since: Some(revision),
             ..
         } => {
-            lines.push(format!("passes every test {}", survivors.join(", ")));
+            lines.push(format!("passes every test {}", clean_list(survivors)));
             lines.push(format!(
                 "no test tells this change from the code as it was at {}: add one that fails without it",
-                short_revision(revision)
+                clean(short_revision(revision))
             ));
         }
         Finding::Survivor {
@@ -1484,11 +1506,11 @@ fn finding_body(finding: &Finding) -> Vec<String> {
             advice,
             ..
         } => {
-            lines.push(format!("passes every test as: {}", survivors.join(", ")));
+            lines.push(format!("passes every test as: {}", clean_list(survivors)));
             if let Some(witness) = witness {
-                lines.extend(witness_lines(witness));
+                lines.extend(witness_lines(witness, sanitize));
             } else if let Some(advice) = advice {
-                lines.push(advice.clone());
+                lines.push(clean(advice));
             } else {
                 lines.push(
                     "built on its own, where nothing can be recorded: either no test runs this code, or one does and does not check what it gives"
@@ -1500,8 +1522,20 @@ fn finding_body(finding: &Finding) -> Vec<String> {
     lines
 }
 
-fn witness_lines(witness: &VerifiedWitness) -> Vec<String> {
+fn witness_lines(witness: &VerifiedWitness, sanitize: bool) -> Vec<String> {
+    let clean = |s: &str| {
+        if sanitize {
+            sanitize_inline(s)
+        } else {
+            s.to_string()
+        }
+    };
+    let call = clean(&witness.call);
+    let orig = clean(&witness.original);
+    let mut_val = clean(&witness.mutant);
+    let assertion = clean(&witness.assertion);
     if let Some(test) = &witness.in_test {
+        let test = clean(test);
         // The test may make the call more than once, with another result each time.
         let place = witness
             .in_test_line
@@ -1513,26 +1547,21 @@ fn witness_lines(witness: &VerifiedWitness) -> Vec<String> {
         );
         return vec![
             format!(
-                "verified on `{}` where `{test}` calls it{on}: original returned {}, mutant returned {}",
-                witness.call, witness.original, witness.mutant,
+                "verified on `{call}` where `{test}` calls it{on}: original returned {orig}, mutant returned {mut_val}",
             ),
-            format!(
-                "in `{test}`, compare the result of {of} with this value: `{}`",
-                witness.assertion
-            ),
+            format!("in `{test}`, compare the result of {of} with this value: `{assertion}`"),
         ];
     }
     let mut lines = vec![format!(
-        "verified on `{}`: original returned {}, mutant returned {}",
-        witness.call, witness.original, witness.mutant,
+        "verified on `{call}`: original returned {orig}, mutant returned {mut_val}",
     )];
     if let Some(killed) = witness.individually_killed {
         lines.push(format!(
             "the selected tests detected all {killed} component changes in isolation"
         ));
     }
-    lines.extend(witness.guidance.iter().cloned());
-    lines.push(format!("add a test with `{}`", witness.assertion));
+    lines.extend(witness.guidance.iter().map(|s| clean(s)));
+    lines.push(format!("add a test with `{assertion}`"));
     lines
 }
 
@@ -1549,63 +1578,91 @@ fn finding_parts(finding: &Finding) -> (&'static str, &Location) {
     }
 }
 
-/// Strips ANSI/VT terminal escape sequences, C0/C1/DEL control characters, and Unicode
-/// bidirectional override/isolate controls from untrusted project text before writing to a
-/// terminal. When `preserve_newlines` is false, `\n`, `\r`, and `\t` are collapsed to spaces
-/// so untrusted fields cannot forge new lines in text reports.
+/// Strips 7-bit and 8-bit ANSI/VT terminal escape sequences (CSI, OSC, DCS, SOS, PM, APC,
+/// and nF/Fp/Fe ESC sequences), C0/C1/DEL control characters, and Unicode bidirectional
+/// override/isolate controls from untrusted project text before writing to a terminal.
+/// When `preserve_newlines` is false, `\n`, `\r`, and `\t` are collapsed to spaces so
+/// untrusted fields cannot forge new lines in text reports.
 fn sanitize_terminal_text(text: &str, preserve_newlines: bool) -> String {
+    fn consume_csi(chars: &mut std::iter::Peekable<std::str::Chars<'_>>) {
+        while let Some(&next) = chars.peek() {
+            if (' '..='?').contains(&next) {
+                chars.next();
+            } else if ('@'..='~').contains(&next) {
+                chars.next();
+                break;
+            } else {
+                // Incomplete/malformed CSI: stop before consuming unrelated text or newlines.
+                break;
+            }
+        }
+    }
+    fn consume_st_terminated(
+        chars: &mut std::iter::Peekable<std::str::Chars<'_>>,
+        allow_bel: bool,
+    ) {
+        while let Some(next) = chars.next() {
+            if (allow_bel && next == '\x07') || next == '\u{009c}' {
+                break;
+            }
+            if next == '\x1b' && chars.peek() == Some(&'\\') {
+                chars.next();
+                break;
+            }
+        }
+    }
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(ch) = chars.next() {
         if ch == '\x1b' {
             match chars.peek().copied() {
-                // CSI: ESC [ <param>* <interm>* <final>
+                // 7-bit CSI: ESC [ <param/interm 0x20-0x3F>* <final 0x40-0x7E>
                 Some('[') => {
                     chars.next();
-                    for next in chars.by_ref() {
-                        if ('@'..='~').contains(&next) {
-                            break;
-                        }
-                    }
+                    consume_csi(&mut chars);
                 }
-                // OSC: ESC ] ... (BEL | ST)
+                // 7-bit OSC: ESC ] ... (BEL | ESC \ | C1 ST)
                 Some(']') => {
                     chars.next();
-                    while let Some(next) = chars.next() {
-                        if next == '\x07' {
-                            break;
-                        }
-                        if next == '\x1b' && chars.peek() == Some(&'\\') {
-                            chars.next();
-                            break;
-                        }
-                    }
+                    consume_st_terminated(&mut chars, true);
                 }
-                // DCS / SOS / PM / APC: ESC (P | X | ^ | _) ... ST
+                // 7-bit DCS / SOS / PM / APC: ESC (P | X | ^ | _) ... (ESC \ | C1 ST)
                 Some('P' | 'X' | '^' | '_') => {
                     chars.next();
-                    while let Some(next) = chars.next() {
-                        if next == '\x1b' && chars.peek() == Some(&'\\') {
+                    consume_st_terminated(&mut chars, false);
+                }
+                // nF sequences (e.g., ESC ( B charset designation): 0x20-0x2F intermediates + 0x30-0x7E final.
+                Some(next) if (' '..='/').contains(&next) => {
+                    while let Some(&c) = chars.peek() {
+                        if (' '..='/').contains(&c) {
                             chars.next();
+                        } else if ('0'..='~').contains(&c) {
+                            chars.next();
+                            break;
+                        } else {
                             break;
                         }
                     }
                 }
-                // 2-byte ESC sequence (e.g., ESC c, ESC ( B).
-                Some(next) if (' '..='~').contains(&next) => {
+                // Single-final ESC sequence (e.g., ESC c, ESC 7, ESC =).
+                Some(next) if ('0'..='~').contains(&next) => {
                     chars.next();
                 }
                 _ => {}
             }
             continue;
         }
-        // 8-bit C1 CSI (\u{009B} ... final byte).
+        // 8-bit C1 CSI (\u{009B}), OSC (\u{009D}), DCS (\u{0090}), SOS (\u{0098}), PM (\u{009E}), APC (\u{009F}).
         if ch == '\u{009b}' {
-            for next in chars.by_ref() {
-                if ('@'..='~').contains(&next) {
-                    break;
-                }
-            }
+            consume_csi(&mut chars);
+            continue;
+        }
+        if ch == '\u{009d}' {
+            consume_st_terminated(&mut chars, true);
+            continue;
+        }
+        if matches!(ch, '\u{0090}' | '\u{0098}' | '\u{009e}' | '\u{009f}') {
+            consume_st_terminated(&mut chars, false);
             continue;
         }
         // Unicode BiDi override/isolate controls (Trojan Source / terminal spoofing).
@@ -1643,7 +1700,8 @@ pub fn sanitize_inline(text: &str) -> String {
 }
 
 /// Sanitizes multi-line terminal output while preserving intentional `\n` line breaks.
-fn sanitize_terminal(text: &str) -> String {
+#[doc(hidden)]
+pub fn sanitize_terminal(text: &str) -> String {
     sanitize_terminal_text(text, true)
 }
 
@@ -1673,8 +1731,8 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
                 sanitize_inline(&at.code)
             ));
         }
-        for line in finding_body(finding) {
-            out.push_str(&format!("  {}\n", sanitize_inline(&line)));
+        for line in finding_body(finding, true) {
+            out.push_str(&format!("  {line}\n"));
         }
         if report.weakened.iter().any(|before| {
             (before.file.as_str(), before.line, before.column)
@@ -3093,7 +3151,7 @@ mod tests {
             witness: None,
         };
         // Of several mutants one was followed: the report says which.
-        let body = finding_body(&gap(&["`a <= b`", "`a == b`"], Some("`a <= b`")));
+        let body = finding_body(&gap(&["`a <= b`", "`a == b`"], Some("`a <= b`")), false);
         assert_eq!(
             body[2..],
             [
@@ -3106,7 +3164,7 @@ mod tests {
             gap(&["`a <= b`"], Some("`a <= b`")),
             gap(&["`a <= b`", "`a == b`"], None),
         ] {
-            let body = finding_body(&single);
+            let body = finding_body(&single, false);
             assert_eq!(body.len(), 3, "{body:?}");
             assert!(body[2].starts_with("with the mutant"), "{body:?}");
         }
@@ -3586,5 +3644,33 @@ mod tests {
         assert!(!text.lines().any(|l| l.starts_with("FAKE")), "{text:?}");
         assert!(text.contains("src/lib.rs:10:5"), "{text:?}");
         assert!(text.contains("pkgred FAKE:"), "{text:?}");
+
+        // C1 OSC/DCS, C1 ST terminator, nF ESC ( B, and incomplete OSC do not leak payloads
+        // or swallow subsequent fields on the same line.
+        assert_eq!(sanitize_inline("a\u{009d}0;title\u{009c}b"), "ab");
+        assert_eq!(sanitize_inline("a\u{0090}dcs-payload\u{009c}b"), "ab");
+        assert_eq!(sanitize_inline("a\x1b]0;title\u{009c}b"), "ab");
+        assert_eq!(sanitize_inline("a\x1b(Bb"), "ab");
+        let report_unclosed = Report {
+            package: "p".into(),
+            sites: 1,
+            findings: vec![Finding::AssertionGap {
+                at: Location {
+                    file: "src/lib.rs".into(),
+                    line: 1,
+                    column: 1,
+                    code: "x == 1".into(),
+                    ..Location::default()
+                },
+                survivors: vec!["`a\x1b]0;unterminated".into(), "`b`".into()],
+                tests: vec!["t".into()],
+                effects: vec![],
+                effects_of: None,
+                witness: None,
+            }],
+            ..Report::default()
+        };
+        let unclosed_text = render_text(&report_unclosed, false);
+        assert!(unclosed_text.contains("`a, `b`"), "{unclosed_text:?}");
     }
 }
