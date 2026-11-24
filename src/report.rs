@@ -7,6 +7,9 @@ use std::path::PathBuf;
 use crate::instrument::{ArithOp, LiteralSide, Site, SiteKind};
 use crate::plan::{CmpOp, InputGap, LogicGap, Mutation, Obs};
 
+/// Top-level JSON/JSONL schema version emitted by `tmt`.
+pub const SCHEMA_VERSION: u32 = 1;
+
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct Location {
     pub file: String,
@@ -87,6 +90,10 @@ pub struct VerifiedWitness {
     pub original: String,
     pub mutant: String,
     pub assertion: String,
+    /// When the original and mutant returned the same multi-field struct differing on one
+    /// field (recursively), the narrowed dotted field path (e.g. `"fee"` or `"inner.fee"`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub field: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub guidance: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -360,8 +367,9 @@ pub struct Candidate {
     pub edits: Vec<CandidateEdit>,
 }
 
-#[derive(Clone, Debug, Default, PartialEq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct Report {
+    pub schema_version: u32,
     pub package: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mutants: Option<Vec<Candidate>>,
@@ -404,6 +412,35 @@ pub struct Report {
     /// tests as they were at the revision found these mutants out.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub weakened: Vec<Location>,
+}
+
+impl Default for Report {
+    fn default() -> Self {
+        Self {
+            schema_version: SCHEMA_VERSION,
+            package: String::new(),
+            mutants: None,
+            analysis: Analysis::default(),
+            audit: None,
+            evaluation: None,
+            sites: 0,
+            skipped_sites: 0,
+            skipped: Vec::new(),
+            unviable_mutants: 0,
+            mutants_not_built: 0,
+            mutants_not_evaluated: 0,
+            mutants_not_compiled: 0,
+            mutants_run: 0,
+            mutants_killed: 0,
+            mutants_timed_out: 0,
+            timeout_rechecks: TimeoutRechecks::default(),
+            findings: Vec::new(),
+            suppressed: 0,
+            unreached: Vec::new(),
+            unstable: Vec::new(),
+            weakened: Vec::new(),
+        }
+    }
 }
 
 impl Report {
@@ -1512,6 +1549,104 @@ fn finding_parts(finding: &Finding) -> (&'static str, &Location) {
     }
 }
 
+/// Strips ANSI/VT terminal escape sequences, C0/C1/DEL control characters, and Unicode
+/// bidirectional override/isolate controls from untrusted project text before writing to a
+/// terminal. When `preserve_newlines` is false, `\n`, `\r`, and `\t` are collapsed to spaces
+/// so untrusted fields cannot forge new lines in text reports.
+fn sanitize_terminal_text(text: &str, preserve_newlines: bool) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\x1b' {
+            match chars.peek().copied() {
+                // CSI: ESC [ <param>* <interm>* <final>
+                Some('[') => {
+                    chars.next();
+                    for next in chars.by_ref() {
+                        if ('@'..='~').contains(&next) {
+                            break;
+                        }
+                    }
+                }
+                // OSC: ESC ] ... (BEL | ST)
+                Some(']') => {
+                    chars.next();
+                    while let Some(next) = chars.next() {
+                        if next == '\x07' {
+                            break;
+                        }
+                        if next == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                // DCS / SOS / PM / APC: ESC (P | X | ^ | _) ... ST
+                Some('P' | 'X' | '^' | '_') => {
+                    chars.next();
+                    while let Some(next) = chars.next() {
+                        if next == '\x1b' && chars.peek() == Some(&'\\') {
+                            chars.next();
+                            break;
+                        }
+                    }
+                }
+                // 2-byte ESC sequence (e.g., ESC c, ESC ( B).
+                Some(next) if (' '..='~').contains(&next) => {
+                    chars.next();
+                }
+                _ => {}
+            }
+            continue;
+        }
+        // 8-bit C1 CSI (\u{009B} ... final byte).
+        if ch == '\u{009b}' {
+            for next in chars.by_ref() {
+                if ('@'..='~').contains(&next) {
+                    break;
+                }
+            }
+            continue;
+        }
+        // Unicode BiDi override/isolate controls (Trojan Source / terminal spoofing).
+        if matches!(
+            ch,
+            '\u{061c}'
+                | '\u{200e}'
+                | '\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+        ) {
+            continue;
+        }
+        if ch == '\n' && preserve_newlines {
+            out.push('\n');
+            continue;
+        }
+        if matches!(ch, '\n' | '\r' | '\t') {
+            out.push(' ');
+            continue;
+        }
+        if ch.is_control() {
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
+/// Sanitizes an untrusted single-line string for terminal output (no escape sequences, no
+/// control characters, no injected line breaks).
+#[doc(hidden)]
+pub fn sanitize_inline(text: &str) -> String {
+    sanitize_terminal_text(text, false)
+}
+
+/// Sanitizes multi-line terminal output while preserving intentional `\n` line breaks.
+fn sanitize_terminal(text: &str) -> String {
+    sanitize_terminal_text(text, true)
+}
+
 pub fn render_text(report: &Report, show_unreached: bool) -> String {
     let mut out = String::new();
     let mut previous: Option<(&str, usize)> = None;
@@ -1523,7 +1658,8 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
         if same_line {
             out.push_str(&format!(
                 "  + {kind}  column {}\n    {}\n",
-                at.column, at.code
+                at.column,
+                sanitize_inline(&at.code)
             ));
         } else {
             if previous.is_some() {
@@ -1531,11 +1667,14 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
             }
             out.push_str(&format!(
                 "{kind}  {}:{}:{}\n    {}\n",
-                at.file, at.line, at.column, at.code
+                sanitize_inline(&at.file),
+                at.line,
+                at.column,
+                sanitize_inline(&at.code)
             ));
         }
         for line in finding_body(finding) {
-            out.push_str(&format!("  {line}\n"));
+            out.push_str(&format!("  {}\n", sanitize_inline(&line)));
         }
         if report.weakened.iter().any(|before| {
             (before.file.as_str(), before.line, before.column)
@@ -1543,7 +1682,9 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
         }) {
             out.push_str(&format!(
                 "  the tests as they were at {} found this out: a change to the tests lets it through\n",
-                short_revision(report.analysis.since.as_deref().unwrap_or("the revision"))
+                sanitize_inline(short_revision(
+                    report.analysis.since.as_deref().unwrap_or("the revision")
+                ))
             ));
         }
         previous = Some((at.file.as_str(), at.line));
@@ -1555,14 +1696,20 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
         for at in &report.unreached {
             out.push_str(&format!(
                 "UNREACHED  {}:{}:{}\n    {}\n\n",
-                at.file, at.line, at.column, at.code
+                sanitize_inline(&at.file),
+                at.line,
+                at.column,
+                sanitize_inline(&at.code)
             ));
         }
     }
     for at in &report.unstable {
         out.push_str(&format!(
             "UNSTABLE  {}:{}:{}\n    {}\n  the trace predicted a survivor but the re-run failed: the tests are not deterministic, or do something the trace cannot see\n\n",
-            at.file, at.line, at.column, at.code
+            sanitize_inline(&at.file),
+            at.line,
+            at.column,
+            sanitize_inline(&at.code)
         ));
     }
     let input = report
@@ -1584,7 +1731,7 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
     };
     out.push_str(&format!(
         "{}: {} sites, {} input gaps, {} assertion gaps, {} mutants run ({} killed{by_time_limit}), {} sites unreached",
-        report.package,
+        sanitize_inline(&report.package),
         report.sites,
         input,
         assertion,
@@ -1634,7 +1781,10 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
         for at in &audit.disagreements {
             out.push_str(&format!(
                 "  {}:{}:{}  {}\n",
-                at.file, at.line, at.column, at.code
+                sanitize_inline(&at.file),
+                at.line,
+                at.column,
+                sanitize_inline(&at.code)
             ));
         }
         if audit.rebuilt > 0 {
@@ -1649,32 +1799,32 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
         for differs in &audit.source_disagreements {
             out.push_str(&format!(
                 "  {}:{}:{}  {}: {} as a probe, {} built\n",
-                differs.at.file,
+                sanitize_inline(&differs.at.file),
                 differs.at.line,
                 differs.at.column,
-                differs.mutant,
-                differs.as_probe,
-                differs.built
+                sanitize_inline(&differs.mutant),
+                sanitize_inline(&differs.as_probe),
+                sanitize_inline(&differs.built)
             ));
         }
         if audit.trace_differences.is_empty() {
             out.push_str("audit: recorded once more, the tests did the same\n");
         }
         for binary in &audit.trace_differences {
+            let name = sanitize_inline(&binary.binary);
             if binary.rerun_failed && binary.records == 0 {
                 out.push_str(&format!(
-                    "audit: recorded once more, `{}` did not pass: its tests do not always do the same\n",
-                    binary.binary
+                    "audit: recorded once more, `{name}` did not pass: its tests do not always do the same\n"
                 ));
             } else if binary.rerun_failed {
                 out.push_str(&format!(
-                    "audit: recorded once more, `{}` did not pass and differs in {} records: its tests do not always do the same\n",
-                    binary.binary, binary.records
+                    "audit: recorded once more, `{name}` did not pass and differs in {} records: its tests do not always do the same\n",
+                    binary.records
                 ));
             } else {
                 out.push_str(&format!(
-                    "audit: recorded once more, `{}` differs in {} records: its tests do not always do the same\n",
-                    binary.binary, binary.records
+                    "audit: recorded once more, `{name}` differs in {} records: its tests do not always do the same\n",
+                    binary.records
                 ));
             }
         }
@@ -1711,7 +1861,7 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
     if !show_unreached && !report.unreached.is_empty() {
         out.push_str("(--show-unreached lists the code no test executes)\n");
     }
-    out
+    sanitize_terminal(&out)
 }
 
 #[cfg(test)]
@@ -2746,6 +2896,7 @@ mod tests {
             ..Location::default()
         };
         let report = Report {
+            schema_version: SCHEMA_VERSION,
             mutants: None,
             package: "p".into(),
             analysis: Analysis::default(),
@@ -3396,5 +3547,44 @@ mod tests {
             results[5]
         );
         assert!(sarif["runs"][0]["properties"].get("audit").is_some());
+    }
+
+    #[test]
+    fn render_text_sanitizes_terminal_escape_sequences_bidi_and_injected_newlines() {
+        let report = Report {
+            package: "pkg\x1b[31mred\x1b[0m\nFAKE".into(),
+            sites: 1,
+            findings: vec![Finding::AssertionGap {
+                at: Location {
+                    file: "src/\x1b]52;c;evil\x07lib.rs".into(),
+                    line: 10,
+                    column: 5,
+                    code: "x\u{202e} == 1\r\nFAKE LINE".into(),
+                    ..Location::default()
+                },
+                survivors: vec!["`x \x1b[2J!= 1`".into()],
+                tests: vec!["tests::\u{009b}31mspoof".into()],
+                effects: vec![],
+                effects_of: None,
+                witness: None,
+            }],
+            ..Report::default()
+        };
+        assert_eq!(report.schema_version, SCHEMA_VERSION);
+        let json: serde_json::Value = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["schema_version"], SCHEMA_VERSION);
+        // JSON remains lossless.
+        assert!(json["package"].as_str().unwrap().contains('\x1b'));
+
+        let text = render_text(&report, false);
+        assert!(!text.contains('\x1b'), "{text:?}");
+        assert!(!text.contains('\x07'), "{text:?}");
+        assert!(!text.contains('\u{009b}'), "{text:?}");
+        assert!(!text.contains('\u{202e}'), "{text:?}");
+        assert!(!text.contains('\r'), "{text:?}");
+        // Injected newlines in untrusted fields cannot start a forged line.
+        assert!(!text.lines().any(|l| l.starts_with("FAKE")), "{text:?}");
+        assert!(text.contains("src/lib.rs:10:5"), "{text:?}");
+        assert!(text.contains("pkgred FAKE:"), "{text:?}");
     }
 }

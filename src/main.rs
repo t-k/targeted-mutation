@@ -616,6 +616,7 @@ fn report_exit(result: &report::Report) -> u8 {
 fn report_json(result: &report::Report) -> serde_json::Value {
     if let Some(mutants) = &result.mutants {
         serde_json::json!({
+            "schema_version": report::SCHEMA_VERSION,
             "package": result.package,
             "analysis": result.analysis,
             "mutants": mutants,
@@ -641,12 +642,20 @@ fn show_report(result: &report::Report, format: OutputFormat, show_unreached: bo
         }
         OutputFormat::Text => {
             if let Some(mutants) = &result.mutants {
-                println!("{}: {} source candidates", result.package, mutants.len());
+                println!(
+                    "{}: {} source candidates",
+                    report::sanitize_inline(&result.package),
+                    mutants.len()
+                );
                 for candidate in mutants {
                     let edit = &candidate.edits[0];
                     println!(
                         "{}:{}:{}: {} -> {}",
-                        edit.file, edit.line, edit.column, candidate.what, candidate.into
+                        report::sanitize_inline(&edit.file),
+                        edit.line,
+                        edit.column,
+                        report::sanitize_inline(&candidate.what),
+                        report::sanitize_inline(&candidate.into)
                     );
                 }
             } else {
@@ -674,12 +683,19 @@ fn stream_reports(options: &driver::Options, packages: &[String], workspace: boo
                         _ => 0,
                     }
                 };
-                let mut record = serde_json::json!({"package": result.package});
+                let mut record = serde_json::json!({
+                    "schema_version": report::SCHEMA_VERSION,
+                    "package": result.package,
+                });
                 record["report"] = report_json(&result);
                 (record, (priority, code))
             }
             Err(err) => (
-                serde_json::json!({"package": name, "error": format!("{err:#}")}),
+                serde_json::json!({
+                    "schema_version": report::SCHEMA_VERSION,
+                    "package": name,
+                    "error": format!("{err:#}"),
+                }),
                 (4, 1),
             ),
         };
@@ -724,7 +740,9 @@ fn show_workspace(
     let has_errors = !errors.is_empty();
     match format {
         OutputFormat::Json => {
-            let mut combined = serde_json::json!({});
+            let mut combined = serde_json::json!({
+                "schema_version": report::SCHEMA_VERSION,
+            });
             combined["packages"] =
                 serde_json::Value::Array(reports.iter().map(report_json).collect());
             combined["errors"] = serde_json::Value::Array(errors);

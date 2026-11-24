@@ -5744,3 +5744,67 @@ mod tests {
         "{report:#}"
     );
 }
+
+#[test]
+fn stronger_assertions_narrow_struct_fields_and_emit_schema_version() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("struct-field-narrowing");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"struct-narrow\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+#[derive(Debug)]
+pub struct Quote {
+    pub subtotal: i32,
+    pub fee: i32,
+}
+
+pub fn quote(subtotal: i32, rate: i32) -> Quote {
+    Quote {
+        subtotal,
+        fee: subtotal * rate,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn checks_subtotal_only() {
+        let q = quote(200, 3);
+        assert_eq!(q.subtotal, 200);
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let run = tmt(&dir, &["--format", "json", "--quiet", "--rebuild"]);
+    assert_eq!(run.code, 2, "{}", run.stderr);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_eq!(report["schema_version"], 1, "{report:#}");
+    let gaps = findings(&report, "assertion_gap");
+    let narrowed = gaps.iter().find(|f| {
+        f["witness"]["field"].as_str() == Some("fee")
+            && f["witness"]["assertion"].as_str() == Some("assert_eq!(quote(200, 3).fee, 600);")
+    });
+    assert!(narrowed.is_some(), "{report:#}");
+
+    // `--list --format json` and `--format jsonl` also emit `schema_version: 1`.
+    let listed = tmt(&dir, &["--list", "--format", "json", "--quiet"]);
+    assert_eq!(listed.code, 0, "{}", listed.stderr);
+    let listed_json: Value = serde_json::from_str(&listed.stdout).unwrap();
+    assert_eq!(listed_json["schema_version"], 1, "{listed_json:#}");
+
+    let jsonl = tmt(&dir, &["--format", "jsonl", "--quiet"]);
+    assert_eq!(jsonl.code, 2, "{}", jsonl.stderr);
+    let first_line: Value = serde_json::from_str(jsonl.stdout.lines().next().unwrap()).unwrap();
+    assert_eq!(first_line["schema_version"], 1, "{first_line:#}");
+    assert_eq!(first_line["report"]["schema_version"], 1, "{first_line:#}");
+}

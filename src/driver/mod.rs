@@ -2473,9 +2473,15 @@ fn run_package(
         let observe = |scenario: &witness::Scenario,
                        baseline: &TestBinary,
                        edits: &[witness::Edit],
+                       field_path: Option<&str>,
                        expected: Option<&str>|
          -> Result<Option<witness::Observation>> {
-            let test = scenario.test_edit(&file.original, witness::TEST_NAME, expected);
+            let test = scenario.test_edit_with_field(
+                &file.original,
+                witness::TEST_NAME,
+                field_path,
+                expected,
+            );
             let edits: Vec<_> = edits.iter().cloned().chain([test]).collect();
             let Some(exe) = compile_observer(&edits)? else {
                 return Ok(None);
@@ -2728,18 +2734,60 @@ fn run_package(
                                 // A combined build can fail or the code can depend on
                                 // the harness. Retry the original input in isolation.
                             }
-                            let Some(original) = observe(scenario, baseline, &[], None)? else {
+                            let Some(original) = observe(scenario, baseline, &[], None, None)?
+                            else {
                                 return Ok(None);
                             };
                             let value = original.value;
-                            if !witness::is_expected_literal(&value) {
+                            if witness::is_expected_literal(&value) {
+                                let Some(mutant) = observe(
+                                    scenario,
+                                    baseline,
+                                    &survivor.candidate.edits,
+                                    None,
+                                    Some(&value),
+                                )?
+                                else {
+                                    return Ok(None);
+                                };
+                                if mutant.equals_expected != Some(false) || value == mutant.value {
+                                    return Ok(None);
+                                }
+                                let Some(checked) =
+                                    observe(scenario, baseline, &[], None, Some(&value))?
+                                else {
+                                    return Ok(None);
+                                };
+                                if checked.equals_expected != Some(true) || checked.value != value {
+                                    return Ok(None);
+                                }
+                                return Ok(scenario.verified(value, mutant.value));
+                            }
+                            // Multi-field Debug struct: narrow to a single differing public
+                            // literal field and compiler-verify `&result.<path> == &(<val>)`.
+                            if witness::parse_debug_struct(&value).is_none() {
                                 return Ok(None);
                             }
+                            let Some(raw_mutant) =
+                                observe(scenario, baseline, &survivor.candidate.edits, None, None)?
+                            else {
+                                return Ok(None);
+                            };
+                            let Some((path, field_orig, _)) =
+                                witness::narrow_struct_field(&value, &raw_mutant.value)
+                            else {
+                                return Ok(None);
+                            };
+                            if !witness::is_expected_literal(&field_orig) {
+                                return Ok(None);
+                            }
+                            let field_path = path.join(".");
                             let Some(mutant) = observe(
                                 scenario,
                                 baseline,
                                 &survivor.candidate.edits,
-                                Some(&value),
+                                Some(&field_path),
+                                Some(&field_orig),
                             )?
                             else {
                                 return Ok(None);
@@ -2747,7 +2795,13 @@ fn run_package(
                             if mutant.equals_expected != Some(false) || value == mutant.value {
                                 return Ok(None);
                             }
-                            let Some(checked) = observe(scenario, baseline, &[], Some(&value))?
+                            let Some(checked) = observe(
+                                scenario,
+                                baseline,
+                                &[],
+                                Some(&field_path),
+                                Some(&field_orig),
+                            )?
                             else {
                                 return Ok(None);
                             };

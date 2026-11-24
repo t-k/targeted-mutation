@@ -87,22 +87,36 @@ impl Scenario {
     }
 
     pub fn test_edit(&self, source: &str, name: &str, expected: Option<&str>) -> Edit {
+        self.test_edit_with_field(source, name, None, expected)
+    }
+
+    pub fn test_edit_with_field(
+        &self,
+        source: &str,
+        name: &str,
+        field_path: Option<&str>,
+        expected: Option<&str>,
+    ) -> Edit {
         let offset = self.placement.as_ref().map_or(source.len(), |p| p.offset);
         Edit {
             span: offset..offset,
-            replacement: self.test_source(name, expected),
+            replacement: self.test_source(name, field_path, expected),
         }
     }
 
-    fn test_source(&self, name: &str, expected: Option<&str>) -> String {
+    fn test_source(&self, name: &str, field_path: Option<&str>, expected: Option<&str>) -> String {
         let result_type = if self.position {
             ": __tmt_witness_std::option::Option<__tmt_witness_std::primitive::usize>"
         } else {
             ""
         };
+        let subject = match field_path {
+            Some(path) => format!("&result.{path}"),
+            None => "&result".to_owned(),
+        };
         let observation = match expected {
             Some(expected) => format!(
-                r#"__tmt_witness_std::format!("{{result:?}}\t{{}}\n", &result == &({expected}))"#
+                r#"__tmt_witness_std::format!("{{result:?}}\t{{}}\n", {subject} == &({expected}))"#
             ),
             None => r#"__tmt_witness_std::format!("{result:?}\n")"#.to_owned(),
         };
@@ -161,6 +175,19 @@ fn {name}() {{
                 .expression
                 .strip_prefix("self::")
                 .unwrap_or(&self.expression);
+            let narrowed = narrow_struct_field(&original, &mutant)
+                .filter(|(_, field_orig, _)| is_expected_literal(field_orig));
+            let (field, assert_stmt) = match narrowed {
+                Some((path, field_orig, _)) => {
+                    let field_path = path.join(".");
+                    let target = format_field_target(call, &field_path);
+                    (
+                        Some(field_path),
+                        format!("assert_eq!({target}, {field_orig});"),
+                    )
+                }
+                None => (None, format!("assert_eq!({call}, {original});")),
+            };
             let guidance = self
                 .guidance
                 .as_ref()
@@ -173,13 +200,11 @@ fn {name}() {{
             VerifiedWitness {
                 call: call.to_owned(),
                 assertion: if self.assertion_prefix.is_empty() {
-                    format!("assert_eq!({call}, {original});")
+                    assert_stmt
                 } else {
-                    format!(
-                        "{} assert_eq!({call}, {original});",
-                        self.assertion_prefix.trim_end()
-                    )
+                    format!("{} {assert_stmt}", self.assertion_prefix.trim_end())
                 },
+                field,
                 original,
                 mutant,
                 guidance,
@@ -189,6 +214,173 @@ fn {name}() {{
                 in_test_column: self.after.as_ref().and(self.call_at).map(|at| at.1),
             }
         })
+    }
+}
+
+fn format_field_target(call: &str, field_path: &str) -> String {
+    let postfix_safe = syn::parse_str::<Expr>(call).is_ok_and(|expr| {
+        matches!(
+            expr,
+            Expr::Call(_)
+                | Expr::MethodCall(_)
+                | Expr::Path(_)
+                | Expr::Field(_)
+                | Expr::Index(_)
+                | Expr::Paren(_)
+                | Expr::Await(_)
+                | Expr::Try(_)
+        )
+    });
+    if postfix_safe {
+        format!("{call}.{field_path}")
+    } else {
+        format!("({call}).{field_path}")
+    }
+}
+
+fn is_plain_ident(text: &str) -> bool {
+    let mut chars = text.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    if !(first.is_ascii_alphabetic() || first == '_') {
+        return false;
+    }
+    if !chars.all(|c| c.is_ascii_alphanumeric() || c == '_') {
+        return false;
+    }
+    syn::parse_str::<syn::Ident>(text).is_ok()
+}
+
+/// Parses a Rust `Debug` named struct (`TypeName { f1: v1, f2: v2 }`) with at least two
+/// distinct identifier fields. Returns `None` for non-structs, single-field structs,
+/// non-exhaustive `..` output, or malformed delimiters.
+pub(crate) fn parse_debug_struct(text: &str) -> Option<(&str, Vec<(&str, &str)>)> {
+    let trimmed = text.trim();
+    let open = trimmed.find('{')?;
+    if !trimmed.ends_with('}') {
+        return None;
+    }
+    let name = trimmed[..open].trim();
+    if !is_plain_ident(name) {
+        return None;
+    }
+    let inner = trimmed[open + 1..trimmed.len() - 1].trim();
+    if inner.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    let mut depth_paren = 0usize;
+    let mut depth_bracket = 0usize;
+    let mut depth_brace = 0usize;
+    let mut in_string = false;
+    let mut in_char = false;
+    let mut escaped = false;
+    let mut start = 0usize;
+    let bytes = inner.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            i += 1;
+            continue;
+        }
+        if in_char {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'\'' {
+                in_char = false;
+            }
+            i += 1;
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'\'' => in_char = true,
+            b'(' => depth_paren += 1,
+            b')' => depth_paren = depth_paren.checked_sub(1)?,
+            b'[' => depth_bracket += 1,
+            b']' => depth_bracket = depth_bracket.checked_sub(1)?,
+            b'{' => depth_brace += 1,
+            b'}' => depth_brace = depth_brace.checked_sub(1)?,
+            b',' if depth_paren == 0 && depth_bracket == 0 && depth_brace == 0 => {
+                parts.push(inner[start..i].trim());
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    if in_string || in_char || depth_paren != 0 || depth_bracket != 0 || depth_brace != 0 {
+        return None;
+    }
+    let tail = inner[start..].trim();
+    if !tail.is_empty() {
+        parts.push(tail);
+    }
+    if parts.len() < 2 {
+        return None;
+    }
+    let mut fields = Vec::with_capacity(parts.len());
+    let mut seen = std::collections::HashSet::with_capacity(parts.len());
+    for part in parts {
+        if part == ".." {
+            return None;
+        }
+        let (key, value) = part.split_once(':')?;
+        let key = key.trim();
+        let value = value.trim();
+        if !is_plain_ident(key) || value.is_empty() || !seen.insert(key) {
+            return None;
+        }
+        fields.push((key, value));
+    }
+    Some((name, fields))
+}
+
+/// When `original` and `mutant` are Debug-formatted named structs of the same type and field
+/// set that differ on exactly one field (recursively), returns `(field_path, orig_val, mut_val)`.
+pub(crate) fn narrow_struct_field(
+    original: &str,
+    mutant: &str,
+) -> Option<(Vec<String>, String, String)> {
+    let (orig_name, orig_fields) = parse_debug_struct(original)?;
+    let (mut_name, mut_fields) = parse_debug_struct(mutant)?;
+    if orig_name != mut_name || orig_fields.len() != mut_fields.len() {
+        return None;
+    }
+    let mut_map: BTreeMap<&str, &str> = mut_fields.into_iter().collect();
+    let mut differing: Option<(&str, &str, &str)> = None;
+    for (key, orig_val) in orig_fields {
+        let mut_val = *mut_map.get(key)?;
+        if orig_val != mut_val {
+            if differing.is_some() {
+                return None;
+            }
+            differing = Some((key, orig_val, mut_val));
+        }
+    }
+    let (key, orig_val, mut_val) = differing?;
+    if let Some((mut deeper_path, deep_orig, deep_mut)) = narrow_struct_field(orig_val, mut_val) {
+        let mut path = Vec::with_capacity(deeper_path.len() + 1);
+        path.push(key.to_owned());
+        path.append(&mut deeper_path);
+        Some((path, deep_orig, deep_mut))
+    } else {
+        Some((
+            vec![key.to_owned()],
+            orig_val.to_owned(),
+            mut_val.to_owned(),
+        ))
     }
 }
 
@@ -914,5 +1106,84 @@ mod tests {
             let parsed = syn::parse_file(&source).unwrap_or_else(|err| panic!("{source}: {err}"));
             assert!(position_searches(&source, &parsed).is_empty(), "{source}");
         }
+    }
+
+    #[test]
+    fn narrow_struct_field_handles_flat_nested_strings_and_rejects_ambiguous_shapes() {
+        // Flat struct differing on one field.
+        assert_eq!(
+            narrow_struct_field(
+                "Quote { subtotal: 200, fee: 600 }",
+                "Quote { subtotal: 200, fee: 203 }"
+            ),
+            Some((vec!["fee".into()], "600".into(), "203".into()))
+        );
+
+        // Nested struct narrowing recursively.
+        assert_eq!(
+            narrow_struct_field(
+                "Resp { ok: true, meta: Meta { code: 200, msg: \"a, {b}\" } }",
+                "Resp { ok: true, meta: Meta { code: 200, msg: \"err\" } }"
+            ),
+            Some((
+                vec!["meta".into(), "msg".into()],
+                "\"a, {b}\"".into(),
+                "\"err\"".into()
+            ))
+        );
+
+        // Escaped quotes inside string fields do not confuse delimiter splitting.
+        assert_eq!(
+            narrow_struct_field(
+                r#"Row { a: "x\", y: 1", b: 10 }"#,
+                r#"Row { a: "x\", y: 1", b: 20 }"#
+            ),
+            Some((vec!["b".into()], "10".into(), "20".into()))
+        );
+
+        // Reject multiple differing fields, different struct names, single-field structs, and `..`.
+        assert_eq!(
+            narrow_struct_field(
+                "Quote { subtotal: 200, fee: 600 }",
+                "Quote { subtotal: 100, fee: 203 }"
+            ),
+            None
+        );
+        assert_eq!(
+            narrow_struct_field("A { x: 1, y: 2 }", "B { x: 1, y: 3 }"),
+            None
+        );
+        assert_eq!(narrow_struct_field("Wrap { x: 1 }", "Wrap { x: 2 }"), None);
+        assert_eq!(
+            narrow_struct_field("Quote { subtotal: 200, .. }", "Quote { subtotal: 100, .. }"),
+            None
+        );
+
+        // `Scenario::verified` formats narrowed assertion and populates `field`.
+        let scenario = Scenario {
+            expression: "quote(200, 3)".into(),
+            ..Scenario::default()
+        };
+        let witness = scenario
+            .verified(
+                "Quote { subtotal: 200, fee: 600 }".into(),
+                "Quote { subtotal: 200, fee: 203 }".into(),
+            )
+            .unwrap();
+        assert_eq!(witness.field.as_deref(), Some("fee"));
+        assert_eq!(witness.assertion, "assert_eq!(quote(200, 3).fee, 600);");
+
+        // Non-postfix call expressions are parenthesized before `.field`.
+        let binary_scenario = Scenario {
+            expression: "&quote(200, 3)".into(),
+            ..Scenario::default()
+        };
+        let witness = binary_scenario
+            .verified(
+                "Quote { subtotal: 200, fee: 600 }".into(),
+                "Quote { subtotal: 200, fee: 203 }".into(),
+            )
+            .unwrap();
+        assert_eq!(witness.assertion, "assert_eq!((&quote(200, 3)).fee, 600);");
     }
 }
