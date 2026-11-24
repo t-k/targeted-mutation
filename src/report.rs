@@ -2944,4 +2944,33 @@ mod tests {
             "fn f(k: Option<i32>, base: O) -> O"
         );
     }
+
+    #[test]
+    fn audit_reports_unjudged_all_tests_reruns_in_text_and_json() {
+        let mut report = Report {
+            package: "demo".into(),
+            audit: Some(Audit {
+                sampled: 3,
+                survivors: 3,
+                not_audited: 2,
+                ..Audit::default()
+            }),
+            ..Report::default()
+        };
+        let text = render_text(&report, false);
+        assert!(
+            text.contains(
+                "audit: 3 of 3 surviving mutants run against all tests, 0 failed one they had not been run against, 2 could not be judged\n"
+            ),
+            "{text}"
+        );
+        let value = serde_json::to_value(&report).unwrap();
+        assert_eq!(value["audit"]["not_audited"], 2);
+
+        report.audit.as_mut().unwrap().not_audited = 0;
+        let clean_text = render_text(&report, false);
+        assert!(!clean_text.contains("could not be judged"), "{clean_text}");
+        let clean_value = serde_json::to_value(&report).unwrap();
+        assert!(clean_value["audit"].get("not_audited").is_none());
+    }
 }

@@ -1256,7 +1256,17 @@ fn copy_entry(
         let Ok(target) = src.canonicalize() else {
             return Ok(()); // dangling
         };
-        if target.ancestors().any(&skip) {
+        // Only check skipped ancestors strictly below `workspace` so a workspace situated
+        // under a directory named e.g. `node_modules` does not drop its own symlinks.
+        let skipped = if target.starts_with(workspace) {
+            target
+                .ancestors()
+                .take_while(|ancestor| *ancestor != workspace && ancestor.starts_with(workspace))
+                .any(&skip)
+        } else {
+            skip(&target)
+        };
+        if skipped {
             return Ok(());
         }
         if target.is_dir() {
@@ -2776,6 +2786,7 @@ fn since_diff(workspace: &Path, revision: &str) -> Result<String> {
         &[
             "diff",
             "-U0",
+            "--inter-hunk-context=0",
             "--no-color",
             "--no-ext-diff",
             "--relative",
@@ -9707,6 +9718,29 @@ fn main() {
         )
         .unwrap();
         assert!(!nested_dst.join("link.txt").exists());
+        // A workspace whose own outer ancestor has a skipped name (e.g. `node_modules`)
+        // still copies symlinks pointing to files inside the workspace.
+        let outer_ws = dir.join("node_modules/pkg");
+        fs::create_dir_all(&outer_ws).unwrap();
+        let real = outer_ws.join("real.txt");
+        fs::write(&real, "ok").unwrap();
+        let inner_link = outer_ws.join("alias.txt");
+        symlink(&real, &inner_link).unwrap();
+        let outer_ws_canon = outer_ws.canonicalize().unwrap();
+        let outer_dst = copy.join("outer-ancestor");
+        fs::create_dir_all(&outer_dst).unwrap();
+        let state = WorkCopy::open(&outer_dst, &outer_dst);
+        let skip_node_modules =
+            |path: &Path| path.file_name().is_some_and(|name| name == "node_modules");
+        copy_entry(
+            &inner_link,
+            &outer_dst.join("alias.txt"),
+            &outer_ws_canon,
+            &skip_node_modules,
+            &state,
+        )
+        .unwrap();
+        assert!(outer_dst.join("alias.txt").exists());
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -138,12 +138,17 @@ pub fn hunks(diff: &str) -> Vec<Hunk> {
                     old_left -= 1;
                 }
                 Some(b'+') if new_left > 0 => new_left -= 1,
+                Some(b' ') if old_left > 0 && new_left > 0 => {
+                    old.push_str(&body[1..]);
+                    old_left -= 1;
+                    new_left -= 1;
+                }
                 _ => break,
             }
             if lines.peek().is_some_and(|next| next.starts_with('\\')) {
                 // `\ No newline at end of file`, about the line just read.
                 lines.next();
-                if body.starts_with('-') {
+                if body.starts_with('-') || body.starts_with(' ') {
                     old.truncate(old.trim_end_matches(['\n', '\r']).len());
                 }
             }
@@ -762,5 +767,47 @@ diff --git a/src/a.rs b/src/a.rs
         assert!(scope.touches("src/a.rs", 23, 23));
         assert!(!scope.touches("src/hijacked.rs", 1, 100));
         assert!(!scope.touches("src/another.rs", 1, 100));
+    }
+
+    #[test]
+    fn hunks_and_from_diff_handle_inter_hunk_context_from_git() {
+        let dir =
+            std::env::temp_dir().join(format!("tmt-inter-hunk-context-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let old = "line 1\nkeep A\nkeep B\nold tail\n";
+        let new = "line 1 changed\nkeep A\nkeep B\n++ b/hijacked.rs\n";
+        std::fs::write(dir.join("a.rs"), old).unwrap();
+        std::fs::write(dir.join("b.rs"), new).unwrap();
+        let output = std::process::Command::new("git")
+            .current_dir(&dir)
+            .args([
+                "-c",
+                "diff.interHunkContext=10",
+                "diff",
+                "--no-index",
+                "-U0",
+                "--no-color",
+                "--no-ext-diff",
+                "--src-prefix=a/",
+                "--dst-prefix=b/",
+                "a.rs",
+                "b.rs",
+            ])
+            .output()
+            .unwrap();
+        let diff = String::from_utf8(output.stdout).unwrap();
+        assert!(
+            diff.contains("\n keep A\n"),
+            "expected context line:\n{diff}"
+        );
+        let scope = Scope::from_diff(&diff);
+        assert_eq!(scope.files().collect::<Vec<_>>(), ["b.rs"]);
+        assert!(scope.touches("b.rs", 1, 4));
+        assert!(!scope.touches("hijacked.rs", 1, 100));
+        let parsed = hunks(&diff);
+        assert_eq!(parsed.len(), 1, "{parsed:?}");
+        assert_eq!(undo(new, &[&parsed[0]]).as_deref(), Some(old));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }
