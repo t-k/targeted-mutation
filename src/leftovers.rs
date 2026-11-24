@@ -419,9 +419,11 @@ fn reap_target(target: &StoppedTarget) -> bool {
     {
         return true;
     }
-    if let Some(expected) = target.start.as_deref()
-        && start_token(target.pid).as_deref() != Some(expected)
-    {
+    let Some(expected) = target.start.as_deref() else {
+        // Without a verified start token, fail closed rather than calling `waitpid` by raw PID.
+        return true;
+    };
+    if start_token(target.pid).as_deref() != Some(expected) {
         // Either already gone/reaped or PID was recycled for a different process.
         return true;
     }
@@ -1096,16 +1098,28 @@ mod tests {
         assert!(!should_fallback_from_waitid_pidfd(None));
         assert!(!stop(u32::MAX - 7));
 
-        let child = Command::new("true")
+        let child = Command::new("sleep")
+            .arg("5")
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
         let pid = child.id();
-        let mut pending = vec![StoppedTarget {
+        let start = start_token(pid);
+        assert!(start.is_some());
+        // Missing start token fails closed without reaping.
+        assert!(reap_target(&StoppedTarget {
             pid,
             start: None,
+            #[cfg(target_os = "linux")]
+            pidfd: None,
+        }));
+        assert!(alive(pid));
+        assert!(stop(pid));
+        let mut pending = vec![StoppedTarget {
+            pid,
+            start,
             #[cfg(target_os = "linux")]
             pidfd: None,
         }];
