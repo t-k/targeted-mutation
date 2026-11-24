@@ -386,52 +386,8 @@ fn run_package(
     workspace_shard: Option<WorkspaceShard>,
 ) -> Result<Report> {
     let _leftovers = LeftoverNote(options.progress);
-    if let Some(shard) = options.shard
-        && (!options.source_only || shard.index >= shard.count)
-    {
-        bail!("shards require --source-only and a valid shard index");
-    }
-    let mut seen_errors = HashSet::new();
-    let mut error_values = vec![];
-    for expression in &options.error_values {
-        let expression = expression.trim();
-        // The text is written into the code of probes, each on the line of its site: it
-        // is one line, and has nothing in it that is not to be seen.
-        if expression.chars().any(char::is_control) {
-            bail!(
-                "invalid --error expression {expression:?}: it has to be on one line, \
-                 without control characters"
-            );
-        }
-        let parsed = syn::parse_str::<syn::Expr>(expression)
-            .with_context(|| format!("invalid --error expression {expression:?}"))?;
-        if seen_errors.insert(quote::ToTokens::to_token_stream(&parsed).to_string()) {
-            error_values.push(expression);
-        }
-    }
+    let error_values = validate_package_options(options)?;
     let selection = &options.test_selection;
-    if options.nextest.is_some() {
-        if !cfg!(unix) {
-            bail!("the nextest runner is available on Unix");
-        }
-        if !options.source_only || options.doc || selection.enabled() {
-            bail!(
-                "--test-tool nextest requires --source-only; select tests through the nextest profile"
-            );
-        }
-    }
-    if options.baseline_jobs > 1 && !selection.enabled() {
-        bail!("--baseline-jobs requires isolated tests or a test wrapper or selection");
-    }
-    if options.doc && selection.enabled() {
-        bail!("--doc cannot be combined with isolated test selection");
-    }
-    if options.source_only && options.jobs > 1 {
-        eprintln!(
-            "tmt: warning: --source-only runs mutants serially in one working copy; ignoring --jobs {}",
-            options.jobs
-        );
-    }
     let effective_jobs = if options.source_only { 1 } else { options.jobs };
     let note = |text: &str| {
         if options.progress {
@@ -514,136 +470,13 @@ fn run_package(
         .ok_or_else(|| anyhow!("package `{}` has no lib or bin target", package.name))?;
 
     // 2. Copy the workspace.
-    let workspace = metadata.workspace_root.canonicalize()?;
-    let requested_work = catalogue
-        .map(|catalogue| &catalogue.path)
-        .or(options.work_dir.as_ref());
-    let work = match requested_work {
-        Some(dir) => {
-            fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-            dir.canonicalize()?
-        }
-        None => metadata.target_directory.join("tmt"),
-    };
-    // The copy is brought up to date on every run, and files that are no longer wanted
-    // are deleted from it. Make sure it is ours to delete from.
-    if workspace.starts_with(&work) {
-        bail!(
-            "the work directory {} contains the workspace; choose a directory of its own",
-            work.display()
-        );
-    }
-    fs::create_dir_all(&work).with_context(|| format!("creating {}", work.display()))?;
-    let work = work.canonicalize()?;
-    let work_lock = if catalogue.is_none() {
-        Some(Arc::new(WorkLock::take(&work)?))
-    } else {
-        None
-    };
-    let copy = work.join("src");
-    let marker = work.join(WORK_MARKER);
-    if copy.exists() && !marker.exists() {
-        bail!(
-            "{} exists and was not created by tmt; refusing to delete it. \
-                 Choose another --work-dir or remove it yourself.",
-            copy.display()
-        );
-    }
-    fs::write(
-        &marker,
-        "Working directory of tmt (targeted-mutation). Safe to delete.\n",
-    )?;
-    let target_dir = metadata.target_directory.clone();
-    let forbidden = |path: &Path| {
-        path == target_dir
-            || path == work
-            || batch.is_some_and(|batch| path == batch.work)
-            || path.file_name().is_some_and(|n| n == ".git")
-            || (path.parent() == Some(workspace.as_path())
-                && path.file_name().is_some_and(|n| n == "target"))
-    };
-    let state = WorkCopy::open(&work, &copy);
-    let fixtures = options
-        .copy_fixtures
-        .iter()
-        .map(|path| fixture_relative(path))
-        .collect::<Result<Vec<_>>>()?;
-    let excluded = fixture_exclusions(&workspace, &fixtures, &options.copy_fixture_excludes)?;
-    let fixture_forbidden = |path: &Path| forbidden(path) || excluded.contains(path);
-    let skip = |path: &Path| {
-        fixture_forbidden(path) || path.file_name().is_some_and(|n| n == "node_modules")
-    };
-    if options.progress && !options.list {
-        for path in &excluded {
-            note(&format!(
-                "excluded fixture {}",
-                path.strip_prefix(&workspace).unwrap_or(path).display()
-            ));
-        }
-    }
-    if catalogue.is_none_or(|catalogue| !catalogue.ready.get()) {
-        work_directory(&work, "src")?;
-        let visible = if options.all_files {
-            None
-        } else {
-            git_visible_files(&workspace)?
-        };
-        match visible {
-            // Only what git would not ignore: build output, caches, local notes and secrets
-            // that are kept out of the repository stay out of the copy too.
-            Some(files) => {
-                let copied = copy_git_visible(&workspace, &copy, files, &workspace, &skip, &state)?;
-                note(&format!(
-                    "copied {copied} files (ignored files are left out)"
-                ));
-            }
-            None => copy_tree(&workspace, &copy, &workspace, &skip, &state)?,
-        }
-        for relative in &fixtures {
-            copy_fixture_entry(
-                &workspace.join(relative),
-                &copy.join(relative),
-                &workspace,
-                &fixture_forbidden,
-                &state,
-                &mut BTreeSet::new(),
-            )?;
-        }
-        prune(&copy, &state)?;
-        if options.git_index {
-            git_index::snapshot(&workspace, &copy)?;
-        }
-        if !options.list {
-            // Relative path dependencies that leave the workspace would point nowhere from the copy.
-            let mut manifests: Vec<&Path> = metadata
-                .packages
-                .iter()
-                .map(|p| p.manifest_path.as_path())
-                .collect();
-            let root_manifest = metadata.workspace_root.join("Cargo.toml");
-            manifests.push(&root_manifest);
-            for manifest in manifests {
-                let Ok(canonical) = manifest.canonicalize() else {
-                    continue;
-                };
-                let (Some(manifest_dir), Ok(relative)) =
-                    (canonical.parent(), canonical.strip_prefix(&workspace))
-                else {
-                    continue;
-                };
-                let text = fs::read_to_string(&canonical)?;
-                if let Some(rewritten) =
-                    absolutize_path_dependencies(&text, manifest_dir, &workspace, &copy)?
-                {
-                    state.write(&copy.join(relative), &rewritten)?;
-                }
-            }
-        }
-        if let Some(catalogue) = catalogue {
-            state.settle(&workspace)?;
-            catalogue.ready.set(true);
-        }
-    }
+    let PreparedWorkCopy {
+        workspace,
+        work,
+        work_lock,
+        copy,
+        state,
+    } = prepare_work_copy(options, metadata, batch, catalogue, &note)?;
 
     let in_copy = |path: &Path| -> Result<PathBuf> {
         let canonical = path.canonicalize()?;
@@ -1636,7 +1469,7 @@ fn run_package(
     // Sites whose mutant could not be run as a probe for what it is. With `--rebuild`
     // they are built from the source instead; without, they are counted.
     let mut not_evaluated: HashSet<u32> = HashSet::new();
-    let mut work: Vec<SiteWork> = vec![];
+    let mut site_work: Vec<SiteWork> = vec![];
     // `(index of the finding, job of its first surviving mutant)`.
     let mut effect_jobs: Vec<(usize, usize)> = vec![];
     for file in &files {
@@ -1729,7 +1562,7 @@ fn run_package(
                 .iter()
                 .map(|m| (*m, add(*m, &|bin| infected(bin, *m))))
                 .collect();
-            work.push(SiteWork {
+            site_work.push(SiteWork {
                 file: &file.display,
                 site,
                 gaps,
@@ -1754,86 +1587,23 @@ fn run_package(
     // 6b. On request, check what the run rests on: that the tests chosen for a mutant
     // are the ones that could fail with it, and that the tests do the same twice.
     if let Some(wanted) = options.audit {
-        let survivors: Vec<usize> = (0..jobs.len())
-            .filter(|job| results[*job].survived.is_some())
-            .collect();
-        let chosen: Vec<usize> = spread(survivors.len(), wanted)
-            .into_iter()
-            .map(|nth| survivors[nth])
-            .collect();
-        session.note(&format!(
-            "audit: running {} of {} surviving mutants against all tests",
-            chosen.len(),
-            survivors.len()
-        ));
-        let against_all: Vec<Job> = chosen
-            .iter()
-            .map(|job| Job {
-                site: jobs[*job].site,
-                mutation: jobs[*job].mutation,
-                tests: (0..session.binaries.len()).map(|bin| (bin, None)).collect(),
-            })
-            .collect();
-        let mut audit = report::Audit {
-            sampled: chosen.len(),
-            survivors: survivors.len(),
-            ..report::Audit::default()
-        };
-        let audit_checkpoint = probe_phase("audit", &against_all)?;
-        for (job, again) in chosen.iter().zip(session.run_jobs(
-            &against_all,
+        report.audit = Some(run_audit_phase(
+            &session,
+            &files,
+            &jobs,
+            &mut results,
+            &mut report.timeout_rechecks,
+            &scratch,
+            wanted,
             options.jobs,
-            "audit mutants",
-            audit_checkpoint.as_ref(),
-        )?) {
-            report.timeout_rechecks.include(&again);
-            if again.unable || again.unconfirmed_timeout {
-                audit.not_audited += 1;
-            } else if audit_all_tests_disagrees(&again) {
-                // The verdict of all tests is the one that counts.
-                results[*job] = again;
-                let site = files
-                    .iter()
-                    .find_map(|f| Some((f, f.sites.iter().find(|s| s.id == jobs[*job].site)?)));
-                if let Some((file, site)) = site {
-                    audit
-                        .disagreements
-                        .push(report::location(&file.display, site));
-                }
-            }
-        }
-        session.note("audit: recording the tests once more");
-        for (index, bin) in session.binaries.iter().enumerate() {
-            let path = scratch.join(format!("trace-{index}-audit.tsv"));
-            let _ = fs::remove_file(&path);
-            let trace_env = path.to_string_lossy().into_owned();
-            let limit = Duration::from_secs(3600);
-            let outcome = run_binary(
-                bin,
-                None,
-                &[("TMT_TRACE", &trace_env)],
-                limit,
-                RunOutput::Quiet,
-                1,
-            )?;
-            let again = Trace::parse(&fs::read_to_string(&path).unwrap_or_default());
-            let _ = fs::remove_file(&path);
-            let records = bin.trace.differences(&again);
-            if outcome != Outcome::Pass || records > 0 {
-                audit.trace_differences.push(report::TraceDifference {
-                    binary: bin.name.clone(),
-                    records,
-                    rerun_failed: outcome != Outcome::Pass,
-                });
-            }
-        }
-        report.audit = Some(audit);
+            &probe_phase,
+        )?);
     }
     // 6c. In code that did not change, a mutant that passes says something about this
     // change only if the tests as they were found it out. They are built once, with
     // the program as it is, and run against those mutants.
     let mut found_out_before: HashSet<usize> = HashSet::new();
-    let asked: Vec<usize> = work
+    let asked: Vec<usize> = site_work
         .iter()
         .filter(|item| beyond.contains(&item.site.id))
         .flat_map(|item| {
@@ -1951,12 +1721,12 @@ fn run_package(
             .iter()
             .all(|(_, confirm, _)| confirm.iter().all(|j| results[*j].survived.is_some()))
     };
-    let constants: BTreeSet<(&str, usize, usize)> = work
+    let constants: BTreeSet<(&str, usize, usize)> = site_work
         .iter()
         .filter(|w| w.cannot_differ || (w.constant && confirmed(w)))
         .map(|w| (w.file, w.site.start, w.site.end))
         .collect();
-    for item in &work {
+    for item in &site_work {
         let at = report::location(item.file, item.site);
         for (finding, confirm, constant_expr) in &item.gaps {
             // Already said by the site of the expression itself (or, for a comparison that
@@ -2023,45 +1793,15 @@ fn run_package(
 
     // 7. What do the surviving mutants change in the tests that let them through?
     if options.effects && !effect_jobs.is_empty() {
-        session.note(&format!("tracing {} surviving mutants", effect_jobs.len()));
-        let sites: BTreeMap<u32, (&str, &Site)> = files
-            .iter()
-            .flat_map(|f| f.sites.iter().map(move |s| (s.id, (f.display.as_str(), s))))
-            .collect();
-        let traced = run_pool(effect_jobs.len(), options.jobs, |index| {
-            session.trace_job(
-                &jobs[effect_jobs[index].1],
-                &scratch,
-                options.jobs.clamp(1, effect_jobs.len()),
-            )
-        })?;
-        for ((finding, job), mut changes) in effect_jobs.iter().zip(traced) {
-            // What happens inside the mutated code itself is not an effect of it: deleting
-            // a statement trivially stops the expressions in it from running.
-            if let Some((mutated_file, mutated)) = sites.get(&jobs[*job].site) {
-                for found in changes.values_mut() {
-                    found.retain(|change| {
-                        sites.get(&change.site()).is_none_or(|(file, site)| {
-                            file != mutated_file
-                                || site.end <= mutated.start
-                                || mutated.end <= site.start
-                        })
-                    });
-                }
-                changes.retain(|_, found| !found.is_empty());
-            }
-            if let Finding::AssertionGap {
-                effects,
-                effects_of,
-                ..
-            } = &mut report.findings[*finding]
-            {
-                *effects = describe_effects(&changes, &sites);
-                *effects_of = sites
-                    .get(&jobs[*job].site)
-                    .map(|(_, site)| report::describe(site, jobs[*job].mutation));
-            }
-        }
+        run_effects_phase(
+            &session,
+            &files,
+            &jobs,
+            &effect_jobs,
+            &scratch,
+            options.jobs,
+            &mut report.findings,
+        )?;
     }
 
     // 7b. What a probe cannot be put in is mutated in the source, built and run: code in
@@ -3045,6 +2785,359 @@ fn run_package(
     name_findings(&mut report.findings, &places);
 
     // 8. Findings the user has already dealt with.
+    apply_suppressions_and_finish(options, &files, &mut report, checkpoint.as_ref())?;
+    Ok(report)
+}
+
+fn validate_package_options(options: &Options) -> Result<Vec<&str>> {
+    if let Some(shard) = options.shard
+        && (!options.source_only || shard.index >= shard.count)
+    {
+        bail!("shards require --source-only and a valid shard index");
+    }
+    let mut seen_errors = HashSet::new();
+    let mut error_values = vec![];
+    for expression in &options.error_values {
+        let expression = expression.trim();
+        // The text is written into the code of probes, each on the line of its site: it
+        // is one line, and has nothing in it that is not to be seen.
+        if expression.chars().any(char::is_control) {
+            bail!(
+                "invalid --error expression {expression:?}: it has to be on one line, \
+                 without control characters"
+            );
+        }
+        let parsed = syn::parse_str::<syn::Expr>(expression)
+            .with_context(|| format!("invalid --error expression {expression:?}"))?;
+        if seen_errors.insert(quote::ToTokens::to_token_stream(&parsed).to_string()) {
+            error_values.push(expression);
+        }
+    }
+    let selection = &options.test_selection;
+    if options.nextest.is_some() {
+        if !cfg!(unix) {
+            bail!("the nextest runner is available on Unix");
+        }
+        if !options.source_only || options.doc || selection.enabled() {
+            bail!(
+                "--test-tool nextest requires --source-only; select tests through the nextest profile"
+            );
+        }
+    }
+    if options.baseline_jobs > 1 && !selection.enabled() {
+        bail!("--baseline-jobs requires isolated tests or a test wrapper or selection");
+    }
+    if options.doc && selection.enabled() {
+        bail!("--doc cannot be combined with isolated test selection");
+    }
+    if options.source_only && options.jobs > 1 {
+        eprintln!(
+            "tmt: warning: --source-only runs mutants serially in one working copy; ignoring --jobs {}",
+            options.jobs
+        );
+    }
+    Ok(error_values)
+}
+
+struct PreparedWorkCopy {
+    workspace: PathBuf,
+    work: PathBuf,
+    work_lock: Option<Arc<WorkLock>>,
+    copy: PathBuf,
+    state: WorkCopy,
+}
+
+fn prepare_work_copy(
+    options: &Options,
+    metadata: &Metadata,
+    batch: Option<&WorkspaceBatch<'_>>,
+    catalogue: Option<&CatalogueSnapshot>,
+    note: &impl Fn(&str),
+) -> Result<PreparedWorkCopy> {
+    let workspace = metadata.workspace_root.canonicalize()?;
+    let requested_work = catalogue
+        .map(|catalogue| &catalogue.path)
+        .or(options.work_dir.as_ref());
+    let work = match requested_work {
+        Some(dir) => {
+            fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+            dir.canonicalize()?
+        }
+        None => metadata.target_directory.join("tmt"),
+    };
+    // The copy is brought up to date on every run, and files that are no longer wanted
+    // are deleted from it. Make sure it is ours to delete from.
+    if workspace.starts_with(&work) {
+        bail!(
+            "the work directory {} contains the workspace; choose a directory of its own",
+            work.display()
+        );
+    }
+    fs::create_dir_all(&work).with_context(|| format!("creating {}", work.display()))?;
+    let work = work.canonicalize()?;
+    let work_lock = if catalogue.is_none() {
+        Some(Arc::new(WorkLock::take(&work)?))
+    } else {
+        None
+    };
+    let copy = work.join("src");
+    let marker = work.join(WORK_MARKER);
+    if copy.exists() && !marker.exists() {
+        bail!(
+            "{} exists and was not created by tmt; refusing to delete it. \
+                 Choose another --work-dir or remove it yourself.",
+            copy.display()
+        );
+    }
+    fs::write(
+        &marker,
+        "Working directory of tmt (targeted-mutation). Safe to delete.\n",
+    )?;
+    let target_dir = metadata.target_directory.clone();
+    let forbidden = |path: &Path| {
+        path == target_dir
+            || path == work
+            || batch.is_some_and(|batch| path == batch.work)
+            || path.file_name().is_some_and(|n| n == ".git")
+            || (path.parent() == Some(workspace.as_path())
+                && path.file_name().is_some_and(|n| n == "target"))
+    };
+    let state = WorkCopy::open(&work, &copy);
+    let fixtures = options
+        .copy_fixtures
+        .iter()
+        .map(|path| fixture_relative(path))
+        .collect::<Result<Vec<_>>>()?;
+    let excluded = fixture_exclusions(&workspace, &fixtures, &options.copy_fixture_excludes)?;
+    let fixture_forbidden = |path: &Path| forbidden(path) || excluded.contains(path);
+    let skip = |path: &Path| {
+        fixture_forbidden(path) || path.file_name().is_some_and(|n| n == "node_modules")
+    };
+    if options.progress && !options.list {
+        for path in &excluded {
+            note(&format!(
+                "excluded fixture {}",
+                path.strip_prefix(&workspace).unwrap_or(path).display()
+            ));
+        }
+    }
+    if catalogue.is_none_or(|catalogue| !catalogue.ready.get()) {
+        work_directory(&work, "src")?;
+        let visible = if options.all_files {
+            None
+        } else {
+            git_visible_files(&workspace)?
+        };
+        match visible {
+            // Only what git would not ignore: build output, caches, local notes and secrets
+            // that are kept out of the repository stay out of the copy too.
+            Some(files) => {
+                let copied = copy_git_visible(&workspace, &copy, files, &workspace, &skip, &state)?;
+                note(&format!(
+                    "copied {copied} files (ignored files are left out)"
+                ));
+            }
+            None => copy_tree(&workspace, &copy, &workspace, &skip, &state)?,
+        }
+        for relative in &fixtures {
+            copy_fixture_entry(
+                &workspace.join(relative),
+                &copy.join(relative),
+                &workspace,
+                &fixture_forbidden,
+                &state,
+                &mut BTreeSet::new(),
+            )?;
+        }
+        prune(&copy, &state)?;
+        if options.git_index {
+            git_index::snapshot(&workspace, &copy)?;
+        }
+        if !options.list {
+            // Relative path dependencies that leave the workspace would point nowhere from the copy.
+            let mut manifests: Vec<&Path> = metadata
+                .packages
+                .iter()
+                .map(|p| p.manifest_path.as_path())
+                .collect();
+            let root_manifest = metadata.workspace_root.join("Cargo.toml");
+            manifests.push(&root_manifest);
+            for manifest in manifests {
+                let Ok(canonical) = manifest.canonicalize() else {
+                    continue;
+                };
+                let (Some(manifest_dir), Ok(relative)) =
+                    (canonical.parent(), canonical.strip_prefix(&workspace))
+                else {
+                    continue;
+                };
+                let text = fs::read_to_string(&canonical)?;
+                if let Some(rewritten) =
+                    absolutize_path_dependencies(&text, manifest_dir, &workspace, &copy)?
+                {
+                    state.write(&copy.join(relative), &rewritten)?;
+                }
+            }
+        }
+        if let Some(catalogue) = catalogue {
+            state.settle(&workspace)?;
+            catalogue.ready.set(true);
+        }
+    }
+    Ok(PreparedWorkCopy {
+        workspace,
+        work,
+        work_lock,
+        copy,
+        state,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_audit_phase<'a>(
+    session: &Session,
+    files: &[SourceFile],
+    jobs: &[Job],
+    results: &mut [JobResult],
+    timeout_rechecks: &mut report::TimeoutRechecks,
+    scratch: &Path,
+    wanted: usize,
+    workers: usize,
+    probe_phase: &impl Fn(&str, &[Job]) -> Result<Option<Phase<'a>>>,
+) -> Result<report::Audit> {
+    let survivors: Vec<usize> = (0..jobs.len())
+        .filter(|job| results[*job].survived.is_some())
+        .collect();
+    let chosen: Vec<usize> = spread(survivors.len(), wanted)
+        .into_iter()
+        .map(|nth| survivors[nth])
+        .collect();
+    session.note(&format!(
+        "audit: running {} of {} surviving mutants against all tests",
+        chosen.len(),
+        survivors.len()
+    ));
+    let against_all: Vec<Job> = chosen
+        .iter()
+        .map(|job| Job {
+            site: jobs[*job].site,
+            mutation: jobs[*job].mutation,
+            tests: (0..session.binaries.len()).map(|bin| (bin, None)).collect(),
+        })
+        .collect();
+    let mut audit = report::Audit {
+        sampled: chosen.len(),
+        survivors: survivors.len(),
+        ..report::Audit::default()
+    };
+    let audit_checkpoint = probe_phase("audit", &against_all)?;
+    for (job, again) in chosen.iter().zip(session.run_jobs(
+        &against_all,
+        workers,
+        "audit mutants",
+        audit_checkpoint.as_ref(),
+    )?) {
+        timeout_rechecks.include(&again);
+        if again.unable || again.unconfirmed_timeout {
+            audit.not_audited += 1;
+        } else if audit_all_tests_disagrees(&again) {
+            // The verdict of all tests is the one that counts.
+            results[*job] = again;
+            let site = files
+                .iter()
+                .find_map(|f| Some((f, f.sites.iter().find(|s| s.id == jobs[*job].site)?)));
+            if let Some((file, site)) = site {
+                audit
+                    .disagreements
+                    .push(report::location(&file.display, site));
+            }
+        }
+    }
+    session.note("audit: recording the tests once more");
+    for (index, bin) in session.binaries.iter().enumerate() {
+        let path = scratch.join(format!("trace-{index}-audit.tsv"));
+        let _ = fs::remove_file(&path);
+        let trace_env = path.to_string_lossy().into_owned();
+        let limit = Duration::from_secs(3600);
+        let outcome = run_binary(
+            bin,
+            None,
+            &[("TMT_TRACE", &trace_env)],
+            limit,
+            RunOutput::Quiet,
+            1,
+        )?;
+        let again = Trace::parse(&fs::read_to_string(&path).unwrap_or_default());
+        let _ = fs::remove_file(&path);
+        let records = bin.trace.differences(&again);
+        if outcome != Outcome::Pass || records > 0 {
+            audit.trace_differences.push(report::TraceDifference {
+                binary: bin.name.clone(),
+                records,
+                rerun_failed: outcome != Outcome::Pass,
+            });
+        }
+    }
+    Ok(audit)
+}
+
+fn run_effects_phase(
+    session: &Session,
+    files: &[SourceFile],
+    jobs: &[Job],
+    effect_jobs: &[(usize, usize)],
+    scratch: &Path,
+    workers: usize,
+    findings: &mut [Finding],
+) -> Result<()> {
+    session.note(&format!("tracing {} surviving mutants", effect_jobs.len()));
+    let sites: BTreeMap<u32, (&str, &Site)> = files
+        .iter()
+        .flat_map(|f| f.sites.iter().map(move |s| (s.id, (f.display.as_str(), s))))
+        .collect();
+    let traced = run_pool(effect_jobs.len(), workers, |index| {
+        session.trace_job(
+            &jobs[effect_jobs[index].1],
+            scratch,
+            workers.clamp(1, effect_jobs.len()),
+        )
+    })?;
+    for ((finding, job), mut changes) in effect_jobs.iter().zip(traced) {
+        // What happens inside the mutated code itself is not an effect of it: deleting
+        // a statement trivially stops the expressions in it from running.
+        if let Some((mutated_file, mutated)) = sites.get(&jobs[*job].site) {
+            for found in changes.values_mut() {
+                found.retain(|change| {
+                    sites.get(&change.site()).is_none_or(|(file, site)| {
+                        file != mutated_file
+                            || site.end <= mutated.start
+                            || mutated.end <= site.start
+                    })
+                });
+            }
+            changes.retain(|_, found| !found.is_empty());
+        }
+        if let Finding::AssertionGap {
+            effects,
+            effects_of,
+            ..
+        } = &mut findings[*finding]
+        {
+            *effects = describe_effects(&changes, &sites);
+            *effects_of = sites
+                .get(&jobs[*job].site)
+                .map(|(_, site)| report::describe(site, jobs[*job].mutation));
+        }
+    }
+    Ok(())
+}
+
+fn apply_suppressions_and_finish(
+    options: &Options,
+    files: &[SourceFile],
+    report: &mut Report,
+    checkpoint: Option<&Checkpoint>,
+) -> Result<()> {
     let files_with_findings: BTreeSet<&str> = report
         .findings
         .iter()
@@ -3078,10 +3171,10 @@ fn run_package(
         .findings
         .retain(|finding| !known.as_ref().is_some_and(|known| known.knows(finding)));
     report.suppressed = before - report.findings.len();
-    if let Some(checkpoint) = &checkpoint {
+    if let Some(checkpoint) = checkpoint {
         checkpoint.finish_if_complete()?;
     }
-    Ok(report)
+    Ok(())
 }
 
 fn workspace_report_prefix(relative: &Path) -> String {

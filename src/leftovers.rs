@@ -151,11 +151,22 @@ fn asked_to_leave(setting: Option<std::ffi::OsString>) -> bool {
     setting.is_some_and(|value| !value.is_empty())
 }
 
+/// How long to wait after sweeping for stopped descendants to be reparented and reaped.
+const REAP_WAIT: Duration = Duration::from_millis(200);
+
+#[cfg(unix)]
+struct StoppedTarget {
+    pid: u32,
+    start: Option<String>,
+    #[cfg(target_os = "linux")]
+    pidfd: Option<std::os::fd::OwnedFd>,
+}
+
 #[cfg(unix)]
 fn sweep(path: &Path) -> Swept {
     let mut swept = Swept::default();
     let mut stopped = std::collections::BTreeSet::new();
-    let mut reparented_stopped = std::collections::BTreeSet::new();
+    let mut reparented_stopped: Vec<StoppedTarget> = Vec::new();
     let deadline = Instant::now() + PATIENCE;
     let mut settled = false;
     let me = std::process::id();
@@ -196,12 +207,12 @@ fn sweep(path: &Path) -> Swept {
             if !is_left_candidate(pid, me, parent, active_child, subreaper) {
                 continue;
             }
-            if stop_verified(pid, path) {
+            if let Some(target) = stop_verified(pid, path) {
                 stopped.insert(pid);
                 if subreaper {
                     // Under PID 1 or a subreaper, a stopped descendant whose own parent
                     // is also being stopped may be reparented to `me` after this check.
-                    reparented_stopped.insert(pid);
+                    reparented_stopped.push(target);
                 }
             }
         }
@@ -214,12 +225,17 @@ fn sweep(path: &Path) -> Swept {
         // tmt:ignore without the pause the loop only looks more often
         std::thread::sleep(Duration::from_millis(20));
     }
-    // Reap any reparented orphans we stopped so they do not accumulate as zombies.
-    while !reparented_stopped.is_empty() && Instant::now() < deadline {
+    // Reap stopped orphans under PID 1/subreaper with a short bounded wait so an
+    // unrelated parent that closed the watched file cannot stall the sweep for 5s.
+    let reap_deadline = (Instant::now() + REAP_WAIT).min(deadline);
+    while !reparented_stopped.is_empty() && Instant::now() < reap_deadline {
         reap_stopped(&mut reparented_stopped);
         if !reparented_stopped.is_empty() {
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+    if subreaper {
+        reap_subreaper_zombies(me);
     }
     swept.stopped = stopped.len();
     swept
@@ -233,14 +249,64 @@ fn can_stop_verified(before: Option<&str>, still_holds: bool, after: Option<&str
 }
 
 #[cfg(unix)]
-fn reap_stopped(pids: &mut BTreeSet<u32>) {
-    pids.retain(|&pid| !reap_child(pid));
+fn reap_stopped(targets: &mut Vec<StoppedTarget>) {
+    targets.retain(|target| !reap_target(target));
 }
 
-/// Non-blocking `waitpid(pid, WNOHANG)` for a single stopped orphan under PID 1/subreaper.
-/// Returns `true` once the process has been reaped or has exited under another parent.
+/// Reaps a single stopped orphan without ever touching active sibling runner children.
+/// On Linux with a pinned `pidfd`, uses `waitid(P_PIDFD, ...)` to prevent PID-reuse races.
+/// Otherwise synchronizes with `STARTING` + `ACTIVE_CHILDREN` + `start_token` before `waitpid`.
 #[cfg(unix)]
-fn reap_child(pid: u32) -> bool {
+fn reap_target(target: &StoppedTarget) -> bool {
+    #[cfg(target_os = "linux")]
+    if let Some(pidfd) = &target.pidfd {
+        use std::os::fd::AsRawFd as _;
+        const P_PIDFD: std::ffi::c_uint = 3;
+        const WNOHANG: std::ffi::c_int = 1;
+        const WEXITED: std::ffi::c_int = 4;
+        #[repr(C)]
+        struct SigInfo {
+            si_signo: std::ffi::c_int,
+            si_errno: std::ffi::c_int,
+            si_code: std::ffi::c_int,
+            _pad: [u64; 15],
+        }
+        unsafe extern "C" {
+            fn waitid(
+                idtype: std::ffi::c_uint,
+                id: std::ffi::c_uint,
+                infop: *mut SigInfo,
+                options: std::ffi::c_int,
+            ) -> std::ffi::c_int;
+        }
+        let mut info = SigInfo {
+            si_signo: 0,
+            si_errno: 0,
+            si_code: 0,
+            _pad: [0; 15],
+        };
+        // SAFETY: `waitid(P_PIDFD, fd, &mut info, WEXITED | WNOHANG)` targets only the
+        // process pinned by `pidfd` and never blocks.
+        let rc = unsafe {
+            waitid(
+                P_PIDFD,
+                pidfd.as_raw_fd() as std::ffi::c_uint,
+                &mut info,
+                WEXITED | WNOHANG,
+            )
+        };
+        if rc == 0 {
+            // `si_signo != 0` means the process was reaped; `0` means still alive.
+            return info.si_signo != 0;
+        }
+        let errno = io::Error::last_os_error().raw_os_error();
+        if errno == Some(4 /* EINTR */) {
+            return false;
+        }
+        // `ECHILD`: either reaped by another parent or not yet reparented to `me`.
+        return parent_of(target.pid).is_none();
+    }
+
     unsafe extern "C" {
         fn waitpid(
             pid: std::ffi::c_int,
@@ -249,22 +315,31 @@ fn reap_child(pid: u32) -> bool {
         ) -> std::ffi::c_int;
     }
     const WNOHANG: std::ffi::c_int = 1;
-    let Ok(raw_pid) = std::ffi::c_int::try_from(pid) else {
+    let Ok(raw_pid) = std::ffi::c_int::try_from(target.pid) else {
         return true;
     };
     if raw_pid <= 1 {
         return true;
     }
+    // Synchronize with `Watch::spawn` and verify process identity while holding `STARTING`
+    // so a newly spawned runner reusing the same PID cannot be reaped before registration.
+    let _spawn = STARTING.lock().unwrap_or_else(|e| e.into_inner());
     if ACTIVE_CHILDREN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
-        .contains(&pid)
+        .contains(&target.pid)
     {
         return true;
     }
+    if let Some(expected) = target.start.as_deref()
+        && start_token(target.pid).as_deref() != Some(expected)
+    {
+        // Either already gone/reaped or PID was recycled for a different process.
+        return true;
+    }
     let mut status: std::ffi::c_int = 0;
-    // SAFETY: `waitpid` with a specific `pid > 1` and `WNOHANG` never blocks and never
-    // reaps any unrelated active runner child.
+    // SAFETY: `waitpid` with a verified `pid > 1` and `WNOHANG` never blocks and never
+    // reaps any active runner child.
     let rc = unsafe { waitpid(raw_pid, &mut status, WNOHANG) };
     if rc > 0 {
         return true;
@@ -272,14 +347,68 @@ fn reap_child(pid: u32) -> bool {
     if rc == 0 {
         return false;
     }
-    // `ECHILD`: either already reaped by another parent, or a grandchild not yet
-    // reparented to `me` while its intermediate parent is still exiting.
     let errno = io::Error::last_os_error().raw_os_error();
     if errno == Some(4 /* EINTR */) {
         return false;
     }
-    parent_of(pid).is_none()
+    parent_of(target.pid).is_none()
 }
+
+/// Under PID 1/subreaper, reaps already-exited zombie direct children that are not owned
+/// by any active `Watch` (e.g. grandchildren killed via process-group timeout whose FD
+/// closed before `sweep` ran).
+#[cfg(target_os = "linux")]
+fn reap_subreaper_zombies(me: u32) {
+    unsafe extern "C" {
+        fn waitpid(
+            pid: std::ffi::c_int,
+            status: *mut std::ffi::c_int,
+            options: std::ffi::c_int,
+        ) -> std::ffi::c_int;
+    }
+    const WNOHANG: std::ffi::c_int = 1;
+    let _spawn = STARTING.lock().unwrap_or_else(|e| e.into_inner());
+    let active = ACTIVE_CHILDREN.lock().unwrap_or_else(|e| e.into_inner());
+    let Ok(entries) = fs::read_dir("/proc") else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        if pid <= 1 || pid == me || active.contains(&pid) {
+            continue;
+        }
+        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
+            continue;
+        };
+        if is_zombie_child_in_stat(&stat, me)
+            && let Ok(raw_pid) = std::ffi::c_int::try_from(pid)
+        {
+            let mut status: std::ffi::c_int = 0;
+            // SAFETY: non-blocking waitpid on a verified non-active zombie child.
+            unsafe { waitpid(raw_pid, &mut status, WNOHANG) };
+        }
+    }
+}
+
+#[cfg(any(test, target_os = "linux"))]
+fn is_zombie_child_in_stat(stat: &str, me: u32) -> bool {
+    let Some(close) = stat.rfind(')') else {
+        return false;
+    };
+    let mut fields = stat[close + 1..].split_whitespace();
+    let state = fields.next();
+    let ppid = fields.next().and_then(|p| p.parse::<u32>().ok());
+    state == Some("Z") && ppid == Some(me)
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn reap_subreaper_zombies(_me: u32) {}
 
 /// Only fall back from `pidfd_open` to PID-based signalling when the kernel does not
 /// implement `pidfd_open` (`ENOSYS`). Other errors (`EMFILE`, `EPERM`, `ESRCH`) fail
@@ -293,7 +422,7 @@ fn should_fallback_from_pidfd(errno: Option<i32>) -> bool {
 /// On Linux, pins the process with `pidfd_open` before verifying file ownership and
 /// signals via `pidfd_send_signal` to eliminate PID-reuse races.
 #[cfg(target_os = "linux")]
-fn stop_verified(pid: u32, path: &Path) -> bool {
+fn stop_verified(pid: u32, path: &Path) -> Option<StoppedTarget> {
     use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
     use std::os::unix::fs::MetadataExt as _;
 
@@ -302,15 +431,11 @@ fn stop_verified(pid: u32, path: &Path) -> bool {
     unsafe extern "C" {
         fn syscall(num: std::ffi::c_long, ...) -> std::ffi::c_long;
     }
-    let Ok(wanted_meta) = fs::metadata(path) else {
-        return false;
-    };
+    let wanted_meta = fs::metadata(path).ok()?;
     let wanted = (wanted_meta.dev(), wanted_meta.ino());
-    let Ok(raw_pid) = std::ffi::c_int::try_from(pid) else {
-        return false;
-    };
+    let raw_pid = std::ffi::c_int::try_from(pid).ok()?;
     if raw_pid <= 1 {
-        return false;
+        return None;
     }
     // SAFETY: `pidfd_open(pid, 0)` takes two integers and returns a new fd or -1.
     let raw_fd = unsafe { syscall(SYS_PIDFD_OPEN, raw_pid, 0 as std::ffi::c_uint) };
@@ -318,7 +443,7 @@ fn stop_verified(pid: u32, path: &Path) -> bool {
         // SAFETY: `raw_fd` is a newly created valid file descriptor owned by this scope.
         let pidfd = unsafe { OwnedFd::from_raw_fd(raw_fd as std::os::fd::RawFd) };
         if !holds_path_linux(pid, wanted) {
-            return false;
+            return None;
         }
         // SAFETY: `pidfd_send_signal` targets the pinned process description; if the
         // process exited and the PID was recycled, the kernel returns `ESRCH`.
@@ -331,33 +456,39 @@ fn stop_verified(pid: u32, path: &Path) -> bool {
                 0 as std::ffi::c_uint,
             )
         };
-        return rc == 0;
+        return (rc == 0).then_some(StoppedTarget {
+            pid,
+            start: None,
+            pidfd: Some(pidfd),
+        });
     }
     // Fallback strictly for kernels older than 5.3 without `pidfd_open` (`ENOSYS`).
     if !should_fallback_from_pidfd(io::Error::last_os_error().raw_os_error()) {
-        return false;
+        return None;
     }
     let before = start_token(pid);
     let still_holds = before.is_some() && holds_path_linux(pid, wanted);
     let after = if still_holds { start_token(pid) } else { None };
-    if can_stop_verified(before.as_deref(), still_holds, after.as_deref()) {
-        stop(pid);
-        true
+    if can_stop_verified(before.as_deref(), still_holds, after.as_deref()) && stop(pid) {
+        Some(StoppedTarget {
+            pid,
+            start: before,
+            pidfd: None,
+        })
     } else {
-        false
+        None
     }
 }
 
 #[cfg(all(unix, not(target_os = "linux")))]
-fn stop_verified(pid: u32, path: &Path) -> bool {
+fn stop_verified(pid: u32, path: &Path) -> Option<StoppedTarget> {
     let before = start_token(pid);
     let still_holds = before.is_some() && holds_path_lsof(pid, path);
     let after = if still_holds { start_token(pid) } else { None };
-    if can_stop_verified(before.as_deref(), still_holds, after.as_deref()) {
-        stop(pid);
-        true
+    if can_stop_verified(before.as_deref(), still_holds, after.as_deref()) && stop(pid) {
+        Some(StoppedTarget { pid, start: before })
     } else {
-        false
+        None
     }
 }
 
@@ -578,7 +709,7 @@ fn pids(listing: &str) -> Vec<u32> {
 }
 
 #[cfg(unix)]
-fn stop(pid: u32) {
+fn stop(pid: u32) -> bool {
     unsafe extern "C" {
         fn kill(pid: std::ffi::c_int, signal: std::ffi::c_int) -> std::ffi::c_int;
     }
@@ -588,8 +719,9 @@ fn stop(pid: u32) {
         && pid > 1
     {
         // SAFETY: a plain system call with two integers.
-        unsafe { kill(pid, 9) };
+        return unsafe { kill(pid, 9) == 0 };
     }
+    false
 }
 
 #[cfg(all(test, unix))]
@@ -859,6 +991,10 @@ mod tests {
         assert!(!should_fallback_from_pidfd(Some(24)));
         assert!(!should_fallback_from_pidfd(Some(1)));
         assert!(!should_fallback_from_pidfd(None));
+        assert!(is_zombie_child_in_stat("99 (a) b) Z 1 99 99 0", 1));
+        assert!(!is_zombie_child_in_stat("99 (sh) S 1 99 99 0", 1));
+        assert!(!is_zombie_child_in_stat("99 (sh) Z 2 99 99 0", 1));
+        assert!(!stop(u32::MAX - 7));
 
         let child = Command::new("true")
             .stdin(Stdio::null())
@@ -867,7 +1003,12 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = child.id();
-        let mut pending = BTreeSet::from([pid]);
+        let mut pending = vec![StoppedTarget {
+            pid,
+            start: None,
+            #[cfg(target_os = "linux")]
+            pidfd: None,
+        }];
         let deadline = Instant::now() + Duration::from_secs(5);
         while !pending.is_empty() && Instant::now() < deadline {
             reap_stopped(&mut pending);

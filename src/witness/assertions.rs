@@ -50,6 +50,7 @@ pub(crate) fn unpinned_calls(source: &str, file: &syn::File) -> Vec<CalledFuncti
         // Nested `fn` items are hoisted across the block, while `let` bindings take
         // effect only after their initialiser (so `let f = f(3);` still finds `f(3)`).
         let mut shadowed = item_fn_names(&test.function.block);
+        let allow_super = !test.module.is_empty() && !test.module.contains("::");
         let body = test.function.block.brace_token.span.open().byte_range().end;
         let end = test
             .function
@@ -64,29 +65,30 @@ pub(crate) fn unpinned_calls(source: &str, file: &syn::File) -> Vec<CalledFuncti
                 let mut calls = Calls {
                     source,
                     names: &functions,
+                    allow_super,
                     found: vec![],
                 };
                 calls.visit_stmt(stmt);
-                for (name, call, at) in calls.found {
+                for (name, call, at, qualified) in calls.found {
                     let (Some(before), Some(after)) =
                         (source.get(body..at.start), source.get(at.end..end))
                     else {
                         continue;
                     };
-                    if shadowed.contains(name) {
+                    if !qualified && shadowed.contains(name) {
                         continue;
                     }
                     // The same call written twice is two calls: the test may get to one
                     // and not to the other, or change something in between.
-                    let scenarios = found.entry(name).or_default();
-                    if scenarios.len() < MAX_CALLS {
-                        let line_start = source[..at.start].rfind('\n').map_or(0, |end| end + 1);
-                        let place = (
-                            source[..at.start].matches('\n').count() + 1,
-                            source[line_start..at.start].chars().count() + 1,
-                        );
-                        scenarios.push(scenario(test, before, call, after, place));
-                    }
+                    let line_start = source[..at.start].rfind('\n').map_or(0, |end| end + 1);
+                    let place = (
+                        source[..at.start].matches('\n').count() + 1,
+                        source[line_start..at.start].chars().count() + 1,
+                    );
+                    found
+                        .entry(name)
+                        .or_default()
+                        .push(scenario(test, before, call, after, place));
                 }
             }
             if let syn::Stmt::Local(local) = stmt {
@@ -96,7 +98,24 @@ pub(crate) fn unpinned_calls(source: &str, file: &syn::File) -> Vec<CalledFuncti
     }
     found
         .into_iter()
-        .map(|(name, scenarios)| {
+        .map(|(name, all_scenarios)| {
+            // Prioritize distinct call expressions under `MAX_CALLS`, then fill any
+            // remaining slots with repeated calls in appearance order.
+            let mut seen_exprs = BTreeSet::new();
+            let mut distinct = Vec::new();
+            let mut repeated = Vec::new();
+            for item in all_scenarios {
+                if seen_exprs.insert(item.expression.clone()) {
+                    distinct.push(item);
+                } else {
+                    repeated.push(item);
+                }
+            }
+            let scenarios: Vec<Scenario> = distinct
+                .into_iter()
+                .chain(repeated)
+                .take(MAX_CALLS)
+                .collect();
             let function = functions[name];
             CalledFunction {
                 item: function.span().byte_range(),
@@ -218,23 +237,35 @@ fn literal(expr: &Expr) -> bool {
 struct Calls<'a> {
     source: &'a str,
     names: &'a BTreeMap<String, &'a ItemFn>,
-    found: Vec<(&'a str, String, Range<usize>)>,
+    allow_super: bool,
+    found: Vec<(&'a str, String, Range<usize>, bool)>,
 }
 
 impl<'a> Calls<'a> {
     /// The call as it is written, if it is one of a function of the file with literal
     /// arguments, as many as the function takes.
-    fn call(&self, call: &syn::ExprCall) -> Option<(&'a str, String)> {
+    fn call(&self, call: &syn::ExprCall) -> Option<(&'a str, String, bool)> {
         let Expr::Path(path) = call.func.as_ref() else {
             return None;
         };
         // An attribute of the call may leave it out. A path that is one name has no
         // type before it, and an attribute in front of it is the call's.
-        if !call.attrs.is_empty() {
+        if !call.attrs.is_empty() || path.qself.is_some() || path.path.leading_colon.is_some() {
             return None;
         }
-        let name = path.path.get_ident()?.to_string();
-        let (name, function) = self.names.get_key_value(&name)?;
+        let (ident, qualified) = if let Some(ident) = path.path.get_ident() {
+            (ident, false)
+        } else if self.allow_super
+            && path.path.segments.len() == 2
+            && path.path.segments[0].ident == "super"
+            && path.path.segments[0].arguments.is_empty()
+            && path.path.segments[1].arguments.is_empty()
+        {
+            (&path.path.segments[1].ident, true)
+        } else {
+            return None;
+        };
+        let (name, function) = self.names.get_key_value(&ident.to_string())?;
         if function.sig.inputs.len() != call.args.len() || !call.args.iter().all(literal) {
             return None;
         }
@@ -242,7 +273,7 @@ impl<'a> Calls<'a> {
         // the argument.
         let text = self.source.get(call.span().byte_range())?;
         (text.chars().count() <= 100 && !text.contains('\n'))
-            .then(|| (name.as_str(), text.to_owned()))
+            .then(|| (name.as_str(), text.to_owned(), qualified))
     }
 
     /// Whether the expression calls a function of the file by its name, with whatever
@@ -311,8 +342,8 @@ fn assertion(mac: &syn::Macro) -> bool {
 impl<'ast> Visit<'ast> for Calls<'_> {
     fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
         let at = call.span().byte_range();
-        if let Some((name, text)) = self.call(call) {
-            self.found.push((name, text, at));
+        if let Some((name, text, qualified)) = self.call(call) {
+            self.found.push((name, text, at, qualified));
         }
         syn::visit::visit_expr_call(self, call);
     }
@@ -431,9 +462,9 @@ mod tests {
                 Some("many".to_string()),
                 vec![
                     "bucket(0)".to_string(),
-                    "bucket(0)".into(),
                     "bucket(1)".into(),
-                    "bucket(1)".into()
+                    "bucket(2)".into(),
+                    "bucket(3)".into()
                 ]
             )]
         );
@@ -985,5 +1016,37 @@ fn rebinds_name() {
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].scenarios.len(), 1);
         assert_eq!(found[0].scenarios[0].expression, "bucket(3)");
+    }
+
+    #[test]
+    fn super_qualified_calls_and_distinct_call_priority() {
+        let source = "\
+fn bucket(n: i32) -> &'static str { if n > 0 { \"pos\" } else { \"neg\" } }
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn calls_via_super_and_repeats() {
+        let bucket = super::bucket(1);
+        assert_ne!(bucket, \"\");
+        assert_ne!(super::bucket(1), \"\");
+        assert_ne!(super::bucket(1), \"\");
+        assert_ne!(super::bucket(1), \"\");
+        assert_ne!(super::bucket(2), \"\");
+    }
+}
+";
+        let file = syn::parse_file(source).unwrap();
+        let found = unpinned_calls(source, &file);
+        assert_eq!(found.len(), 1);
+        let expressions: Vec<&str> = found[0]
+            .scenarios
+            .iter()
+            .map(|s| s.expression.as_str())
+            .collect();
+        assert_eq!(expressions.len(), MAX_CALLS);
+        assert!(
+            expressions.contains(&"super::bucket(2)"),
+            "expected distinct call `super::bucket(2)` not to be starved: {expressions:?}"
+        );
     }
 }
