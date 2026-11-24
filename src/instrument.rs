@@ -2218,12 +2218,12 @@ fn same_tokens_of(a: &str, b: &str, holes: bool) -> Option<bool> {
             if items.peek().is_some_and(|next| next == "," || next == ";") {
                 items.next();
             } else if items.peek().is_none() && kept.last().is_some_and(|last| last == ",") {
-                // Keep the sole comma of a single-element tuple `(1, #[cfg(off)] 2)`:
-                // dropping it would turn `(1,)` into the parenthesised expression `(1)`.
-                let single_tuple =
-                    matches!(list, Some((proc_macro2::Delimiter::Parenthesis, false)))
-                        && kept.iter().filter(|token| *token == ",").count() == 1;
-                if !single_tuple {
+                // Inside parentheses that may be a tuple, a trailing comma before a left-out
+                // element can be the sole comma of a 1-tuple (even when inner type arguments
+                // contain commas, as in `(f::<A, B>(), #[cfg(off)] 2)`). Keep it conservatively.
+                let may_be_tuple =
+                    matches!(list, Some((proc_macro2::Delimiter::Parenthesis, false)));
+                if !may_be_tuple {
                     kept.pop();
                 }
             }
@@ -2813,8 +2813,12 @@ impl<'ast> Visit<'ast> for Finder<'_> {
         let joins = |start: usize, operand_start: usize| {
             let prev = self.source[..start].chars().next_back();
             let next = self.source[operand_start..].chars().next();
-            let word_or_dash = |c: char| c.is_alphanumeric() || c == '_' || c == '-';
-            prev.is_some_and(word_or_dash) && next.is_some_and(word_or_dash)
+            // Any two adjacent non-delimiter characters can glue into a different token or
+            // comment (`return!x` -> `returnx`, `return!℘` -> `return℘`, `a/!*b` -> `a/*b`).
+            let glues = |c: char| {
+                !c.is_whitespace() && !matches!(c, '(' | ')' | '[' | ']' | '{' | '}' | ',' | ';')
+            };
+            prev.is_some_and(glues) && next.is_some_and(glues)
         };
         if let syn::UnOp::Not(bang) = &node.op
             && node.attrs.is_empty()
@@ -3629,9 +3633,8 @@ mod tests {
         ] {
             assert_eq!(same_tokens(&with, "enum E { A, B }"), Some(true), "{with}");
         }
-        // A left-out element in a tuple keeps the sole comma when only one element remains
-        // (because `(1, #[cfg(off)] 2)` is a 1-tuple `(1,)`, not `(1)`), and drops the comma
-        // when at least two elements remain.
+        // A left-out element in a tuple keeps its comma conservatively so a 1-tuple
+        // (including one with commas in type arguments) is never equated with `(x)`.
         assert_eq!(
             same_tokens(
                 &format!("const T: (u8,) = (1, {hole});"),
@@ -3649,7 +3652,7 @@ mod tests {
         assert_eq!(
             same_tokens(
                 &format!("const T: (u8, u8) = (1, 2, {hole});"),
-                "const T: (u8, u8) = (1, 2);"
+                "const T: (u8, u8) = (1, 2,);"
             ),
             Some(true)
         );
@@ -6387,17 +6390,37 @@ fn f(x: i32) -> bool {
         let explicit_tuple = "fn f() -> (i32,) { (1,) }";
         assert_eq!(same_built_tokens(&single_tuple, plain_expr), Some(false));
         assert_eq!(same_built_tokens(&single_tuple, explicit_tuple), Some(true));
-        // A two-element tuple losing its third item still has a comma separating elements.
-        let pair_with_cfg = format!("fn f() -> (i32, i32) {{ (1, 2, {LEFT_OUT}) }}");
-        let pair = "fn f() -> (i32, i32) { (1, 2) }";
-        assert_eq!(same_built_tokens(&pair_with_cfg, pair), Some(true));
+        // Commas inside type arguments must not trick tuple comma handling into dropping
+        // the sole tuple comma.
+        let generic_tuple = format!("fn f() {{ let _ = (g::<A, B>(), {LEFT_OUT}); }}");
+        let generic_plain = "fn f() { let _ = (g::<A, B>()); }";
+        let generic_explicit = "fn f() { let _ = (g::<A, B>(),); }";
+        assert_eq!(
+            same_built_tokens(&generic_tuple, generic_plain),
+            Some(false)
+        );
+        assert_eq!(
+            same_built_tokens(&generic_tuple, generic_explicit),
+            Some(true)
+        );
     }
 
     #[test]
     fn deleting_unary_operator_does_not_merge_adjacent_tokens() {
-        for source in [
-            "fn f(x: bool) -> bool { return!x; }",
-            "fn g() -> i32 { return-1; }",
+        for (source, expected) in [
+            (
+                "fn f(x: bool) -> bool { return!x; }",
+                "fn f(x: bool) -> bool { return x; }",
+            ),
+            ("fn g() -> i32 { return-1; }", "fn g() -> i32 { return 1; }"),
+            (
+                "fn h(a: i32, b: &i32) -> i32 { a/!*b }",
+                "fn h(a: i32, b: &i32) -> i32 { a/ *b }",
+            ),
+            (
+                "fn u(℘: bool) -> bool { return!℘; }",
+                "fn u(℘: bool) -> bool { return ℘; }",
+            ),
         ] {
             let found = discover(source, 0).unwrap();
             let unary = found
@@ -6409,6 +6432,7 @@ fn f(x: i32) -> bool {
                 let mut text = source.to_string();
                 text.replace_range(mutant.start..mutant.end, &mutant.replacement);
                 assert!(syn::parse_file(&text).is_ok(), "merged tokens:\n{text}");
+                assert_eq!(same_tokens(&text, expected), Some(true), "{text}");
             }
         }
     }

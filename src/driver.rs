@@ -1256,7 +1256,7 @@ fn copy_entry(
         let Ok(target) = src.canonicalize() else {
             return Ok(()); // dangling
         };
-        if skip(&target) {
+        if target.ancestors().any(&skip) {
             return Ok(());
         }
         if target.is_dir() {
@@ -5336,7 +5336,9 @@ fn run_package(
             audit_checkpoint.as_ref(),
         )?) {
             report.timeout_rechecks.include(&again);
-            if audit_all_tests_disagrees(&again) {
+            if again.unable || again.unconfirmed_timeout {
+                audit.not_audited += 1;
+            } else if audit_all_tests_disagrees(&again) {
                 // The verdict of all tests is the one that counts.
                 results[*job] = again;
                 let site = files
@@ -9684,6 +9686,27 @@ fn main() {
                 "row {index}: {entry_kind}/{target_kind}/{location}/{skipped}"
             );
         }
+        // A symlink pointing to a file nested under a skipped ancestor directory is also skipped.
+        let nested_ws = workspace.join("skipped-ancestor");
+        let blocked_dir = nested_ws.join("blocked");
+        fs::create_dir_all(&blocked_dir).unwrap();
+        let nested_file = blocked_dir.join("secret.txt");
+        fs::write(&nested_file, "blocked").unwrap();
+        let link = nested_ws.join("link.txt");
+        symlink(&nested_file, &link).unwrap();
+        let blocked_canon = blocked_dir.canonicalize().unwrap();
+        let nested_dst = copy.join("skipped-ancestor");
+        fs::create_dir_all(&nested_dst).unwrap();
+        let state = WorkCopy::open(&nested_dst, &nested_dst);
+        copy_entry(
+            &link,
+            &nested_dst.join("link.txt"),
+            &ws_canon,
+            &|path| path == blocked_canon,
+            &state,
+        )
+        .unwrap();
+        assert!(!nested_dst.join("link.txt").exists());
         fs::remove_dir_all(dir).unwrap();
     }
 

@@ -224,7 +224,6 @@ fn holders(path: &Path) -> io::Result<Vec<u32>> {
 
     let wanted = fs::metadata(path)?;
     let wanted = (wanted.dev(), wanted.ino());
-    let file_name = path.file_name().and_then(|name| name.to_str());
     let mut pids = vec![];
     for process in fs::read_dir("/proc")?.flatten() {
         let Some(pid) = process.file_name().to_str().and_then(|n| n.parse().ok()) else {
@@ -237,14 +236,12 @@ fn holders(path: &Path) -> io::Result<Vec<u32>> {
         };
         let has = files.flatten().any(|file| {
             let entry = file.path();
-            // Avoid calling stat on unrelated mounts (such as a hung FUSE or NFS share)
-            // when `/proc/<pid>/fd/<n>` already tells us the target cannot be our mark file.
-            if let (Some(wanted_name), Ok(target)) = (file_name, fs::read_link(&entry)) {
-                let target = target.to_string_lossy();
-                let target = target.strip_suffix(" (deleted)").unwrap_or(&target);
-                if !target.ends_with(wanted_name) {
-                    return false;
-                }
+            // Skip pseudo-descriptors (`socket:[...]`, `pipe:[...]`, `anon_inode:[...]`)
+            // without discarding renamed or hard-linked paths to the same inode.
+            if let Ok(target) = fs::read_link(&entry)
+                && !target.is_absolute()
+            {
+                return false;
             }
             fs::metadata(&entry).is_ok_and(|open| (open.dev(), open.ino()) == wanted)
         });

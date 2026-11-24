@@ -290,6 +290,10 @@ impl SkippedSite {
     }
 }
 
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
+}
+
 /// What a run that was asked to check itself found (`--audit`).
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
 pub struct Audit {
@@ -297,6 +301,9 @@ pub struct Audit {
     pub sampled: usize,
     /// How many surviving mutants there were to choose from.
     pub survivors: usize,
+    /// Sampled survivors whose all-tests re-run could not be judged (`Unable` or unconfirmed timeout).
+    #[serde(skip_serializing_if = "is_zero_usize")]
+    pub not_audited: usize,
     /// Where one of those failed a test it had not been run against: the tests were not
     /// chosen as they should have been, or do not always do the same.
     pub disagreements: Vec<Location>,
@@ -1327,11 +1334,15 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
     out.push('\n');
     if let Some(audit) = &report.audit {
         out.push_str(&format!(
-            "audit: {} of {} surviving mutants run against all tests, {} failed one they had not been run against\n",
+            "audit: {} of {} surviving mutants run against all tests, {} failed one they had not been run against",
             audit.sampled,
             audit.survivors,
             audit.disagreements.len()
         ));
+        if audit.not_audited > 0 {
+            out.push_str(&format!(", {} could not be judged", audit.not_audited));
+        }
+        out.push('\n');
         for at in &audit.disagreements {
             out.push_str(&format!(
                 "  {}:{}:{}  {}\n",

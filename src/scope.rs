@@ -45,60 +45,14 @@ impl Scope {
     /// is left there now behaves differently.
     pub fn from_diff(diff: &str) -> Scope {
         let mut scope = Scope::default();
-        let mut file: Option<String> = None;
-        let lines: Vec<&str> = diff.lines().collect();
-        let mut i = 0;
-        let (mut old_left, mut new_left) = (0usize, 0usize);
-        while i < lines.len() {
-            let line = lines[i];
-            if old_left + new_left > 0 {
-                // Hand-written diffs without full body lines may move straight to the next
-                // file header (`diff --git`, or `--- ` / `+++ ` followed by `@@ `). Real
-                // `git diff -U0` hunk lines always begin with `-`, `+`, or `\`, never `@@ `.
-                let starts_next_file = line.starts_with("diff --git ")
-                    || (line.starts_with("--- ")
-                        && lines
-                            .get(i + 1)
-                            .is_some_and(|next| next.starts_with("+++ "))
-                        && lines
-                            .get(i + 2)
-                            .is_none_or(|after| after.starts_with("@@ ")));
-                if starts_next_file {
-                    old_left = 0;
-                    new_left = 0;
-                } else if line.starts_with('\\') {
-                    i += 1;
-                    continue;
-                } else if line.starts_with('-') && old_left > 0 {
-                    old_left -= 1;
-                    i += 1;
-                    continue;
-                } else if line.starts_with('+') && new_left > 0 {
-                    new_left -= 1;
-                    i += 1;
-                    continue;
-                } else {
-                    old_left = 0;
-                    new_left = 0;
-                }
-            }
-            if let Some(path) = line.strip_prefix("+++ ") {
-                // `+++ b/path`, or `+++ /dev/null` for a deleted file.
-                file = new_path(path);
-            } else if let Some((old_count, start, count)) = hunk_header(line) {
-                old_left = old_count;
-                new_left = count;
-                if let Some(file) = &file {
-                    let range = if count == 0 {
-                        // `+N,0`: lines were removed after line N.
-                        (start.max(1), start + 1)
-                    } else {
-                        (start, start + count - 1)
-                    };
-                    scope.add(file, range);
-                }
-            }
-            i += 1;
+        for hunk in hunks(diff) {
+            let range = if hunk.count == 0 {
+                // `+N,0`: lines were removed after line N.
+                (hunk.start.max(1), hunk.start + 1)
+            } else {
+                (hunk.start, hunk.start + hunk.count - 1)
+            };
+            scope.add(&hunk.file, range);
         }
         scope
     }
@@ -451,13 +405,20 @@ deleted file mode 100644
 --- a/src/gone.rs
 +++ /dev/null
 @@ -1,5 +0,0 @@
--all
+-all 1
+-all 2
+-all 3
+-all 4
+-all 5
 diff --git a/src/new.rs b/src/new.rs
 new file mode 100644
 --- /dev/null
 +++ b/src/new.rs
 @@ -0,0 +1,4 @@
-+fresh
++fresh 1
++fresh 2
++fresh 3
++fresh 4
 ";
         let scope = Scope::from_diff(diff);
         // Changed: 10..=12. Single line: 31. Pure deletion after line 40: 40 and 41.
@@ -499,21 +460,32 @@ new file mode 100644
 --- a/src/two words.rs\t
 +++ b/src/two words.rs\t
 @@ -3 +3 @@
+-old
++new
 --- \"a/src/\\344\\276\\241\\346\\240\\274.rs\"
 +++ \"b/src/\\344\\276\\241\\346\\240\\274.rs\"
 @@ -5 +5 @@
+-old
++new
 --- \"a/src/a\\\"b\\\\c\\td e.rs\"
 +++ \"b/src/a\\\"b\\\\c\\td e.rs\"
 @@ -7 +7 @@
+-old
++new
 --- a/src/価格.rs
 +++ b/src/価格.rs
 @@ -9 +9 @@
+-old
++new
 --- \"a/src/gone \\303\\251.rs\"
 +++ /dev/null
 @@ -1 +0,0 @@
+-old
 --- \"a/src/\\344\\276\\241\\346\\240\\274 \\350\\241\\250.rs\"\t
 +++ \"b/src/\\344\\276\\241\\346\\240\\274 \\350\\241\\250.rs\"\t
 @@ -2 +2 @@
+-old
++new
 ";
         let scope = Scope::from_diff(diff);
         assert_eq!(
@@ -766,16 +738,20 @@ new file mode 100644
     }
 
     #[test]
-    fn from_diff_ignores_plus_markers_inside_hunk_body() {
+    fn from_diff_ignores_header_like_lines_inside_hunk_body() {
         let diff = "\
 diff --git a/src/a.rs b/src/a.rs
 --- a/src/a.rs
 +++ b/src/a.rs
-@@ -2,0 +3,3 @@
+@@ -2,1 +3,3 @@
+--- a/src/fake.rs
 +let header = \"++\";
 +++ /dev/null
 +++ b/src/hijacked.rs
 @@ -10 +13 @@
+--- a/src/another.rs
++++ b/src/another.rs
+@@ -20 +23 @@
 -old
 +new
 ";
@@ -783,6 +759,8 @@ diff --git a/src/a.rs b/src/a.rs
         assert_eq!(scope.files().collect::<Vec<_>>(), ["src/a.rs"]);
         assert!(scope.touches("src/a.rs", 3, 5));
         assert!(scope.touches("src/a.rs", 13, 13));
+        assert!(scope.touches("src/a.rs", 23, 23));
         assert!(!scope.touches("src/hijacked.rs", 1, 100));
+        assert!(!scope.touches("src/another.rs", 1, 100));
     }
 }
