@@ -35,6 +35,10 @@ static STARTING: Mutex<()> = Mutex::new(());
 /// Direct child PIDs of active `Watch` runs, so a subreaper/PID-1 process can tell its
 /// still-running sibling children apart from reparented orphans.
 static ACTIVE_CHILDREN: Mutex<BTreeSet<u32>> = Mutex::new(BTreeSet::new());
+/// Stopped orphans under PID 1/subreaper whose reparenting took longer than `REAP_WAIT`,
+/// carried over to subsequent sweeps so only verified stopped targets are ever reaped.
+#[cfg(unix)]
+static PENDING_REAP: Mutex<Vec<StoppedTarget>> = Mutex::new(Vec::new());
 
 /// How long those who have the file are stopped again and again before giving up.
 const PATIENCE: Duration = Duration::from_secs(5);
@@ -171,6 +175,10 @@ fn sweep(path: &Path) -> Swept {
     let mut settled = false;
     let me = std::process::id();
     let subreaper = is_subreaper(me);
+    if subreaper {
+        let mut carried = PENDING_REAP.lock().unwrap_or_else(|e| e.into_inner());
+        reap_stopped(&mut carried);
+    }
     loop {
         match held(path) {
             Ok(true) => {}
@@ -187,10 +195,35 @@ fn sweep(path: &Path) -> Swept {
             settled = true;
             continue;
         }
+        #[cfg(not(target_os = "linux"))]
+        let before_ps = ps_snapshot();
         let Ok(holders) = holders(path) else {
             swept.left = true;
             break;
         };
+        #[cfg(not(target_os = "linux"))]
+        let after_ps = ps_snapshot();
+        #[cfg(not(target_os = "linux"))]
+        let candidates: Vec<u32> = holders
+            .into_iter()
+            .filter(|&pid| {
+                let parent = after_ps.get(&pid).map(|info| info.ppid);
+                let active_child = if subreaper && parent == Some(me) {
+                    let _spawn = STARTING.lock().unwrap_or_else(|e| e.into_inner());
+                    ACTIVE_CHILDREN
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .contains(&pid)
+                } else {
+                    false
+                };
+                is_left_candidate(pid, me, parent, active_child, subreaper)
+            })
+            .collect();
+        #[cfg(not(target_os = "linux"))]
+        let verified_pids = verified_snapshot_pids(&candidates, &before_ps, &after_ps);
+        let mut stopped_in_pass = false;
+        #[cfg(target_os = "linux")]
         for pid in holders {
             let parent = parent_of(pid);
             let active_child = if subreaper && parent == Some(me) {
@@ -208,6 +241,7 @@ fn sweep(path: &Path) -> Swept {
                 continue;
             }
             if let Some(target) = stop_verified(pid, path) {
+                stopped_in_pass = true;
                 stopped.insert(pid);
                 if subreaper {
                     // Under PID 1 or a subreaper, a stopped descendant whose own parent
@@ -216,10 +250,41 @@ fn sweep(path: &Path) -> Swept {
                 }
             }
         }
+        #[cfg(not(target_os = "linux"))]
+        for pid in verified_pids {
+            if stop(pid) {
+                stopped_in_pass = true;
+                stopped.insert(pid);
+                if subreaper {
+                    reparented_stopped.push(StoppedTarget {
+                        pid,
+                        start: after_ps.get(&pid).map(|info| info.start.clone()),
+                    });
+                }
+            }
+        }
         reap_stopped(&mut reparented_stopped);
         // tmt:ignore giving up needs a holder that cannot be stopped, which a test cannot make
         if Instant::now() >= deadline {
-            swept.left = true;
+            if stopped_in_pass {
+                // If we just killed holders right as the deadline elapsed (e.g. slow `lsof`),
+                // allow the kernel a brief moment to close their FDs before reporting `left`.
+                let settle_deadline = Instant::now() + Duration::from_millis(200);
+                loop {
+                    match held(path) {
+                        Ok(false) => break,
+                        Ok(true) if Instant::now() < settle_deadline => {
+                            std::thread::sleep(Duration::from_millis(10));
+                        }
+                        _ => {
+                            swept.left = true;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                swept.left = true;
+            }
             break;
         }
         // tmt:ignore without the pause the loop only looks more often
@@ -234,8 +299,15 @@ fn sweep(path: &Path) -> Swept {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
-    if subreaper {
-        reap_subreaper_zombies(me);
+    if subreaper && !reparented_stopped.is_empty() {
+        let mut carried = PENDING_REAP.lock().unwrap_or_else(|e| e.into_inner());
+        reap_stopped(&mut carried);
+        const MAX_PENDING_REAP: usize = 256;
+        for target in reparented_stopped {
+            if carried.len() < MAX_PENDING_REAP {
+                carried.push(target);
+            }
+        }
     }
     swept.stopped = stopped.len();
     swept
@@ -354,62 +426,6 @@ fn reap_target(target: &StoppedTarget) -> bool {
     parent_of(target.pid).is_none()
 }
 
-/// Under PID 1/subreaper, reaps already-exited zombie direct children that are not owned
-/// by any active `Watch` (e.g. grandchildren killed via process-group timeout whose FD
-/// closed before `sweep` ran).
-#[cfg(target_os = "linux")]
-fn reap_subreaper_zombies(me: u32) {
-    unsafe extern "C" {
-        fn waitpid(
-            pid: std::ffi::c_int,
-            status: *mut std::ffi::c_int,
-            options: std::ffi::c_int,
-        ) -> std::ffi::c_int;
-    }
-    const WNOHANG: std::ffi::c_int = 1;
-    let _spawn = STARTING.lock().unwrap_or_else(|e| e.into_inner());
-    let active = ACTIVE_CHILDREN.lock().unwrap_or_else(|e| e.into_inner());
-    let Ok(entries) = fs::read_dir("/proc") else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|n| n.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        if pid <= 1 || pid == me || active.contains(&pid) {
-            continue;
-        }
-        let Ok(stat) = fs::read_to_string(entry.path().join("stat")) else {
-            continue;
-        };
-        if is_zombie_child_in_stat(&stat, me)
-            && let Ok(raw_pid) = std::ffi::c_int::try_from(pid)
-        {
-            let mut status: std::ffi::c_int = 0;
-            // SAFETY: non-blocking waitpid on a verified non-active zombie child.
-            unsafe { waitpid(raw_pid, &mut status, WNOHANG) };
-        }
-    }
-}
-
-#[cfg(any(test, target_os = "linux"))]
-fn is_zombie_child_in_stat(stat: &str, me: u32) -> bool {
-    let Some(close) = stat.rfind(')') else {
-        return false;
-    };
-    let mut fields = stat[close + 1..].split_whitespace();
-    let state = fields.next();
-    let ppid = fields.next().and_then(|p| p.parse::<u32>().ok());
-    state == Some("Z") && ppid == Some(me)
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn reap_subreaper_zombies(_me: u32) {}
-
 /// Only fall back from `pidfd_open` to PID-based signalling when the kernel does not
 /// implement `pidfd_open` (`ENOSYS`). Other errors (`EMFILE`, `EPERM`, `ESRCH`) fail
 /// closed rather than re-opening a PID-reuse race.
@@ -480,16 +496,98 @@ fn stop_verified(pid: u32, path: &Path) -> Option<StoppedTarget> {
     }
 }
 
-#[cfg(all(unix, not(target_os = "linux")))]
-fn stop_verified(pid: u32, path: &Path) -> Option<StoppedTarget> {
-    let before = start_token(pid);
-    let still_holds = before.is_some() && holds_path_lsof(pid, path);
-    let after = if still_holds { start_token(pid) } else { None };
-    if can_stop_verified(before.as_deref(), still_holds, after.as_deref()) && stop(pid) {
-        Some(StoppedTarget { pid, start: before })
-    } else {
-        None
+/// Selects candidate PIDs that are verified to belong to the watched holders across a
+/// `before_ps -> lsof -> after_ps` bracket:
+/// 1. Any candidate present in both snapshots with an identical start timestamp, and
+/// 2. Any newly spawned candidate (absent from `before_ps`, present in `after_ps`) whose
+///    parent chain in `after_ps` descends from a verified holder from (1).
+#[cfg(any(test, all(unix, not(target_os = "linux"))))]
+fn verified_snapshot_pids(
+    candidates: &[u32],
+    before_ps: &std::collections::HashMap<u32, PsEntry>,
+    after_ps: &std::collections::HashMap<u32, PsEntry>,
+) -> Vec<u32> {
+    let verified: BTreeSet<u32> = candidates
+        .iter()
+        .copied()
+        .filter(|pid| {
+            can_stop_verified(
+                before_ps.get(pid).map(|info| info.start.as_str()),
+                true,
+                after_ps.get(pid).map(|info| info.start.as_str()),
+            )
+        })
+        .collect();
+    let mut selected: Vec<u32> = verified.iter().copied().collect();
+    for &pid in candidates {
+        if verified.contains(&pid) || before_ps.contains_key(&pid) {
+            continue;
+        }
+        let mut current = pid;
+        for _ in 0..32 {
+            let Some(parent) = after_ps.get(&current).map(|info| info.ppid) else {
+                break;
+            };
+            if parent == current || parent <= 1 {
+                break;
+            }
+            if verified.contains(&parent) {
+                selected.push(pid);
+                break;
+            }
+            current = parent;
+        }
     }
+    selected
+}
+
+#[cfg(any(test, all(unix, not(target_os = "linux"))))]
+#[derive(Debug, PartialEq, Eq)]
+struct PsEntry {
+    ppid: u32,
+    start: String,
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn ps_snapshot() -> std::collections::HashMap<u32, PsEntry> {
+    let Ok(listed) = Command::new("ps")
+        .env("LC_ALL", "C")
+        .args(["-eo", "pid=,ppid=,lstart="])
+        .stdin(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .output()
+    else {
+        return std::collections::HashMap::new();
+    };
+    parse_ps_snapshot(&String::from_utf8_lossy(&listed.stdout))
+}
+
+#[cfg(any(test, all(unix, not(target_os = "linux"))))]
+fn parse_ps_snapshot(listing: &str) -> std::collections::HashMap<u32, PsEntry> {
+    let mut table = std::collections::HashMap::new();
+    for line in listing.lines() {
+        let trimmed = line.trim();
+        let Some((pid_str, rest)) = trimmed.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let rest = rest.trim_start();
+        let Some((ppid_str, start_str)) = rest.split_once(char::is_whitespace) else {
+            continue;
+        };
+        let start = start_str.trim();
+        if let (Ok(pid), Ok(ppid)) = (pid_str.parse::<u32>(), ppid_str.parse::<u32>())
+            && !start.is_empty()
+        {
+            table.insert(
+                pid,
+                PsEntry {
+                    ppid,
+                    start: start.to_owned(),
+                },
+            );
+        }
+    }
+    table
 }
 
 #[cfg(target_os = "linux")]
@@ -508,23 +606,6 @@ fn holds_path_linux(pid: u32, wanted: (u64, u64)) -> bool {
         }
         fs::metadata(&entry).is_ok_and(|open| (open.dev(), open.ino()) == wanted)
     })
-}
-
-#[cfg(all(unix, not(target_os = "linux")))]
-fn holds_path_lsof(pid: u32, path: &Path) -> bool {
-    let pid_str = pid.to_string();
-    for lsof in ["lsof", "/usr/sbin/lsof", "/usr/bin/lsof"] {
-        if let Ok(output) = Command::new(lsof)
-            .args(["-p", &pid_str, "-a", "-t", "--"])
-            .arg(path)
-            .stdin(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .output()
-        {
-            return pids(&String::from_utf8_lossy(&output.stdout)).contains(&pid);
-        }
-    }
-    false
 }
 
 /// Whether a process that has the file is one the run left.
@@ -591,6 +672,7 @@ fn start_in_stat(stat: &str) -> Option<&str> {
 #[cfg(all(unix, not(target_os = "linux")))]
 fn start_token(pid: u32) -> Option<String> {
     let listed = Command::new("ps")
+        .env("LC_ALL", "C")
         .args(["-o", "lstart=", "-p", &pid.to_string()])
         .stdin(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -683,8 +765,7 @@ fn holders(path: &Path) -> io::Result<Vec<u32>> {
     let mut last = io::Error::from(io::ErrorKind::NotFound);
     for lsof in ["lsof", "/usr/sbin/lsof", "/usr/bin/lsof"] {
         match Command::new(lsof)
-            .arg("-t")
-            .arg("--")
+            .args(["-n", "-P", "-w", "-t", "--"])
             .arg(path)
             .stdin(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -991,9 +1072,6 @@ mod tests {
         assert!(!should_fallback_from_pidfd(Some(24)));
         assert!(!should_fallback_from_pidfd(Some(1)));
         assert!(!should_fallback_from_pidfd(None));
-        assert!(is_zombie_child_in_stat("99 (a) b) Z 1 99 99 0", 1));
-        assert!(!is_zombie_child_in_stat("99 (sh) S 1 99 99 0", 1));
-        assert!(!is_zombie_child_in_stat("99 (sh) Z 2 99 99 0", 1));
         assert!(!stop(u32::MAX - 7));
 
         let child = Command::new("true")
@@ -1018,5 +1096,47 @@ mod tests {
         }
         assert!(pending.is_empty(), "expected stopped child to be reaped");
         std::mem::forget(child);
+    }
+
+    #[test]
+    fn ps_snapshot_parses_pid_ppid_and_start_timestamp() {
+        let table = parse_ps_snapshot(
+            "  12   7 Tue Nov 24 18:07:25 2026\n\
+             invalid line\n\
+             42   1   \n\
+             99 12 火 11/24 18:07:25 2026\n",
+        );
+        assert_eq!(
+            table.get(&12),
+            Some(&PsEntry {
+                ppid: 7,
+                start: "Tue Nov 24 18:07:25 2026".to_owned(),
+            })
+        );
+        assert_eq!(
+            table.get(&99),
+            Some(&PsEntry {
+                ppid: 12,
+                start: "火 11/24 18:07:25 2026".to_owned(),
+            })
+        );
+        assert!(!table.contains_key(&42));
+
+        let before = parse_ps_snapshot(
+            "100 1 Tue Nov 24 18:00:00 2026\n\
+             200 1 Tue Nov 24 18:00:00 2026\n",
+        );
+        let after = parse_ps_snapshot(
+            "100 1 Tue Nov 24 18:00:00 2026\n\
+             101 100 Tue Nov 24 18:00:03 2026\n\
+             200 1 Tue Nov 24 18:00:04 2026\n\
+             300 1 Tue Nov 24 18:00:03 2026\n",
+        );
+        // 100 matches both snapshots; 101 was spawned by 100 during lsof;
+        // 200 changed start time (recycled PID); 300 is an unrelated new process.
+        assert_eq!(
+            verified_snapshot_pids(&[100, 101, 200, 300], &before, &after),
+            vec![100, 101]
+        );
     }
 }

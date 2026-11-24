@@ -45,7 +45,13 @@ pub(crate) fn unpinned_calls(source: &str, file: &syn::File) -> Vec<CalledFuncti
     }
     let mut tests = Vec::new();
     collect_tests(&file.items, "", None, &mut tests);
-    let mut found: BTreeMap<&str, Vec<Scenario>> = BTreeMap::new();
+    #[derive(Default)]
+    struct FunctionCalls {
+        distinct: Vec<Scenario>,
+        repeated: Vec<Scenario>,
+        seen_keys: BTreeSet<String>,
+    }
+    let mut found: BTreeMap<&str, FunctionCalls> = BTreeMap::new();
     for test in tests.iter().filter(|test| plain(test.function)) {
         // Nested `fn` items are hoisted across the block, while `let` bindings take
         // effect only after their initialiser (so `let f = f(3);` still finds `f(3)`).
@@ -69,26 +75,40 @@ pub(crate) fn unpinned_calls(source: &str, file: &syn::File) -> Vec<CalledFuncti
                     found: vec![],
                 };
                 calls.visit_stmt(stmt);
-                for (name, call, at, qualified) in calls.found {
+                for (name, call, dedup_key, at, qualified) in calls.found {
+                    if !qualified && shadowed.contains(name) {
+                        continue;
+                    }
+                    let bucket = found.entry(name).or_default();
+                    let is_new = !bucket.seen_keys.contains(&dedup_key);
+                    let take_distinct = is_new && bucket.distinct.len() < MAX_CALLS;
+                    let take_repeated =
+                        !is_new && bucket.distinct.len() + bucket.repeated.len() < MAX_CALLS;
+                    if !take_distinct && !take_repeated {
+                        continue;
+                    }
                     let (Some(before), Some(after)) =
                         (source.get(body..at.start), source.get(at.end..end))
                     else {
                         continue;
                     };
-                    if !qualified && shadowed.contains(name) {
-                        continue;
-                    }
                     // The same call written twice is two calls: the test may get to one
-                    // and not to the other, or change something in between.
+                    // and not to the other, or change something in between. Only construct
+                    // `Scenario` for calls that can enter the `MAX_CALLS` budget.
                     let line_start = source[..at.start].rfind('\n').map_or(0, |end| end + 1);
                     let place = (
                         source[..at.start].matches('\n').count() + 1,
                         source[line_start..at.start].chars().count() + 1,
                     );
-                    found
-                        .entry(name)
-                        .or_default()
-                        .push(scenario(test, before, call, after, place));
+                    let built = scenario(test, before, call, after, place);
+                    if take_distinct {
+                        bucket.seen_keys.insert(dedup_key);
+                        bucket.distinct.push(built);
+                        let keep_repeated = MAX_CALLS - bucket.distinct.len();
+                        bucket.repeated.truncate(keep_repeated);
+                    } else {
+                        bucket.repeated.push(built);
+                    }
                 }
             }
             if let syn::Stmt::Local(local) = stmt {
@@ -98,22 +118,11 @@ pub(crate) fn unpinned_calls(source: &str, file: &syn::File) -> Vec<CalledFuncti
     }
     found
         .into_iter()
-        .map(|(name, all_scenarios)| {
-            // Prioritize distinct call expressions under `MAX_CALLS`, then fill any
-            // remaining slots with repeated calls in appearance order.
-            let mut seen_exprs = BTreeSet::new();
-            let mut distinct = Vec::new();
-            let mut repeated = Vec::new();
-            for item in all_scenarios {
-                if seen_exprs.insert(item.expression.clone()) {
-                    distinct.push(item);
-                } else {
-                    repeated.push(item);
-                }
-            }
-            let scenarios: Vec<Scenario> = distinct
+        .map(|(name, bucket)| {
+            let scenarios: Vec<Scenario> = bucket
+                .distinct
                 .into_iter()
-                .chain(repeated)
+                .chain(bucket.repeated)
                 .take(MAX_CALLS)
                 .collect();
             let function = functions[name];
@@ -238,13 +247,13 @@ struct Calls<'a> {
     source: &'a str,
     names: &'a BTreeMap<String, &'a ItemFn>,
     allow_super: bool,
-    found: Vec<(&'a str, String, Range<usize>, bool)>,
+    found: Vec<(&'a str, String, String, Range<usize>, bool)>,
 }
 
 impl<'a> Calls<'a> {
     /// The call as it is written, if it is one of a function of the file with literal
     /// arguments, as many as the function takes.
-    fn call(&self, call: &syn::ExprCall) -> Option<(&'a str, String, bool)> {
+    fn call(&self, call: &syn::ExprCall) -> Option<(&'a str, String, String, bool)> {
         let Expr::Path(path) = call.func.as_ref() else {
             return None;
         };
@@ -272,8 +281,18 @@ impl<'a> Calls<'a> {
         // The call as the test has it, to the letter: space inside a text is part of
         // the argument.
         let text = self.source.get(call.span().byte_range())?;
-        (text.chars().count() <= 100 && !text.contains('\n'))
-            .then(|| (name.as_str(), text.to_owned(), qualified))
+        if text.chars().count() > 100 || text.contains('\n') {
+            return None;
+        }
+        // Normalize arguments for deduplication so spelling variants (`f(1)`, `f (1)`,
+        // `f(1,)`, `super::f(1)`) do not crowd out calls with distinct arguments.
+        let dedup_key = call
+            .args
+            .iter()
+            .map(|arg| quote::ToTokens::to_token_stream(arg).to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        Some((name.as_str(), text.to_owned(), dedup_key, qualified))
     }
 
     /// Whether the expression calls a function of the file by its name, with whatever
@@ -342,8 +361,8 @@ fn assertion(mac: &syn::Macro) -> bool {
 impl<'ast> Visit<'ast> for Calls<'_> {
     fn visit_expr_call(&mut self, call: &'ast syn::ExprCall) {
         let at = call.span().byte_range();
-        if let Some((name, text, qualified)) = self.call(call) {
-            self.found.push((name, text, at, qualified));
+        if let Some((name, text, dedup_key, qualified)) = self.call(call) {
+            self.found.push((name, text, dedup_key, at, qualified));
         }
         syn::visit::visit_expr_call(self, call);
     }
@@ -1024,13 +1043,15 @@ fn rebinds_name() {
 fn bucket(n: i32) -> &'static str { if n > 0 { \"pos\" } else { \"neg\" } }
 #[cfg(test)]
 mod tests {
+    use super::bucket;
+
     #[test]
     fn calls_via_super_and_repeats() {
+        assert_ne!(bucket(1), \"\");
+        assert_ne!(bucket (1), \"\");
+        assert_ne!(bucket(1,), \"\");
         let bucket = super::bucket(1);
         assert_ne!(bucket, \"\");
-        assert_ne!(super::bucket(1), \"\");
-        assert_ne!(super::bucket(1), \"\");
-        assert_ne!(super::bucket(1), \"\");
         assert_ne!(super::bucket(2), \"\");
     }
 }
@@ -1046,7 +1067,7 @@ mod tests {
         assert_eq!(expressions.len(), MAX_CALLS);
         assert!(
             expressions.contains(&"super::bucket(2)"),
-            "expected distinct call `super::bucket(2)` not to be starved: {expressions:?}"
+            "expected distinct call `super::bucket(2)` not to be starved by spelling variants: {expressions:?}"
         );
     }
 }
