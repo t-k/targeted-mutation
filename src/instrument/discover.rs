@@ -1029,7 +1029,23 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                 comma: (low_end, high_start),
                 close: (high_end, end),
             };
-            self.push(kind, start, end, node.receiver.span());
+            // The probe evaluates both bounds before dropping one, whereas `.min(hi)` /
+            // `.max(lo)` skips the dropped bound. Route calls with potentially side-effecting
+            // bounds to source-built mutants so probes and builds never disagree.
+            if does_nothing_else(&node.args[0]) && does_nothing_else(&node.args[1]) {
+                self.push(kind, start, end, node.receiver.span());
+            } else {
+                let at = node.receiver.span().start();
+                self.add_rebuild(Site {
+                    id: NO_ID,
+                    kind,
+                    line: at.line,
+                    column: at.column + 1,
+                    start,
+                    end,
+                    text: self.source[start..end].to_string(),
+                });
+            }
         }
         if let Some(op) = rounding_op(&name)
             && node.args.is_empty()
@@ -1087,7 +1103,11 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             && node.attrs.is_empty()
             && let Some(array) = literal_array_receiver(&node.receiver)
             && (2..=8).contains(&array.elems.len())
-            && array.elems.iter().all(is_primitive_literal)
+            && let Some(keys) = array
+                .elems
+                .iter()
+                .map(literal_key)
+                .collect::<Option<Vec<_>>>()
             && let (Some((start, receiver_end)), Some((arg_start, arg_end)), Some((_, end))) = (
                 self.range(node.receiver.span()),
                 self.range(node.args[0].span()),
@@ -1103,9 +1123,7 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                 .collect();
             if let Some(spans) = elem_spans {
                 let mut seen = HashSet::new();
-                let all_unique = spans
-                    .iter()
-                    .all(|&(es, ee)| seen.insert(tokens_of(&self.source[es..ee])));
+                let all_unique = keys.iter().all(|key| seen.insert(key.as_str()));
                 if all_unique && spans.windows(2).all(|w| in_order(w[0].1, w[1].0)) {
                     let elements = spans
                         .iter()
@@ -1558,22 +1576,71 @@ fn literal_array_receiver(mut expr: &syn::Expr) -> Option<&syn::ExprArray> {
     }
 }
 
-fn is_primitive_literal(expr: &syn::Expr) -> bool {
-    match expr {
-        syn::Expr::Lit(syn::ExprLit { attrs, lit }) if attrs.is_empty() => {
-            !matches!(lit, syn::Lit::Verbatim(_))
+fn literal_key(mut expr: &syn::Expr) -> Option<String> {
+    while let syn::Expr::Paren(syn::ExprParen {
+        attrs, expr: inner, ..
+    })
+    | syn::Expr::Group(syn::ExprGroup {
+        attrs, expr: inner, ..
+    }) = expr
+    {
+        if !attrs.is_empty() {
+            return None;
         }
+        expr = inner;
+    }
+    match expr {
+        syn::Expr::Lit(syn::ExprLit { attrs, lit }) if attrs.is_empty() => match lit {
+            syn::Lit::Int(n) => {
+                if let Ok(v) = n.base10_parse::<i128>() {
+                    Some(format!("int:{v}"))
+                } else {
+                    n.base10_parse::<u128>().ok().map(|v| format!("uint:{v}"))
+                }
+            }
+            syn::Lit::Float(f) => f.base10_parse::<f64>().ok().map(|v| {
+                let bits = if v == 0.0 {
+                    0.0f64.to_bits()
+                } else {
+                    v.to_bits()
+                };
+                format!("float:{bits:016x}")
+            }),
+            syn::Lit::Str(s) => Some(format!("str:{}", s.value())),
+            syn::Lit::ByteStr(b) => Some(format!("bstr:{:?}", b.value())),
+            syn::Lit::CStr(c) => Some(format!("cstr:{:?}", c.value())),
+            syn::Lit::Char(c) => Some(format!("char:{}", c.value())),
+            syn::Lit::Byte(b) => Some(format!("byte:{}", b.value())),
+            syn::Lit::Bool(b) => Some(format!("bool:{}", b.value())),
+            _ => None,
+        },
         syn::Expr::Unary(syn::ExprUnary {
             attrs,
             op: syn::UnOp::Neg(_),
             expr,
-        }) if attrs.is_empty() => matches!(
-            expr.as_ref(),
+        }) if attrs.is_empty() => match expr.as_ref() {
             syn::Expr::Lit(syn::ExprLit {
                 attrs,
-                lit: syn::Lit::Int(_) | syn::Lit::Float(_),
-            }) if attrs.is_empty()
-        ),
-        _ => false,
+                lit: syn::Lit::Int(n),
+            }) if attrs.is_empty() => n
+                .base10_parse::<i128>()
+                .ok()
+                .and_then(i128::checked_neg)
+                .map(|v| format!("int:{v}")),
+            syn::Expr::Lit(syn::ExprLit {
+                attrs,
+                lit: syn::Lit::Float(f),
+            }) if attrs.is_empty() => f.base10_parse::<f64>().ok().map(|v| {
+                let neg = -v;
+                let bits = if neg == 0.0 {
+                    0.0f64.to_bits()
+                } else {
+                    neg.to_bits()
+                };
+                format!("float:{bits:016x}")
+            }),
+            _ => None,
+        },
+        _ => None,
     }
 }

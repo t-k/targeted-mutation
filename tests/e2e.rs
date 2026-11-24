@@ -5482,6 +5482,39 @@ pub fn all_positive(xs: &[i32]) -> bool {
     xs.iter().all(|&x| x > 0)
 }
 
+pub fn reuse_iter_after_all(xs: &[i32]) -> Option<i32> {
+    let mut it = xs.iter().copied();
+    let _ = it.all(|x| x > 0);
+    it.next()
+}
+
+pub fn check_ref_iter(it: &mut std::slice::Iter<'_, i32>) -> bool {
+    it.all(|&x| x > 0)
+}
+
+pub fn reuse_copy_iter_after_any() -> Option<i32> {
+    #[derive(Clone, Copy)]
+    struct Pair(u8);
+    impl Iterator for Pair {
+        type Item = i32;
+        fn next(&mut self) -> Option<i32> {
+            let cur = self.0;
+            if cur >= 2 {
+                return None;
+            }
+            self.0 += 1;
+            Some(cur as i32)
+        }
+    }
+    let mut it = Pair(0);
+    let _ = it.any(|x| x == 0);
+    it.next()
+}
+
+pub fn clamp_panic_guard(x: i32, lo: i32, hi: i32) -> i32 {
+    x.clamp(lo, hi)
+}
+
 pub fn allowed_method(m: &str) -> bool {
     ["GET", "POST", "PUT"].contains(&m)
 }
@@ -5489,12 +5522,18 @@ pub fn allowed_method(m: &str) -> bool {
 pub struct Custom(pub i32);
 impl Custom {
     pub fn starts_with(&self, n: i32) -> bool { self.0 == n }
+    pub fn replace(&self, a: i32, b: i32) -> i32 { self.0 + a + b }
     pub fn floor(&self) -> i32 { self.0 }
     pub fn clamp(&self, lo: i32, hi: i32) -> i32 { self.0 + lo + hi }
+    pub fn all(&mut self, f: impl Fn(i32) -> bool) -> bool { f(self.0) }
 }
 
-pub fn uses_custom(c: &Custom) -> bool {
-    c.starts_with(1) && c.floor() == 1 && c.clamp(0, 0) == 1
+pub fn uses_custom(c: &mut Custom) -> bool {
+    c.starts_with(1)
+        && c.replace(1, 2) == 4
+        && c.floor() == 1
+        && c.clamp(0, 0) == 1
+        && c.all(|x| x == 1)
 }
 
 #[cfg(test)]
@@ -5509,10 +5548,19 @@ mod tests {
         assert_eq!(bounded(50), 50);
         assert_eq!(whole(2.0), 2.0);
         assert!(all_positive(&[1, 2, 3]));
+        assert_eq!(reuse_iter_after_all(&[1, -1, 5]), Some(5));
+        assert!(check_ref_iter(&mut [1, 2].iter()));
+        assert_eq!(reuse_copy_iter_after_any(), Some(1));
         assert!(allowed_method("GET"));
         assert!(allowed_method("POST"));
         assert!(!allowed_method("DELETE"));
-        assert!(uses_custom(&Custom(1)));
+        assert!(uses_custom(&mut Custom(1)));
+    }
+
+    #[test]
+    #[should_panic]
+    fn reversed_clamp_panics() {
+        let _ = clamp_panic_guard(5, 10, 0);
     }
 }
 "#,
@@ -5521,6 +5569,8 @@ mod tests {
 
     let (code, report) = json(&dir);
     assert_eq!(code, 2, "{report:#}");
+    // Custom types without alternate methods compile cleanly without needing probe skips.
+    assert_eq!(report["skipped_sites"].as_u64(), Some(0), "{report:#}");
     let input_gaps = findings(&report, "input_gap");
     let has_gap = |needle: &str| {
         input_gaps
@@ -5533,6 +5583,16 @@ mod tests {
     assert!(has_gap("x.max(0)"), "{report:#}");
     assert!(has_gap("x.trunc()"), "{report:#}");
     assert!(has_gap("x.ceil()"), "{report:#}");
+
+    // Reversed-bounds clamp panic test must kill both clamp mutants (neither input_gap nor unreached).
+    assert!(
+        !report["findings"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|f| f["code"].as_str() == Some("x.clamp(lo, hi)")),
+        "{report:#}"
+    );
 
     let assertion_gaps = findings(&report, "assertion_gap");
     assert!(
@@ -5550,18 +5610,29 @@ mod tests {
             .iter()
             .any(|f| matches!(
                 f["code"].as_str().unwrap_or(""),
-                "c.starts_with(1)" | "c.floor()" | "c.clamp(0, 0)"
+                "c.starts_with(1)"
+                    | "c.replace(1, 2)"
+                    | "c.floor()"
+                    | "c.clamp(0, 0)"
+                    | "c.all(|x| x == 1)"
             )),
         "{report:#}"
     );
 
-    // With --rebuild, dropping "PUT" from `["GET", "POST", "PUT"].contains(&m)` survives.
+    // With --rebuild, dropping "PUT" from `["GET", "POST", "PUT"].contains(&m)` survives
+    // and names the removed element.
     let run = tmt(
         &dir,
-        &["--json", "--quiet", "--rebuild", "--lines", "src/lib.rs:23"],
+        &["--json", "--quiet", "--rebuild", "--lines", "src/lib.rs:56"],
     );
     assert_eq!(run.code, 2, "{}", run.stderr);
     let rebuilt: Value = serde_json::from_str(&run.stdout).unwrap();
     let survivors = findings(&rebuilt, "survivor");
     assert_eq!(survivors.len(), 1, "{rebuilt:#}");
+    assert!(
+        strings(&survivors[0]["survivors"])
+            .iter()
+            .any(|s| s.contains("without `\"PUT\"`")),
+        "{rebuilt:#}"
+    );
 }

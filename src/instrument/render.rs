@@ -290,7 +290,7 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     order: 0,
                     text: format!(
                         ") {{ (__tmt_a, __tmt_p) => {{ #[allow(unused_imports)] use {rt}::{{AnyStrAffix as _, StrAffixPrim as _}}; \
-                         if (&{rt}::Aff(__tmt_a, &__tmt_p)).tmt_str_affix({}u32, {starts}) {{ (*__tmt_a).contains(__tmt_p) }} else {{ (*__tmt_a).{same}(__tmt_p) }} }} }})",
+                         (&{rt}::Aff::new(__tmt_a, __tmt_p)).tmt_str_affix({}u32, {starts}, |__tmt_a, __tmt_p| (*__tmt_a).{same}(__tmt_p)) }} }})",
                         site.id
                     ),
                     site: site.id,
@@ -304,16 +304,10 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                 close,
                 ..
             } => {
-                let (same_call, other_call) = if *replace_all {
-                    (
-                        "(*__tmt_a).replace(__tmt_f, __tmt_t)",
-                        "(*__tmt_a).replacen(__tmt_f, __tmt_t, 1)",
-                    )
+                let same_call = if *replace_all {
+                    "(*__tmt_a).replace(__tmt_f, __tmt_t)"
                 } else {
-                    (
-                        "(*__tmt_a).replacen(__tmt_f, __tmt_t, 1)",
-                        "(*__tmt_a).replace(__tmt_f, __tmt_t)",
-                    )
+                    "(*__tmt_a).replacen(__tmt_f, __tmt_t, 1)"
                 };
                 edits.push(Edit {
                     pos: call.0,
@@ -338,7 +332,7 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     order: 0,
                     text: format!(
                         ") {{ (__tmt_a, __tmt_f, __tmt_t) => {{ #[allow(unused_imports)] use {rt}::{{AnyStrReplace as _, StrReplacePrim as _}}; \
-                         if (&{rt}::Rep(__tmt_a, &__tmt_f, &__tmt_t)).tmt_str_replace({}u32, {replace_all}) {{ {other_call} }} else {{ {same_call} }} }} }})",
+                         (&{rt}::Rep::new(__tmt_a, __tmt_f, __tmt_t)).tmt_str_replace({}u32, {replace_all}, |__tmt_a, __tmt_f, __tmt_t| {same_call}) }} }})",
                         site.id
                     ),
                     site: site.id,
@@ -371,8 +365,7 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     order: 0,
                     text: format!(
                         ") {{ (__tmt_a, __tmt_lo, __tmt_hi) => {{ #[allow(unused_imports)] use {rt}::{{AnyClamp as _, ClampPrim as _}}; \
-                         match (&{rt}::Clp(__tmt_a, &__tmt_lo, &__tmt_hi)).tmt_clamp({}u32) {{ \
-                         1u8 => (*__tmt_a).min(__tmt_hi), 2u8 => (*__tmt_a).max(__tmt_lo), _ => (*__tmt_a).clamp(__tmt_lo, __tmt_hi) }} }} }})",
+                         (&{rt}::Clp::new(__tmt_a, __tmt_lo, __tmt_hi)).tmt_clamp({}u32, |__tmt_a, __tmt_lo, __tmt_hi| (*__tmt_a).clamp(__tmt_lo, __tmt_hi)) }} }})",
                         site.id
                     ),
                     site: site.id,
@@ -381,8 +374,6 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
             }
             SiteKind::Rounding { op, call, .. } => {
                 let same = op.name();
-                let alt1 = op.alt1().name();
-                let alt2 = op.alt2().name();
                 let op_code = op.code();
                 edits.push(Edit {
                     pos: call.0,
@@ -391,8 +382,7 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     order: 0,
                     text: format!(
                         ")) {{ __tmt_a => {{ #[allow(unused_imports)] use {rt}::{{AnyRound as _, RoundPrim as _}}; \
-                         match (&{rt}::Rnd(__tmt_a)).tmt_round({}u32, {op_code}u8) {{ \
-                         1u8 => (*__tmt_a).{alt1}(), 2u8 => (*__tmt_a).{alt2}(), _ => (*__tmt_a).{same}() }} }} }})",
+                         (&{rt}::Rnd(__tmt_a)).tmt_round({}u32, {op_code}u8, || (*__tmt_a).{same}()) }} }})",
                         site.id
                     ),
                     site: site.id,
@@ -402,13 +392,13 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
             SiteKind::Quantifier {
                 all, call, close, ..
             } => {
-                let (same, other) = if *all { ("all", "any") } else { ("any", "all") };
+                let same = if *all { "all" } else { "any" };
                 edits.push(Edit {
                     pos: call.0,
                     end: call.1,
                     phase: 1,
                     order: 0,
-                    text: ", ".into(),
+                    text: ").__tmt_quant_mut(), ".into(),
                     site: site.id,
                 });
                 edits.push(Edit {
@@ -417,12 +407,17 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     phase: 1,
                     order: 0,
                     text: format!(
-                        ") {{ (mut __tmt_i, __tmt_f) => {{ if {rt}::quant({}u32) {{ __tmt_i.{other}(__tmt_f) }} else {{ __tmt_i.{same}(__tmt_f) }} }} }})",
+                        ") {{ (__tmt_q, __tmt_f) => (&__tmt_q).tmt_quant({}u32, {all}, __tmt_f, |__tmt_i, __tmt_f| (*__tmt_i).{same}(__tmt_f)) }} }})",
                         site.id
                     ),
                     site: site.id,
                 });
-                ("(match (".to_string(), String::new())
+                (
+                    format!(
+                        "({{ #[allow(unused_imports)] use {rt}::{{AnyQuant as _, QuantPrim as _, TmtQuantExt as _}}; match (("
+                    ),
+                    String::new(),
+                )
             }
             SiteKind::LiteralSet { .. } => continue,
             SiteKind::Range { inclusive, gap, .. } => {

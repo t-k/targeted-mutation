@@ -1681,7 +1681,10 @@ impl TmtStrRef for &String {
 
 pub trait TmtStrPat {
     fn tmt_affix_differs(&self, s: &str, starts: bool) -> bool;
+    fn tmt_str_contains(&self, s: &str) -> bool;
     fn tmt_replace_differs(&self, s: &str, to: &str) -> bool;
+    fn tmt_str_replace(&self, s: &str, to: &str) -> String;
+    fn tmt_str_replacen1(&self, s: &str, to: &str) -> String;
 }
 
 impl TmtStrPat for &str {
@@ -1696,8 +1699,23 @@ impl TmtStrPat for &str {
     }
 
     #[inline(always)]
+    fn tmt_str_contains(&self, s: &str) -> bool {
+        s.contains(*self)
+    }
+
+    #[inline(always)]
     fn tmt_replace_differs(&self, s: &str, to: &str) -> bool {
         s.replace(*self, to) != s.replacen(*self, to, 1)
+    }
+
+    #[inline(always)]
+    fn tmt_str_replace(&self, s: &str, to: &str) -> String {
+        s.replace(*self, to)
+    }
+
+    #[inline(always)]
+    fn tmt_str_replacen1(&self, s: &str, to: &str) -> String {
+        s.replacen(*self, to, 1)
     }
 }
 
@@ -1708,8 +1726,23 @@ impl TmtStrPat for &&str {
     }
 
     #[inline(always)]
+    fn tmt_str_contains(&self, s: &str) -> bool {
+        (*self).tmt_str_contains(s)
+    }
+
+    #[inline(always)]
     fn tmt_replace_differs(&self, s: &str, to: &str) -> bool {
         (*self).tmt_replace_differs(s, to)
+    }
+
+    #[inline(always)]
+    fn tmt_str_replace(&self, s: &str, to: &str) -> String {
+        (*self).tmt_str_replace(s, to)
+    }
+
+    #[inline(always)]
+    fn tmt_str_replacen1(&self, s: &str, to: &str) -> String {
+        (*self).tmt_str_replacen1(s, to)
     }
 }
 
@@ -1720,8 +1753,23 @@ impl TmtStrPat for String {
     }
 
     #[inline(always)]
+    fn tmt_str_contains(&self, s: &str) -> bool {
+        self.as_str().tmt_str_contains(s)
+    }
+
+    #[inline(always)]
     fn tmt_replace_differs(&self, s: &str, to: &str) -> bool {
         self.as_str().tmt_replace_differs(s, to)
+    }
+
+    #[inline(always)]
+    fn tmt_str_replace(&self, s: &str, to: &str) -> String {
+        self.as_str().tmt_str_replace(s, to)
+    }
+
+    #[inline(always)]
+    fn tmt_str_replacen1(&self, s: &str, to: &str) -> String {
+        self.as_str().tmt_str_replacen1(s, to)
     }
 }
 
@@ -1732,8 +1780,23 @@ impl TmtStrPat for &String {
     }
 
     #[inline(always)]
+    fn tmt_str_contains(&self, s: &str) -> bool {
+        self.as_str().tmt_str_contains(s)
+    }
+
+    #[inline(always)]
     fn tmt_replace_differs(&self, s: &str, to: &str) -> bool {
         self.as_str().tmt_replace_differs(s, to)
+    }
+
+    #[inline(always)]
+    fn tmt_str_replace(&self, s: &str, to: &str) -> String {
+        self.as_str().tmt_str_replace(s, to)
+    }
+
+    #[inline(always)]
+    fn tmt_str_replacen1(&self, s: &str, to: &str) -> String {
+        self.as_str().tmt_str_replacen1(s, to)
     }
 }
 
@@ -1749,8 +1812,23 @@ impl TmtStrPat for char {
     }
 
     #[inline(always)]
+    fn tmt_str_contains(&self, s: &str) -> bool {
+        s.contains(*self)
+    }
+
+    #[inline(always)]
     fn tmt_replace_differs(&self, s: &str, to: &str) -> bool {
         s.replace(*self, to) != s.replacen(*self, to, 1)
+    }
+
+    #[inline(always)]
+    fn tmt_str_replace(&self, s: &str, to: &str) -> String {
+        s.replace(*self, to)
+    }
+
+    #[inline(always)]
+    fn tmt_str_replacen1(&self, s: &str, to: &str) -> String {
+        s.replacen(*self, to, 1)
     }
 }
 
@@ -1761,125 +1839,217 @@ impl TmtStrPat for &char {
     }
 
     #[inline(always)]
+    fn tmt_str_contains(&self, s: &str) -> bool {
+        (*self).tmt_str_contains(s)
+    }
+
+    #[inline(always)]
     fn tmt_replace_differs(&self, s: &str, to: &str) -> bool {
         (*self).tmt_replace_differs(s, to)
     }
-}
 
-pub struct Aff<'a, A: ?Sized, P: ?Sized>(pub &'a A, pub &'a P);
-
-pub trait StrAffixPrim {
-    fn tmt_str_affix(&self, site: u32, starts: bool) -> bool;
-}
-
-pub trait AnyStrAffix {
-    fn tmt_str_affix(&self, site: u32, starts: bool) -> bool;
-}
-
-impl<'a, A: ?Sized + TmtStrRef, P: TmtStrPat> StrAffixPrim for Aff<'a, A, P> {
     #[inline(always)]
-    fn tmt_str_affix(&self, site: u32, starts: bool) -> bool {
-        if idle(site) {
-            return false;
-        }
-        if mutant_at(site) == Some(Mutant::StrContains) {
-            return true;
-        }
-        let differs = self.1.tmt_affix_differs(self.0.tmt_as_str(), starts);
-        record_bits(b'A', site, if differs { ARITH_DIFFERS } else { ARITH_SAME });
-        false
+    fn tmt_str_replace(&self, s: &str, to: &str) -> String {
+        (*self).tmt_str_replace(s, to)
+    }
+
+    #[inline(always)]
+    fn tmt_str_replacen1(&self, s: &str, to: &str) -> String {
+        (*self).tmt_str_replacen1(s, to)
     }
 }
 
-impl<'r, 'a, A: ?Sized, P: ?Sized> AnyStrAffix for &'r Aff<'a, A, P> {
-    fn tmt_str_affix(&self, site: u32, _starts: bool) -> bool {
+pub struct Aff<'a, A: ?Sized, P>(Cell<Option<(&'a A, P)>>);
+
+impl<'a, A: ?Sized, P> Aff<'a, A, P> {
+    #[inline(always)]
+    pub fn new(a: &'a A, p: P) -> Self {
+        Aff(Cell::new(Some((a, p))))
+    }
+
+    #[inline(always)]
+    fn take(&self) -> (&'a A, P) {
+        self.0.take().expect("operands are taken once")
+    }
+}
+
+pub trait StrAffixPrim<'a, A: ?Sized + 'a, P> {
+    fn tmt_str_affix<F: FnOnce(&'a A, P) -> bool>(&self, site: u32, starts: bool, orig: F) -> bool;
+}
+
+pub trait AnyStrAffix<'a, A: ?Sized + 'a, P> {
+    fn tmt_str_affix<R, F: FnOnce(&'a A, P) -> R>(&self, site: u32, starts: bool, orig: F) -> R;
+}
+
+impl<'a, A: ?Sized + TmtStrRef, P: TmtStrPat> StrAffixPrim<'a, A, P> for Aff<'a, A, P> {
+    #[inline(always)]
+    fn tmt_str_affix<F: FnOnce(&'a A, P) -> bool>(&self, site: u32, starts: bool, orig: F) -> bool {
+        let (a, p) = self.take();
+        if idle(site) {
+            return orig(a, p);
+        }
+        if mutant_at(site) == Some(Mutant::StrContains) {
+            return p.tmt_str_contains(a.tmt_as_str());
+        }
+        let differs = p.tmt_affix_differs(a.tmt_as_str(), starts);
+        record_bits(b'A', site, if differs { ARITH_DIFFERS } else { ARITH_SAME });
+        orig(a, p)
+    }
+}
+
+impl<'r, 'a, A: ?Sized, P> AnyStrAffix<'a, A, P> for &'r Aff<'a, A, P> {
+    fn tmt_str_affix<R, F: FnOnce(&'a A, P) -> R>(&self, site: u32, _starts: bool, orig: F) -> R {
+        let (a, p) = self.take();
         if !idle(site) {
             record_bits(b'A', site, ARITH_OPAQUE);
         }
-        false
+        orig(a, p)
     }
 }
 
 /// `s.replace(from, to)` <-> `s.replacen(from, to, 1)`.
-pub struct Rep<'a, A: ?Sized, P: ?Sized, T: ?Sized>(pub &'a A, pub &'a P, pub &'a T);
+pub struct Rep<'a, A: ?Sized, P, T>(Cell<Option<(&'a A, P, T)>>);
 
-pub trait StrReplacePrim {
-    fn tmt_str_replace(&self, site: u32, replace_all: bool) -> bool;
+impl<'a, A: ?Sized, P, T> Rep<'a, A, P, T> {
+    #[inline(always)]
+    pub fn new(a: &'a A, p: P, t: T) -> Self {
+        Rep(Cell::new(Some((a, p, t))))
+    }
+
+    #[inline(always)]
+    fn take(&self) -> (&'a A, P, T) {
+        self.0.take().expect("operands are taken once")
+    }
 }
 
-pub trait AnyStrReplace {
-    fn tmt_str_replace(&self, site: u32, replace_all: bool) -> bool;
+pub trait StrReplacePrim<'a, A: ?Sized + 'a, P, T> {
+    fn tmt_str_replace<F: FnOnce(&'a A, P, T) -> String>(
+        &self,
+        site: u32,
+        replace_all: bool,
+        orig: F,
+    ) -> String;
 }
 
-impl<'a, A: ?Sized + TmtStrRef, P: TmtStrPat, T: ?Sized + TmtStrRef> StrReplacePrim
+pub trait AnyStrReplace<'a, A: ?Sized + 'a, P, T> {
+    fn tmt_str_replace<R, F: FnOnce(&'a A, P, T) -> R>(
+        &self,
+        site: u32,
+        replace_all: bool,
+        orig: F,
+    ) -> R;
+}
+
+impl<'a, A: ?Sized + TmtStrRef, P: TmtStrPat, T: TmtStrRef> StrReplacePrim<'a, A, P, T>
     for Rep<'a, A, P, T>
 {
     #[inline(always)]
-    fn tmt_str_replace(&self, site: u32, _replace_all: bool) -> bool {
+    fn tmt_str_replace<F: FnOnce(&'a A, P, T) -> String>(
+        &self,
+        site: u32,
+        replace_all: bool,
+        orig: F,
+    ) -> String {
+        let (a, p, t) = self.take();
         if idle(site) {
-            return false;
+            return orig(a, p, t);
         }
         if mutant_at(site) == Some(Mutant::StrReplaceMultiplicity) {
-            return true;
+            return if replace_all {
+                p.tmt_str_replacen1(a.tmt_as_str(), t.tmt_as_str())
+            } else {
+                p.tmt_str_replace(a.tmt_as_str(), t.tmt_as_str())
+            };
         }
-        let differs = self
-            .1
-            .tmt_replace_differs(self.0.tmt_as_str(), self.2.tmt_as_str());
+        let differs = p.tmt_replace_differs(a.tmt_as_str(), t.tmt_as_str());
         record_bits(b'A', site, if differs { ARITH_DIFFERS } else { ARITH_SAME });
-        false
+        orig(a, p, t)
     }
 }
 
-impl<'r, 'a, A: ?Sized, P: ?Sized, T: ?Sized> AnyStrReplace for &'r Rep<'a, A, P, T> {
-    fn tmt_str_replace(&self, site: u32, _replace_all: bool) -> bool {
+impl<'r, 'a, A: ?Sized, P, T> AnyStrReplace<'a, A, P, T> for &'r Rep<'a, A, P, T> {
+    fn tmt_str_replace<R, F: FnOnce(&'a A, P, T) -> R>(
+        &self,
+        site: u32,
+        _replace_all: bool,
+        orig: F,
+    ) -> R {
+        let (a, p, t) = self.take();
         if !idle(site) {
             record_bits(b'A', site, ARITH_OPAQUE);
         }
-        false
+        orig(a, p, t)
     }
 }
 
-/// `x.clamp(lo, hi)` -> `x.min(hi)` (1) or `x.max(lo)` (2).
-pub struct Clp<'a, A, L, H>(pub &'a A, pub &'a L, pub &'a H);
+/// `x.clamp(lo, hi)` -> `x.min(hi)` or `x.max(lo)`.
+pub struct Clp<'a, A: ?Sized, L, H>(Cell<Option<(&'a A, L, H)>>);
 
-pub trait ClampPrim {
-    fn tmt_clamp(&self, site: u32) -> u8;
+impl<'a, A: ?Sized, L, H> Clp<'a, A, L, H> {
+    #[inline(always)]
+    pub fn new(a: &'a A, lo: L, hi: H) -> Self {
+        Clp(Cell::new(Some((a, lo, hi))))
+    }
+
+    #[inline(always)]
+    fn take(&self) -> (&'a A, L, H) {
+        self.0.take().expect("operands are taken once")
+    }
 }
 
-pub trait AnyClamp {
-    fn tmt_clamp(&self, site: u32) -> u8;
+pub trait ClampPrim<'a, A: ?Sized + 'a, L, H> {
+    type Out;
+    fn tmt_clamp<F: FnOnce(&'a A, L, H) -> Self::Out>(&self, site: u32, orig: F) -> Self::Out;
 }
 
-impl<'r, 'a, A, L, H> AnyClamp for &'r Clp<'a, A, L, H> {
-    fn tmt_clamp(&self, site: u32) -> u8 {
+pub trait AnyClamp<'a, A: ?Sized + 'a, L, H> {
+    fn tmt_clamp<R, F: FnOnce(&'a A, L, H) -> R>(&self, site: u32, orig: F) -> R;
+}
+
+impl<'r, 'a, A: ?Sized, L, H> AnyClamp<'a, A, L, H> for &'r Clp<'a, A, L, H> {
+    fn tmt_clamp<R, F: FnOnce(&'a A, L, H) -> R>(&self, site: u32, orig: F) -> R {
+        let (a, lo, hi) = self.take();
         if !idle(site) {
             record_bits(b'A', site, ARITH_OPAQUE);
         }
-        0
+        orig(a, lo, hi)
     }
 }
 
 macro_rules! tmt_clamp_ints {
     ($($t:ty)*) => {$(
-        impl<'a> ClampPrim for Clp<'a, $t, $t, $t> {
+        impl<'a> ClampPrim<'a, $t, $t, $t> for Clp<'a, $t, $t, $t> {
+            type Out = $t;
             #[inline(always)]
-            fn tmt_clamp(&self, site: u32) -> u8 {
+            fn tmt_clamp<F: FnOnce(&'a $t, $t, $t) -> $t>(&self, site: u32, orig: F) -> $t {
+                let (a, lo, hi) = self.take();
                 if idle(site) {
-                    return 0;
+                    return orig(a, lo, hi);
                 }
+                let x = *a;
                 match mutant_at(site) {
-                    Some(Mutant::ClampDropLower) => return 1,
-                    Some(Mutant::ClampDropUpper) => return 2,
+                    Some(Mutant::ClampDropLower) => return x.min(hi),
+                    Some(Mutant::ClampDropUpper) => return x.max(lo),
                     _ => {}
                 }
-                let (x, lo, hi) = (*self.0, *self.1, *self.2);
                 if lo <= hi {
-                    let orig = x.clamp(lo, hi);
-                    let mut bits = if orig == x.min(hi) { ARITH_SAME } else { ARITH_DIFFERS };
-                    bits |= if orig == x.max(lo) { ARITH_SAME2 } else { ARITH_DIFFERS2 };
+                    let v = x.clamp(lo, hi);
+                    let mut bits = if v == x.min(hi) { ARITH_SAME } else { ARITH_DIFFERS };
+                    bits |= if v == x.max(lo) { ARITH_SAME2 } else { ARITH_DIFFERS2 };
                     record_bits(b'A', site, bits);
+                } else {
+                    // `clamp` panics on reversed bounds while `min` and `max` return a value.
+                    record_bits(b'A', site, ARITH_DIFFERS | ARITH_DIFFERS2);
                 }
-                0
+                orig(a, lo, hi)
+            }
+        }
+        impl<'a, 'b> ClampPrim<'a, &'b $t, $t, $t> for Clp<'a, &'b $t, $t, $t> {
+            type Out = $t;
+            #[inline(always)]
+            fn tmt_clamp<F: FnOnce(&'a &'b $t, $t, $t) -> $t>(&self, site: u32, orig: F) -> $t {
+                let (a, lo, hi) = self.take();
+                (&Clp::new(*a, lo, hi)).tmt_clamp(site, |_, lo, hi| orig(a, lo, hi))
             }
         }
     )*};
@@ -1888,27 +2058,40 @@ tmt_clamp_ints!(i8 i16 i32 i64 isize u8 u16 u32 u64 usize);
 
 macro_rules! tmt_clamp_floats {
     ($($t:ty)*) => {$(
-        impl<'a> ClampPrim for Clp<'a, $t, $t, $t> {
+        impl<'a> ClampPrim<'a, $t, $t, $t> for Clp<'a, $t, $t, $t> {
+            type Out = $t;
             #[inline(always)]
-            fn tmt_clamp(&self, site: u32) -> u8 {
+            fn tmt_clamp<F: FnOnce(&'a $t, $t, $t) -> $t>(&self, site: u32, orig: F) -> $t {
+                let (a, lo, hi) = self.take();
                 if idle(site) {
-                    return 0;
+                    return orig(a, lo, hi);
                 }
+                let x = *a;
                 match mutant_at(site) {
-                    Some(Mutant::ClampDropLower) => return 1,
-                    Some(Mutant::ClampDropUpper) => return 2,
+                    Some(Mutant::ClampDropLower) => return x.min(hi),
+                    Some(Mutant::ClampDropUpper) => return x.max(lo),
                     _ => {}
                 }
-                let (x, lo, hi) = (*self.0, *self.1, *self.2);
                 if lo <= hi {
-                    let orig = x.clamp(lo, hi) as f64;
+                    let v = x.clamp(lo, hi) as f64;
                     let drop_lo = x.min(hi) as f64;
                     let drop_hi = x.max(lo) as f64;
-                    let mut bits = if float_min_max_same(orig, drop_lo) { ARITH_SAME } else { ARITH_DIFFERS };
-                    bits |= if float_min_max_same(orig, drop_hi) { ARITH_SAME2 } else { ARITH_DIFFERS2 };
+                    let mut bits = if float_min_max_same(v, drop_lo) { ARITH_SAME } else { ARITH_DIFFERS };
+                    bits |= if float_min_max_same(v, drop_hi) { ARITH_SAME2 } else { ARITH_DIFFERS2 };
                     record_bits(b'A', site, bits);
+                } else {
+                    // `clamp` panics on reversed or NaN bounds while `min` and `max` do not.
+                    record_bits(b'A', site, ARITH_DIFFERS | ARITH_DIFFERS2);
                 }
-                0
+                orig(a, lo, hi)
+            }
+        }
+        impl<'a, 'b> ClampPrim<'a, &'b $t, $t, $t> for Clp<'a, &'b $t, $t, $t> {
+            type Out = $t;
+            #[inline(always)]
+            fn tmt_clamp<F: FnOnce(&'a &'b $t, $t, $t) -> $t>(&self, site: u32, orig: F) -> $t {
+                let (a, lo, hi) = self.take();
+                (&Clp::new(*a, lo, hi)).tmt_clamp(site, |_, lo, hi| orig(a, lo, hi))
             }
         }
     )*};
@@ -1919,67 +2102,151 @@ tmt_clamp_floats!(f32 f64);
 pub struct Rnd<'a, A: ?Sized>(pub &'a A);
 
 pub trait RoundPrim {
-    fn tmt_round(&self, site: u32, op: u8) -> u8;
+    type Out;
+    fn tmt_round<F: FnOnce() -> Self::Out>(&self, site: u32, op: u8, orig: F) -> Self::Out;
 }
 
 pub trait AnyRound {
-    fn tmt_round(&self, site: u32, op: u8) -> u8;
+    fn tmt_round<R, F: FnOnce() -> R>(&self, site: u32, op: u8, orig: F) -> R;
 }
 
 impl<'r, 'a, A: ?Sized> AnyRound for &'r Rnd<'a, A> {
-    fn tmt_round(&self, site: u32, _op: u8) -> u8 {
+    fn tmt_round<R, F: FnOnce() -> R>(&self, site: u32, _op: u8, orig: F) -> R {
         if !idle(site) {
             record_bits(b'A', site, ARITH_OPAQUE);
         }
-        0
+        orig()
     }
 }
 
 macro_rules! tmt_round_floats {
     ($($t:ty)*) => {$(
         impl<'a> RoundPrim for Rnd<'a, $t> {
+            type Out = $t;
             #[inline(always)]
-            fn tmt_round(&self, site: u32, op: u8) -> u8 {
+            fn tmt_round<F: FnOnce() -> $t>(&self, site: u32, op: u8, orig: F) -> $t {
                 if idle(site) {
-                    return 0;
-                }
-                match mutant_at(site) {
-                    Some(Mutant::RoundAlt1) => return 1,
-                    Some(Mutant::RoundAlt2) => return 2,
-                    _ => {}
+                    return orig();
                 }
                 let x = *self.0;
-                let (orig, alt1, alt2) = match op {
+                match mutant_at(site) {
+                    Some(Mutant::RoundAlt1) => {
+                        return match op {
+                            0 => x.trunc(),
+                            _ => x.floor(),
+                        };
+                    }
+                    Some(Mutant::RoundAlt2) => {
+                        return match op {
+                            0 => x.ceil(),
+                            1 | 2 => x.trunc(),
+                            _ => x.round(),
+                        };
+                    }
+                    _ => {}
+                }
+                let (v, alt1, alt2) = match op {
                     0 => (x.floor(), x.trunc(), x.ceil()),
                     1 => (x.ceil(), x.floor(), x.trunc()),
                     2 => (x.round(), x.floor(), x.trunc()),
                     _ => (x.trunc(), x.floor(), x.round()),
                 };
-                let mut bits = if float_min_max_same(orig as f64, alt1 as f64) { ARITH_SAME } else { ARITH_DIFFERS };
-                bits |= if float_min_max_same(orig as f64, alt2 as f64) { ARITH_SAME2 } else { ARITH_DIFFERS2 };
+                let mut bits = if float_min_max_same(v as f64, alt1 as f64) { ARITH_SAME } else { ARITH_DIFFERS };
+                bits |= if float_min_max_same(v as f64, alt2 as f64) { ARITH_SAME2 } else { ARITH_DIFFERS2 };
                 record_bits(b'A', site, bits);
-                0
+                orig()
             }
         }
         impl<'a, 'b> RoundPrim for Rnd<'a, &'b $t> {
+            type Out = $t;
             #[inline(always)]
-            fn tmt_round(&self, site: u32, op: u8) -> u8 {
-                (&Rnd::<$t>(*self.0)).tmt_round(site, op)
+            fn tmt_round<F: FnOnce() -> $t>(&self, site: u32, op: u8, orig: F) -> $t {
+                (&Rnd::<$t>(*self.0)).tmt_round(site, op, orig)
             }
         }
     )*};
 }
 tmt_round_floats!(f32 f64);
 
-/// `iter.all(f)` <-> `iter.any(f)`: reach-guided probe.
-#[inline(always)]
-pub fn quant(site: u32) -> bool {
-    if idle(site) {
-        return false;
+/// `iter.all(f)` <-> `iter.any(f)`: reach-guided probe specialized to `Iterator`.
+pub struct Qnt<'a, I: ?Sized>(Cell<Option<&'a mut I>>);
+
+impl<'a, I: ?Sized> Qnt<'a, I> {
+    #[inline(always)]
+    pub fn new(iter: &'a mut I) -> Self {
+        Qnt(Cell::new(Some(iter)))
     }
-    if mutant_at(site) == Some(Mutant::QuantifierSwap) {
-        return true;
+
+    #[inline(always)]
+    fn take(&self) -> &'a mut I {
+        self.0.take().expect("iterator is taken once")
     }
-    record_bits(b'R', site, 1);
-    false
+}
+
+/// Reborrows any receiver (`T`, `&mut T`, or temporary) as `Qnt<'_, Self>` via method auto-ref.
+pub trait TmtQuantExt {
+    fn __tmt_quant_mut(&mut self) -> Qnt<'_, Self>;
+}
+
+impl<T: ?Sized> TmtQuantExt for T {
+    #[inline(always)]
+    fn __tmt_quant_mut(&mut self) -> Qnt<'_, Self> {
+        Qnt::new(self)
+    }
+}
+
+pub trait QuantPrim<'a, I: ?Sized + 'a> {
+    type Item;
+    fn tmt_quant<P: FnMut(Self::Item) -> bool, G: FnOnce(&'a mut I, P) -> bool>(
+        &self,
+        site: u32,
+        all: bool,
+        pred: P,
+        orig: G,
+    ) -> bool;
+}
+
+pub trait AnyQuant<'a, I: ?Sized + 'a> {
+    fn tmt_quant<P, R, G: FnOnce(&'a mut I, P) -> R>(
+        &self,
+        site: u32,
+        all: bool,
+        pred: P,
+        orig: G,
+    ) -> R;
+}
+
+impl<'a, I: Iterator> QuantPrim<'a, I> for Qnt<'a, I> {
+    type Item = I::Item;
+    #[inline(always)]
+    fn tmt_quant<P: FnMut(I::Item) -> bool, G: FnOnce(&'a mut I, P) -> bool>(
+        &self,
+        site: u32,
+        all: bool,
+        pred: P,
+        orig: G,
+    ) -> bool {
+        let iter = self.take();
+        if idle(site) {
+            return orig(iter, pred);
+        }
+        if mutant_at(site) == Some(Mutant::QuantifierSwap) {
+            return if all { iter.any(pred) } else { iter.all(pred) };
+        }
+        record_bits(b'R', site, 1);
+        orig(iter, pred)
+    }
+}
+
+impl<'r, 'a, I: ?Sized> AnyQuant<'a, I> for &'r Qnt<'a, I> {
+    fn tmt_quant<P, R, G: FnOnce(&'a mut I, P) -> R>(
+        &self,
+        _site: u32,
+        _all: bool,
+        pred: P,
+        orig: G,
+    ) -> R {
+        let iter = self.take();
+        orig(iter, pred)
+    }
 }

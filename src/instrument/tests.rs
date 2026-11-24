@@ -3177,3 +3177,92 @@ pub fn checks(s: &str, x: i32, y: f64, xs: &[i32]) -> bool {
         }
     }
 }
+
+#[test]
+fn clamp_impure_bounds_literal_set_value_dedup_and_multiline_line_preservation() {
+    let source = r#"
+fn impure_clamp(x: i32) -> i32 {
+    x.clamp(
+        lo_fn(),
+        hi_fn(),
+    )
+}
+fn multiline_replace(s: &str) -> String {
+    s.replace(
+        "a",
+        "b",
+    )
+}
+fn dup_hex(x: u32) -> bool {
+    [1, 0x1].contains(&x)
+}
+fn dup_raw_str(s: &str) -> bool {
+    ["a", r"a"].contains(&s)
+}
+fn dup_signed_zero(x: f64) -> bool {
+    [0.0, -0.0].contains(&x)
+}
+"#;
+    let found = discover(source, 0).unwrap();
+    // Impure clamp bounds go to rebuild_sites instead of probes.
+    assert!(
+        !found
+            .sites
+            .iter()
+            .any(|s| matches!(s.kind, SiteKind::Clamp { .. }))
+    );
+    let clamp_site = found
+        .rebuild_sites
+        .iter()
+        .find(|s| matches!(s.kind, SiteKind::Clamp { .. }))
+        .expect("impure clamp in rebuild_sites");
+    let mut clamp_mutants = source_mutants(clamp_site);
+    keep_line_ends(source, &mut clamp_mutants);
+    assert_eq!(clamp_mutants.len(), 2);
+    let line_of = |text: &str, needle: &str| {
+        text.lines()
+            .position(|l| l.contains(needle))
+            .expect("needle present")
+    };
+    let orig_lo_line = line_of(source, "lo_fn()");
+    let orig_hi_line = line_of(source, "hi_fn()");
+    let mut drop_lo = source.to_string();
+    drop_lo.replace_range(
+        clamp_mutants[0].start..clamp_mutants[0].end,
+        &clamp_mutants[0].replacement,
+    );
+    assert!(syn::parse_file(&drop_lo).is_ok(), "{drop_lo}");
+    assert_eq!(line_of(&drop_lo, "hi_fn()"), orig_hi_line);
+    let mut drop_hi = source.to_string();
+    drop_hi.replace_range(
+        clamp_mutants[1].start..clamp_mutants[1].end,
+        &clamp_mutants[1].replacement,
+    );
+    assert!(syn::parse_file(&drop_hi).is_ok(), "{drop_hi}");
+    assert_eq!(line_of(&drop_hi, "lo_fn()"), orig_lo_line);
+
+    // Multiline replace keeps both argument lines intact.
+    let rep_site = found
+        .sites
+        .iter()
+        .find(|s| matches!(s.kind, SiteKind::StrReplace { .. }))
+        .expect("replace site");
+    let mut rep_mutants = source_mutants(rep_site);
+    keep_line_ends(source, &mut rep_mutants);
+    let mut rep_text = source.to_string();
+    rep_text.replace_range(
+        rep_mutants[0].start..rep_mutants[0].end,
+        &rep_mutants[0].replacement,
+    );
+    assert!(syn::parse_file(&rep_text).is_ok(), "{rep_text}");
+    assert_eq!(line_of(&rep_text, "\"a\""), line_of(source, "\"a\""));
+    assert_eq!(line_of(&rep_text, "\"b\""), line_of(source, "\"b\""));
+
+    // Value-equivalent duplicates are rejected from LiteralSet.
+    assert!(
+        !found
+            .rebuild_sites
+            .iter()
+            .any(|s| matches!(s.kind, SiteKind::LiteralSet { .. }))
+    );
+}

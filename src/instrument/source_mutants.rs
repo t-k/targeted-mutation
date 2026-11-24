@@ -244,19 +244,34 @@ pub fn source_mutants(site: &Site) -> Vec<SourceMutant> {
             close,
             ..
         } => {
+            // Preserve the original source slice covering `(from, to` so multiline
+            // arguments keep their exact line numbers.
+            let args_slice = method
+                .1
+                .checked_sub(site.start)
+                .zip(close.0.checked_sub(site.start))
+                .and_then(|(s, e)| site.text.get(s..e));
             if *replace_all {
+                let replacement = match args_slice {
+                    Some(slice) => format!("replacen{slice}, 1)"),
+                    None => format!("replacen({from}, {to}, 1)"),
+                };
                 vec![change(
                     method.0,
                     close.1,
-                    format!("replacen({from}, {to}, 1)"),
+                    replacement,
                     "replace",
                     "replacen(..., 1)",
                 )]
             } else {
+                let replacement = match args_slice {
+                    Some(slice) => format!("replace{slice})"),
+                    None => format!("replace({from}, {to})"),
+                };
                 vec![change(
                     method.0,
                     close.1,
-                    format!("replace({from}, {to})"),
+                    replacement,
                     "replacen",
                     "replace",
                 )]
@@ -266,24 +281,64 @@ pub fn source_mutants(site: &Site) -> Vec<SourceMutant> {
             low,
             high,
             call,
+            comma,
             close,
             ..
-        } => vec![
-            change(
-                call.0,
-                close.1,
-                format!(".min({high})"),
-                "clamp",
-                "min (drop lower)",
-            ),
-            change(
-                call.0,
-                close.1,
-                format!(".max({low})"),
-                "clamp",
-                "max (drop upper)",
-            ),
-        ],
+        } => {
+            // Keep surviving argument expressions on their original source lines.
+            let drop_lower = call
+                .0
+                .checked_sub(site.start)
+                .zip(comma.1.checked_sub(site.start))
+                .and_then(|(s, e)| site.text.get(s..e))
+                .map(|dropped| {
+                    change(
+                        call.0,
+                        comma.1,
+                        format!(".min({}", "\n".repeat(dropped.matches('\n').count())),
+                        "clamp",
+                        "min (drop lower)",
+                    )
+                })
+                .unwrap_or_else(|| {
+                    change(
+                        call.0,
+                        close.1,
+                        format!(".min({high})"),
+                        "clamp",
+                        "min (drop lower)",
+                    )
+                });
+            let drop_upper = call
+                .0
+                .checked_sub(site.start)
+                .zip(call.1.checked_sub(site.start))
+                .zip(comma.0.checked_sub(site.start))
+                .and_then(|((cs, ce), le)| {
+                    let before_low = site.text.get(cs..ce)?;
+                    let low_slice = site.text.get(ce..le)?;
+                    Some(change(
+                        call.0,
+                        close.1,
+                        format!(
+                            ".max({}{low_slice})",
+                            "\n".repeat(before_low.matches('\n').count())
+                        ),
+                        "clamp",
+                        "max (drop upper)",
+                    ))
+                })
+                .unwrap_or_else(|| {
+                    change(
+                        call.0,
+                        close.1,
+                        format!(".max({low})"),
+                        "clamp",
+                        "max (drop upper)",
+                    )
+                });
+            vec![drop_lower, drop_upper]
+        }
         SiteKind::Rounding { op, method, .. } => vec![
             change(
                 method.0,

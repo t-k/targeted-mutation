@@ -2071,6 +2071,17 @@ fn run_package(
                             (SiteKind::Field { .. }, true) => {
                                 format!("without the field `{}`", report::one_line(&site.text))
                             }
+                            (
+                                SiteKind::LiteralSet {
+                                    receiver, argument, ..
+                                },
+                                true,
+                            ) => format!(
+                                "without `{}` in `{}.contains({})`",
+                                report::one_line(&mutant.into),
+                                report::one_line(receiver),
+                                report::one_line(argument)
+                            ),
                             _ => report::describe(site, mutation_of(site, mutant)),
                         };
                         match survivors.last_mut() {
