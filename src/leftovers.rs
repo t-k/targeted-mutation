@@ -155,8 +155,11 @@ fn asked_to_leave(setting: Option<std::ffi::OsString>) -> bool {
 fn sweep(path: &Path) -> Swept {
     let mut swept = Swept::default();
     let mut stopped = std::collections::BTreeSet::new();
+    let mut reparented_stopped = std::collections::BTreeSet::new();
     let deadline = Instant::now() + PATIENCE;
     let mut settled = false;
+    let me = std::process::id();
+    let subreaper = is_subreaper(me);
     loop {
         match held(path) {
             Ok(true) => {}
@@ -177,26 +180,30 @@ fn sweep(path: &Path) -> Swept {
             swept.left = true;
             break;
         };
-        let me = std::process::id();
-        let subreaper = is_subreaper(me);
-        let candidates: Vec<(u32, Option<String>)> = holders
-            .into_iter()
-            .map(|pid| (pid, start_token(pid)))
-            .collect();
-        for (pid, observed_start) in candidates {
-            let active_child = ACTIVE_CHILDREN
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .contains(&pid);
-            if is_left_candidate(pid, me, parent_of(pid), active_child, subreaper)
-                && observed_start
-                    .as_deref()
-                    .is_none_or(|expected| start_token(pid).as_deref() == Some(expected))
-            {
-                stop(pid);
+        for pid in holders {
+            let parent = parent_of(pid);
+            let active_child = if subreaper && parent == Some(me) {
+                // Synchronize with `Watch::spawn` so a sibling child that just forked is
+                // registered in `ACTIVE_CHILDREN` before deciding whether it is an orphan.
+                let _spawn = STARTING.lock().unwrap_or_else(|e| e.into_inner());
+                ACTIVE_CHILDREN
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains(&pid)
+            } else {
+                false
+            };
+            if !is_left_candidate(pid, me, parent, active_child, subreaper) {
+                continue;
+            }
+            if stop_verified(pid, path) {
                 stopped.insert(pid);
+                if parent == Some(me) {
+                    reparented_stopped.insert(pid);
+                }
             }
         }
+        reap_stopped(&mut reparented_stopped);
         // tmt:ignore giving up needs a holder that cannot be stopped, which a test cannot make
         if Instant::now() >= deadline {
             swept.left = true;
@@ -205,8 +212,156 @@ fn sweep(path: &Path) -> Swept {
         // tmt:ignore without the pause the loop only looks more often
         std::thread::sleep(Duration::from_millis(20));
     }
+    // Reap any reparented orphans we stopped so they do not accumulate as zombies.
+    while !reparented_stopped.is_empty() && Instant::now() < deadline {
+        reap_stopped(&mut reparented_stopped);
+        if !reparented_stopped.is_empty() {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
     swept.stopped = stopped.len();
     swept
+}
+
+/// Decides whether a non-pidfd candidate may be stopped: both start-time snapshots must
+/// exist and match, and the process must still hold the watched file between them.
+#[cfg(any(test, unix))]
+fn can_stop_verified(before: Option<&str>, still_holds: bool, after: Option<&str>) -> bool {
+    matches!((before, after), (Some(a), Some(b)) if still_holds && a == b)
+}
+
+#[cfg(unix)]
+fn reap_stopped(pids: &mut BTreeSet<u32>) {
+    pids.retain(|&pid| !reap_child(pid));
+}
+
+/// Non-blocking `waitpid(pid, WNOHANG)` for a single stopped reparented orphan.
+/// Returns `true` once the child has been reaped or no longer exists (`ECHILD`).
+#[cfg(unix)]
+fn reap_child(pid: u32) -> bool {
+    unsafe extern "C" {
+        fn waitpid(
+            pid: std::ffi::c_int,
+            status: *mut std::ffi::c_int,
+            options: std::ffi::c_int,
+        ) -> std::ffi::c_int;
+    }
+    const WNOHANG: std::ffi::c_int = 1;
+    let Ok(pid) = std::ffi::c_int::try_from(pid) else {
+        return true;
+    };
+    if pid <= 1 {
+        return true;
+    }
+    let mut status: std::ffi::c_int = 0;
+    // SAFETY: `waitpid` with a specific `pid > 1` and `WNOHANG` never blocks and never
+    // reaps any unrelated active runner child.
+    let rc = unsafe { waitpid(pid, &mut status, WNOHANG) };
+    rc > 0 || (rc < 0 && io::Error::last_os_error().raw_os_error() != Some(4 /* EINTR */))
+}
+
+/// Stops `pid` only after re-verifying that the exact same process still holds `path`.
+/// On Linux, pins the process with `pidfd_open` before verifying file ownership and
+/// signals via `pidfd_send_signal` to eliminate PID-reuse races.
+#[cfg(target_os = "linux")]
+fn stop_verified(pid: u32, path: &Path) -> bool {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    use std::os::unix::fs::MetadataExt as _;
+
+    const SYS_PIDFD_OPEN: std::ffi::c_long = 434;
+    const SYS_PIDFD_SEND_SIGNAL: std::ffi::c_long = 424;
+    unsafe extern "C" {
+        fn syscall(num: std::ffi::c_long, ...) -> std::ffi::c_long;
+    }
+    let Ok(wanted_meta) = fs::metadata(path) else {
+        return false;
+    };
+    let wanted = (wanted_meta.dev(), wanted_meta.ino());
+    let Ok(raw_pid) = std::ffi::c_int::try_from(pid) else {
+        return false;
+    };
+    if raw_pid <= 1 {
+        return false;
+    }
+    // SAFETY: `pidfd_open(pid, 0)` takes two integers and returns a new fd or -1.
+    let raw_fd = unsafe { syscall(SYS_PIDFD_OPEN, raw_pid, 0 as std::ffi::c_uint) };
+    if raw_fd >= 0 {
+        // SAFETY: `raw_fd` is a newly created valid file descriptor owned by this scope.
+        let pidfd = unsafe { OwnedFd::from_raw_fd(raw_fd as std::os::fd::RawFd) };
+        if !holds_path_linux(pid, wanted) {
+            return false;
+        }
+        // SAFETY: `pidfd_send_signal` targets the pinned process description; if the
+        // process exited and the PID was recycled, the kernel returns `ESRCH`.
+        let rc = unsafe {
+            syscall(
+                SYS_PIDFD_SEND_SIGNAL,
+                pidfd.as_raw_fd(),
+                9 as std::ffi::c_int,
+                std::ptr::null::<std::ffi::c_void>(),
+                0 as std::ffi::c_uint,
+            )
+        };
+        return rc == 0;
+    }
+    // Fallback for kernels older than 5.3 without `pidfd_open` (`ENOSYS` = 38).
+    let before = start_token(pid);
+    let still_holds = before.is_some() && holds_path_linux(pid, wanted);
+    let after = if still_holds { start_token(pid) } else { None };
+    if can_stop_verified(before.as_deref(), still_holds, after.as_deref()) {
+        stop(pid);
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn stop_verified(pid: u32, path: &Path) -> bool {
+    let before = start_token(pid);
+    let still_holds = before.is_some() && holds_path_lsof(pid, path);
+    let after = if still_holds { start_token(pid) } else { None };
+    if can_stop_verified(before.as_deref(), still_holds, after.as_deref()) {
+        stop(pid);
+        true
+    } else {
+        false
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn holds_path_linux(pid: u32, wanted: (u64, u64)) -> bool {
+    use std::os::unix::fs::MetadataExt as _;
+
+    let Ok(files) = fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    files.flatten().any(|file| {
+        let entry = file.path();
+        if let Ok(target) = fs::read_link(&entry)
+            && !target.is_absolute()
+        {
+            return false;
+        }
+        fs::metadata(&entry).is_ok_and(|open| (open.dev(), open.ino()) == wanted)
+    })
+}
+
+#[cfg(all(unix, not(target_os = "linux")))]
+fn holds_path_lsof(pid: u32, path: &Path) -> bool {
+    let pid_str = pid.to_string();
+    for lsof in ["lsof", "/usr/sbin/lsof", "/usr/bin/lsof"] {
+        if let Ok(output) = Command::new(lsof)
+            .args(["-p", &pid_str, "-a", "-t", "--"])
+            .arg(path)
+            .stdin(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .output()
+        {
+            return pids(&String::from_utf8_lossy(&output.stdout)).contains(&pid);
+        }
+    }
+    false
 }
 
 /// Whether a process that has the file is one the run left.
@@ -658,5 +813,33 @@ mod tests {
         assert_eq!(start_in_stat("12 (sh) S 7"), None);
         assert!(start_token(std::process::id()).is_some());
         assert_eq!(start_token(u32::MAX - 7), None);
+    }
+
+    #[test]
+    fn verified_stop_rejects_recycled_or_missing_tokens_and_reaps_stopped_child() {
+        assert!(can_stop_verified(Some("t1"), true, Some("t1")));
+        assert!(!can_stop_verified(Some("t1"), true, Some("t2")));
+        assert!(!can_stop_verified(Some("t1"), false, Some("t1")));
+        assert!(!can_stop_verified(None, true, Some("t1")));
+        assert!(!can_stop_verified(Some("t1"), true, None));
+        assert!(!can_stop_verified(None, true, None));
+
+        let child = Command::new("true")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let pid = child.id();
+        let mut pending = BTreeSet::from([pid]);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !pending.is_empty() && Instant::now() < deadline {
+            reap_stopped(&mut pending);
+            if !pending.is_empty() {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+        }
+        assert!(pending.is_empty(), "expected stopped child to be reaped");
+        std::mem::forget(child);
     }
 }

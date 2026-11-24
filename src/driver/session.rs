@@ -728,10 +728,26 @@ impl Session {
             }
         }
         if workers > 1 {
-            // Measure unique slow filtered baselines serially before spawning parallel
-            // workers so timing runs are not distorted by concurrent CPU contention.
-            for (index, filter) in jobs.iter().flat_map(|job| &job.tests) {
-                self.binaries[*index].filtered_limit(filter.as_deref(), false, 1);
+            // Measure unique slow filtered baselines serially for uncached jobs before
+            // spawning parallel workers, using the same thread-sharing budget that the
+            // parallel pool will use so timings are neither contended nor optimistic.
+            let pending: Vec<usize> = (0..jobs.len())
+                .filter(|&index| {
+                    checkpoint
+                        .is_none_or(|phase| phase.get::<JobResult>(index).ok().flatten().is_none())
+                })
+                .collect();
+            if pending.len() > 1 {
+                let parallel_sharing = workers.clamp(1, jobs.len().max(1));
+                for index in pending {
+                    for (bin_index, filter) in &jobs[index].tests {
+                        self.binaries[*bin_index].filtered_limit(
+                            filter.as_deref(),
+                            false,
+                            parallel_sharing,
+                        );
+                    }
+                }
             }
         }
         let run = |index: usize, sharing| self.run_job(&jobs[index], sharing);

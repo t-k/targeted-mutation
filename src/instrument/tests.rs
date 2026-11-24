@@ -890,13 +890,17 @@ fn attributes_const_methods_and_let_on_the_right() {
     // Conditional or skip attributes on assignments attach to the left operand in syn 2
     // and must not produce an empty `if live(id) {}` statement wrapper.
     let guarded = r#"
-        fn g(s: &mut S, x: &mut u32) {
+        fn g(s: &mut S, x: &mut u32, mut a: u32, mut b: u32) {
             #[cfg(feature = "off")]
             s.total += 1;
             #[mutants::skip]
             *x = 2;
             #[cfg_attr(test, allow(unused))]
             *x += 3;
+            #[cfg(feature = "off")]
+            (a, b) = (1, 2);
+            #[cfg(feature = "off")]
+            [a, b] = [1, 2];
             s.plain();
         }
     "#;

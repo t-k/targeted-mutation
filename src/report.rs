@@ -336,6 +336,8 @@ pub struct SourceDisagreement {
 pub struct TraceDifference {
     pub binary: String,
     pub records: usize,
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub rerun_failed: bool,
 }
 
 /// A source edit in the candidate catalogue. Byte offsets refer to the original file.
@@ -1152,15 +1154,26 @@ fn sarif_run(report: &Report) -> serde_json::Value {
             }));
         }
         for diff in &audit.trace_differences {
+            let text = if diff.rerun_failed && diff.records == 0 {
+                format!(
+                    "audit trace re-run for `{}` did not pass (tests may not be deterministic)",
+                    diff.binary
+                )
+            } else if diff.rerun_failed {
+                format!(
+                    "audit trace re-run for `{}` did not pass and differed in {} records",
+                    diff.binary, diff.records
+                )
+            } else {
+                format!(
+                    "audit trace for `{}` differed between two runs ({} records)",
+                    diff.binary, diff.records
+                )
+            };
             results.push(serde_json::json!({
                 "ruleId": "audit-disagreement",
                 "level": "error",
-                "message": {
-                    "text": format!(
-                        "audit trace for `{}` differed between two runs ({} records)",
-                        diff.binary, diff.records
-                    )
-                }
+                "message": { "text": text }
             }));
         }
     }
@@ -1485,10 +1498,17 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
             out.push_str("audit: recorded once more, the tests did the same\n");
         }
         for binary in &audit.trace_differences {
-            out.push_str(&format!(
-                "audit: recorded once more, `{}` differs in {} records: its tests do not always do the same\n",
-                binary.binary, binary.records
-            ));
+            if binary.rerun_failed && binary.records == 0 {
+                out.push_str(&format!(
+                    "audit: recorded once more, `{}` did not pass: its tests do not always do the same\n",
+                    binary.binary
+                ));
+            } else {
+                out.push_str(&format!(
+                    "audit: recorded once more, `{}` differs in {} records: its tests do not always do the same\n",
+                    binary.binary, binary.records
+                ));
+            }
         }
     }
     if report.mutants_not_compiled > 0 {
@@ -2803,6 +2823,7 @@ mod tests {
         audit.trace_differences.push(TraceDifference {
             binary: "p".into(),
             records: 4,
+            rerun_failed: false,
         });
         let text = render_text(&report, false);
         assert!(
@@ -3141,10 +3162,18 @@ mod tests {
                     as_probe: "passes".into(),
                     built: "fails".into(),
                 }],
-                trace_differences: vec![TraceDifference {
-                    binary: "unit".into(),
-                    records: 3,
-                }],
+                trace_differences: vec![
+                    TraceDifference {
+                        binary: "unit".into(),
+                        records: 3,
+                        rerun_failed: false,
+                    },
+                    TraceDifference {
+                        binary: "flaky".into(),
+                        records: 0,
+                        rerun_failed: true,
+                    },
+                ],
             }),
             ..Report::default()
         };
@@ -3162,7 +3191,16 @@ mod tests {
                 ("audit-disagreement", "error"),
                 ("audit-disagreement", "error"),
                 ("audit-disagreement", "error"),
+                ("audit-disagreement", "error"),
             ]
+        );
+        assert!(
+            results[4]["message"]["text"]
+                .as_str()
+                .unwrap()
+                .contains("did not pass"),
+            "{}",
+            results[4]
         );
         assert!(sarif["runs"][0]["properties"].get("audit").is_some());
     }

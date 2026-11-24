@@ -465,9 +465,55 @@ fn int_literal(expr: &syn::Expr) -> Option<i128> {
     }
 }
 
+fn expr_attrs(expr: &syn::Expr) -> &[syn::Attribute] {
+    match expr {
+        syn::Expr::Array(e) => &e.attrs,
+        syn::Expr::Assign(e) => &e.attrs,
+        syn::Expr::Async(e) => &e.attrs,
+        syn::Expr::Await(e) => &e.attrs,
+        syn::Expr::Binary(e) => &e.attrs,
+        syn::Expr::Block(e) => &e.attrs,
+        syn::Expr::Break(e) => &e.attrs,
+        syn::Expr::Call(e) => &e.attrs,
+        syn::Expr::Cast(e) => &e.attrs,
+        syn::Expr::Closure(e) => &e.attrs,
+        syn::Expr::Const(e) => &e.attrs,
+        syn::Expr::Continue(e) => &e.attrs,
+        syn::Expr::Field(e) => &e.attrs,
+        syn::Expr::ForLoop(e) => &e.attrs,
+        syn::Expr::Group(e) => &e.attrs,
+        syn::Expr::If(e) => &e.attrs,
+        syn::Expr::Index(e) => &e.attrs,
+        syn::Expr::Infer(e) => &e.attrs,
+        syn::Expr::Let(e) => &e.attrs,
+        syn::Expr::Lit(e) => &e.attrs,
+        syn::Expr::Loop(e) => &e.attrs,
+        syn::Expr::Macro(e) => &e.attrs,
+        syn::Expr::Match(e) => &e.attrs,
+        syn::Expr::MethodCall(e) => &e.attrs,
+        syn::Expr::Paren(e) => &e.attrs,
+        syn::Expr::Path(e) => &e.attrs,
+        syn::Expr::Range(e) => &e.attrs,
+        syn::Expr::RawAddr(e) => &e.attrs,
+        syn::Expr::Reference(e) => &e.attrs,
+        syn::Expr::Repeat(e) => &e.attrs,
+        syn::Expr::Return(e) => &e.attrs,
+        syn::Expr::Struct(e) => &e.attrs,
+        syn::Expr::Try(e) => &e.attrs,
+        syn::Expr::TryBlock(e) => &e.attrs,
+        syn::Expr::Tuple(e) => &e.attrs,
+        syn::Expr::Unary(e) => &e.attrs,
+        syn::Expr::Unsafe(e) => &e.attrs,
+        syn::Expr::While(e) => &e.attrs,
+        syn::Expr::Yield(e) => &e.attrs,
+        _ => &[],
+    }
+}
+
 /// Whether an expression (or its leftmost place/receiver where `syn` attaches statement
-/// attributes such as `#[cfg(feature = "x")] x += 1;`) carries a conditional compilation
-/// or skip attribute that could erase the expression and leave an empty statement guard.
+/// attributes such as `#[cfg(feature = "x")] x += 1;` or `#[cfg(..)] (a, b) = (1, 2);`)
+/// carries a conditional compilation or skip attribute that could erase the expression
+/// and leave an empty statement guard.
 fn has_conditional_or_skip_attr(expr: &syn::Expr) -> bool {
     let attrs_block = |attrs: &[syn::Attribute]| {
         is_test_only(attrs)
@@ -476,17 +522,17 @@ fn has_conditional_or_skip_attr(expr: &syn::Expr) -> bool {
                 .iter()
                 .any(|attr| attr.path().is_ident("cfg") || attr.path().is_ident("cfg_attr"))
     };
+    if attrs_block(expr_attrs(expr)) {
+        return true;
+    }
     match expr {
-        syn::Expr::Path(e) => attrs_block(&e.attrs),
-        syn::Expr::Field(e) => attrs_block(&e.attrs) || has_conditional_or_skip_attr(&e.base),
-        syn::Expr::Index(e) => attrs_block(&e.attrs) || has_conditional_or_skip_attr(&e.expr),
-        syn::Expr::Unary(e) => attrs_block(&e.attrs) || has_conditional_or_skip_attr(&e.expr),
-        syn::Expr::Paren(e) => attrs_block(&e.attrs) || has_conditional_or_skip_attr(&e.expr),
-        syn::Expr::Group(e) => attrs_block(&e.attrs) || has_conditional_or_skip_attr(&e.expr),
-        syn::Expr::Call(e) => attrs_block(&e.attrs) || has_conditional_or_skip_attr(&e.func),
-        syn::Expr::MethodCall(e) => {
-            attrs_block(&e.attrs) || has_conditional_or_skip_attr(&e.receiver)
-        }
+        syn::Expr::Field(e) => has_conditional_or_skip_attr(&e.base),
+        syn::Expr::Index(e) => has_conditional_or_skip_attr(&e.expr),
+        syn::Expr::Unary(e) => has_conditional_or_skip_attr(&e.expr),
+        syn::Expr::Paren(e) => has_conditional_or_skip_attr(&e.expr),
+        syn::Expr::Group(e) => has_conditional_or_skip_attr(&e.expr),
+        syn::Expr::Call(e) => has_conditional_or_skip_attr(&e.func),
+        syn::Expr::MethodCall(e) => has_conditional_or_skip_attr(&e.receiver),
         _ => false,
     }
 }

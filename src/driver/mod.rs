@@ -1823,6 +1823,7 @@ fn run_package(
                 audit.trace_differences.push(report::TraceDifference {
                     binary: bin.name.clone(),
                     records,
+                    rerun_failed: outcome != Outcome::Pass,
                 });
             }
         }
