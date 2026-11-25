@@ -3165,7 +3165,7 @@ fn build_progress_handles_non_utf8_stdout_identically_to_quiet() {
     #[cfg(unix)]
     {
         let mut cmd = Command::new("/bin/sh");
-        cmd.args(["-c", "printf '{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"demo\",\"kind\":[\"lib\"]}}\\n\\xff\\xfe\\n'"]);
+        cmd.args(["-c", "printf '{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"demo\",\"kind\":[\"lib\"]}}\\n\\377\\376\\n'"]);
         let mut lines = Vec::new();
         let out =
             run_cargo_with_progress_interval(&mut cmd, true, Duration::from_secs(60), |line| {
