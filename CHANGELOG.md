@@ -5,6 +5,18 @@ All notable changes to `targeted-mutation` (`cargo tmt`) are documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.3] - 2026-11-25
+
+### Improved
+
+- **Runtime cast-source type observation for disjoint `|` ↔ `^`**:
+  - Added lightweight `CastPrim` / `CastAny` runtime observation probes (`C <site> <slot> <min|-> <max|->`) for non-literal primitive casts (`as u32`, etc.) and primitive `From::from` operands inside `|` / `^`, allowing `rustc`'s own type inference to prove disjoint widening bit-packing even across inferred iterators and method chains such as `bytes.chunks(3)` and `chunk.get(1).copied().unwrap_or(0)`.
+  - Stayed conservative on polymorphic/conflicting observations across calls or binaries, generic fallbacks, signed widening, pointer casts/aliases (preserving `&mut T` reborrows), and shadowed `From` traits (including `#![no_implicit_prelude]`).
+- **Progress and empty-run diagnostic polish**:
+  - Counted only files containing at least one active site in `tmt: N sites in M file(s)` (using singular `file` for 1).
+  - Omitted the `--source-only` suggestion on `NoMutantsExecuted` when every candidate was skipped solely as unviable/uncompilable (`unreached` empty, `mutants_not_built == 0`, `mutants_not_evaluated == 0`).
+  - Appended `(<N>s elapsed)` when repeated periodic build-progress ticks emit the same status line while waiting on crate compilation/linking.
+
 ## [0.10.2] - 2026-11-25
 
 ### Improved
