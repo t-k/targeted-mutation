@@ -2013,7 +2013,10 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
         let breakdown = &report.survivor_breakdown;
         let mut parts = vec![];
         if breakdown.redundant_constant > 0 {
-            parts.push(format!("{} redundant constant", breakdown.redundant_constant));
+            parts.push(format!(
+                "{} redundant constant",
+                breakdown.redundant_constant
+            ));
         }
         if breakdown.preexisting_unchanged > 0 {
             parts.push(format!(

@@ -5823,7 +5823,11 @@ fn assert_json_counts_reconcile(report: &Value) {
         + sb["preexisting_unchanged"].as_u64().unwrap()
         + sb["unchanged_not_compared"].as_u64().unwrap()
         + sb["unconfirmed_gap"].as_u64().unwrap();
-    assert_eq!(run, killed + survived, "run != killed + survived: {report:#}");
+    assert_eq!(
+        run,
+        killed + survived,
+        "run != killed + survived: {report:#}"
+    );
     assert!(timed_out <= killed, "timed_out > killed: {report:#}");
     assert_eq!(
         survived, sb_sum,
@@ -5923,7 +5927,10 @@ mod tests {
     let no_verify = tmt(&dir, &["--json", "--quiet", "--no-effects", "--no-verify"]);
     let no_verify_json: Value = serde_json::from_str(&no_verify.stdout).unwrap();
     assert_json_counts_reconcile(&no_verify_json);
-    assert_eq!(no_verify_json["evaluation"], "partial", "{no_verify_json:#}");
+    assert_eq!(
+        no_verify_json["evaluation"], "partial",
+        "{no_verify_json:#}"
+    );
 
     // With `--rebuild`: all mutants are built and evaluated -> `evaluation` is omitted (`null`).
     let full = tmt(&dir, &["--json", "--quiet", "--no-effects", "--rebuild"]);
@@ -5976,7 +5983,10 @@ mod tests {
     );
     fs::write(dir.join("src/lib.rs"), updated_src).unwrap();
 
-    let run = tmt(&dir, &["--since", &base, "--json", "--quiet", "--no-effects"]);
+    let run = tmt(
+        &dir,
+        &["--since", &base, "--json", "--quiet", "--no-effects"],
+    );
     assert_eq!(run.code, 0, "{}\n{}", run.stdout, run.stderr);
     let report: Value = serde_json::from_str(&run.stdout).unwrap();
     assert_json_counts_reconcile(&report);
@@ -5989,8 +5999,7 @@ mod tests {
         "expected preexisting survivors in unchanged code: {report:#}"
     );
     assert_eq!(
-        report["survivor_breakdown"]["preexisting_unchanged"],
-        report["mutants_survived"],
+        report["survivor_breakdown"]["preexisting_unchanged"], report["mutants_survived"],
         "{report:#}"
     );
     // Only the test changed, so there are no unbuilt source-revert mutants -> complete evaluation.
@@ -6016,7 +6025,11 @@ mod tests {
         &dir,
         &["--since", &with_helper, "--json", "--quiet", "--no-effects"],
     );
-    assert_eq!(uncompared.code, 0, "{}\n{}", uncompared.stdout, uncompared.stderr);
+    assert_eq!(
+        uncompared.code, 0,
+        "{}\n{}",
+        uncompared.stdout, uncompared.stderr
+    );
     let uncompared_json: Value = serde_json::from_str(&uncompared.stdout).unwrap();
     assert_json_counts_reconcile(&uncompared_json);
     assert!(
@@ -6054,7 +6067,10 @@ fn since_const_only_change_without_rebuild_reports_unbuilt_and_no_mutants_execut
         base_src.replace("LIMIT: u32 = 10;", "LIMIT: u32 = 20;"),
     )
     .unwrap();
-    let run = tmt(&dir, &["--since", &base, "--json", "--quiet", "--no-effects"]);
+    let run = tmt(
+        &dir,
+        &["--since", &base, "--json", "--quiet", "--no-effects"],
+    );
     assert_eq!(run.code, 3, "{}\n{}", run.stdout, run.stderr);
     let report: Value = serde_json::from_str(&run.stdout).unwrap();
     assert_json_counts_reconcile(&report);
@@ -6066,7 +6082,11 @@ fn since_const_only_change_without_rebuild_reports_unbuilt_and_no_mutants_execut
 
     // When a sibling module has a const-only change alongside a probed function change in
     // `lib.rs`, the sibling module's unbuilt revert must still be counted and mark `partial`.
-    fs::write(dir.join("src/limits.rs"), "pub const MAX_ITEMS: u32 = 10;\n").unwrap();
+    fs::write(
+        dir.join("src/limits.rs"),
+        "pub const MAX_ITEMS: u32 = 10;\n",
+    )
+    .unwrap();
     fs::write(
         dir.join("src/lib.rs"),
         "pub mod limits;\npub fn add(a: i32, b: i32) -> i32 { a + b }\n#[test]\nfn ok() { assert_eq!(add(2, 3), 5); assert_eq!(limits::MAX_ITEMS, 10); }\n",
@@ -6074,7 +6094,11 @@ fn since_const_only_change_without_rebuild_reports_unbuilt_and_no_mutants_execut
     .unwrap();
     git_output(&dir, &["add", "-A"]);
     let with_sibling = git_output(&dir, &["write-tree"]);
-    fs::write(dir.join("src/limits.rs"), "pub const MAX_ITEMS: u32 = 20;\n").unwrap();
+    fs::write(
+        dir.join("src/limits.rs"),
+        "pub const MAX_ITEMS: u32 = 20;\n",
+    )
+    .unwrap();
     fs::write(
         dir.join("src/lib.rs"),
         "pub mod limits;\npub fn add(a: i32, b: i32) -> i32 { a + b + 1 }\n#[test]\nfn ok() { assert_eq!(add(2, 3), 6); assert_eq!(limits::MAX_ITEMS, 20); }\n",
@@ -6082,11 +6106,20 @@ fn since_const_only_change_without_rebuild_reports_unbuilt_and_no_mutants_execut
     .unwrap();
     let mixed = tmt(
         &dir,
-        &["--since", &with_sibling, "--json", "--quiet", "--no-effects"],
+        &[
+            "--since",
+            &with_sibling,
+            "--json",
+            "--quiet",
+            "--no-effects",
+        ],
     );
     let mixed_json: Value = serde_json::from_str(&mixed.stdout).unwrap();
     assert_json_counts_reconcile(&mixed_json);
-    assert!(mixed_json["mutants_run"].as_u64().unwrap() > 0, "{mixed_json:#}");
+    assert!(
+        mixed_json["mutants_run"].as_u64().unwrap() > 0,
+        "{mixed_json:#}"
+    );
     assert!(
         mixed_json["mutants_not_built"].as_u64().unwrap() >= 2,
         "expected unbuilt reverts from both lib.rs and sibling limits.rs: {mixed_json:#}"
@@ -6110,7 +6143,11 @@ fn unparseable_sibling_module_marks_evaluation_partial_in_json_sarif_and_text() 
     )
     .unwrap();
     // UTF-8 BOM makes syn reject `broken.rs` while rustc still compiles it.
-    fs::write(dir.join("src/broken.rs"), "\u{feff}pub fn ok() -> i32 { 1 }\n").unwrap();
+    fs::write(
+        dir.join("src/broken.rs"),
+        "\u{feff}pub fn ok() -> i32 { 1 }\n",
+    )
+    .unwrap();
 
     let json_run = tmt(&dir, &["--json", "--quiet", "--no-effects"]);
     assert_eq!(json_run.code, 0, "{}\n{}", json_run.stdout, json_run.stderr);
