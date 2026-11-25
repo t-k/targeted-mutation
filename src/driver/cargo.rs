@@ -186,8 +186,14 @@ pub(super) struct Profile {
 }
 
 #[derive(Deserialize)]
+pub(super) struct DiagnosticCode {
+    pub(super) code: String,
+}
+
+#[derive(Deserialize)]
 pub(super) struct Diagnostic {
     pub(super) level: String,
+    pub(super) code: Option<DiagnosticCode>,
     pub(super) rendered: Option<String>,
     pub(super) message: Option<String>,
     #[serde(default)]
@@ -213,6 +219,8 @@ pub(super) struct ErrorSpan {
 /// often point at the cause (for "possibly-uninitialized", at the guard we inserted).
 #[derive(Debug, PartialEq)]
 pub(super) struct CompileError {
+    pub(super) code: Option<String>,
+    pub(super) message: String,
     pub(super) primary: Vec<ErrorSpan>,
     pub(super) secondary: Vec<ErrorSpan>,
     pub(super) rendered: String,
@@ -327,7 +335,8 @@ pub(super) fn parse_build_output(stdout: &str, packages: &[&str]) -> BuildOutput
                 if diag.level != "error" {
                     continue;
                 }
-                let rendered = diag.rendered.or(diag.message).unwrap_or_default();
+                let raw_message = diag.message.unwrap_or_default();
+                let rendered = diag.rendered.unwrap_or_else(|| raw_message.clone());
                 if !rendered.is_empty() && !out.diagnostics.contains(&rendered) {
                     out.diagnostics.push(rendered.clone());
                 }
@@ -337,6 +346,8 @@ pub(super) fn parse_build_output(stdout: &str, packages: &[&str]) -> BuildOutput
                     line: s.line_start,
                 };
                 let error = CompileError {
+                    code: diag.code.map(|c| c.code),
+                    message: raw_message,
                     primary: diag
                         .spans
                         .iter()

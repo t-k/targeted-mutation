@@ -294,6 +294,106 @@ exec "$@"
 }
 
 #[test]
+fn stage_external_supports_monorepo_parent_relative_paths_and_skips_repair_when_missing() {
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("monorepo-parent-relative");
+    if root.exists() {
+        fs::remove_dir_all(&root).unwrap();
+    }
+    let pkg = root.join("apps/api");
+    fs::create_dir_all(pkg.join("src")).unwrap();
+    write(&root, "proto/contract.txt", "v1-contract");
+    write(&root, "testdata/cases.txt", "42");
+    write(
+        &pkg,
+        "Cargo.toml",
+        "[package]\nname = \"api\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[workspace]\n",
+    );
+    write(
+        &pkg,
+        "build.rs",
+        r#"fn main() {
+    let text = std::fs::read_to_string("../../proto/contract.txt").expect("proto missing");
+    println!("cargo:rustc-env=CONTRACT_VER={}", text.trim());
+}
+"#,
+    );
+    write(
+        &pkg,
+        "src/lib.rs",
+        r#"const CONTRACT: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../proto/contract.txt"));
+const CASE: &str = include_str!("../../../testdata/cases.txt");
+
+pub fn is_valid(n: u32) -> bool {
+    n >= 4
+}
+
+#[test]
+fn checks_boundary() {
+    assert_eq!(CONTRACT.trim(), "v1-contract");
+    assert_eq!(CASE.trim(), "42");
+    assert!(!is_valid(3));
+    assert!(is_valid(4));
+    assert_eq!(env!("CONTRACT_VER"), "v1-contract");
+}
+"#,
+    );
+
+    // Without --stage-external, build.rs fails or include_str! fails without a pointless repair rebuild.
+    let missing = command(&pkg, &["--lines", "src/lib.rs:4-6", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(1));
+    let missing_err = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        !missing_err.contains("rebuilding without the sites that failed to compile"),
+        "should not trigger repair rebuild: {missing_err}"
+    );
+
+    // Also verify missing include_str! alone (when build.rs succeeds) skips repair rebuild.
+    let only_include_missing = command(
+        &pkg,
+        &[
+            "--stage-external",
+            "../../proto",
+            "--lines",
+            "src/lib.rs:4-6",
+            "--json",
+        ],
+    )
+    .output()
+    .unwrap();
+    assert_eq!(only_include_missing.status.code(), Some(1));
+    let include_err = String::from_utf8_lossy(&only_include_missing.stderr);
+    assert!(
+        include_err.contains("unrelated to instrumentation"),
+        "{include_err}"
+    );
+    assert!(
+        !include_err.contains("rebuilding without the sites that failed to compile"),
+        "include_str! failure must not trigger repair rebuild: {include_err}"
+    );
+
+    // With both external parent paths staged (shorthand + explicit mapping), build and tests succeed.
+    let ok = command(
+        &pkg,
+        &[
+            "--stage-external",
+            "../../proto",
+            "--stage-external",
+            &format!("{}=../../testdata", root.join("testdata").display()),
+            "--lines",
+            "src/lib.rs:4-6",
+            "--quiet",
+            "--json",
+        ],
+    )
+    .output()
+    .unwrap();
+    let report = json(&ok, 0);
+    assert_eq!(report["analysis"]["stage_external"].as_array().unwrap().len(), 2);
+}
+
+#[test]
 fn workspace_catalogue_has_one_snapshot_and_streamed_reports() {
     let path = package("catalogue-stream");
     write(

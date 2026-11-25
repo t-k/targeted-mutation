@@ -28,6 +28,9 @@ pub(super) const WRITTEN_LOG: &str = ".tmt-written";
 /// What the log names and the run did not write again goes back to a plain copy.
 pub(super) struct WorkCopy {
     pub(super) root: PathBuf,
+    /// Directory inside `root` that corresponds to the user's `workspace`.
+    /// Equal to `root` unless external parent-relative paths are staged above the workspace copy.
+    pub(super) copy_root: PathBuf,
     pub(super) log: PathBuf,
     /// Paths of the copy that the current run wants to exist.
     pub(super) kept: RefCell<HashSet<PathBuf>>,
@@ -42,7 +45,12 @@ pub(super) struct WorkCopy {
 }
 
 impl WorkCopy {
+    #[cfg(test)]
     pub(super) fn open(work: &Path, root: &Path) -> WorkCopy {
+        Self::open_with_copy_root(work, root, root)
+    }
+
+    pub(super) fn open_with_copy_root(work: &Path, root: &Path, copy_root: &Path) -> WorkCopy {
         let log = work.join(WRITTEN_LOG);
         // The log is appended to and replaced: never through a link to somewhere else.
         for file in [log.clone(), log.with_extension("new")] {
@@ -64,6 +72,7 @@ impl WorkCopy {
             .collect();
         WorkCopy {
             root: root.to_path_buf(),
+            copy_root: copy_root.to_path_buf(),
             log,
             kept: RefCell::default(),
             logged: RefCell::new(earlier.clone()),
@@ -85,7 +94,7 @@ impl WorkCopy {
         } else if !self.visited.borrow().contains(path) {
             return Ok(None);
         } else {
-            workspace.join(path.strip_prefix(&self.root).unwrap_or(path))
+            workspace.join(path.strip_prefix(&self.copy_root).unwrap_or(path))
         };
         fs::read_to_string(&source)
             .map(Some)
@@ -152,7 +161,7 @@ impl WorkCopy {
                 fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
             }
             if self.visited.borrow().contains(path) {
-                let source = workspace.join(path.strip_prefix(&self.root).unwrap_or(path));
+                let source = workspace.join(path.strip_prefix(&self.copy_root).unwrap_or(path));
                 copy_as_new(&source, path)?;
             }
         }
@@ -334,6 +343,174 @@ pub(super) fn copy_tree(
         };
         copy_entry(&src, &to.join(name), workspace, skip, state)?;
     }
+    Ok(())
+}
+
+/// An external file or directory staged relative to the isolated workspace copy,
+/// for monorepo packages whose `build.rs` or `include_str!` references parent paths.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
+pub struct StageExternal {
+    /// Source path (workspace-relative or absolute).
+    pub from: PathBuf,
+    /// Relative destination from the isolated workspace copy (must ascend via `..`).
+    pub rel: PathBuf,
+}
+
+impl std::str::FromStr for StageExternal {
+    type Err = anyhow::Error;
+
+    fn from_str(text: &str) -> Result<Self> {
+        if text.bytes().any(|b| b < 0x20 || b == 0x7f) {
+            bail!("--stage-external must not contain control characters");
+        }
+        let (from, rel) = match text.split_once('=') {
+            Some((from, rel)) => (from, rel),
+            None => (text, text),
+        };
+        if from.is_empty() {
+            bail!("--stage-external source path must not be empty");
+        }
+        let rel = validate_external_rel(Path::new(rel))?;
+        Ok(Self {
+            from: PathBuf::from(from),
+            rel,
+        })
+    }
+}
+
+/// Validates and normalizes a parent-relative staging target (e.g. `../../proto`).
+/// Returns `(normalized_rel, parent_depth)`.
+pub(super) fn parse_external_rel(path: &Path) -> Result<(PathBuf, usize)> {
+    use std::path::Component;
+    let mut parents = 0usize;
+    let mut tail: Vec<std::ffi::OsString> = Vec::new();
+    for part in path.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if tail.pop().is_none() {
+                    parents += 1;
+                }
+            }
+            Component::Normal(name) => tail.push(name.to_os_string()),
+            Component::RootDir | Component::Prefix(_) => {
+                bail!(
+                    "--stage-external destination must be a relative path: {}",
+                    path.display()
+                );
+            }
+        }
+    }
+    if parents == 0 {
+        bail!(
+            "--stage-external destination must escape the workspace via `..` (use --copy-fixture for paths inside the workspace): {}",
+            path.display()
+        );
+    }
+    if tail.is_empty() {
+        bail!(
+            "--stage-external destination must name a file or directory under a parent, not the parent itself: {}",
+            path.display()
+        );
+    }
+    let mut normalized = PathBuf::new();
+    for _ in 0..parents {
+        normalized.push("..");
+    }
+    for name in tail {
+        normalized.push(name);
+    }
+    Ok((normalized, parents))
+}
+
+fn validate_external_rel(path: &Path) -> Result<PathBuf> {
+    parse_external_rel(path).map(|(normalized, _)| normalized)
+}
+
+/// Computes the subdirectory inside `<work>/src` where the workspace copy should live
+/// so that every `--stage-external` parent-relative target stays confined under `<work>/src`.
+pub(super) fn staged_copy_subdir(workspace: &Path, staged: &[StageExternal]) -> Result<PathBuf> {
+    if staged.is_empty() {
+        return Ok(PathBuf::new());
+    }
+    let mut max_depth = 0usize;
+    for entry in staged {
+        let (_, depth) = parse_external_rel(&entry.rel)?;
+        max_depth = max_depth.max(depth);
+    }
+    let repo_prefix = super::repository_prefix(workspace);
+    let mut parts: Vec<String> = Path::new(&repo_prefix)
+        .components()
+        .filter_map(|part| match part {
+            std::path::Component::Normal(name) => Some(name.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect();
+    let mut pad = 0usize;
+    while parts.len() < max_depth {
+        parts.insert(0, format!("_parent_{pad}"));
+        pad += 1;
+    }
+    Ok(parts.into_iter().collect())
+}
+
+/// Copies an external file or directory into the confined staging area under `<work>/src`.
+pub(super) fn copy_external_entry(
+    from: &Path,
+    to: &Path,
+    work: &Path,
+    forbidden: &dyn Fn(&Path) -> bool,
+    state: &WorkCopy,
+    visiting: &mut BTreeSet<PathBuf>,
+) -> Result<()> {
+    let resolved = from
+        .canonicalize()
+        .with_context(|| format!("resolving external path {}", from.display()))?;
+    if resolved.starts_with(work)
+        || resolved
+            .components()
+            .any(|part| part.as_os_str() == ".git")
+        || forbidden(&resolved)
+    {
+        bail!(
+            "--stage-external source resolves to a forbidden path: {}",
+            resolved.display()
+        );
+    }
+    let kind = fs::metadata(&resolved)?.file_type();
+    if let Some(parent) = to.parent() {
+        real_dir(parent, state)?;
+    }
+    if kind.is_file() {
+        return sync_file(&resolved, to, state);
+    }
+    if !kind.is_dir() || !visiting.insert(resolved.clone()) {
+        bail!(
+            "--stage-external source {} is a cycle or is not a regular file or directory",
+            from.display()
+        );
+    }
+    real_dir(to, state)?;
+    state.kept.borrow_mut().insert(to.to_path_buf());
+    for entry in fs::read_dir(&resolved).with_context(|| format!("reading {}", resolved.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if path.file_name().is_some_and(|n| n == ".git" || n == "node_modules")
+            || (path.is_dir() && path.join("CACHEDIR.TAG").exists())
+            || forbidden(&path)
+        {
+            continue;
+        }
+        copy_external_entry(
+            &path,
+            &to.join(entry.file_name()),
+            work,
+            forbidden,
+            state,
+            visiting,
+        )?;
+    }
+    visiting.remove(&resolved);
     Ok(())
 }
 

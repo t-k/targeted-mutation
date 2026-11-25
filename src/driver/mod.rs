@@ -82,6 +82,7 @@ pub struct Options {
     pub copy_fixtures: Vec<PathBuf>,
     pub copy_fixture_excludes: Vec<PathBuf>,
     pub output_fixtures: Vec<Fixture>,
+    pub stage_external: Vec<StageExternal>,
     pub checkpoint: bool,
     /// Also run the doc tests (slow: rustdoc recompiles them for every mutant they reach).
     pub doc: bool,
@@ -109,6 +110,7 @@ impl TestSelection {
 }
 
 pub use crate::report::CargoConfig;
+pub use workcopy::StageExternal;
 
 impl CargoConfig {
     /// The arguments that say the same to `cargo metadata`, `cargo test` and rustdoc.
@@ -824,6 +826,7 @@ fn run_package(
             copy_fixtures: options.copy_fixtures.clone(),
             copy_fixture_excludes: options.copy_fixture_excludes.clone(),
             output_fixtures: options.output_fixtures.clone(),
+            stage_external: options.stage_external.clone(),
             checkpoint: (options.checkpoint && !options.list)
                 .then(|| work.join("checkpoint.jsonl")),
         },
@@ -1043,6 +1046,12 @@ fn run_package(
         };
         if build.errors.is_empty() {
             bail!("the build failed:\n{build_note}{}", diagnostics());
+        }
+        if build.errors.iter().any(is_non_probe_error) {
+            bail!(
+                "the build failed with an error unrelated to instrumentation:\n{build_note}{}",
+                diagnostics()
+            );
         }
         rounds += 1;
         let before = disabled.len();
@@ -1277,6 +1286,12 @@ fn run_package(
                 .output_fixtures
                 .iter()
                 .map(|fixture| build_target.join(&fixture.to)),
+        );
+        inputs.extend(
+            options
+                .stage_external
+                .iter()
+                .map(|entry| normalize(&copy.join(&entry.rel))),
         );
         Some(crate::campaign_identity::compute(
             &copy,
@@ -3111,13 +3126,19 @@ fn prepare_work_copy(
     } else {
         None
     };
-    let copy = work.join("src");
+    let stage_root = work.join("src");
+    let copy_subdir = staged_copy_subdir(&workspace, &options.stage_external)?;
+    let copy = if copy_subdir.as_os_str().is_empty() {
+        stage_root.clone()
+    } else {
+        stage_root.join(&copy_subdir)
+    };
     let marker = work.join(WORK_MARKER);
-    if copy.exists() && !marker.exists() {
+    if stage_root.exists() && !marker.exists() {
         bail!(
             "{} exists and was not created by tmt; refusing to delete it. \
                  Choose another --work-dir or remove it yourself.",
-            copy.display()
+            stage_root.display()
         );
     }
     fs::write(
@@ -3133,7 +3154,7 @@ fn prepare_work_copy(
             || (path.parent() == Some(workspace.as_path())
                 && path.file_name().is_some_and(|n| n == "target"))
     };
-    let state = WorkCopy::open(&work, &copy);
+    let state = WorkCopy::open_with_copy_root(&work, &stage_root, &copy);
     let fixtures = options
         .copy_fixtures
         .iter()
@@ -3154,6 +3175,15 @@ fn prepare_work_copy(
     }
     if catalogue.is_none_or(|catalogue| !catalogue.ready.get()) {
         work_directory(&work, "src")?;
+        real_dir(&copy, &state)?;
+        if copy != stage_root {
+            for ancestor in copy.ancestors() {
+                if ancestor == stage_root || !ancestor.starts_with(&stage_root) {
+                    break;
+                }
+                state.kept.borrow_mut().insert(ancestor.to_path_buf());
+            }
+        }
         let visible = if options.all_files {
             None
         } else {
@@ -3180,7 +3210,34 @@ fn prepare_work_copy(
                 &mut BTreeSet::new(),
             )?;
         }
-        prune(&copy, &state)?;
+        for entry in &options.stage_external {
+            let (rel, _) = parse_external_rel(&entry.rel)?;
+            let dst = normalize(&copy.join(&rel));
+            if !dst.starts_with(&stage_root)
+                || dst == stage_root
+                || copy.starts_with(&dst)
+                || dst.starts_with(&copy)
+            {
+                bail!(
+                    "--stage-external destination collides with the workspace copy or escapes staging: {}",
+                    entry.rel.display()
+                );
+            }
+            let src = if entry.from.is_absolute() {
+                entry.from.clone()
+            } else {
+                normalize(&workspace.join(&entry.from))
+            };
+            copy_external_entry(
+                &src,
+                &dst,
+                &work,
+                &forbidden,
+                &state,
+                &mut BTreeSet::new(),
+            )?;
+        }
+        prune(&stage_root, &state)?;
         if options.git_index {
             git_index::snapshot(&workspace, &copy)?;
         }

@@ -448,6 +448,13 @@ struct Cli {
     /// Stage workspace path FROM at TO relative to isolated Cargo output (repeatable).
     #[arg(long, value_name = "FROM=TO", help_heading = HEADING_WORK)]
     copy_output_fixture: Vec<targeted_mutation::output_fixture::Fixture>,
+
+    /// Stage an external parent-relative path into the isolated work copy (repeatable).
+    ///
+    /// Accepts either `PATH` (e.g. `../../proto`) or `SRC=REL` (e.g. `/abs/proto=../../proto`),
+    /// where `REL` ascends above the workspace via `..`.
+    #[arg(long, value_name = "SRC[=REL]", help_heading = HEADING_WORK)]
+    stage_external: Vec<driver::StageExternal>,
 }
 
 impl Cli {
@@ -569,6 +576,7 @@ fn main() -> ExitCode {
         copy_fixtures: cli.copy_fixture,
         copy_fixture_excludes: cli.copy_fixture_exclude,
         output_fixtures: cli.copy_output_fixture,
+        stage_external: cli.stage_external,
         checkpoint: cli.checkpoint,
         doc: cli.doc,
     };

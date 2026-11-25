@@ -433,6 +433,8 @@ fn parses_cargo_json_messages() {
     assert_eq!(
         out.errors,
         [CompileError {
+            code: None,
+            message: String::new(),
             primary: vec![ErrorSpan {
                 file: "src/lib.rs".into(),
                 byte_start: 40,
@@ -562,6 +564,8 @@ fn a_primary_blame_does_not_inspect_later_fallbacks() {
         line: 1,
     };
     let error = CompileError {
+        code: None,
+        message: String::new(),
         primary: vec![span("primary.rs", probe)],
         secondary: vec![span("secondary.rs", 0)],
         rendered: String::new(),
@@ -2685,6 +2689,8 @@ fn an_error_is_blamed_on_the_file_it_names() {
     let blamed = rendered.inserted_by(probe).unwrap();
     assert!(blamed >= 100, "{blamed}");
     let error = CompileError {
+        code: None,
+        message: String::new(),
         primary: vec![ErrorSpan {
             file: "second.rs".to_string(),
             byte_start: probe,
@@ -2694,6 +2700,82 @@ fn an_error_is_blamed_on_the_file_it_names() {
         rendered: String::new(),
     };
     assert_eq!(blame_error(&error, &files, copy, &HashSet::new()), [blamed]);
+}
+
+#[test]
+fn non_probe_errors_are_detected_and_never_blamed() {
+    let copy = Path::new("/copy");
+    let source = "pub fn f(n: u32) -> bool { n >= 4 }\nconst S: &str = include_str!(\"../../missing.json\");\n";
+    let mut found = instrument::discover(source, 0).unwrap();
+    let rendered = instrument::render(source, &found.sites, &|_| true);
+    let files = [SourceFile {
+        display: "src/lib.rs".into(),
+        path: copy.join("src/lib.rs"),
+        owners: BTreeSet::new(),
+        original: source.into(),
+        lines: scope::LineIndex::new(source),
+        sites: std::mem::take(&mut found.sites),
+        rebuild_sites: vec![],
+        places: vec![],
+        rendered: Some(rendered),
+    }];
+    let span = ErrorSpan {
+        file: "src/lib.rs".into(),
+        byte_start: 0,
+        line: 2,
+    };
+    let cases = [
+        (
+            None,
+            "couldn't read `src/../../missing.json`: No such file or directory",
+            "error: couldn't read `src/../../missing.json`: No such file or directory",
+        ),
+        (
+            None,
+            "environment variable `MISSING_VAR` not defined at compile time",
+            "error: environment variable `MISSING_VAR` not defined at compile time",
+        ),
+        (
+            Some("E0583"),
+            "file not found for module `ghost`",
+            "error[E0583]: file not found for module `ghost`",
+        ),
+    ];
+    for (code, message, rendered) in cases {
+        let error = CompileError {
+            code: code.map(str::to_string),
+            message: message.to_string(),
+            primary: vec![span.clone()],
+            secondary: vec![],
+            rendered: rendered.to_string(),
+        };
+        assert!(is_non_probe_error(&error), "{message}");
+        assert!(blame_error(&error, &files, copy, &HashSet::new()).is_empty());
+    }
+}
+
+#[test]
+fn stage_external_parses_and_validates_parent_relative_specs() {
+    let shorthand: StageExternal = "../../proto".parse().unwrap();
+    assert_eq!(shorthand.from, PathBuf::from("../../proto"));
+    assert_eq!(shorthand.rel, PathBuf::from("../../proto"));
+
+    let explicit: StageExternal = "/abs/shared/proto=../../proto".parse().unwrap();
+    assert_eq!(explicit.from, PathBuf::from("/abs/shared/proto"));
+    assert_eq!(explicit.rel, PathBuf::from("../../proto"));
+
+    for bad in [
+        "",
+        "proto",
+        "./proto",
+        "../..",
+        "/abs/dest",
+        "src=/abs/dest",
+        "=../../proto",
+        "../../proto\n",
+    ] {
+        assert!(bad.parse::<StageExternal>().is_err(), "should reject {bad:?}");
+    }
 }
 
 #[test]

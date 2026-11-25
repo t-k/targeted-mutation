@@ -100,6 +100,25 @@ pub(super) fn since_diff(workspace: &Path, revision: &str) -> Result<String> {
     )
 }
 
+/// Whether a compiler error is caused by a missing external file or compile-time
+/// environment variable that probe instrumentation cannot introduce or fix.
+pub(super) fn is_non_probe_error(error: &CompileError) -> bool {
+    let msg = error.message.as_str();
+    let rendered = error.rendered.as_str();
+    if msg.starts_with("couldn't read ")
+        || rendered.contains("error: couldn't read ")
+        || (msg.starts_with("environment variable ")
+            && msg.ends_with(" not defined at compile time"))
+        || (rendered.contains("environment variable ")
+            && rendered.contains(" not defined at compile time"))
+        || error.code.as_deref() == Some("E0583")
+        || msg.starts_with("file not found for module ")
+    {
+        return true;
+    }
+    false
+}
+
 /// The sites to disable for one compile error, from the most to the least specific guess:
 /// the innermost site at a primary span, at a secondary span, any site on the line of a
 /// primary span, and finally every site of the file.
@@ -109,6 +128,9 @@ pub(super) fn blame_error(
     copy: &Path,
     disabled: &HashSet<u32>,
 ) -> Vec<u32> {
+    if is_non_probe_error(error) {
+        return vec![];
+    }
     let enabled = |id: u32| !disabled.contains(&id);
     let file_of = |span: &ErrorSpan| {
         let path = copy.join(&span.file);
