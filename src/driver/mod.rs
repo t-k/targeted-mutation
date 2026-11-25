@@ -1613,15 +1613,15 @@ fn run_package(
                     let trimmed = text.trim_start();
                     start += text.len() - trimmed.len();
                     text = trimmed.trim_end();
-                    match text
-                        .strip_prefix('(')
-                        .and_then(|inner| inner.strip_suffix(')'))
+                    if matches!(syn::parse_str::<syn::Expr>(text), Ok(syn::Expr::Paren(_)))
+                        && let Some(inner) = text
+                            .strip_prefix('(')
+                            .and_then(|inner| inner.strip_suffix(')'))
                     {
-                        Some(inner) => {
-                            start += 1;
-                            text = inner;
-                        }
-                        None => break,
+                        start += 1;
+                        text = inner;
+                    } else {
+                        break;
                     }
                 }
                 file.sites.iter().any(|other| {
