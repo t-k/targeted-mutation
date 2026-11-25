@@ -29,8 +29,8 @@ pub(crate) use discover::{discover_parsed, discover_with_errors, parse_source};
 pub(crate) use items::ItemIndex;
 pub use items::{NamedItem, enclosing_item, named_items, offset_of};
 pub use model::{
-    ArithOp, ArmGuard, Discovery, LiteralSide, NO_ID, RUNTIME_MOD, RoundingOp, Site, SiteKind,
-    TestModule,
+    ArithOp, ArmGuard, BitValueType, Discovery, LiteralSide, LocalBitType, NO_ID, RUNTIME_MOD,
+    RoundingOp, Site, SiteKind, TestModule,
 };
 pub use render::{Rendered, blame, render};
 pub use source_mutants::{SourceMutant, keep_line_ends, source_mutants};

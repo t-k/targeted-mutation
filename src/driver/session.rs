@@ -538,6 +538,8 @@ impl Session {
                         lhs,
                         rhs,
                         gap,
+                        local_types,
+                        shadowed_prims,
                     } if op.second(*assign).is_some() => {
                         let disjoint_or_xor = !*assign
                             && !merged.differs2
@@ -553,7 +555,14 @@ impl Session {
                                     .filter(|first| recorded.all(|other| other == *first))
                                     .map(|b| b.lhs);
                                 instrument::disjoint_bits(
-                                    lhs, site.start, rhs, gap.1, bounds, primitive,
+                                    lhs,
+                                    site.start,
+                                    rhs,
+                                    gap.1,
+                                    bounds,
+                                    primitive,
+                                    local_types,
+                                    shadowed_prims,
                                 )
                             };
                         if disjoint_or_xor {

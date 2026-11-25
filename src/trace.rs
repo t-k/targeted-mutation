@@ -860,7 +860,15 @@ mod tests {
         assert_eq!((&tmt_rt::W(&1.5f64)).tmt_val(), Val::Float(1.5));
         assert_eq!((&tmt_rt::W(&&2.5f32)).tmt_val(), Val::Float(2.5));
         assert_eq!((&tmt_rt::W("text")).tmt_val(), Val::None);
-        assert_eq!((&tmt_rt::W(&'c')).tmt_val(), Val::None);
+        assert_eq!((&tmt_rt::W(&true)).tmt_val(), Val::None);
+        assert_eq!(
+            (&tmt_rt::W(&'c')).tmt_val(),
+            Val::Int('c' as u32 as i128, 0, 0x10_D7FF)
+        );
+        assert_eq!(
+            (&tmt_rt::W(&'\u{e000}')).tmt_val(),
+            Val::Int(0xD800, 0, 0x10_D7FF)
+        );
 
         for (a, b) in [(1, 2), (2, 2), (3, 2)] {
             assert_eq!(

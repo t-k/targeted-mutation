@@ -6,6 +6,8 @@ use proc_macro2::Span;
 use syn::spanned::Spanned;
 use syn::visit::{self, Visit};
 
+use super::model::{BitValueType, LocalBitType};
+
 /// `#[mutants::skip]`, also inside `cfg_attr`: the mark cargo-mutants uses for code that
 /// is not to be mutated.
 pub(crate) fn is_skipped(attrs: &[syn::Attribute]) -> bool {
@@ -379,6 +381,302 @@ fn type_mask(width: u32) -> u128 {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CastTarget {
+    Fixed(BitValueType),
+    PtrSized,
+}
+
+pub(super) fn is_prim_type_name(ident: &str) -> bool {
+    parse_prim_ident(ident).is_some()
+}
+
+fn parse_prim_ident(ident: &str) -> Option<CastTarget> {
+    Some(match ident {
+        "u8" => CastTarget::Fixed(BitValueType::Unsigned(8)),
+        "u16" => CastTarget::Fixed(BitValueType::Unsigned(16)),
+        "u32" => CastTarget::Fixed(BitValueType::Unsigned(32)),
+        "u64" => CastTarget::Fixed(BitValueType::Unsigned(64)),
+        "u128" => CastTarget::Fixed(BitValueType::Unsigned(128)),
+        "i8" => CastTarget::Fixed(BitValueType::Signed(8)),
+        "i16" => CastTarget::Fixed(BitValueType::Signed(16)),
+        "i32" => CastTarget::Fixed(BitValueType::Signed(32)),
+        "i64" => CastTarget::Fixed(BitValueType::Signed(64)),
+        "i128" => CastTarget::Fixed(BitValueType::Signed(128)),
+        "bool" => CastTarget::Fixed(BitValueType::Bool),
+        "char" => CastTarget::Fixed(BitValueType::Char),
+        "usize" | "isize" => CastTarget::PtrSized,
+        _ => return None,
+    })
+}
+
+fn parse_cast_target(ty: &syn::Type, shadowed_prims: &[String]) -> Option<CastTarget> {
+    match ty {
+        syn::Type::Paren(inner) => parse_cast_target(&inner.elem, shadowed_prims),
+        syn::Type::Group(inner) => parse_cast_target(&inner.elem, shadowed_prims),
+        syn::Type::Path(path) if path.qself.is_none() => {
+            let segs: Vec<&syn::PathSegment> = path.path.segments.iter().collect();
+            if !segs.iter().all(|s| s.arguments.is_none()) {
+                return None;
+            }
+            match segs.as_slice() {
+                [only] => {
+                    let name = only.ident.to_string();
+                    if shadowed_prims.iter().any(|s| s == &name) {
+                        return None;
+                    }
+                    parse_prim_ident(&name)
+                }
+                [root, prim, name]
+                    if (root.ident == "core" || root.ident == "std")
+                        && prim.ident == "primitive"
+                        && (path.path.leading_colon.is_some()
+                            || !shadowed_prims.iter().any(|s| s == &root.ident.to_string())) =>
+                {
+                    parse_prim_ident(&name.ident.to_string())
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+pub(super) fn parse_bit_value_type(
+    ty: &syn::Type,
+    shadowed_prims: &[String],
+) -> Option<BitValueType> {
+    match parse_cast_target(ty, shadowed_prims) {
+        Some(CastTarget::Fixed(t)) => Some(t),
+        _ => None,
+    }
+}
+
+pub(super) fn parse_local_bit_type(
+    ty: &syn::Type,
+    shadowed_prims: &[String],
+) -> Option<LocalBitType> {
+    match ty {
+        syn::Type::Paren(inner) => parse_local_bit_type(&inner.elem, shadowed_prims),
+        syn::Type::Group(inner) => parse_local_bit_type(&inner.elem, shadowed_prims),
+        syn::Type::Reference(reference) => parse_local_bit_type(&reference.elem, shadowed_prims),
+        syn::Type::Slice(slice) => {
+            parse_bit_value_type(&slice.elem, shadowed_prims).map(LocalBitType::SliceOf)
+        }
+        syn::Type::Array(array) => {
+            parse_bit_value_type(&array.elem, shadowed_prims).map(LocalBitType::SliceOf)
+        }
+        _ => parse_bit_value_type(ty, shadowed_prims).map(LocalBitType::Value),
+    }
+}
+
+fn parse_prim_from_call<'a>(
+    call: &'a syn::ExprCall,
+    shadowed_prims: &[String],
+) -> Option<(CastTarget, &'a syn::Expr)> {
+    if call.args.len() != 1 {
+        return None;
+    }
+    let syn::Expr::Path(path) = &*call.func else {
+        return None;
+    };
+    if path.qself.is_some() {
+        return None;
+    }
+    let segs: Vec<&syn::PathSegment> = path.path.segments.iter().collect();
+    if !segs.iter().all(|s| s.arguments.is_none()) {
+        return None;
+    }
+    let target = match segs.as_slice() {
+        [ty, method] if method.ident == "from" => {
+            let name = ty.ident.to_string();
+            if shadowed_prims.iter().any(|s| s == &name) {
+                return None;
+            }
+            parse_prim_ident(&name)?
+        }
+        [root, prim, ty, method]
+            if (root.ident == "core" || root.ident == "std")
+                && prim.ident == "primitive"
+                && method.ident == "from"
+                && (path.path.leading_colon.is_some()
+                    || !shadowed_prims.iter().any(|s| s == &root.ident.to_string())) =>
+        {
+            parse_prim_ident(&ty.ident.to_string())?
+        }
+        _ => return None,
+    };
+    Some((target, call.args.first()?))
+}
+
+fn single_ident(expr: &syn::Expr) -> Option<String> {
+    match expr {
+        syn::Expr::Paren(inner) => single_ident(&inner.expr),
+        syn::Expr::Group(inner) => single_ident(&inner.expr),
+        syn::Expr::Path(path) if path.qself.is_none() => {
+            path.path.get_ident().map(ToString::to_string)
+        }
+        _ => None,
+    }
+}
+
+fn lookup_local_type(name: &str, local_types: &[(String, LocalBitType)]) -> Option<LocalBitType> {
+    local_types
+        .iter()
+        .find(|(k, _)| k == name)
+        .map(|(_, ty)| *ty)
+}
+
+pub(super) fn infer_bit_value_type(
+    expr: &syn::Expr,
+    local_types: &[(String, LocalBitType)],
+    shadowed_prims: &[String],
+) -> Option<BitValueType> {
+    match expr {
+        syn::Expr::Paren(inner) => infer_bit_value_type(&inner.expr, local_types, shadowed_prims),
+        syn::Expr::Group(inner) => infer_bit_value_type(&inner.expr, local_types, shadowed_prims),
+        syn::Expr::Unary(syn::ExprUnary {
+            op: syn::UnOp::Deref(_),
+            expr,
+            ..
+        }) => infer_bit_value_type(expr, local_types, shadowed_prims),
+        syn::Expr::Path(_) => {
+            let name = single_ident(expr)?;
+            match lookup_local_type(&name, local_types) {
+                Some(LocalBitType::Value(ty)) => Some(ty),
+                _ => None,
+            }
+        }
+        syn::Expr::Index(index) => {
+            if matches!(*index.index, syn::Expr::Range(_)) {
+                return None;
+            }
+            let name = single_ident(&index.expr)?;
+            match lookup_local_type(&name, local_types) {
+                Some(LocalBitType::SliceOf(ty)) => Some(ty),
+                _ => None,
+            }
+        }
+        syn::Expr::Cast(cast) => parse_bit_value_type(&cast.ty, shadowed_prims),
+        syn::Expr::Call(call) => match parse_prim_from_call(call, shadowed_prims) {
+            Some((CastTarget::Fixed(ty), _)) => Some(ty),
+            _ => None,
+        },
+        syn::Expr::Lit(syn::ExprLit { lit, .. }) => match lit {
+            syn::Lit::Byte(_) => Some(BitValueType::Unsigned(8)),
+            syn::Lit::Bool(_) => Some(BitValueType::Bool),
+            syn::Lit::Char(_) => Some(BitValueType::Char),
+            syn::Lit::Int(integer) => match parse_prim_ident(integer.suffix()) {
+                Some(CastTarget::Fixed(ty)) => Some(ty),
+                _ => None,
+            },
+            _ => None,
+        },
+        // Do not infer binary expression result types from operands: overloaded operator
+        // traits can have an arbitrary `Output` type wider than either operand.
+        _ => None,
+    }
+}
+
+fn bit_value_mask(ty: BitValueType) -> u128 {
+    match ty {
+        BitValueType::Unsigned(w) | BitValueType::Signed(w) => type_mask(w),
+        BitValueType::Bool => 0x1,
+        BitValueType::Char => 0x1f_ffff,
+    }
+}
+
+fn cast_possible_ones(
+    inner: &syn::Expr,
+    target: CastTarget,
+    outer_width: u32,
+    base_offset: usize,
+    is_primitive: &dyn Fn(usize, usize) -> bool,
+    local_types: &[(String, LocalBitType)],
+    shadowed_prims: &[String],
+) -> u128 {
+    let outer_full = type_mask(outer_width);
+    let src_ty = infer_bit_value_type(inner, local_types, shadowed_prims);
+    match target {
+        CastTarget::Fixed(dst_ty) => {
+            let dst_mask = bit_value_mask(dst_ty) & outer_full;
+            match src_ty {
+                Some(BitValueType::Unsigned(src_w)) => {
+                    possible_ones(
+                        inner,
+                        src_w,
+                        false,
+                        base_offset,
+                        is_primitive,
+                        local_types,
+                        shadowed_prims,
+                    ) & dst_mask
+                }
+                Some(BitValueType::Bool) => 0x1 & dst_mask,
+                Some(BitValueType::Char) => 0x1f_ffff & dst_mask,
+                Some(BitValueType::Signed(src_w)) => {
+                    let src_ones = possible_ones(
+                        inner,
+                        src_w,
+                        true,
+                        base_offset,
+                        is_primitive,
+                        local_types,
+                        shadowed_prims,
+                    );
+                    let sign_bit = 1u128 << (src_w - 1);
+                    if dst_ty.width() <= src_w || (src_ones & sign_bit) == 0 {
+                        src_ones & dst_mask
+                    } else {
+                        // Signed widening sign-extends negative values into all upper bits,
+                        // while preserving guaranteed-zero lower bits of `src_ones`.
+                        let ext_mask = dst_mask & !type_mask(src_w);
+                        (src_ones | ext_mask) & dst_mask
+                    }
+                }
+                None => match dst_ty {
+                    BitValueType::Unsigned(_) | BitValueType::Bool | BitValueType::Char => dst_mask,
+                    BitValueType::Signed(_) => outer_full,
+                },
+            }
+        }
+        CastTarget::PtrSized => match src_ty {
+            Some(BitValueType::Unsigned(src_w)) if src_w <= outer_width => {
+                possible_ones(
+                    inner,
+                    src_w,
+                    false,
+                    base_offset,
+                    is_primitive,
+                    local_types,
+                    shadowed_prims,
+                ) & outer_full
+            }
+            Some(BitValueType::Bool) => 0x1 & outer_full,
+            Some(BitValueType::Char) if outer_width >= 21 => 0x1f_ffff & outer_full,
+            Some(BitValueType::Signed(src_w)) if src_w <= outer_width => {
+                let src_ones = possible_ones(
+                    inner,
+                    src_w,
+                    true,
+                    base_offset,
+                    is_primitive,
+                    local_types,
+                    shadowed_prims,
+                );
+                let sign_bit = 1u128 << (src_w - 1);
+                if (src_ones & sign_bit) == 0 {
+                    src_ones & outer_full
+                } else {
+                    let ext_mask = outer_full & !type_mask(src_w);
+                    (src_ones | ext_mask) & outer_full
+                }
+            }
+            _ => outer_full,
+        },
+    }
+}
+
 fn nonneg_int_literal(expr: &syn::Expr) -> Option<u128> {
     match expr {
         syn::Expr::Paren(inner) => nonneg_int_literal(&inner.expr),
@@ -404,23 +702,64 @@ fn possible_ones(
     signed: bool,
     base_offset: usize,
     is_primitive: &dyn Fn(usize, usize) -> bool,
+    local_types: &[(String, LocalBitType)],
+    shadowed_prims: &[String],
 ) -> u128 {
     let full = type_mask(width);
     match expr {
-        syn::Expr::Paren(inner) => {
-            possible_ones(&inner.expr, width, signed, base_offset, is_primitive)
-        }
-        syn::Expr::Group(inner) => {
-            possible_ones(&inner.expr, width, signed, base_offset, is_primitive)
-        }
-        syn::Expr::Lit(syn::ExprLit {
-            lit: syn::Lit::Int(integer),
-            ..
-        }) => integer
-            .base10_parse::<u128>()
-            .ok()
-            .filter(|v| *v <= full)
-            .unwrap_or(full),
+        syn::Expr::Paren(inner) => possible_ones(
+            &inner.expr,
+            width,
+            signed,
+            base_offset,
+            is_primitive,
+            local_types,
+            shadowed_prims,
+        ),
+        syn::Expr::Group(inner) => possible_ones(
+            &inner.expr,
+            width,
+            signed,
+            base_offset,
+            is_primitive,
+            local_types,
+            shadowed_prims,
+        ),
+        syn::Expr::Lit(syn::ExprLit { lit, .. }) => match lit {
+            syn::Lit::Int(integer) => integer
+                .base10_parse::<u128>()
+                .ok()
+                .filter(|v| *v <= full)
+                .unwrap_or(full),
+            syn::Lit::Byte(b) => (b.value() as u128) & full,
+            syn::Lit::Bool(b) => u128::from(b.value) & full,
+            syn::Lit::Char(c) => (c.value() as u32 as u128) & full,
+            _ => full,
+        },
+        syn::Expr::Cast(cast) => match parse_cast_target(&cast.ty, shadowed_prims) {
+            Some(target) => cast_possible_ones(
+                &cast.expr,
+                target,
+                width,
+                base_offset,
+                is_primitive,
+                local_types,
+                shadowed_prims,
+            ),
+            None => full,
+        },
+        syn::Expr::Call(call) => match parse_prim_from_call(call, shadowed_prims) {
+            Some((target, arg)) => cast_possible_ones(
+                arg,
+                target,
+                width,
+                base_offset,
+                is_primitive,
+                local_types,
+                shadowed_prims,
+            ),
+            None => full,
+        },
         syn::Expr::Binary(binary) => {
             let range = binary.span().byte_range();
             if !is_primitive(base_offset + range.start, base_offset + range.end) {
@@ -428,17 +767,54 @@ fn possible_ones(
             }
             match binary.op {
                 syn::BinOp::BitAnd(_) => {
-                    possible_ones(&binary.left, width, signed, base_offset, is_primitive)
-                        & possible_ones(&binary.right, width, signed, base_offset, is_primitive)
+                    possible_ones(
+                        &binary.left,
+                        width,
+                        signed,
+                        base_offset,
+                        is_primitive,
+                        local_types,
+                        shadowed_prims,
+                    ) & possible_ones(
+                        &binary.right,
+                        width,
+                        signed,
+                        base_offset,
+                        is_primitive,
+                        local_types,
+                        shadowed_prims,
+                    )
                 }
                 syn::BinOp::BitOr(_) | syn::BinOp::BitXor(_) => {
-                    (possible_ones(&binary.left, width, signed, base_offset, is_primitive)
-                        | possible_ones(&binary.right, width, signed, base_offset, is_primitive))
-                        & full
+                    (possible_ones(
+                        &binary.left,
+                        width,
+                        signed,
+                        base_offset,
+                        is_primitive,
+                        local_types,
+                        shadowed_prims,
+                    ) | possible_ones(
+                        &binary.right,
+                        width,
+                        signed,
+                        base_offset,
+                        is_primitive,
+                        local_types,
+                        shadowed_prims,
+                    )) & full
                 }
                 syn::BinOp::Shl(_) => match nonneg_int_literal(&binary.right) {
                     Some(k) if k < width as u128 => {
-                        (possible_ones(&binary.left, width, signed, base_offset, is_primitive) << k)
+                        (possible_ones(
+                            &binary.left,
+                            width,
+                            signed,
+                            base_offset,
+                            is_primitive,
+                            local_types,
+                            shadowed_prims,
+                        ) << k)
                             & full
                     }
                     _ => full,
@@ -447,8 +823,15 @@ fn possible_ones(
                     if !signed {
                         match nonneg_int_literal(&binary.right) {
                             Some(k) if k < width as u128 => {
-                                possible_ones(&binary.left, width, false, base_offset, is_primitive)
-                                    >> k
+                                possible_ones(
+                                    &binary.left,
+                                    width,
+                                    false,
+                                    base_offset,
+                                    is_primitive,
+                                    local_types,
+                                    shadowed_prims,
+                                ) >> k
                             }
                             _ => full,
                         }
@@ -483,6 +866,8 @@ fn possible_ones(
                                         false,
                                         base_offset,
                                         is_primitive,
+                                        local_types,
+                                        shadowed_prims,
                                     ) >> shift
                                 } else {
                                     full
@@ -502,8 +887,15 @@ fn possible_ones(
                         Some((k, other)) if k >= 2 && k.is_power_of_two() => {
                             let shift = k.trailing_zeros();
                             if shift < width {
-                                (possible_ones(other, width, signed, base_offset, is_primitive)
-                                    << shift)
+                                (possible_ones(
+                                    other,
+                                    width,
+                                    signed,
+                                    base_offset,
+                                    is_primitive,
+                                    local_types,
+                                    shadowed_prims,
+                                ) << shift)
                                     & full
                             } else {
                                 full
@@ -525,6 +917,7 @@ fn possible_ones(
 /// `lhs_start` and `rhs_start` are the byte offsets of `lhs` and `rhs` in the original
 /// source file; `is_primitive` checks whether a binary sub-expression in that source range
 /// was observed executing as a primitive integer operator.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn disjoint_bits(
     lhs: &str,
     lhs_start: usize,
@@ -532,6 +925,8 @@ pub(crate) fn disjoint_bits(
     rhs_start: usize,
     bounds: Option<(i128, i128)>,
     is_primitive: &dyn Fn(usize, usize) -> bool,
+    local_types: &[(String, LocalBitType)],
+    shadowed_prims: &[String],
 ) -> bool {
     let Some((width, signed)) = bounds.and_then(int_type_info) else {
         return false;
@@ -542,8 +937,24 @@ pub(crate) fn disjoint_bits(
     ) else {
         return false;
     };
-    let lhs_ones = possible_ones(&lhs_expr, width, signed, lhs_start, is_primitive);
-    let rhs_ones = possible_ones(&rhs_expr, width, signed, rhs_start, is_primitive);
+    let lhs_ones = possible_ones(
+        &lhs_expr,
+        width,
+        signed,
+        lhs_start,
+        is_primitive,
+        local_types,
+        shadowed_prims,
+    );
+    let rhs_ones = possible_ones(
+        &rhs_expr,
+        width,
+        signed,
+        rhs_start,
+        is_primitive,
+        local_types,
+        shadowed_prims,
+    );
     (lhs_ones & rhs_ones) == 0
 }
 

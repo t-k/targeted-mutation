@@ -1385,3 +1385,100 @@ fn covers_all() {
         + b["unconfirmed_gap"].as_u64().unwrap();
     assert_eq!(survived, sum);
 }
+
+#[test]
+fn widening_cast_bitpack_and_byte_char_nearest_values_e2e() {
+    let path = package("bitpack-literal-ux");
+    write(
+        &path,
+        "src/lib.rs",
+        r#"
+pub fn pack_u8(first: u8, second: u8, third: u8) -> u32 {
+    ((first as u32) << 16) | ((second as u32) << 8) | third as u32
+}
+
+pub fn pack_i8(first: i8, second: i8) -> u32 {
+    ((first as u32) << 8) | (second as u32)
+}
+
+pub fn is_tag_a(tag: u8) -> bool {
+    tag == b'A'
+}
+
+pub fn is_char_a(ch: char) -> bool {
+    ch == 'A'
+}
+
+pub fn above_surrogate(ch: char) -> bool {
+    ch >= '\u{e000}'
+}
+
+#[test]
+fn covers_cases() {
+    assert_eq!(pack_u8(0x12, 0x34, 0x56), 0x0012_3456);
+    assert_eq!(pack_i8(0x12, 0x34), 0x0000_1234);
+    assert!(!is_tag_a(b'o'));
+    assert!(!is_char_a('o'));
+    assert!(!above_surrogate('\u{d7ff}'));
+    assert!(above_surrogate('\u{e000}'));
+}
+"#,
+    );
+    let run = command(&path, &["--quiet", "--json", "--no-effects"])
+        .output()
+        .unwrap();
+    let report = json(&run, 2);
+    let findings = report["findings"].as_array().unwrap();
+
+    // 1. Widening u8 bit-packing must not report `|` -> `^` INPUT GAPs.
+    let pack_u8_gaps: Vec<&Value> = findings
+        .iter()
+        .filter(|f| f["item"].as_str() == Some("pack_u8"))
+        .collect();
+    assert!(
+        pack_u8_gaps.is_empty(),
+        "unexpected pack_u8 gaps: {pack_u8_gaps:#?}"
+    );
+
+    // 2. Signed i8 widening must still report `|` -> `^` INPUT GAP (sign-extension can overlap).
+    assert!(
+        findings.iter().any(|f| {
+            f["item"].as_str() == Some("pack_i8")
+                && f["kind"].as_str() == Some("input_gap")
+                && f["survivors"]
+                    .as_array()
+                    .is_some_and(|s| s.iter().any(|v| v.as_str().unwrap_or("").contains('^')))
+        }),
+        "expected signed widening pack_i8 | -> ^ input gap in {findings:#?}"
+    );
+
+    // 3. Byte and char literal comparisons show readable literal + numeric value in observed.
+    let tag_gap = findings
+        .iter()
+        .find(|f| f["item"].as_str() == Some("is_tag_a") && f["kind"] == "input_gap")
+        .expect("expected input_gap for is_tag_a");
+    assert_eq!(
+        tag_gap["observed"].as_str(),
+        Some("nearest values the tests passed: `tag` = b'o' (111)")
+    );
+
+    let char_gap = findings
+        .iter()
+        .find(|f| f["item"].as_str() == Some("is_char_a") && f["kind"] == "input_gap")
+        .expect("expected input_gap for is_char_a");
+    assert_eq!(
+        char_gap["observed"].as_str(),
+        Some("nearest values the tests passed: `ch` = 'o' (111)")
+    );
+
+    // 4. Surrogate boundary (`\u{d7ff}` and `\u{e000}`) is contiguous in scalar space:
+    // no spurious input_gap or surrogate code point suggestion is emitted.
+    let surrogate_gaps: Vec<&Value> = findings
+        .iter()
+        .filter(|f| f["item"].as_str() == Some("above_surrogate"))
+        .collect();
+    assert!(
+        surrogate_gaps.is_empty(),
+        "unexpected surrogate boundary gaps: {surrogate_gaps:#?}"
+    );
+}

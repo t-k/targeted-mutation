@@ -1,8 +1,9 @@
 use std::fs::{self, File, OpenOptions};
-use std::io;
+use std::io::{self, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use anyhow::{Context, Result, bail};
 
@@ -32,17 +33,111 @@ impl WorkLock {
     }
 
     pub(crate) fn take(work: &Path) -> Result<Self> {
-        let path = lock_directory(work)?.join("owner");
+        let dir = lock_directory(work)?;
+        let path = dir.join("owner");
         match acquire(&path) {
-            Ok(file) => Ok(Self {
-                _file: Arc::new(file),
-            }),
+            Ok(file) => {
+                write_holder_pid(&dir);
+                Ok(Self {
+                    _file: Arc::new(file),
+                })
+            }
             Err(err) if contended(&err) => {
-                bail!("another tmt run is using {}", work.display())
+                let holder = read_holder_pid(&dir)
+                    .map(|pid| format!(" (last recorded pid {pid})"))
+                    .unwrap_or_default();
+                bail!(
+                    "another tmt run is using {}{holder}; pass a separate --work-dir to run in parallel",
+                    work.display()
+                )
             }
             Err(err) => Err(err).with_context(|| format!("locking {}", path.display())),
         }
     }
+}
+
+/// Best-effort atomic write of the lock holder's PID for contention diagnostics.
+/// Never fails lock acquisition and never follows a symlink at the destination.
+fn write_holder_pid(dir: &Path) {
+    static NEXT_TMP: AtomicUsize = AtomicUsize::new(0);
+    let pid = std::process::id();
+    let seq = NEXT_TMP.fetch_add(1, Ordering::Relaxed);
+    let tmp = dir.join(format!(".pid.{pid}.{seq}.tmp"));
+    let target = dir.join("pid");
+    let created = OpenOptions::new().write(true).create_new(true).open(&tmp);
+    let Ok(mut file) = created else {
+        let _ = fs::remove_file(&target);
+        return;
+    };
+    if writeln!(file, "{pid}").is_err() {
+        drop(file);
+        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_file(&target);
+        return;
+    }
+    drop(file);
+    if fs::rename(&tmp, &target).is_err() {
+        let _ = fs::remove_file(&tmp);
+        let _ = fs::remove_file(&target);
+    }
+}
+
+fn read_holder_pid(dir: &Path) -> Option<u32> {
+    let path = dir.join("pid");
+    let mut options = OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_NOFOLLOW rejects symlinks atomically; O_NONBLOCK prevents blocking on a FIFO.
+        #[cfg(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly"
+        ))]
+        const FLAGS: i32 = 0x0100 | 0x0004; // O_NOFOLLOW | O_NONBLOCK
+        #[cfg(all(target_os = "linux", any(target_arch = "x86_64", target_arch = "x86")))]
+        const FLAGS: i32 = 0o400000 | 0o4000; // O_NOFOLLOW | O_NONBLOCK
+        #[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+        const FLAGS: i32 = 0o100000 | 0o4000; // O_NOFOLLOW | O_NONBLOCK
+        #[cfg(not(any(
+            target_os = "macos",
+            target_os = "ios",
+            target_os = "freebsd",
+            target_os = "netbsd",
+            target_os = "openbsd",
+            target_os = "dragonfly",
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "x86", target_arch = "aarch64")
+            )
+        )))]
+        const FLAGS: i32 = 0;
+        if FLAGS == 0 {
+            return None;
+        }
+        options.custom_flags(FLAGS);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x00200000;
+        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    let file = options.open(&path).ok()?;
+    let meta = file.metadata().ok()?;
+    if is_link(&meta) || !meta.is_file() || meta.len() > 64 {
+        return None;
+    }
+    let mut buf = String::new();
+    file.take(65).read_to_string(&mut buf).ok()?;
+    if buf.len() > 64 {
+        return None;
+    }
+    buf.trim().parse::<u32>().ok().filter(|&pid| pid > 0)
 }
 
 /// A directory at the old sentinel's path makes the two protocols exclude
@@ -331,6 +426,7 @@ mod tests {
             err.to_string().contains("another tmt run is using"),
             "{err:#}"
         );
+        assert!(err.to_string().contains("--work-dir"), "{err:#}");
         assert!(!err.to_string().contains("delete"), "{err:#}");
     }
 
@@ -535,5 +631,72 @@ mod tests {
             fs::read_to_string(&target).unwrap(),
             "outside the reserved path"
         );
+    }
+
+    #[test]
+    fn contention_reports_holder_pid_and_handles_missing_or_corrupt_pid_file() {
+        let work = Scratch::new();
+        let mut holder = lock_child(&work.0);
+        let child_pid = holder.0.id();
+        let err = WorkLock::take(&work.0)
+            .err()
+            .expect("second owner took lock")
+            .to_string();
+        assert!(err.contains("another tmt run is using"), "{err}");
+        assert!(
+            err.contains(&format!("(last recorded pid {child_pid})")),
+            "expected holder pid in error: {err}"
+        );
+        assert!(err.contains("--work-dir"), "{err}");
+
+        // Corrupt, oversized, symlink, FIFO, or missing PID file still produces the
+        // contention error and --work-dir hint without blocking.
+        let pid_path = work.0.join(".tmt-lock/pid");
+        fs::write(&pid_path, "not-a-pid\n").unwrap();
+        let err = WorkLock::take(&work.0).err().unwrap().to_string();
+        assert!(!err.contains("last recorded pid"), "{err}");
+        assert!(err.contains("--work-dir"), "{err}");
+
+        fs::write(&pid_path, "0\n").unwrap();
+        let err = WorkLock::take(&work.0).err().unwrap().to_string();
+        assert!(!err.contains("last recorded pid"), "{err}");
+        assert!(err.contains("--work-dir"), "{err}");
+
+        fs::write(&pid_path, "1".repeat(80)).unwrap();
+        let err = WorkLock::take(&work.0).err().unwrap().to_string();
+        assert!(!err.contains("last recorded pid"), "{err}");
+        assert!(err.contains("--work-dir"), "{err}");
+
+        #[cfg(unix)]
+        {
+            let outside = work.0.join("outside-pid");
+            fs::write(&outside, "99999\n").unwrap();
+            fs::remove_file(&pid_path).unwrap();
+            std::os::unix::fs::symlink(&outside, &pid_path).unwrap();
+            let err = WorkLock::take(&work.0).err().unwrap().to_string();
+            assert!(!err.contains("99999"), "{err}");
+            assert!(!err.contains("last recorded pid"), "{err}");
+            assert!(err.contains("--work-dir"), "{err}");
+
+            fs::remove_file(&pid_path).unwrap();
+            assert!(
+                Command::new("mkfifo")
+                    .arg(&pid_path)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let err = WorkLock::take(&work.0).err().unwrap().to_string();
+            assert!(!err.contains("last recorded pid"), "{err}");
+            assert!(err.contains("--work-dir"), "{err}");
+        }
+
+        fs::remove_file(&pid_path).unwrap();
+        let err = WorkLock::take(&work.0).err().unwrap().to_string();
+        assert!(!err.contains("last recorded pid"), "{err}");
+        assert!(err.contains("--work-dir"), "{err}");
+
+        holder.0.stdin.take().unwrap().write_all(b"done\n").unwrap();
+        assert!(holder.0.wait().unwrap().success());
     }
 }

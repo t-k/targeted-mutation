@@ -809,22 +809,31 @@ pub fn describe(site: &Site, m: Mutation) -> String {
             match m {
                 Mutation::Const(c) => format!("`{c}`"),
                 Mutation::Op(op2) => format!("`{lhs} {} {rhs}`", op2.symbol()),
-                Mutation::Shift(d) => match literal {
-                    LiteralSide::Rhs(k) => format!("`{lhs} {sym} {}`", k + d),
-                    // k op rhs + d  <=>  k - d op rhs
-                    LiteralSide::Lhs(k) => format!("`{} {sym} {rhs}`", k - d),
-                    LiteralSide::None => match (op, d) {
-                        (CmpOp::Ge, 1) => format!("`{lhs} > {rhs}`"),
-                        (CmpOp::Gt, -1) => format!("`{lhs} >= {rhs}`"),
-                        (CmpOp::Le, -1) => format!("`{lhs} < {rhs}`"),
-                        (CmpOp::Lt, 1) => format!("`{lhs} <= {rhs}`"),
-                        // Meant as arithmetic on whole numbers: in the operands' own
-                        // type the addition could overflow, the mutant that was run cannot.
-                        // tmt:ignore a shift of 0 is never planned, so `>=` is the same
-                        (_, d) if d > 0 => format!("`{lhs} {sym} {rhs} + {d}` (without overflow)"),
-                        (_, d) => format!("`{lhs} {sym} {rhs} - {}` (without overflow)", -d),
-                    },
-                },
+                Mutation::Shift(d) => {
+                    let display = literal_display_kind(&lhs, &rhs, *literal);
+                    match literal {
+                        LiteralSide::Rhs(k) => {
+                            format!("`{lhs} {sym} {}`", format_shifted_literal(k + d, display))
+                        }
+                        // k op rhs + d  <=>  k - d op rhs
+                        LiteralSide::Lhs(k) => {
+                            format!("`{} {sym} {rhs}`", format_shifted_literal(k - d, display))
+                        }
+                        LiteralSide::None => match (op, d) {
+                            (CmpOp::Ge, 1) => format!("`{lhs} > {rhs}`"),
+                            (CmpOp::Gt, -1) => format!("`{lhs} >= {rhs}`"),
+                            (CmpOp::Le, -1) => format!("`{lhs} < {rhs}`"),
+                            (CmpOp::Lt, 1) => format!("`{lhs} <= {rhs}`"),
+                            // Meant as arithmetic on whole numbers: in the operands' own
+                            // type the addition could overflow, the mutant that was run cannot.
+                            // tmt:ignore a shift of 0 is never planned, so `>=` is the same
+                            (_, d) if d > 0 => {
+                                format!("`{lhs} {sym} {rhs} + {d}` (without overflow)")
+                            }
+                            (_, d) => format!("`{lhs} {sym} {rhs} - {}` (without overflow)", -d),
+                        },
+                    }
+                }
                 Mutation::ShiftF(d) => match (float_literal(&lhs), float_literal(&rhs)) {
                     (None, Some(k)) => format!("`{lhs} {sym} {}`", show_float(k + d)),
                     (Some(k), None) => format!("`{} {sym} {rhs}`", show_float(k - d)),
@@ -838,11 +847,101 @@ pub fn describe(site: &Site, m: Mutation) -> String {
     }
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum LiteralDisplay {
+    Int,
+    Byte,
+    Char,
+}
+
+fn literal_display_kind(lhs: &str, rhs: &str, literal: LiteralSide) -> LiteralDisplay {
+    let text = match literal {
+        LiteralSide::Rhs(_) => rhs,
+        LiteralSide::Lhs(_) => lhs,
+        LiteralSide::None => return LiteralDisplay::Int,
+    };
+    let Ok(mut expr) = syn::parse_str::<syn::Expr>(text) else {
+        return LiteralDisplay::Int;
+    };
+    loop {
+        match expr {
+            syn::Expr::Paren(inner) => expr = *inner.expr,
+            syn::Expr::Group(inner) => expr = *inner.expr,
+            _ => break,
+        }
+    }
+    match expr {
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Byte(_),
+            ..
+        }) => LiteralDisplay::Byte,
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Char(_),
+            ..
+        }) => LiteralDisplay::Char,
+        _ => LiteralDisplay::Int,
+    }
+}
+
+fn format_byte_lit(b: u8) -> String {
+    match b {
+        b'\'' => "b'\\''".to_string(),
+        b'\\' => "b'\\\\'".to_string(),
+        b'\n' => "b'\\n'".to_string(),
+        b'\r' => "b'\\r'".to_string(),
+        b'\t' => "b'\\t'".to_string(),
+        b'\0' => "b'\\0'".to_string(),
+        0x20..=0x7e => format!("b'{}'", b as char),
+        _ => format!("b'\\x{b:02x}'"),
+    }
+}
+
+fn ord_to_char(ord: i128) -> Option<char> {
+    let u = u32::try_from(ord).ok()?;
+    let scalar = if u < 0xD800 {
+        u
+    } else if u <= 0x10_D7FF {
+        u + 0x800
+    } else {
+        return None;
+    };
+    char::from_u32(scalar)
+}
+
+fn format_shifted_literal(v: i128, display: LiteralDisplay) -> String {
+    match display {
+        LiteralDisplay::Byte => u8::try_from(v)
+            .map(format_byte_lit)
+            .unwrap_or_else(|_| v.to_string()),
+        LiteralDisplay::Char => ord_to_char(v)
+            .map(|c| format!("{c:?}"))
+            .unwrap_or_else(|| v.to_string()),
+        LiteralDisplay::Int => v.to_string(),
+    }
+}
+
+fn format_literal_value(v: i128, display: LiteralDisplay) -> String {
+    match display {
+        LiteralDisplay::Byte => u8::try_from(v)
+            .map(|b| format!("{} ({b})", format_byte_lit(b)))
+            .unwrap_or_else(|_| v.to_string()),
+        LiteralDisplay::Char => ord_to_char(v)
+            .map(|c| format!("{c:?} ({})", c as u32))
+            .unwrap_or_else(|| v.to_string()),
+        LiteralDisplay::Int => v.to_string(),
+    }
+}
+
 /// The operand values that give `lhs - rhs = d`, in words.
 fn input_for(lhs: &str, rhs: &str, literal: LiteralSide, d: i128) -> String {
+    let display = literal_display_kind(lhs, rhs, literal);
     match (literal, d) {
-        (LiteralSide::Rhs(k), d) => format!("`{lhs}` = {}", k + d),
-        (LiteralSide::Lhs(k), d) => format!("`{rhs}` = {}", k - d),
+        (LiteralSide::Rhs(k), d) => {
+            format!("`{lhs}` = {}", format_literal_value(k + d, display))
+        }
+        (LiteralSide::Lhs(k), d) => {
+            format!("`{rhs}` = {}", format_literal_value(k - d, display))
+        }
         (LiteralSide::None, 0) => format!("`{lhs}` equal to `{rhs}`"),
         // tmt:ignore 0 is taken by the arm above, so `>=` is the same
         (LiteralSide::None, d) if d > 0 => format!("`{lhs}` = `{rhs}` + {d}"),
@@ -854,19 +953,26 @@ fn observed_values(lhs: &str, rhs: &str, literal: LiteralSide, obs: &Obs) -> Opt
     if !obs.valued() {
         return None;
     }
+    let display = literal_display_kind(lhs, rhs, literal);
     let ds: Vec<i128> = [obs.max_neg, obs.eq.then_some(0), obs.min_pos]
         .into_iter()
         .flatten()
         .collect();
     let text = match literal {
         LiteralSide::Rhs(k) => {
-            let values: Vec<String> = ds.iter().map(|d| (k + d).to_string()).collect();
+            let values: Vec<String> = ds
+                .iter()
+                .map(|d| format_literal_value(k + d, display))
+                .collect();
             format!("`{lhs}` = {}", values.join(", "))
         }
         LiteralSide::Lhs(k) => {
             let mut values: Vec<i128> = ds.iter().map(|d| k - d).collect();
             values.sort();
-            let values: Vec<String> = values.iter().map(i128::to_string).collect();
+            let values: Vec<String> = values
+                .iter()
+                .map(|v| format_literal_value(*v, display))
+                .collect();
             format!("`{rhs}` = {}", values.join(", "))
         }
         LiteralSide::None => {
@@ -2254,6 +2360,8 @@ mod tests {
             lhs: "*total".into(),
             rhs: "fee".into(),
             gap: (0, 0),
+            local_types: vec![],
+            shadowed_prims: vec![],
         }
     }
 
@@ -2623,6 +2731,8 @@ mod tests {
                 lhs: "bits".into(),
                 rhs: "n".into(),
                 gap: (0, 0),
+                local_types: vec![],
+                shadowed_prims: vec![],
             },
             ..assign.clone()
         };
@@ -3994,6 +4104,160 @@ mod tests {
             add_tests[0].contains("share at least one set bit")
                 && add_tests[0].contains("disjoint by construction"),
             "{add_tests:?}"
+        );
+    }
+
+    #[test]
+    fn byte_and_char_literal_nearest_values_match_pict_table() {
+        let table = include_str!("../tests/data/literal-nearest.pict.tsv");
+        let mut rows = 0;
+        for line in table.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+            let cols: Vec<&str> = line.split('\t').collect();
+            assert_eq!(cols.len(), 4, "unexpected row: {line}");
+            let (lit_kind, lit_side, cmp_op, obs_kind) = (cols[0], cols[1], cols[2], cols[3]);
+            let (lit_text, lit_val): (&str, Option<i128>) = match lit_kind {
+                "byte_ascii" => ("b'A'", Some(65)),
+                "byte_escape" => ("b'\\n'", Some(10)),
+                "byte_non_ascii" => ("b'\\xfe'", Some(254)),
+                "char_ascii" => ("'A'", Some(65)),
+                "char_unicode" => ("'あ'", Some('あ' as u32 as i128)),
+                "int" => ("65", Some(65)),
+                "none" => ("other", None),
+                other => panic!("unexpected LitKind: {other}"),
+            };
+            let (lhs, rhs, literal) = match (lit_val, lit_side) {
+                (Some(k), "rhs") => ("tag", lit_text, LiteralSide::Rhs(k)),
+                (Some(k), "lhs") => (lit_text, "tag", LiteralSide::Lhs(k)),
+                (None, _) => ("tag", "other", LiteralSide::None),
+                other => panic!("unexpected LitSide: {other:?}"),
+            };
+            let obs = match obs_kind {
+                "pos_only" => Obs::of_d(46),
+                "neg_only" => Obs::of_d(-1),
+                "both_sides" => {
+                    let mut o = Obs::of_d(-2);
+                    o.merge(&Obs::of_d(1));
+                    o
+                }
+                "eq_only" => Obs::of_d(0),
+                other => panic!("unexpected ObsKind: {other}"),
+            };
+            let observed = observed_values(lhs, rhs, literal, &obs).expect("valued obs");
+            match lit_kind {
+                "byte_ascii" => {
+                    if lit_side == "rhs" && obs_kind == "pos_only" {
+                        assert_eq!(
+                            observed,
+                            "nearest values the tests passed: `tag` = b'o' (111)"
+                        );
+                    } else {
+                        assert!(
+                            observed.contains("b'") && observed.contains('('),
+                            "{observed}"
+                        );
+                    }
+                }
+                "byte_escape" => {
+                    if lit_side == "rhs" && obs_kind == "eq_only" {
+                        assert_eq!(
+                            observed,
+                            "nearest values the tests passed: `tag` = b'\\n' (10)"
+                        );
+                    } else {
+                        assert!(
+                            observed.contains("b'") && observed.contains('('),
+                            "{observed}"
+                        );
+                    }
+                }
+                "byte_non_ascii" => {
+                    if lit_side == "rhs" && obs_kind == "pos_only" {
+                        // 254 + 46 = 300 > u8::MAX: falls back cleanly to plain integer.
+                        assert_eq!(observed, "nearest values the tests passed: `tag` = 300");
+                    } else {
+                        assert!(observed.contains("b'\\x"), "{observed}");
+                    }
+                }
+                "char_ascii" => {
+                    if lit_side == "rhs" && obs_kind == "pos_only" {
+                        assert_eq!(
+                            observed,
+                            "nearest values the tests passed: `tag` = 'o' (111)"
+                        );
+                    } else {
+                        assert!(
+                            observed.contains('\'') && !observed.contains("b'"),
+                            "{observed}"
+                        );
+                    }
+                }
+                "char_unicode" => {
+                    assert!(
+                        observed.contains('\'') && !observed.contains("b'"),
+                        "{observed}"
+                    );
+                }
+                "int" => {
+                    assert!(!observed.contains('\''), "{observed}");
+                }
+                "none" => {
+                    assert!(observed.contains("`tag` - `other` = "), "{observed}");
+                }
+                _ => unreachable!(),
+            }
+
+            // Also check input_for and Shift description for ordering ops on both literal sides.
+            if lit_kind == "byte_ascii" {
+                let expected_input = "`tag` = b'A' (65)";
+                assert_eq!(input_for(lhs, rhs, literal, 0), expected_input);
+                if cmp_op != "eq" {
+                    let op_sym = if cmp_op == "ge" { ">=" } else { "<" };
+                    let expr = if lit_side == "rhs" {
+                        format!("tag {op_sym} b'A'")
+                    } else {
+                        format!("b'A' {op_sym} tag")
+                    };
+                    let site = site_of(&format!("fn f(tag: u8) -> bool {{ {expr} }}"));
+                    let expected = if lit_side == "rhs" {
+                        format!("`tag {op_sym} b'B'`")
+                    } else {
+                        format!("`b'@' {op_sym} tag`")
+                    };
+                    assert_eq!(describe(&site, Mutation::Shift(1)), expected);
+                }
+            }
+            if lit_kind == "char_ascii" {
+                let expected_input = "`tag` = 'A' (65)";
+                assert_eq!(input_for(lhs, rhs, literal, 0), expected_input);
+                if cmp_op != "eq" {
+                    let op_sym = if cmp_op == "ge" { ">=" } else { "<" };
+                    let expr = if lit_side == "rhs" {
+                        format!("tag {op_sym} 'A'")
+                    } else {
+                        format!("'A' {op_sym} tag")
+                    };
+                    let site = site_of(&format!("fn f(tag: char) -> bool {{ {expr} }}"));
+                    let expected = if lit_side == "rhs" {
+                        format!("`tag {op_sym} 'B'`")
+                    } else {
+                        format!("`'@' {op_sym} tag`")
+                    };
+                    assert_eq!(describe(&site, Mutation::Shift(1)), expected);
+                }
+            }
+            rows += 1;
+        }
+        assert!(rows >= 25, "expected full PICT table, got {rows} rows");
+
+        // Ordinal 0xD800 maps cleanly to '\u{e000}' (57344), skipping surrogates;
+        // out-of-range ordinals fall back to plain integers without panicking.
+        assert_eq!(
+            format_literal_value(0xd800, LiteralDisplay::Char),
+            "'\\u{e000}' (57344)"
+        );
+        assert_eq!(
+            format_literal_value(0x10_d800, LiteralDisplay::Char),
+            "1103872"
         );
     }
 }

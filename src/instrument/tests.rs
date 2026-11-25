@@ -3315,7 +3315,7 @@ fn disjoint_bits_matches_pict_table() {
             "plain" => "b",
             other => panic!("unexpected RhsShape: {other}"),
         };
-        let actual = super::disjoint_bits(lhs, 0, rhs, 100, bounds, &all_primitive);
+        let actual = super::disjoint_bits(lhs, 0, rhs, 100, bounds, &all_primitive, &[], &[]);
         let expected = match (int_type, lhs_shape, rhs_shape) {
             // u8: shl4 => 0xF0, shl2 => 0xFC, mask_hi => 0xF0, cast_u8_shl8 => 0xFF (shift >= 8)
             // u8 rhs: shr4 => 0x0F, shr2 => 0x3F, mask_lo => 0x0F, lit_low => 0x03, rem_4 => 0x03
@@ -3347,6 +3347,8 @@ fn disjoint_bits_matches_pict_table() {
         100,
         Some((u8::MIN as i128, u8::MAX as i128)),
         &no_primitive,
+        &[],
+        &[],
     ));
 
     // i128 bounds must not overflow during signed width detection.
@@ -3357,6 +3359,8 @@ fn disjoint_bits_matches_pict_table() {
         100,
         Some((i128::MIN, i128::MAX)),
         &all_primitive,
+        &[],
+        &[],
     ));
     assert!(!super::disjoint_bits(
         "a << 4",
@@ -3365,6 +3369,8 @@ fn disjoint_bits_matches_pict_table() {
         100,
         Some((i128::MIN, i128::MAX)),
         &all_primitive,
+        &[],
+        &[],
     ));
 
     // Pure vs side-effecting logic right-hand operands.
@@ -3442,4 +3448,426 @@ fn make(groups: usize, n: usize, a: usize, b: usize) {
             "expected `{kept}` to remain a site, got {texts:?}"
         );
     }
+}
+
+#[test]
+fn disjoint_bits_widening_cast_matches_pict_table() {
+    use super::{BitValueType, LocalBitType};
+
+    let table = include_str!("../../tests/data/bit-disjoint-cast.pict.tsv");
+    let all_primitive = |_: usize, _: usize| true;
+    let mut rows = 0;
+    for line in table.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let cols: Vec<&str> = line.split('\t').collect();
+        assert_eq!(cols.len(), 5, "unexpected row: {line}");
+        let (dst_type, src_type, cast_form, shift, rhs_kind) =
+            (cols[0], cols[1], cols[2], cols[3], cols[4]);
+
+        let bounds = match dst_type {
+            "u16" => Some((u16::MIN as i128, u16::MAX as i128)),
+            "u32" => Some((u32::MIN as i128, u32::MAX as i128)),
+            "i32" => Some((i32::MIN as i128, i32::MAX as i128)),
+            "usize" => Some((0, u64::MAX as i128)),
+            "unknown" => None,
+            other => panic!("unexpected DstType: {other}"),
+        };
+        let dst_ident = match dst_type {
+            "unknown" => "u32",
+            other => other,
+        };
+        let mut local_types: Vec<(String, LocalBitType)> =
+            vec![("b".into(), LocalBitType::Value(BitValueType::Unsigned(8)))];
+        if cast_form != "shadowed" {
+            let src_val = match src_type {
+                "u8" => Some(BitValueType::Unsigned(8)),
+                "u16" => Some(BitValueType::Unsigned(16)),
+                "i8" => Some(BitValueType::Signed(8)),
+                "bool" => Some(BitValueType::Bool),
+                "unknown" => None,
+                other => panic!("unexpected SrcType: {other}"),
+            };
+            if let Some(ty) = src_val {
+                if cast_form == "slice_index" {
+                    local_types.push(("buf".into(), LocalBitType::SliceOf(ty)));
+                } else {
+                    local_types.push(("a".into(), LocalBitType::Value(ty)));
+                }
+            }
+        }
+
+        let base_cast = match cast_form {
+            "as_cast" | "shadowed" => format!("(a as {dst_ident})"),
+            "from_call" => format!("{dst_ident}::from(a)"),
+            "nested_cast" => format!("((a as {src_type}) as {dst_ident})"),
+            "slice_index" => format!("(buf[0] as {dst_ident})"),
+            other => panic!("unexpected CastForm: {other}"),
+        };
+        let shift_bits: u32 = match shift {
+            "shl8" => 8,
+            "shl16" => 16,
+            "shl4" => 4,
+            other => panic!("unexpected Shift: {other}"),
+        };
+        let lhs = format!("({base_cast} << {shift_bits})");
+        let rhs = match rhs_kind {
+            "u8_cast" => format!("(b as {dst_ident})"),
+            "u8_shl8" => format!("((b as {dst_ident}) << 8)"),
+            "mask_lo" => "c & 0x0f".to_string(),
+            "plain" => "c".to_string(),
+            other => panic!("unexpected RhsKind: {other}"),
+        };
+
+        let actual = super::disjoint_bits(
+            &lhs,
+            0,
+            &rhs,
+            200,
+            bounds,
+            &all_primitive,
+            &local_types,
+            &[],
+        );
+
+        let dst_width: Option<u32> = match dst_type {
+            "u16" => Some(16),
+            "u32" | "i32" => Some(32),
+            "usize" => Some(64),
+            "unknown" => None,
+            _ => unreachable!(),
+        };
+        let expected = if let Some(dw) = dst_width {
+            let full = if dw >= 128 {
+                u128::MAX
+            } else {
+                (1u128 << dw) - 1
+            };
+            let base_ones = if cast_form == "shadowed" {
+                full
+            } else {
+                match src_type {
+                    "u8" => 0xffu128 & full,
+                    "u16" => 0xffffu128 & full,
+                    "bool" => 0x1u128 & full,
+                    // Signed widening sign-extends negative values -> full mask.
+                    "i8" | "unknown" => full,
+                    _ => unreachable!(),
+                }
+            };
+            let lhs_ones = if shift_bits < dw {
+                (base_ones << shift_bits) & full
+            } else {
+                full
+            };
+            let rhs_ones = match rhs_kind {
+                "u8_cast" => 0xffu128 & full,
+                "u8_shl8" => {
+                    if 8 < dw {
+                        (0xffu128 << 8) & full
+                    } else {
+                        full
+                    }
+                }
+                "mask_lo" => 0x0fu128 & full,
+                "plain" => full,
+                _ => unreachable!(),
+            };
+            (lhs_ones & rhs_ones) == 0
+        } else {
+            false
+        };
+
+        assert_eq!(
+            actual, expected,
+            "dst={dst_type} src={src_type} form={cast_form} shift={shift} rhs={rhs_kind} lhs={lhs} rhs_expr={rhs}"
+        );
+        rows += 1;
+    }
+    assert!(rows >= 30, "expected full PICT table, got {rows} rows");
+}
+
+#[test]
+fn discover_collects_local_types_for_widening_bitpack_and_byte_char_literals() {
+    let source = r#"
+fn pack3(first: u8, second: u8, third: u8) -> u32 {
+    ((first as u32) << 16) | ((second as u32) << 8) | third as u32
+}
+
+fn pack_from(first: u8, second: u8, third: u8) -> u32 {
+    (u32::from(first) << 16) | (u32::from(second) << 8) | u32::from(third)
+}
+
+fn pack_slice(buf: &[u8]) -> u32 {
+    ((buf[0] as u32) << 24) | ((buf[1] as u32) << 16) | ((buf[2] as u32) << 8) | buf[3] as u32
+}
+
+fn pack_signed(first: i8, second: i8) -> u32 {
+    ((first as u32) << 8) | (second as u32)
+}
+
+fn pack_shadowed(first: u8, second: u8) -> u32 {
+    let second = widen_unknown(second);
+    ((first as u32) << 8) | (second as u32)
+}
+
+fn byte_and_char(tag: u8, ch: char) -> bool {
+    tag == b'A' || b'\n' == tag || ch == 'Z' || '0' <= ch
+}
+"#;
+    let found = discover(source, 0).unwrap();
+    let all_primitive = |_: usize, _: usize| true;
+    let u32_bounds = Some((u32::MIN as i128, u32::MAX as i128));
+
+    let disjoint_for = |snippet: &str| {
+        let site = found
+            .sites
+            .iter()
+            .find(|s| s.text == snippet)
+            .unwrap_or_else(|| panic!("site `{snippet}` not found"));
+        let SiteKind::Arith {
+            lhs,
+            rhs,
+            gap,
+            local_types,
+            shadowed_prims,
+            ..
+        } = &site.kind
+        else {
+            panic!("expected Arith for `{snippet}`");
+        };
+        super::disjoint_bits(
+            lhs,
+            site.start,
+            rhs,
+            gap.1,
+            u32_bounds,
+            &all_primitive,
+            local_types,
+            shadowed_prims,
+        )
+    };
+
+    assert!(disjoint_for(
+        "((first as u32) << 16) | ((second as u32) << 8)"
+    ));
+    assert!(disjoint_for(
+        "((first as u32) << 16) | ((second as u32) << 8) | third as u32"
+    ));
+    assert!(disjoint_for(
+        "(u32::from(first) << 16) | (u32::from(second) << 8) | u32::from(third)"
+    ));
+    assert!(disjoint_for(
+        "((buf[0] as u32) << 24) | ((buf[1] as u32) << 16) | ((buf[2] as u32) << 8) | buf[3] as u32"
+    ));
+    assert!(!disjoint_for("((first as u32) << 8) | (second as u32)"));
+
+    let shadow_sites: Vec<bool> = found
+        .sites
+        .iter()
+        .filter(|s| s.text == "((first as u32) << 8) | (second as u32)")
+        .map(|s| match &s.kind {
+            SiteKind::Arith {
+                lhs,
+                rhs,
+                gap,
+                local_types,
+                shadowed_prims,
+                ..
+            } => super::disjoint_bits(
+                lhs,
+                s.start,
+                rhs,
+                gap.1,
+                u32_bounds,
+                &all_primitive,
+                local_types,
+                shadowed_prims,
+            ),
+            _ => unreachable!(),
+        })
+        .collect();
+    assert_eq!(shadow_sites, vec![false, false]);
+
+    let cmp_literals: Vec<(&str, LiteralSide)> = found
+        .sites
+        .iter()
+        .filter_map(|s| match &s.kind {
+            SiteKind::Cmp { literal, .. } => Some((s.text.as_str(), *literal)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        cmp_literals,
+        vec![
+            ("tag == b'A'", LiteralSide::Rhs(65)),
+            ("b'\\n' == tag", LiteralSide::Lhs(10)),
+            ("ch == 'Z'", LiteralSide::Rhs(90)),
+            ("'0' <= ch", LiteralSide::Lhs(48)),
+        ]
+    );
+}
+
+#[test]
+fn disjoint_bits_stays_conservative_on_prim_alias_overloaded_binop_let_chain_and_mod_const() {
+    let all_primitive = |_: usize, _: usize| true;
+    let u32_bounds = Some((u32::MIN as i128, u32::MAX as i128));
+
+    let check_not_disjoint = |source: &str, snippet: &str| {
+        let found = discover(source, 0).unwrap();
+        let site = found
+            .sites
+            .iter()
+            .find(|s| s.text == snippet)
+            .unwrap_or_else(|| panic!("site `{snippet}` not found in {source}"));
+        let SiteKind::Arith {
+            lhs,
+            rhs,
+            gap,
+            local_types,
+            shadowed_prims,
+            ..
+        } = &site.kind
+        else {
+            panic!("expected Arith");
+        };
+        assert!(
+            !super::disjoint_bits(
+                lhs,
+                site.start,
+                rhs,
+                gap.1,
+                u32_bounds,
+                &all_primitive,
+                local_types,
+                shadowed_prims,
+            ),
+            "expected `{snippet}` to stay conservative"
+        );
+    };
+
+    // 1. Type alias shadowing primitive `u8`.
+    check_not_disjoint(
+        r#"
+#[allow(non_camel_case_types)]
+type u8 = u16;
+fn f(hi: u8, lo: u8) -> u32 {
+    ((hi as u32) << 8) | (lo as u32)
+}
+"#,
+        "((hi as u32) << 8) | (lo as u32)",
+    );
+
+    // 2. Overloaded binary op inside cast must not inherit operand width.
+    check_not_disjoint(
+        r#"
+fn f(a: u8, wide: Wide) -> u32 {
+    ((a + wide) as u32) | 0x100
+}
+"#,
+        "((a + wide) as u32) | 0x100",
+    );
+
+    // 3. `if let` chain shadowing outer `lo: u8` before RHS of `&&`.
+    check_not_disjoint(
+        r#"
+fn f(hi: u8, lo: u8, opt: Option<u16>) -> bool {
+    if let Some(lo) = opt && (((hi as u32) << 8) | (lo as u32)) != 0 {
+        true
+    } else {
+        false
+    }
+}
+"#,
+        "((hi as u32) << 8) | (lo as u32)",
+    );
+
+    // 4. Inline module constant shadowing parent module constant of narrower type.
+    check_not_disjoint(
+        r#"
+const X: u8 = 1;
+mod inner {
+    const X: u16 = 0x100;
+    fn f(hi: u8) -> u32 {
+        ((hi as u32) << 8) | (X as u32)
+    }
+}
+"#,
+        "((hi as u32) << 8) | (X as u32)",
+    );
+
+    // 5. Conditional `#[cfg]` let binding must not override outer type.
+    check_not_disjoint(
+        r#"
+fn f(lo: u16) -> u32 {
+    #[cfg(feature = "narrow")]
+    let lo = lo as u8;
+    0x100u32 | (lo as u32)
+}
+"#,
+        "0x100u32 | (lo as u32)",
+    );
+
+    // 6. Inline module `use super::WIDE as LO` must not inherit parent `LO: u8`.
+    check_not_disjoint(
+        r#"
+const LO: u8 = 1;
+const WIDE: u16 = 0x100;
+mod inner {
+    use super::WIDE as LO;
+    fn f() -> u32 {
+        0x100u32 | (LO as u32)
+    }
+}
+"#,
+        "0x100u32 | (LO as u32)",
+    );
+
+    // 7. Local `mod core` shadowing `core::primitive::u8`.
+    check_not_disjoint(
+        r#"
+mod core {
+    pub mod primitive {
+        pub type u8 = u16;
+    }
+}
+fn f(lo: core::primitive::u8) -> u32 {
+    0x100u32 | (lo as u32)
+}
+"#,
+        "0x100u32 | (lo as u32)",
+    );
+
+    // 8. Signed widening sign-extends into upper bits (`false`), while guaranteed-zero
+    // low bits from an outer shift stay disjoint (`true`).
+    assert!(!super::disjoint_bits(
+        "(a as u32)",
+        0,
+        "((b as u32) << 8)",
+        100,
+        u32_bounds,
+        &all_primitive,
+        &[
+            (
+                "a".into(),
+                super::LocalBitType::Value(super::BitValueType::Signed(8))
+            ),
+            (
+                "b".into(),
+                super::LocalBitType::Value(super::BitValueType::Unsigned(8))
+            ),
+        ],
+        &[],
+    ));
+    assert!(super::disjoint_bits(
+        "((a as u32) << 1)",
+        0,
+        "1",
+        100,
+        u32_bounds,
+        &all_primitive,
+        &[(
+            "a".into(),
+            super::LocalBitType::Value(super::BitValueType::Signed(8))
+        )],
+        &[],
+    ));
 }

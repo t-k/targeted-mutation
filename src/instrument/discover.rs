@@ -1,6 +1,6 @@
 //! AST discovery of mutation sites.
 
-use std::collections::HashSet;
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use anyhow::{Context, Result};
 use proc_macro2::{Span, TokenStream, TokenTree};
@@ -12,9 +12,12 @@ use crate::plan::CmpOp;
 use super::body_values::{
     body_values_with_errors, does_nothing_else, may_bypass_result_probe, tokens_of,
 };
-use super::cfg::{is_skipped, is_test_only};
+use super::cfg::{
+    infer_bit_value_type, is_prim_type_name, is_skipped, is_test_only, parse_local_bit_type,
+};
 use super::model::{
-    ArithOp, ArmGuard, Discovery, LiteralSide, NO_ID, RoundingOp, Site, SiteKind, TestModule,
+    ArithOp, ArmGuard, Discovery, LiteralSide, LocalBitType, NO_ID, RoundingOp, Site, SiteKind,
+    TestModule,
 };
 
 /// Finds the sites in one source file, numbering them from `first_id`.
@@ -56,6 +59,7 @@ pub(crate) fn discover_parsed(
             _ => None,
         })
         .collect();
+    let shadowed_prims = collect_shadowed_prim_types(file);
     let mut finder = Finder {
         source,
         next_id: first_id,
@@ -64,6 +68,8 @@ pub(crate) fn discover_parsed(
         const_depth: 0,
         error_values,
         for_ranges: std::collections::HashSet::new(),
+        type_scopes: vec![HashMap::new()],
+        shadowed_prims,
     };
     finder.visit_file(file);
     finder.found
@@ -80,6 +86,13 @@ struct Finder<'s> {
     const_depth: usize,
     /// Where the ranges start that a `for` runs through directly.
     for_ranges: std::collections::HashSet<usize>,
+    /// Lexical stack of static primitive-type bindings for disjoint bitop analysis.
+    /// `Some(ty)` records a known primitive/slice type; `None` records a shadowing
+    /// binding whose type is unknown so outer bindings of the same name are hidden.
+    type_scopes: Vec<HashMap<String, Option<LocalBitType>>>,
+    /// Primitive type names shadowed anywhere in this file by type aliases, structs,
+    /// enums, unions, traits, or explicit `use` imports.
+    shadowed_prims: Vec<String>,
 }
 
 impl Finder<'_> {
@@ -293,6 +306,268 @@ impl Finder<'_> {
             self.next_id += 1;
         }
     }
+
+    fn push_type_scope(&mut self) {
+        self.type_scopes.push(HashMap::new());
+    }
+
+    fn pop_type_scope(&mut self) {
+        if self.type_scopes.len() > 1 {
+            self.type_scopes.pop();
+        }
+    }
+
+    fn bind_type(&mut self, name: String, ty: Option<LocalBitType>) {
+        if let Some(scope) = self.type_scopes.last_mut() {
+            scope.insert(name, ty);
+        }
+    }
+
+    fn lookup_type(&self, name: &str) -> Option<LocalBitType> {
+        for scope in self.type_scopes.iter().rev() {
+            if let Some(entry) = scope.get(name) {
+                return *entry;
+            }
+        }
+        None
+    }
+
+    fn seed_item_constants(&mut self, items: &[syn::Item]) {
+        for item in items {
+            match item {
+                syn::Item::Const(c) if !is_test_only(&c.attrs) => {
+                    let ty = (!has_cfg_attr(&c.attrs))
+                        .then(|| parse_local_bit_type(&c.ty, &self.shadowed_prims))
+                        .flatten();
+                    self.bind_type(c.ident.to_string(), ty);
+                }
+                syn::Item::Static(s) if !is_test_only(&s.attrs) => {
+                    let ty = (!has_cfg_attr(&s.attrs))
+                        .then(|| parse_local_bit_type(&s.ty, &self.shadowed_prims))
+                        .flatten();
+                    self.bind_type(s.ident.to_string(), ty);
+                }
+                _ => {}
+            }
+        }
+    }
+
+    fn bind_pat_unknown(&mut self, pat: &syn::Pat) {
+        let mut names = Vec::new();
+        collect_pat_idents(pat, &mut names);
+        for name in names {
+            self.bind_type(name, None);
+        }
+    }
+
+    fn bind_pat_with_type(&mut self, pat: &syn::Pat, ty: &syn::Type) {
+        match pat {
+            syn::Pat::Ident(ident) => {
+                let parsed = parse_local_bit_type(ty, &self.shadowed_prims);
+                self.bind_type(ident.ident.to_string(), parsed);
+                if let Some((_, subpat)) = &ident.subpat {
+                    self.bind_pat_with_type(subpat, ty);
+                }
+            }
+            syn::Pat::Reference(reference) => {
+                if let syn::Type::Reference(ty_ref) = strip_type_wrappers(ty) {
+                    self.bind_pat_with_type(&reference.pat, &ty_ref.elem);
+                } else {
+                    self.bind_pat_with_type(&reference.pat, ty);
+                }
+            }
+            syn::Pat::Type(typed) => self.bind_pat_with_type(&typed.pat, &typed.ty),
+            syn::Pat::Paren(inner) => self.bind_pat_with_type(&inner.pat, ty),
+            syn::Pat::Tuple(tuple) => {
+                if let syn::Type::Tuple(ty_tuple) = strip_type_wrappers(ty)
+                    && tuple.elems.len() == ty_tuple.elems.len()
+                {
+                    for (sub_pat, sub_ty) in tuple.elems.iter().zip(ty_tuple.elems.iter()) {
+                        self.bind_pat_with_type(sub_pat, sub_ty);
+                    }
+                } else {
+                    self.bind_pat_unknown(pat);
+                }
+            }
+            syn::Pat::Slice(slice) => {
+                let elem_ty = match strip_type_wrappers(ty) {
+                    syn::Type::Array(arr) => Some(&*arr.elem),
+                    syn::Type::Slice(sl) => Some(&*sl.elem),
+                    syn::Type::Reference(r) => match strip_type_wrappers(&r.elem) {
+                        syn::Type::Array(arr) => Some(&*arr.elem),
+                        syn::Type::Slice(sl) => Some(&*sl.elem),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+                if let Some(elem_ty) = elem_ty {
+                    for elem in &slice.elems {
+                        self.bind_pat_with_type(elem, elem_ty);
+                    }
+                } else {
+                    self.bind_pat_unknown(pat);
+                }
+            }
+            _ => self.bind_pat_unknown(pat),
+        }
+    }
+
+    fn bind_sig_inputs(&mut self, sig: &syn::Signature) {
+        for arg in &sig.inputs {
+            if let syn::FnArg::Typed(typed) = arg {
+                self.bind_pat_with_type(&typed.pat, &typed.ty);
+            }
+        }
+    }
+
+    fn referenced_local_types(
+        &self,
+        lhs: &syn::Expr,
+        rhs: &syn::Expr,
+    ) -> Vec<(String, LocalBitType)> {
+        let mut names = BTreeSet::new();
+        collect_expr_idents(lhs, &mut names);
+        collect_expr_idents(rhs, &mut names);
+        names
+            .into_iter()
+            .filter_map(|name| self.lookup_type(&name).map(|ty| (name, ty)))
+            .collect()
+    }
+
+    fn infer_init_local_type(&self, expr: &syn::Expr) -> Option<LocalBitType> {
+        let mut names = BTreeSet::new();
+        collect_expr_idents(expr, &mut names);
+        let snapshot: Vec<(String, LocalBitType)> = names
+            .into_iter()
+            .filter_map(|name| self.lookup_type(&name).map(|ty| (name, ty)))
+            .collect();
+        if let Some(ty) = infer_bit_value_type(expr, &snapshot, &self.shadowed_prims) {
+            return Some(LocalBitType::Value(ty));
+        }
+        // Propagate slice/array bindings (`let bytes = buf;` or `let bytes = &buf;`).
+        let mut inner = expr;
+        loop {
+            match inner {
+                syn::Expr::Paren(e) => inner = &e.expr,
+                syn::Expr::Group(e) => inner = &e.expr,
+                syn::Expr::Reference(e) => inner = &e.expr,
+                _ => break,
+            }
+        }
+        if let syn::Expr::Path(path) = inner
+            && path.qself.is_none()
+            && let Some(ident) = path.path.get_ident()
+        {
+            return self.lookup_type(&ident.to_string());
+        }
+        None
+    }
+}
+
+fn strip_type_wrappers(mut ty: &syn::Type) -> &syn::Type {
+    loop {
+        match ty {
+            syn::Type::Paren(inner) => ty = &inner.elem,
+            syn::Type::Group(inner) => ty = &inner.elem,
+            _ => return ty,
+        }
+    }
+}
+
+fn collect_pat_idents(pat: &syn::Pat, out: &mut Vec<String>) {
+    struct PatIdents<'a>(&'a mut Vec<String>);
+    impl<'ast> Visit<'ast> for PatIdents<'_> {
+        fn visit_pat_ident(&mut self, node: &'ast syn::PatIdent) {
+            self.0.push(node.ident.to_string());
+            visit::visit_pat_ident(self, node);
+        }
+        fn visit_expr(&mut self, _: &'ast syn::Expr) {}
+        fn visit_type(&mut self, _: &'ast syn::Type) {}
+    }
+    PatIdents(out).visit_pat(pat);
+}
+
+fn collect_expr_idents(expr: &syn::Expr, out: &mut BTreeSet<String>) {
+    struct ExprIdents<'a>(&'a mut BTreeSet<String>);
+    impl<'ast> Visit<'ast> for ExprIdents<'_> {
+        fn visit_expr_path(&mut self, node: &'ast syn::ExprPath) {
+            if node.qself.is_none()
+                && let Some(ident) = node.path.get_ident()
+            {
+                self.0.insert(ident.to_string());
+            }
+        }
+        fn visit_type(&mut self, _: &'ast syn::Type) {}
+    }
+    ExprIdents(out).visit_expr(expr);
+}
+
+fn has_cfg_attr(attrs: &[syn::Attribute]) -> bool {
+    attrs
+        .iter()
+        .any(|a| a.path().is_ident("cfg") || a.path().is_ident("cfg_attr"))
+}
+
+fn collect_shadowed_prim_types(file: &syn::File) -> Vec<String> {
+    struct Shadowed(BTreeSet<String>);
+    impl Shadowed {
+        fn record(&mut self, ident: &syn::Ident) {
+            let name = ident.to_string();
+            if is_prim_type_name(&name) || matches!(name.as_str(), "core" | "std") {
+                self.0.insert(name);
+            }
+        }
+        fn record_use_tree(&mut self, tree: &syn::UseTree) {
+            match tree {
+                syn::UseTree::Path(p) => self.record_use_tree(&p.tree),
+                syn::UseTree::Name(n) => self.record(&n.ident),
+                syn::UseTree::Rename(r) => self.record(&r.rename),
+                syn::UseTree::Group(g) => {
+                    for item in &g.items {
+                        self.record_use_tree(item);
+                    }
+                }
+                syn::UseTree::Glob(_) => {}
+            }
+        }
+    }
+    impl<'ast> Visit<'ast> for Shadowed {
+        fn visit_item_mod(&mut self, node: &'ast syn::ItemMod) {
+            self.record(&node.ident);
+            visit::visit_item_mod(self, node);
+        }
+        fn visit_item_type(&mut self, node: &'ast syn::ItemType) {
+            self.record(&node.ident);
+            visit::visit_item_type(self, node);
+        }
+        fn visit_item_struct(&mut self, node: &'ast syn::ItemStruct) {
+            self.record(&node.ident);
+            visit::visit_item_struct(self, node);
+        }
+        fn visit_item_enum(&mut self, node: &'ast syn::ItemEnum) {
+            self.record(&node.ident);
+            visit::visit_item_enum(self, node);
+        }
+        fn visit_item_union(&mut self, node: &'ast syn::ItemUnion) {
+            self.record(&node.ident);
+            visit::visit_item_union(self, node);
+        }
+        fn visit_item_trait(&mut self, node: &'ast syn::ItemTrait) {
+            self.record(&node.ident);
+            visit::visit_item_trait(self, node);
+        }
+        fn visit_item_trait_alias(&mut self, node: &'ast syn::ItemTraitAlias) {
+            self.record(&node.ident);
+            visit::visit_item_trait_alias(self, node);
+        }
+        fn visit_item_use(&mut self, node: &'ast syn::ItemUse) {
+            self.record_use_tree(&node.tree);
+            visit::visit_item_use(self, node);
+        }
+    }
+    let mut found = Shadowed(BTreeSet::new());
+    found.visit_file(file);
+    found.0.into_iter().collect()
 }
 
 fn cmp_op(op: &syn::BinOp) -> Option<CmpOp> {
@@ -450,10 +725,38 @@ fn is_assign_op(op: &syn::BinOp) -> bool {
     )
 }
 
+fn char_ord(c: char) -> i128 {
+    let u = c as u32;
+    if u >= 0xE000 {
+        (u - 0x800) as i128
+    } else {
+        u as i128
+    }
+}
+
 fn int_literal(expr: &syn::Expr) -> Option<i128> {
     match expr {
         syn::Expr::Paren(e) => int_literal(&e.expr),
         syn::Expr::Group(e) => int_literal(&e.expr),
+        syn::Expr::Lit(syn::ExprLit { lit, .. }) => match lit {
+            syn::Lit::Int(lit) => lit.base10_parse().ok(),
+            syn::Lit::Byte(lit) => Some(lit.value() as i128),
+            syn::Lit::Char(lit) => Some(char_ord(lit.value())),
+            _ => None,
+        },
+        syn::Expr::Unary(syn::ExprUnary {
+            op: syn::UnOp::Neg(_),
+            expr,
+            ..
+        }) => negatable_int_literal(expr).and_then(i128::checked_neg),
+        _ => None,
+    }
+}
+
+fn negatable_int_literal(expr: &syn::Expr) -> Option<i128> {
+    match expr {
+        syn::Expr::Paren(e) => negatable_int_literal(&e.expr),
+        syn::Expr::Group(e) => negatable_int_literal(&e.expr),
         syn::Expr::Lit(syn::ExprLit {
             lit: syn::Lit::Int(lit),
             ..
@@ -462,7 +765,7 @@ fn int_literal(expr: &syn::Expr) -> Option<i128> {
             op: syn::UnOp::Neg(_),
             expr,
             ..
-        }) => int_literal(expr).and_then(i128::checked_neg),
+        }) => negatable_int_literal(expr).and_then(i128::checked_neg),
         _ => None,
     }
 }
@@ -816,6 +1119,48 @@ impl<'ast> Visit<'ast> for Finder<'_> {
     fn visit_local(&mut self, node: &'ast syn::Local) {
         if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) {
             visit::visit_local(self, node);
+            if has_cfg_attr(&node.attrs) {
+                self.bind_pat_unknown(&node.pat);
+                return;
+            }
+            match &node.pat {
+                syn::Pat::Type(typed) => self.bind_pat_with_type(&typed.pat, &typed.ty),
+                syn::Pat::Ident(ident) => {
+                    let inferred = node
+                        .init
+                        .as_ref()
+                        .and_then(|init| self.infer_init_local_type(&init.expr));
+                    self.bind_type(ident.ident.to_string(), inferred);
+                    if let Some((_, subpat)) = &ident.subpat {
+                        self.bind_pat_unknown(subpat);
+                    }
+                }
+                syn::Pat::Slice(slice) => {
+                    let elem_ty = node
+                        .init
+                        .as_ref()
+                        .and_then(|init| self.infer_init_local_type(&init.expr))
+                        .and_then(|ty| match ty {
+                            LocalBitType::SliceOf(elem) => Some(LocalBitType::Value(elem)),
+                            LocalBitType::Value(_) => None,
+                        });
+                    if let Some(elem_ty) = elem_ty {
+                        for elem in &slice.elems {
+                            if let syn::Pat::Ident(ident) = elem {
+                                self.bind_type(ident.ident.to_string(), Some(elem_ty));
+                                if let Some((_, subpat)) = &ident.subpat {
+                                    self.bind_pat_unknown(subpat);
+                                }
+                            } else {
+                                self.bind_pat_unknown(elem);
+                            }
+                        }
+                    } else {
+                        self.bind_pat_unknown(&node.pat);
+                    }
+                }
+                _ => self.bind_pat_unknown(&node.pat),
+            }
         }
     }
     fn visit_pat(&mut self, node: &'ast syn::Pat) {
@@ -850,7 +1195,10 @@ impl<'ast> Visit<'ast> for Finder<'_> {
     }
     fn visit_file(&mut self, node: &'ast syn::File) {
         if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) {
+            self.push_type_scope();
+            self.seed_item_constants(&node.items);
             visit::visit_file(self, node);
+            self.pop_type_scope();
         }
     }
     fn visit_item_enum(&mut self, node: &'ast syn::ItemEnum) {
@@ -974,7 +1322,16 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             }
             return;
         }
-        visit::visit_item_mod(self, node);
+        if let Some((_, items)) = &node.content {
+            // An inline module starts a fresh item namespace: it does not implicitly
+            // inherit parent-module constants without an explicit `use`.
+            let saved = std::mem::replace(&mut self.type_scopes, vec![HashMap::new()]);
+            self.seed_item_constants(items);
+            visit::visit_item_mod(self, node);
+            self.type_scopes = saved;
+        } else {
+            visit::visit_item_mod(self, node);
+        }
     }
 
     fn visit_item_fn(&mut self, node: &'ast syn::ItemFn) {
@@ -983,7 +1340,10 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             let constant = node.sig.constness.is_some() as usize;
             self.const_depth += constant;
             self.function_sites(&node.attrs, &node.sig, &node.block);
+            self.push_type_scope();
+            self.bind_sig_inputs(&node.sig);
             visit::visit_item_fn(self, node);
+            self.pop_type_scope();
             self.const_depth -= constant;
         }
     }
@@ -994,7 +1354,10 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             let constant = node.sig.constness.is_some() as usize;
             self.const_depth += constant;
             self.function_sites(&node.attrs, &node.sig, &node.block);
+            self.push_type_scope();
+            self.bind_sig_inputs(&node.sig);
             visit::visit_impl_item_fn(self, node);
+            self.pop_type_scope();
             self.const_depth -= constant;
         }
     }
@@ -1006,7 +1369,10 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             if let Some(body) = &node.default {
                 self.function_sites(&node.attrs, &node.sig, body);
             }
+            self.push_type_scope();
+            self.bind_sig_inputs(&node.sig);
             visit::visit_trait_item_fn(self, node);
+            self.pop_type_scope();
             self.const_depth -= constant;
         }
     }
@@ -1019,7 +1385,16 @@ impl<'ast> Visit<'ast> for Finder<'_> {
 
     fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {
         if node.constness.is_none() {
+            self.push_type_scope();
+            for pat in &node.inputs {
+                if let syn::Pat::Type(typed) = pat {
+                    self.bind_pat_with_type(&typed.pat, &typed.ty);
+                } else {
+                    self.bind_pat_unknown(pat);
+                }
+            }
             visit::visit_expr_closure(self, node);
+            self.pop_type_scope();
         }
     }
 
@@ -1034,7 +1409,14 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                 self.push(SiteKind::Stmt, start, end, expr.span());
             }
         }
+        self.push_type_scope();
+        for stmt in &node.stmts {
+            if let syn::Stmt::Item(item) = stmt {
+                self.seed_item_constants(std::slice::from_ref(item));
+            }
+        }
         visit::visit_block(self, node);
+        self.pop_type_scope();
     }
 
     fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
@@ -1339,7 +1721,77 @@ impl<'ast> Visit<'ast> for Finder<'_> {
         {
             self.for_ranges.insert(start);
         }
-        visit::visit_expr_for_loop(self, node);
+        for attr in &node.attrs {
+            self.visit_attribute(attr);
+        }
+        if let Some(label) = &node.label {
+            self.visit_label(label);
+        }
+        self.visit_expr(&node.expr);
+        self.push_type_scope();
+        let elem_ty = self
+            .infer_init_local_type(&node.expr)
+            .and_then(|ty| match ty {
+                LocalBitType::SliceOf(elem) => Some(LocalBitType::Value(elem)),
+                LocalBitType::Value(_) => None,
+            });
+        match (&*node.pat, elem_ty) {
+            (syn::Pat::Ident(ident), Some(ty)) => {
+                self.bind_type(ident.ident.to_string(), Some(ty));
+                if let Some((_, subpat)) = &ident.subpat {
+                    self.bind_pat_unknown(subpat);
+                }
+            }
+            (syn::Pat::Reference(reference), Some(ty)) => {
+                if let syn::Pat::Ident(ident) = &*reference.pat {
+                    self.bind_type(ident.ident.to_string(), Some(ty));
+                    if let Some((_, subpat)) = &ident.subpat {
+                        self.bind_pat_unknown(subpat);
+                    }
+                } else {
+                    self.bind_pat_unknown(&node.pat);
+                }
+            }
+            _ => self.bind_pat_unknown(&node.pat),
+        }
+        self.visit_pat(&node.pat);
+        self.visit_block(&node.body);
+        self.pop_type_scope();
+    }
+
+    fn visit_expr_let(&mut self, node: &'ast syn::ExprLet) {
+        for attr in &node.attrs {
+            self.visit_attribute(attr);
+        }
+        self.visit_expr(&node.expr);
+        self.bind_pat_unknown(&node.pat);
+        self.visit_pat(&node.pat);
+    }
+
+    fn visit_expr_if(&mut self, node: &'ast syn::ExprIf) {
+        for attr in &node.attrs {
+            self.visit_attribute(attr);
+        }
+        self.push_type_scope();
+        self.visit_expr(&node.cond);
+        self.visit_block(&node.then_branch);
+        self.pop_type_scope();
+        if let Some((_, else_branch)) = &node.else_branch {
+            self.visit_expr(else_branch);
+        }
+    }
+
+    fn visit_expr_while(&mut self, node: &'ast syn::ExprWhile) {
+        for attr in &node.attrs {
+            self.visit_attribute(attr);
+        }
+        if let Some(label) = &node.label {
+            self.visit_label(label);
+        }
+        self.push_type_scope();
+        self.visit_expr(&node.cond);
+        self.visit_block(&node.body);
+        self.pop_type_scope();
     }
 
     fn visit_expr_range(&mut self, node: &'ast syn::ExprRange) {
@@ -1491,7 +1943,10 @@ impl<'ast> Visit<'ast> for Finder<'_> {
 
     fn visit_arm(&mut self, arm: &'ast syn::Arm) {
         if !is_test_only(&arm.attrs) && !is_skipped(&arm.attrs) {
+            self.push_type_scope();
+            self.bind_pat_unknown(&arm.pat);
             visit::visit_arm(self, arm);
+            self.pop_type_scope();
         }
     }
 
@@ -1671,12 +2126,23 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                     );
                 }
             } else if let Some((op, assign)) = arith_op(&node.op) {
+                let (local_types, shadowed_prims) =
+                    if !assign && matches!(op, ArithOp::BitOr | ArithOp::BitXor) {
+                        (
+                            self.referenced_local_types(&node.left, &node.right),
+                            self.shadowed_prims.clone(),
+                        )
+                    } else {
+                        (Vec::new(), Vec::new())
+                    };
                 let kind = SiteKind::Arith {
                     op,
                     assign,
                     lhs,
                     rhs,
                     gap,
+                    local_types,
+                    shadowed_prims,
                 };
                 // Two literals have no type until the context gives them one, and a
                 // probe is a context of its own.

@@ -15,6 +15,30 @@ pub enum LiteralSide {
     Lhs(i128),
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BitValueType {
+    Unsigned(u32),
+    Signed(u32),
+    Bool,
+    Char,
+}
+
+impl BitValueType {
+    pub(crate) fn width(self) -> u32 {
+        match self {
+            BitValueType::Unsigned(w) | BitValueType::Signed(w) => w,
+            BitValueType::Bool => 1,
+            BitValueType::Char => 21,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LocalBitType {
+    Value(BitValueType),
+    SliceOf(BitValueType),
+}
+
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum SiteKind {
     Cmp {
@@ -41,6 +65,10 @@ pub enum SiteKind {
         lhs: String,
         rhs: String,
         gap: (usize, usize),
+        /// Static primitive types of local bindings referenced by `|` / `^` operands.
+        local_types: Vec<(String, LocalBitType)>,
+        /// Primitive type names shadowed by type aliases/items in this file.
+        shadowed_prims: Vec<String>,
     },
     /// `!operand`. Only `bool` is mutated (the `!` is dropped).
     Not {

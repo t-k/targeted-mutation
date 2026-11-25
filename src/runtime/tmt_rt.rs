@@ -55,6 +55,33 @@ macro_rules! tmt_ints {
 }
 tmt_ints!(i8 i16 i32 i64 isize u8 u16 u32 u64 usize);
 
+/// Order-preserving bijection from Unicode scalar values (`char`) onto the
+/// contiguous range `0..=0x10_D7FF`, closing the surrogate gap `0xD800..=0xDFFF`.
+#[inline(always)]
+fn char_ord(c: char) -> i128 {
+    let u = c as u32;
+    if u >= 0xE000 {
+        (u - 0x800) as i128
+    } else {
+        u as i128
+    }
+}
+
+const CHAR_ORD_MAX: i128 = 0x10_D7FF;
+
+impl<'a> ValNum for W<'a, char> {
+    #[inline(always)]
+    fn tmt_val(&self) -> Val {
+        Val::Int(char_ord(*self.0), 0, CHAR_ORD_MAX)
+    }
+}
+impl<'a, 'b> ValNum for W<'a, &'b char> {
+    #[inline(always)]
+    fn tmt_val(&self) -> Val {
+        Val::Int(char_ord(**self.0), 0, CHAR_ORD_MAX)
+    }
+}
+
 macro_rules! tmt_floats {
     ($($t:ty)*) => {$(
         impl<'a> ValNum for W<'a, $t> {
