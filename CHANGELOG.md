@@ -5,6 +5,26 @@ All notable changes to `targeted-mutation` (`cargo tmt`) are documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.0] - 2026-11-25
+
+### Added
+
+- **External parent-relative path staging (`--stage-external <SRC[=REL]>`)**:
+  - Added repeatable `--stage-external` supporting both shorthand (`../../proto`) and explicit (`SRC=REL`) forms to stage parent-relative files and directories into a confined subdirectory layout under `<work-dir>/src` for monorepo subpackages whose `build.rs` or `include_str!` references shared parent paths.
+  - Enforced symlink confinement to the staged root, case-insensitive collision rejection, and `WorkCopy` separation between staged external paths and the workspace copy.
+- **Substring/module test filtering and Cargo-compatible target flags**:
+  - Added repeatable `--test-filter <PATTERN>` for substring and module-prefix libtest filtering (combined with `--include-test` via union and `--exclude-test` via exclusion).
+  - Added `--lib`, `--bins`, and repeatable `--test <NAME>` target selection flags (including explicit selection of `test = false` targets).
+  - Added pre-build target validation against `cargo metadata` and actionable zero-test hints (suggesting `--lib` / underscore library target names when a binary target has no tests, and suggesting `--test-filter` when `--include-test` matches a runnable test only by substring).
+- **Streaming Cargo build progress and persistent repair exclusion cache**:
+  - Streamed `cargo test --no-run --message-format=json` output to report compiled/cached crate counts and the latest crate name to stderr every 5 seconds during long builds (suppressed under `--quiet`).
+  - Cached compile-error repair exclusions in `<work-dir>/.tmt-repair-cache.json` using exclusive atomic writes (`create_new` + `rename`) and a SHA-256 fingerprint covering the full staged tree, external path dependencies, environment variables, Cargo configuration, and `rustc` version so identical repeat runs finish in a single build.
+
+### Fixed
+
+- **Skip pointless repair rebuilds on non-probe compile errors**:
+  - Detected missing-file and compile-time environment errors (`include_str!`/`include_bytes!`/`include!`, undefined `env!`, and `E0583` missing modules) outside probe-inserted text and exited immediately without running an unnecessary repair rebuild.
+
 ## [0.9.0] - 2026-11-25
 
 ### Added
