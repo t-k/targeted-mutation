@@ -347,6 +347,284 @@ pub(crate) fn reach(expr: &str) -> Option<(crate::plan::Reach, Option<u32>)> {
     reach.map(|reach| (reach, None))
 }
 
+/// Bit width and signedness of a primitive integer type from its inclusive `[min, max]` bounds.
+fn int_type_info(bounds: (i128, i128)) -> Option<(u32, bool)> {
+    let (lo, hi) = bounds;
+    if lo == 0 && hi > 0 {
+        let hi_u = hi as u128;
+        let width = hi_u.trailing_ones();
+        let expected = if width == 128 {
+            u128::MAX
+        } else {
+            (1u128 << width) - 1
+        };
+        (width > 0 && hi_u == expected).then_some((width, false))
+    } else if lo < 0 && hi > 0 {
+        let hi_u = hi as u128;
+        let ones = hi_u.trailing_ones();
+        let width = ones + 1;
+        let expected_hi = (1u128 << ones) - 1;
+        // Two's complement: `iN::MIN == !iN::MAX`, avoiding `hi + 1` overflow on `i128::MAX`.
+        (width <= 128 && hi_u == expected_hi && lo == !hi).then_some((width, true))
+    } else {
+        None
+    }
+}
+
+fn type_mask(width: u32) -> u128 {
+    if width >= 128 {
+        u128::MAX
+    } else {
+        (1u128 << width) - 1
+    }
+}
+
+fn nonneg_int_literal(expr: &syn::Expr) -> Option<u128> {
+    match expr {
+        syn::Expr::Paren(inner) => nonneg_int_literal(&inner.expr),
+        syn::Expr::Group(inner) => nonneg_int_literal(&inner.expr),
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Int(integer),
+            ..
+        }) => integer.base10_parse().ok(),
+        _ => None,
+    }
+}
+
+/// Sound upper bound on the set of bits that may be `1` in `expr` when evaluated at
+/// primitive integer `(width, signed)`. Any bit that is `0` in the returned mask is
+/// guaranteed to be `0` in every evaluation that does not overflow.
+///
+/// `is_primitive` verifies via runtime trace that a binary sub-expression at
+/// `[base_offset + start, base_offset + end)` actually executed as a primitive integer
+/// operator rather than a user-defined trait implementation.
+fn possible_ones(
+    expr: &syn::Expr,
+    width: u32,
+    signed: bool,
+    base_offset: usize,
+    is_primitive: &dyn Fn(usize, usize) -> bool,
+) -> u128 {
+    let full = type_mask(width);
+    match expr {
+        syn::Expr::Paren(inner) => {
+            possible_ones(&inner.expr, width, signed, base_offset, is_primitive)
+        }
+        syn::Expr::Group(inner) => {
+            possible_ones(&inner.expr, width, signed, base_offset, is_primitive)
+        }
+        syn::Expr::Lit(syn::ExprLit {
+            lit: syn::Lit::Int(integer),
+            ..
+        }) => integer
+            .base10_parse::<u128>()
+            .ok()
+            .filter(|v| *v <= full)
+            .unwrap_or(full),
+        syn::Expr::Binary(binary) => {
+            let range = binary.span().byte_range();
+            if !is_primitive(base_offset + range.start, base_offset + range.end) {
+                return full;
+            }
+            match binary.op {
+                syn::BinOp::BitAnd(_) => {
+                    possible_ones(&binary.left, width, signed, base_offset, is_primitive)
+                        & possible_ones(&binary.right, width, signed, base_offset, is_primitive)
+                }
+                syn::BinOp::BitOr(_) | syn::BinOp::BitXor(_) => {
+                    (possible_ones(&binary.left, width, signed, base_offset, is_primitive)
+                        | possible_ones(&binary.right, width, signed, base_offset, is_primitive))
+                        & full
+                }
+                syn::BinOp::Shl(_) => match nonneg_int_literal(&binary.right) {
+                    Some(k) if k < width as u128 => {
+                        (possible_ones(&binary.left, width, signed, base_offset, is_primitive) << k)
+                            & full
+                    }
+                    _ => full,
+                },
+                syn::BinOp::Shr(_) => {
+                    if !signed {
+                        match nonneg_int_literal(&binary.right) {
+                            Some(k) if k < width as u128 => {
+                                possible_ones(&binary.left, width, false, base_offset, is_primitive)
+                                    >> k
+                            }
+                            _ => full,
+                        }
+                    } else {
+                        // Arithmetic right shift sign-extends negative values.
+                        full
+                    }
+                }
+                syn::BinOp::Rem(_) => {
+                    if !signed {
+                        match nonneg_int_literal(&binary.right) {
+                            Some(k) if k >= 1 && k <= full => {
+                                let max_val = k - 1;
+                                let bits = 128 - max_val.leading_zeros();
+                                type_mask(bits) & full
+                            }
+                            _ => full,
+                        }
+                    } else {
+                        full
+                    }
+                }
+                syn::BinOp::Div(_) => {
+                    if !signed {
+                        match nonneg_int_literal(&binary.right) {
+                            Some(k) if k >= 2 && k.is_power_of_two() => {
+                                let shift = k.trailing_zeros();
+                                if shift < width {
+                                    possible_ones(
+                                        &binary.left,
+                                        width,
+                                        false,
+                                        base_offset,
+                                        is_primitive,
+                                    ) >> shift
+                                } else {
+                                    full
+                                }
+                            }
+                            _ => full,
+                        }
+                    } else {
+                        full
+                    }
+                }
+                syn::BinOp::Mul(_) => {
+                    let factor = nonneg_int_literal(&binary.right)
+                        .map(|k| (k, &binary.left))
+                        .or_else(|| nonneg_int_literal(&binary.left).map(|k| (k, &binary.right)));
+                    match factor {
+                        Some((k, other)) if k >= 2 && k.is_power_of_two() => {
+                            let shift = k.trailing_zeros();
+                            if shift < width {
+                                (possible_ones(other, width, signed, base_offset, is_primitive)
+                                    << shift)
+                                    & full
+                            } else {
+                                full
+                            }
+                        }
+                        _ => full,
+                    }
+                }
+                _ => full,
+            }
+        }
+        _ => full,
+    }
+}
+
+/// Whether `lhs` and `rhs` can be statically proved to have disjoint `1` bits, making
+/// `lhs | rhs` and `lhs ^ rhs` equivalent for every input.
+///
+/// `lhs_start` and `rhs_start` are the byte offsets of `lhs` and `rhs` in the original
+/// source file; `is_primitive` checks whether a binary sub-expression in that source range
+/// was observed executing as a primitive integer operator.
+pub(crate) fn disjoint_bits(
+    lhs: &str,
+    lhs_start: usize,
+    rhs: &str,
+    rhs_start: usize,
+    bounds: Option<(i128, i128)>,
+    is_primitive: &dyn Fn(usize, usize) -> bool,
+) -> bool {
+    let Some((width, signed)) = bounds.and_then(int_type_info) else {
+        return false;
+    };
+    let (Ok(lhs_expr), Ok(rhs_expr)) = (
+        syn::parse_str::<syn::Expr>(lhs),
+        syn::parse_str::<syn::Expr>(rhs),
+    ) else {
+        return false;
+    };
+    let lhs_ones = possible_ones(&lhs_expr, width, signed, lhs_start, is_primitive);
+    let rhs_ones = possible_ones(&rhs_expr, width, signed, rhs_start, is_primitive);
+    (lhs_ones & rhs_ones) == 0
+}
+
+/// Whether a boolean right-hand side expression is syntactically side-effect-free (no
+/// blocks, assignments, mutable borrows, arbitrary function calls, or early exits), so
+/// skipping its evaluation under `&&` <-> `||` cannot hide an observable side effect.
+pub(crate) fn is_pure_logic_operand(expr_text: &str) -> bool {
+    let Ok(expr) = syn::parse_str::<syn::Expr>(expr_text) else {
+        return false;
+    };
+    is_pure_expr(&expr)
+}
+
+fn is_pure_expr(expr: &syn::Expr) -> bool {
+    const PURE_METHODS: &[&str] = &[
+        "len",
+        "is_empty",
+        "starts_with",
+        "ends_with",
+        "contains",
+        "eq",
+        "ne",
+        "eq_ignore_ascii_case",
+        "is_some",
+        "is_none",
+        "is_ok",
+        "is_err",
+        "is_ascii",
+        "is_ascii_alphabetic",
+        "is_ascii_alphanumeric",
+        "is_ascii_digit",
+        "is_ascii_hexdigit",
+        "is_ascii_lowercase",
+        "is_ascii_uppercase",
+        "is_ascii_whitespace",
+        "is_alphabetic",
+        "is_alphanumeric",
+        "is_numeric",
+        "is_whitespace",
+        "is_finite",
+        "is_nan",
+        "is_infinite",
+        "is_sign_positive",
+        "is_sign_negative",
+    ];
+    match expr {
+        syn::Expr::Lit(_) | syn::Expr::Path(_) => true,
+        syn::Expr::Paren(e) => is_pure_expr(&e.expr),
+        syn::Expr::Group(e) => is_pure_expr(&e.expr),
+        syn::Expr::Field(e) => is_pure_expr(&e.base),
+        syn::Expr::Index(e) => is_pure_expr(&e.expr) && is_pure_expr(&e.index),
+        syn::Expr::Cast(e) => is_pure_expr(&e.expr),
+        syn::Expr::Reference(e) => e.mutability.is_none() && is_pure_expr(&e.expr),
+        syn::Expr::Unary(e) => is_pure_expr(&e.expr),
+        syn::Expr::Binary(e) => {
+            !matches!(
+                e.op,
+                syn::BinOp::AddAssign(_)
+                    | syn::BinOp::SubAssign(_)
+                    | syn::BinOp::MulAssign(_)
+                    | syn::BinOp::DivAssign(_)
+                    | syn::BinOp::RemAssign(_)
+                    | syn::BinOp::BitXorAssign(_)
+                    | syn::BinOp::BitAndAssign(_)
+                    | syn::BinOp::BitOrAssign(_)
+                    | syn::BinOp::ShlAssign(_)
+                    | syn::BinOp::ShrAssign(_)
+            ) && is_pure_expr(&e.left)
+                && is_pure_expr(&e.right)
+        }
+        syn::Expr::Tuple(e) => e.elems.iter().all(is_pure_expr),
+        syn::Expr::Array(e) => e.elems.iter().all(is_pure_expr),
+        syn::Expr::MethodCall(e) => {
+            PURE_METHODS.contains(&e.method.to_string().as_str())
+                && is_pure_expr(&e.receiver)
+                && e.args.iter().all(is_pure_expr)
+        }
+        _ => false,
+    }
+}
+
 /// Byte ranges of the code that only a test build has: what is under `cfg(test)` or
 /// marked as a test.
 pub(crate) fn test_only_ranges(source: &str, file: &syn::File) -> Vec<(usize, usize)> {

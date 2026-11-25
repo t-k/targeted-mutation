@@ -1244,6 +1244,11 @@ pub fn arith_gap_finding(
         (ArithOp::Add, ArithOp::Sub) | (ArithOp::Sub, ArithOp::Add) => {
             format!("`{rhs}` other than 0")
         }
+        (ArithOp::BitOr, ArithOp::BitXor) | (ArithOp::BitXor, ArithOp::BitOr) => format!(
+            "operands where `{lhs}` and `{rhs}` share at least one set bit (if their bits are disjoint by construction, `{}` and `{}` are equivalent)",
+            op.symbol(),
+            other.symbol()
+        ),
         _ => format!(
             "operands for which `{lhs} {}{eq} {rhs}` and `{lhs} {}{eq} {rhs}` differ",
             op.symbol(),
@@ -3969,5 +3974,26 @@ mod tests {
         };
         let unclosed_text = render_text(&report_unclosed, false);
         assert!(unclosed_text.contains("`a, `b`"), "{unclosed_text:?}");
+    }
+
+    #[test]
+    fn bitor_bitxor_input_gap_advice_mentions_shared_bits_and_disjoint_equivalence() {
+        let found = crate::instrument::discover("fn f(a: u8, b: u8) -> u8 { a | b }", 0).unwrap();
+        let site = found
+            .sites
+            .iter()
+            .find(|s| matches!(s.kind, SiteKind::Arith { .. }))
+            .expect("arith site");
+        let Some(Finding::InputGap { add_tests, .. }) =
+            arith_gap_finding("src/lib.rs", site, Mutation::ArithSwap2, true)
+        else {
+            panic!("expected InputGap for | -> ^");
+        };
+        assert_eq!(add_tests.len(), 1);
+        assert!(
+            add_tests[0].contains("share at least one set bit")
+                && add_tests[0].contains("disjoint by construction"),
+            "{add_tests:?}"
+        );
     }
 }
