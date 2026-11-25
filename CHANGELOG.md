@@ -5,6 +5,20 @@ All notable changes to `targeted-mutation` (`cargo tmt`) are documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.1] - 2026-11-25
+
+### Fixed
+
+- **Effect-trace representative selection with `UNKNOWN_TEST` (`"?"`)**:
+  - Picked the first named test as representative when `UNKNOWN_TEST` (`"?"`) is mixed with named tests in an effect-trace test list instead of rendering `` `?` (and N more) ``, and rendered unnamed-only lists as `"a test"` / `"a test (and N more)"`.
+- **Static bit-disjointness filtering and clearer advice for `|` ↔ `^`**:
+  - Recorded primitive integer type bounds on `|` and `^` probes and skipped the equivalent `|` ↔ `^` (`ArithSwap2`) mutation when runtime-verified primitive sub-expressions prove `(lhs_possible_ones & rhs_possible_ones) == 0` (covering constant shifts, bitmasks, unsigned remainders, and power-of-two mul/div, while conservatively preserving signed right shifts, overloaded operators, and any site where `differs2` was observed).
+  - Updated `INPUT GAP` advice for `|` ↔ `^` when disjointness cannot be statically proved to explain that operands must share at least one set bit and that `|` and `^` are equivalent if disjoint by construction.
+- **Standard collection capacity-hint noise filtering**:
+  - Skipped pure capacity-hint expressions in standard collection constructors (`Vec`, `String`, `VecDeque`, `BinaryHeap`, `HashMap`, `HashSet`, `OsString`, `PathBuf`, `CString`, `BytesMut`, `SmallVec`, `IndexMap`, `IndexSet` `with_capacity` / `with_capacity_and_hasher` / `reserve` / `reserve_exact`) and `.reserve_exact(...)`, as well as statement deletion on plain-place `reserve` / `reserve_exact` calls, while keeping non-capacity arguments, side-effecting blocks/receivers, custom domain APIs, and fallible `try_reserve` intact.
+- **Duplicate enclosing `ASSERTION GAP` on constant-operand `||` / `&&`**:
+  - Suppressed surviving `||` ↔ `&&` (`LogicSwap`) assertion gaps when every observed evaluation produced a boolean value where `a || b == a && b` (all `(false, false)` for `||` or all `(true, true)` for `&&`) and the right-hand operand is syntactically side-effect-free, accounting for the survivor under `survivor_breakdown.redundant_constant` so report counts continue to reconcile.
+
 ## [0.10.0] - 2026-11-25
 
 ### Added
