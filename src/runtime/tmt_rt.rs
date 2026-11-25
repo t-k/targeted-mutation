@@ -106,6 +106,49 @@ impl<'a, 'r, T: ?Sized> ValAny for &'r W<'a, T> {
     }
 }
 
+/// Autoref specialisation for observing the source type bounds of a cast or
+/// primitive `From::from` operand inside `|` / `^`.
+pub trait CastPrim {
+    fn tmt_cast_bounds(&self) -> Option<(i128, i128)>;
+}
+
+pub trait CastAny {
+    fn tmt_cast_bounds(&self) -> Option<(i128, i128)>;
+}
+
+macro_rules! tmt_cast_ints {
+    ($($t:ty)*) => {$(
+        impl<'a> CastPrim for W<'a, $t> {
+            #[inline(always)]
+            fn tmt_cast_bounds(&self) -> Option<(i128, i128)> {
+                Some((<$t>::MIN as i128, <$t>::MAX as i128))
+            }
+        }
+    )*};
+}
+tmt_cast_ints!(i8 i16 i32 i64 i128 isize u8 u16 u32 u64 usize);
+
+impl<'a> CastPrim for W<'a, bool> {
+    #[inline(always)]
+    fn tmt_cast_bounds(&self) -> Option<(i128, i128)> {
+        Some((0, 1))
+    }
+}
+
+impl<'a> CastPrim for W<'a, char> {
+    #[inline(always)]
+    fn tmt_cast_bounds(&self) -> Option<(i128, i128)> {
+        Some((0, 0x1f_ffff))
+    }
+}
+
+impl<'a, 'r, T: ?Sized> CastAny for &'r W<'a, T> {
+    #[inline(always)]
+    fn tmt_cast_bounds(&self) -> Option<(i128, i128)> {
+        None
+    }
+}
+
 pub const LT: u8 = 0;
 pub const LE: u8 = 1;
 pub const GT: u8 = 2;
@@ -462,6 +505,7 @@ struct Tracer {
     /// Bits already written per (kind, site, test) for statement, logic and arithmetic sites.
     bits: HashMap<(u8, u32, u32), u8>,
     typed: HashSet<u32>,
+    cast_typed: HashSet<(u32, u32, Option<(i128, i128)>)>,
 }
 
 struct State {
@@ -544,6 +588,7 @@ fn state() -> &'static State {
                 shelves: Vec::new(),
                 bits: HashMap::new(),
                 typed: HashSet::new(),
+                cast_typed: HashSet::new(),
             })
         });
         let state = State {
@@ -614,6 +659,42 @@ thread_local! {
     // sees something new.
     static SEEN_BITS: RefCell<Vec<u8>> = const { RefCell::new(Vec::new()) };
     static SEEN_CMP: RefCell<Vec<Option<Summary>>> = const { RefCell::new(Vec::new()) };
+    static SEEN_CAST: RefCell<HashSet<(u32, u32, Option<(i128, i128)>)>> = RefCell::new(HashSet::new());
+}
+
+#[inline(always)]
+pub fn record_cast(site: u32, slot: u32, bounds: Option<(i128, i128)>) {
+    match MODE.load(Atomic::Acquire) {
+        MODE_IDLE | MODE_ONE => return,
+        MODE_ALL => {}
+        _ => {
+            state();
+            if MODE.load(Atomic::Acquire) != MODE_ALL {
+                return;
+            }
+        }
+    }
+    record_cast_busy(site, slot, bounds);
+}
+
+#[inline(never)]
+fn record_cast_busy(site: u32, slot: u32, bounds: Option<(i128, i128)>) {
+    let key = (site, slot, bounds);
+    let fresh = SEEN_CAST
+        .try_with(|seen| seen.borrow_mut().insert(key))
+        .unwrap_or(true);
+    if !fresh {
+        return;
+    }
+    with_tracer(|t, _| {
+        if t.cast_typed.insert(key) {
+            let line = match bounds {
+                Some((min, max)) => format!("C\t{site}\t{slot}\t{min}\t{max}\n"),
+                None => format!("C\t{site}\t{slot}\t-\t-\n"),
+            };
+            write_line(&mut t.out, &line);
+        }
+    });
 }
 
 fn bits_slot(kind: u8, site: u32) -> usize {

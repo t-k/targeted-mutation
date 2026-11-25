@@ -474,7 +474,7 @@ fn parse_prim_from_call<'a>(
     call: &'a syn::ExprCall,
     shadowed_prims: &[String],
 ) -> Option<(CastTarget, &'a syn::Expr)> {
-    if call.args.len() != 1 {
+    if call.args.len() != 1 || shadowed_prims.iter().any(|s| s == "From") {
         return None;
     }
     let syn::Expr::Path(path) = &*call.func else {
@@ -586,19 +586,52 @@ fn bit_value_mask(ty: BitValueType) -> u128 {
     }
 }
 
+fn strip_expr_parens(mut expr: &syn::Expr) -> &syn::Expr {
+    loop {
+        match expr {
+            syn::Expr::Paren(inner) => expr = &inner.expr,
+            syn::Expr::Group(inner) => expr = &inner.expr,
+            _ => return expr,
+        }
+    }
+}
+
+fn cast_source_type(
+    inner: &syn::Expr,
+    base_offset: usize,
+    local_types: &[(String, LocalBitType)],
+    shadowed_prims: &[String],
+    cast_bounds: &dyn Fn(usize, usize) -> Option<(i128, i128)>,
+) -> Option<BitValueType> {
+    let stripped = strip_expr_parens(inner);
+    let range = stripped.span().byte_range();
+    if let Some((width, signed)) =
+        cast_bounds(base_offset + range.start, base_offset + range.end).and_then(int_type_info)
+    {
+        return Some(if signed {
+            BitValueType::Signed(width)
+        } else {
+            BitValueType::Unsigned(width)
+        });
+    }
+    infer_bit_value_type(inner, local_types, shadowed_prims)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn cast_possible_ones(
     inner: &syn::Expr,
-    target: CastTarget,
+    target: Option<CastTarget>,
     outer_width: u32,
     base_offset: usize,
     is_primitive: &dyn Fn(usize, usize) -> bool,
     local_types: &[(String, LocalBitType)],
     shadowed_prims: &[String],
+    cast_bounds: &dyn Fn(usize, usize) -> Option<(i128, i128)>,
 ) -> u128 {
     let outer_full = type_mask(outer_width);
-    let src_ty = infer_bit_value_type(inner, local_types, shadowed_prims);
+    let src_ty = cast_source_type(inner, base_offset, local_types, shadowed_prims, cast_bounds);
     match target {
-        CastTarget::Fixed(dst_ty) => {
+        Some(CastTarget::Fixed(dst_ty)) => {
             let dst_mask = bit_value_mask(dst_ty) & outer_full;
             match src_ty {
                 Some(BitValueType::Unsigned(src_w)) => {
@@ -610,6 +643,7 @@ fn cast_possible_ones(
                         is_primitive,
                         local_types,
                         shadowed_prims,
+                        cast_bounds,
                     ) & dst_mask
                 }
                 Some(BitValueType::Bool) => 0x1 & dst_mask,
@@ -623,6 +657,7 @@ fn cast_possible_ones(
                         is_primitive,
                         local_types,
                         shadowed_prims,
+                        cast_bounds,
                     );
                     let sign_bit = 1u128 << (src_w - 1);
                     if dst_ty.width() <= src_w || (src_ones & sign_bit) == 0 {
@@ -640,7 +675,7 @@ fn cast_possible_ones(
                 },
             }
         }
-        CastTarget::PtrSized => match src_ty {
+        Some(CastTarget::PtrSized) | None => match src_ty {
             Some(BitValueType::Unsigned(src_w)) if src_w <= outer_width => {
                 possible_ones(
                     inner,
@@ -650,6 +685,7 @@ fn cast_possible_ones(
                     is_primitive,
                     local_types,
                     shadowed_prims,
+                    cast_bounds,
                 ) & outer_full
             }
             Some(BitValueType::Bool) => 0x1 & outer_full,
@@ -663,6 +699,7 @@ fn cast_possible_ones(
                     is_primitive,
                     local_types,
                     shadowed_prims,
+                    cast_bounds,
                 );
                 let sign_bit = 1u128 << (src_w - 1);
                 if (src_ones & sign_bit) == 0 {
@@ -696,6 +733,7 @@ fn nonneg_int_literal(expr: &syn::Expr) -> Option<u128> {
 /// `is_primitive` verifies via runtime trace that a binary sub-expression at
 /// `[base_offset + start, base_offset + end)` actually executed as a primitive integer
 /// operator rather than a user-defined trait implementation.
+#[allow(clippy::too_many_arguments)]
 fn possible_ones(
     expr: &syn::Expr,
     width: u32,
@@ -704,6 +742,7 @@ fn possible_ones(
     is_primitive: &dyn Fn(usize, usize) -> bool,
     local_types: &[(String, LocalBitType)],
     shadowed_prims: &[String],
+    cast_bounds: &dyn Fn(usize, usize) -> Option<(i128, i128)>,
 ) -> u128 {
     let full = type_mask(width);
     match expr {
@@ -715,6 +754,7 @@ fn possible_ones(
             is_primitive,
             local_types,
             shadowed_prims,
+            cast_bounds,
         ),
         syn::Expr::Group(inner) => possible_ones(
             &inner.expr,
@@ -724,6 +764,7 @@ fn possible_ones(
             is_primitive,
             local_types,
             shadowed_prims,
+            cast_bounds,
         ),
         syn::Expr::Lit(syn::ExprLit { lit, .. }) => match lit {
             syn::Lit::Int(integer) => integer
@@ -736,27 +777,26 @@ fn possible_ones(
             syn::Lit::Char(c) => (c.value() as u32 as u128) & full,
             _ => full,
         },
-        syn::Expr::Cast(cast) => match parse_cast_target(&cast.ty, shadowed_prims) {
-            Some(target) => cast_possible_ones(
-                &cast.expr,
-                target,
-                width,
-                base_offset,
-                is_primitive,
-                local_types,
-                shadowed_prims,
-            ),
-            None => full,
-        },
+        syn::Expr::Cast(cast) => cast_possible_ones(
+            &cast.expr,
+            parse_cast_target(&cast.ty, shadowed_prims),
+            width,
+            base_offset,
+            is_primitive,
+            local_types,
+            shadowed_prims,
+            cast_bounds,
+        ),
         syn::Expr::Call(call) => match parse_prim_from_call(call, shadowed_prims) {
             Some((target, arg)) => cast_possible_ones(
                 arg,
-                target,
+                Some(target),
                 width,
                 base_offset,
                 is_primitive,
                 local_types,
                 shadowed_prims,
+                cast_bounds,
             ),
             None => full,
         },
@@ -775,6 +815,7 @@ fn possible_ones(
                         is_primitive,
                         local_types,
                         shadowed_prims,
+                        cast_bounds,
                     ) & possible_ones(
                         &binary.right,
                         width,
@@ -783,6 +824,7 @@ fn possible_ones(
                         is_primitive,
                         local_types,
                         shadowed_prims,
+                        cast_bounds,
                     )
                 }
                 syn::BinOp::BitOr(_) | syn::BinOp::BitXor(_) => {
@@ -794,6 +836,7 @@ fn possible_ones(
                         is_primitive,
                         local_types,
                         shadowed_prims,
+                        cast_bounds,
                     ) | possible_ones(
                         &binary.right,
                         width,
@@ -802,6 +845,7 @@ fn possible_ones(
                         is_primitive,
                         local_types,
                         shadowed_prims,
+                        cast_bounds,
                     )) & full
                 }
                 syn::BinOp::Shl(_) => match nonneg_int_literal(&binary.right) {
@@ -814,6 +858,7 @@ fn possible_ones(
                             is_primitive,
                             local_types,
                             shadowed_prims,
+                            cast_bounds,
                         ) << k)
                             & full
                     }
@@ -831,6 +876,7 @@ fn possible_ones(
                                     is_primitive,
                                     local_types,
                                     shadowed_prims,
+                                    cast_bounds,
                                 ) >> k
                             }
                             _ => full,
@@ -868,6 +914,7 @@ fn possible_ones(
                                         is_primitive,
                                         local_types,
                                         shadowed_prims,
+                                        cast_bounds,
                                     ) >> shift
                                 } else {
                                     full
@@ -895,6 +942,7 @@ fn possible_ones(
                                     is_primitive,
                                     local_types,
                                     shadowed_prims,
+                                    cast_bounds,
                                 ) << shift)
                                     & full
                             } else {
@@ -916,7 +964,8 @@ fn possible_ones(
 ///
 /// `lhs_start` and `rhs_start` are the byte offsets of `lhs` and `rhs` in the original
 /// source file; `is_primitive` checks whether a binary sub-expression in that source range
-/// was observed executing as a primitive integer operator.
+/// was observed executing as a primitive integer operator, and `cast_bounds` returns the
+/// runtime-observed `[min, max]` bounds of a cast source expression in that byte range.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn disjoint_bits(
     lhs: &str,
@@ -927,6 +976,7 @@ pub(crate) fn disjoint_bits(
     is_primitive: &dyn Fn(usize, usize) -> bool,
     local_types: &[(String, LocalBitType)],
     shadowed_prims: &[String],
+    cast_bounds: &dyn Fn(usize, usize) -> Option<(i128, i128)>,
 ) -> bool {
     let Some((width, signed)) = bounds.and_then(int_type_info) else {
         return false;
@@ -945,6 +995,7 @@ pub(crate) fn disjoint_bits(
         is_primitive,
         local_types,
         shadowed_prims,
+        cast_bounds,
     );
     let rhs_ones = possible_ones(
         &rhs_expr,
@@ -954,6 +1005,7 @@ pub(crate) fn disjoint_bits(
         is_primitive,
         local_types,
         shadowed_prims,
+        cast_bounds,
     );
     (lhs_ones & rhs_ones) == 0
 }

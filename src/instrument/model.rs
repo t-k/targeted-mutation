@@ -69,6 +69,8 @@ pub enum SiteKind {
         local_types: Vec<(String, LocalBitType)>,
         /// Primitive type names shadowed by type aliases/items in this file.
         shadowed_prims: Vec<String>,
+        /// Runtime cast-source type observation probes `(slot, start, end)` inside `|` / `^`.
+        cast_probes: Vec<(u32, usize, usize)>,
     },
     /// `!operand`. Only `bool` is mutated (the `!` is dropped).
     Not {

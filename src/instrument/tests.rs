@@ -3315,7 +3315,17 @@ fn disjoint_bits_matches_pict_table() {
             "plain" => "b",
             other => panic!("unexpected RhsShape: {other}"),
         };
-        let actual = super::disjoint_bits(lhs, 0, rhs, 100, bounds, &all_primitive, &[], &[]);
+        let actual = super::disjoint_bits(
+            lhs,
+            0,
+            rhs,
+            100,
+            bounds,
+            &all_primitive,
+            &[],
+            &[],
+            &|_, _| None,
+        );
         let expected = match (int_type, lhs_shape, rhs_shape) {
             // u8: shl4 => 0xF0, shl2 => 0xFC, mask_hi => 0xF0, cast_u8_shl8 => 0xFF (shift >= 8)
             // u8 rhs: shr4 => 0x0F, shr2 => 0x3F, mask_lo => 0x0F, lit_low => 0x03, rem_4 => 0x03
@@ -3349,6 +3359,7 @@ fn disjoint_bits_matches_pict_table() {
         &no_primitive,
         &[],
         &[],
+        &|_, _| None,
     ));
 
     // i128 bounds must not overflow during signed width detection.
@@ -3361,6 +3372,7 @@ fn disjoint_bits_matches_pict_table() {
         &all_primitive,
         &[],
         &[],
+        &|_, _| None,
     ));
     assert!(!super::disjoint_bits(
         "a << 4",
@@ -3371,6 +3383,7 @@ fn disjoint_bits_matches_pict_table() {
         &all_primitive,
         &[],
         &[],
+        &|_, _| None,
     ));
 
     // Pure vs side-effecting logic right-hand operands.
@@ -3526,6 +3539,7 @@ fn disjoint_bits_widening_cast_matches_pict_table() {
             &all_primitive,
             &local_types,
             &[],
+            &|_, _| None,
         );
 
         let dst_width: Option<u32> = match dst_type {
@@ -3643,6 +3657,7 @@ fn byte_and_char(tag: u8, ch: char) -> bool {
             &all_primitive,
             local_types,
             shadowed_prims,
+            &|_, _| None,
         )
     };
 
@@ -3681,6 +3696,7 @@ fn byte_and_char(tag: u8, ch: char) -> bool {
                 &all_primitive,
                 local_types,
                 shadowed_prims,
+                &|_, _| None,
             ),
             _ => unreachable!(),
         })
@@ -3739,6 +3755,7 @@ fn disjoint_bits_stays_conservative_on_prim_alias_overloaded_binop_let_chain_and
                 &all_primitive,
                 local_types,
                 shadowed_prims,
+                &|_, _| None,
             ),
             "expected `{snippet}` to stay conservative"
         );
@@ -3856,6 +3873,7 @@ fn f(lo: core::primitive::u8) -> u32 {
             ),
         ],
         &[],
+        &|_, _| None,
     ));
     assert!(super::disjoint_bits(
         "((a as u32) << 1)",
@@ -3869,5 +3887,105 @@ fn f(lo: core::primitive::u8) -> u32 {
             super::LocalBitType::Value(super::BitValueType::Signed(8))
         )],
         &[],
+        &|_, _| None,
     ));
+}
+
+#[test]
+fn disjoint_bits_runtime_cast_bounds_matches_pict_table() {
+    let table = include_str!("../../tests/data/runtime-cast-disjoint.pict.tsv");
+    let all_primitive = |_: usize, _: usize| true;
+    let mut rows = 0;
+    for line in table.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let cols: Vec<&str> = line.split('\t').collect();
+        assert_eq!(cols.len(), 5, "unexpected row: {line}");
+        let (rt_type, dst_type, cast_kind, shift, rhs_kind) =
+            (cols[0], cols[1], cols[2], cols[3], cols[4]);
+
+        let outer_bounds = match dst_type {
+            "u32" | "alias_word" => Some((u32::MIN as i128, u32::MAX as i128)),
+            "i32" => Some((i32::MIN as i128, i32::MAX as i128)),
+            other => panic!("unexpected DstType: {other}"),
+        };
+        let dst_ident = match dst_type {
+            "alias_word" => "Word",
+            other => other,
+        };
+        let lhs_rt: Option<(i128, i128)> = match rt_type {
+            "u8" => Some((0, 255)),
+            "u16" => Some((0, 65535)),
+            "i8" => Some((-128, 127)),
+            "bool" => Some((0, 1)),
+            "char" => Some((0, 0x1f_ffff)),
+            "polymorphic" | "none" => None,
+            other => panic!("unexpected RuntimeType: {other}"),
+        };
+        let base_cast = match cast_kind {
+            "as_cast" => format!("(first as {dst_ident})"),
+            "from_call" => format!("{dst_ident}::from(first)"),
+            other => panic!("unexpected CastKind: {other}"),
+        };
+        let shift_bits: u32 = match shift {
+            "shl0" => 0,
+            "shl8" => 8,
+            "shl16" => 16,
+            other => panic!("unexpected Shift: {other}"),
+        };
+        let lhs = if shift_bits == 0 {
+            base_cast
+        } else {
+            format!("({base_cast} << {shift_bits})")
+        };
+        let rhs = match rhs_kind {
+            "u8_cast" => format!("(second as {dst_ident})"),
+            "u8_shl8" => format!("((second as {dst_ident}) << 8)"),
+            "lit_1" => "1".to_string(),
+            other => panic!("unexpected RhsKind: {other}"),
+        };
+
+        // No static local_types at all: only runtime cast_bounds proves the source widths.
+        let cast_bounds = |from: usize, _to: usize| -> Option<(i128, i128)> {
+            if from < 200 { lhs_rt } else { Some((0, 255)) }
+        };
+        let actual = super::disjoint_bits(
+            &lhs,
+            0,
+            &rhs,
+            200,
+            outer_bounds,
+            &all_primitive,
+            &[],
+            &[],
+            &cast_bounds,
+        );
+
+        let full = 0xffff_ffffu128;
+        // User-defined `Word::from` is never assumed to be a primitive widening conversion.
+        let lhs_base = if cast_kind == "from_call" && dst_type == "alias_word" {
+            full
+        } else {
+            match rt_type {
+                "u8" => 0xff,
+                "u16" => 0xffff,
+                "bool" => 0x1,
+                "char" => 0x1f_ffff,
+                "i8" | "polymorphic" | "none" => full,
+                _ => unreachable!(),
+            }
+        };
+        let lhs_ones = (lhs_base << shift_bits) & full;
+        let rhs_ones = match rhs_kind {
+            "u8_cast" => 0xff,
+            "u8_shl8" => 0xff00,
+            "lit_1" => 1,
+            _ => unreachable!(),
+        };
+        let expected = (lhs_ones & rhs_ones) == 0;
+        assert_eq!(
+            actual, expected,
+            "rt={rt_type} dst={dst_type} kind={cast_kind} shift={shift} rhs={rhs_kind}"
+        );
+        rows += 1;
+    }
+    assert!(rows >= 25, "expected full PICT table, got {rows} rows");
 }

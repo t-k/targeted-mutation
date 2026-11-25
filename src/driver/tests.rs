@@ -2992,6 +2992,32 @@ fn build_progress_tracks_compiled_and_cached_artifacts() {
         state.format_line(),
         "building: 1 compiled (1 cached, latest: aws-sdk-s3)"
     );
+
+    #[cfg(unix)]
+    {
+        let mut cmd = Command::new("sh");
+        cmd.args([
+            "-c",
+            r#"printf '%s\n' '{"reason":"compiler-artifact","target":{"name":"clap","kind":["lib"]},"fresh":true}'; sleep 0.12"#,
+        ]);
+        let mut lines = Vec::new();
+        let output = run_cargo_with_progress_interval(
+            &mut cmd,
+            true,
+            std::time::Duration::from_millis(30),
+            |line| lines.push(line.to_string()),
+        )
+        .unwrap();
+        assert!(output.status.success());
+        assert!(
+            lines.len() >= 2,
+            "expected repeated progress ticks: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("s elapsed)")),
+            "expected elapsed suffix on repeated line: {lines:?}"
+        );
+    }
 }
 
 #[test]

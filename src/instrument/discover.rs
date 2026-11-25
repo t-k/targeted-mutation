@@ -68,6 +68,7 @@ pub(crate) fn discover_parsed(
         const_depth: 0,
         error_values,
         for_ranges: std::collections::HashSet::new(),
+        probed_cast_spans: std::collections::HashSet::new(),
         type_scopes: vec![HashMap::new()],
         shadowed_prims,
     };
@@ -86,6 +87,8 @@ struct Finder<'s> {
     const_depth: usize,
     /// Where the ranges start that a `for` runs through directly.
     for_ranges: std::collections::HashSet<usize>,
+    /// Source byte spans `(start, end)` already wrapped with a runtime cast-type probe.
+    probed_cast_spans: std::collections::HashSet<(usize, usize)>,
     /// Lexical stack of static primitive-type bindings for disjoint bitop analysis.
     /// `Some(ty)` records a known primitive/slice type; `None` records a shadowing
     /// binding whose type is unknown so outer bindings of the same name are hidden.
@@ -462,6 +465,122 @@ impl Finder<'_> {
         }
         None
     }
+    fn collect_cast_probes(
+        &mut self,
+        lhs: &syn::Expr,
+        rhs: &syn::Expr,
+    ) -> Vec<(u32, usize, usize)> {
+        let mut raw = Vec::new();
+        collect_cast_expr_spans(lhs, &mut raw);
+        collect_cast_expr_spans(rhs, &mut raw);
+        let mut out = Vec::new();
+        for span in raw {
+            let Some((start, end)) = self.range(span) else {
+                continue;
+            };
+            if self.probed_cast_spans.insert((start, end)) {
+                let slot = out.len() as u32;
+                out.push((slot, start, end));
+            }
+        }
+        out
+    }
+}
+
+fn strip_expr_parens(mut expr: &syn::Expr) -> &syn::Expr {
+    loop {
+        match expr {
+            syn::Expr::Paren(inner) => expr = &inner.expr,
+            syn::Expr::Group(inner) => expr = &inner.expr,
+            _ => return expr,
+        }
+    }
+}
+
+fn is_prim_from_call(call: &syn::ExprCall) -> bool {
+    if call.args.len() != 1 {
+        return false;
+    }
+    let syn::Expr::Path(path) = &*call.func else {
+        return false;
+    };
+    if path.qself.is_some() {
+        return false;
+    }
+    let segs: Vec<&syn::PathSegment> = path.path.segments.iter().collect();
+    if !segs.iter().all(|s| s.arguments.is_none()) {
+        return false;
+    }
+    match segs.as_slice() {
+        [ty, method] if method.ident == "from" => is_prim_type_name(&ty.ident.to_string()),
+        [root, prim, ty, method]
+            if (root.ident == "core" || root.ident == "std")
+                && prim.ident == "primitive"
+                && method.ident == "from" =>
+        {
+            is_prim_type_name(&ty.ident.to_string())
+        }
+        _ => false,
+    }
+}
+
+fn is_prim_cast_target(ty: &syn::Type) -> bool {
+    let syn::Type::Path(path) = strip_type_wrappers(ty) else {
+        return false;
+    };
+    if path.qself.is_some() {
+        return false;
+    }
+    let segs: Vec<&syn::PathSegment> = path.path.segments.iter().collect();
+    if !segs.iter().all(|s| s.arguments.is_none()) {
+        return false;
+    }
+    match segs.as_slice() {
+        [only] => is_prim_type_name(&only.ident.to_string()),
+        [root, prim, name]
+            if (root.ident == "core" || root.ident == "std") && prim.ident == "primitive" =>
+        {
+            is_prim_type_name(&name.ident.to_string())
+        }
+        _ => false,
+    }
+}
+
+fn collect_cast_expr_spans(expr: &syn::Expr, out: &mut Vec<Span>) {
+    struct CastSpans<'a>(&'a mut Vec<Span>);
+    impl<'ast> Visit<'ast> for CastSpans<'_> {
+        fn visit_expr_cast(&mut self, node: &'ast syn::ExprCast) {
+            // Only observe casts to primitive type names (`as u32`, `as usize`, etc.),
+            // never pointer casts (`as *mut u8` or `type Ptr = *mut u8; p as Ptr`) where
+            // wrapping `p: &mut T` in a value binding would turn a reborrow into a move.
+            if is_prim_cast_target(&node.ty) {
+                let inner = strip_expr_parens(&node.expr);
+                if !matches!(inner, syn::Expr::Lit(_)) {
+                    self.0.push(inner.span());
+                }
+                self.visit_expr(inner);
+            }
+        }
+        fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+            if is_prim_from_call(node)
+                && let Some(arg) = node.args.first()
+            {
+                let inner = strip_expr_parens(arg);
+                if !matches!(inner, syn::Expr::Lit(_)) {
+                    self.0.push(inner.span());
+                }
+                self.visit_expr(inner);
+                return;
+            }
+            visit::visit_expr_call(self, node);
+        }
+        fn visit_block(&mut self, _: &'ast syn::Block) {}
+        fn visit_expr_closure(&mut self, _: &'ast syn::ExprClosure) {}
+        fn visit_expr_async(&mut self, _: &'ast syn::ExprAsync) {}
+        fn visit_expr_const(&mut self, _: &'ast syn::ExprConst) {}
+        fn visit_type(&mut self, _: &'ast syn::Type) {}
+    }
+    CastSpans(out).visit_expr(expr);
 }
 
 fn strip_type_wrappers(mut ty: &syn::Type) -> &syn::Type {
@@ -513,7 +632,7 @@ fn collect_shadowed_prim_types(file: &syn::File) -> Vec<String> {
     impl Shadowed {
         fn record(&mut self, ident: &syn::Ident) {
             let name = ident.to_string();
-            if is_prim_type_name(&name) || matches!(name.as_str(), "core" | "std") {
+            if is_prim_type_name(&name) || matches!(name.as_str(), "core" | "std" | "From") {
                 self.0.insert(name);
             }
         }
@@ -566,6 +685,13 @@ fn collect_shadowed_prim_types(file: &syn::File) -> Vec<String> {
         }
     }
     let mut found = Shadowed(BTreeSet::new());
+    if file
+        .attrs
+        .iter()
+        .any(|a| a.path().is_ident("no_implicit_prelude"))
+    {
+        found.0.insert("From".to_string());
+    }
     found.visit_file(file);
     found.0.into_iter().collect()
 }
@@ -2126,15 +2252,24 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                     );
                 }
             } else if let Some((op, assign)) = arith_op(&node.op) {
-                let (local_types, shadowed_prims) =
-                    if !assign && matches!(op, ArithOp::BitOr | ArithOp::BitXor) {
-                        (
-                            self.referenced_local_types(&node.left, &node.right),
-                            self.shadowed_prims.clone(),
-                        )
-                    } else {
-                        (Vec::new(), Vec::new())
-                    };
+                // Two literals have no type until the context gives them one, and a
+                // probe is a context of its own.
+                let literals = is_literal(&node.left) && is_literal(&node.right);
+                let is_disjoint_candidate =
+                    !assign && matches!(op, ArithOp::BitOr | ArithOp::BitXor);
+                let (local_types, shadowed_prims) = if is_disjoint_candidate {
+                    (
+                        self.referenced_local_types(&node.left, &node.right),
+                        self.shadowed_prims.clone(),
+                    )
+                } else {
+                    (Vec::new(), Vec::new())
+                };
+                let cast_probes = if is_disjoint_candidate && !literals && self.const_depth == 0 {
+                    self.collect_cast_probes(&node.left, &node.right)
+                } else {
+                    Vec::new()
+                };
                 let kind = SiteKind::Arith {
                     op,
                     assign,
@@ -2143,10 +2278,8 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                     gap,
                     local_types,
                     shadowed_prims,
+                    cast_probes,
                 };
-                // Two literals have no type until the context gives them one, and a
-                // probe is a context of its own.
-                let literals = is_literal(&node.left) && is_literal(&node.right);
                 if !literals && (!assign || is_plain_place(&node.left)) {
                     self.push(kind, start, end, node.left.span());
                 } else {

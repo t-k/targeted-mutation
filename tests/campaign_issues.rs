@@ -1482,3 +1482,105 @@ fn covers_cases() {
         "unexpected surrogate boundary gaps: {surrogate_gaps:#?}"
     );
 }
+
+#[test]
+fn runtime_cast_type_probe_handles_inferred_base64_chunks_and_polymorphic_from_e2e() {
+    let path = package("runtime-cast-probe");
+    write(
+        &path,
+        "src/lib.rs",
+        r#"
+type Ptr = *mut u8;
+
+pub fn encode_base64_bytes(bytes: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(bytes.len().div_ceil(3) * 4);
+    for chunk in bytes.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied().unwrap_or(0);
+        let third = chunk.get(2).copied().unwrap_or(0);
+        let block = ((first as u32) << 16) | ((second as u32) << 8) | third as u32;
+        output.push(ALPHABET[((block >> 18) & 0x3f) as usize] as char);
+        output.push(ALPHABET[((block >> 12) & 0x3f) as usize] as char);
+        output.push(if chunk.len() > 1 {
+            ALPHABET[((block >> 6) & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+        output.push(if chunk.len() > 2 {
+            ALPHABET[(block & 0x3f) as usize] as char
+        } else {
+            '='
+        });
+    }
+    output
+}
+
+pub fn ptr_cast_reborrow(p: &mut u8) -> usize {
+    let a = ((p as *mut u8) as usize) | 1;
+    let b = ((p as Ptr) as usize) | 1;
+    *p = 0;
+    a.wrapping_add(b)
+}
+
+pub fn generic_from_fallback<T: Copy>(hi: u8, lo: T) -> u32
+where
+    u32: From<T>,
+{
+    ((hi as u32) << 8) | u32::from(lo)
+}
+
+#[test]
+fn exercises_encoders() {
+    assert_eq!(encode_base64_bytes(b"Man"), "TWFu");
+    assert_eq!(encode_base64_bytes(b"Ma"), "TWE=");
+    assert_eq!(encode_base64_bytes(b"M"), "TQ==");
+    let mut x = 1u8;
+    assert_ne!(ptr_cast_reborrow(&mut x), 0);
+    assert_eq!(x, 0);
+    // Generic `T` falls back to `CastAny` (None), keeping `|` -> `^` conservative.
+    assert_eq!(generic_from_fallback(0x01, 0x02u8), 0x0102);
+    assert_eq!(generic_from_fallback(0x01, 0x0002u16), 0x0102);
+}
+"#,
+    );
+    let run = command(&path, &["--quiet", "--json", "--no-effects"])
+        .output()
+        .unwrap();
+    let report = json(&run, 2);
+    let findings = report["findings"].as_array().unwrap();
+
+    // 1. `encode_base64_bytes` with inferred `chunks(3)` / `get().copied().unwrap_or(0)`
+    // must not emit `|` -> `^` INPUT GAPs.
+    let base64_xor_gaps: Vec<&Value> = findings
+        .iter()
+        .filter(|f| {
+            f["item"].as_str() == Some("encode_base64_bytes")
+                && f["survivors"]
+                    .as_array()
+                    .is_some_and(|s| s.iter().any(|v| v.as_str().unwrap_or("").contains('^')))
+        })
+        .collect();
+    assert!(
+        base64_xor_gaps.is_empty(),
+        "unexpected base64 | -> ^ gaps: {base64_xor_gaps:#?}"
+    );
+
+    // 2. Both `as *mut u8` and `as Ptr` (pointer alias) reborrows compile with 0 skipped sites,
+    // and generic `u32::from(lo)` stays conservative and reports `|` -> `^`.
+    assert_eq!(
+        report["skipped_sites"].as_u64(),
+        Some(0),
+        "expected no skipped sites (including ptr_cast_reborrow): {report:#}"
+    );
+    assert!(
+        findings.iter().any(|f| {
+            f["item"].as_str() == Some("generic_from_fallback")
+                && f["kind"].as_str() == Some("input_gap")
+                && f["survivors"]
+                    .as_array()
+                    .is_some_and(|s| s.iter().any(|v| v.as_str().unwrap_or("").contains('^')))
+        }),
+        "expected generic_from_fallback | -> ^ input gap in {findings:#?}"
+    );
+}
