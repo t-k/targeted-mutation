@@ -118,7 +118,11 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                 )
             }
             SiteKind::Arith {
-                op, assign, gap, ..
+                op,
+                assign,
+                gap,
+                cast_probes,
+                ..
             } => {
                 // A compound assignment hands the probe the place to update.
                 let (holder, lhs_open, lhs_close) = if *assign {
@@ -126,6 +130,29 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                 } else {
                     ("Ar", "", "")
                 };
+                for &(slot, start, end) in cast_probes {
+                    let wider = 2 * (end - start) as i64 + 1;
+                    edits.push(Edit {
+                        pos: start,
+                        end: start,
+                        phase: 2,
+                        order: -wider,
+                        text: "(match (".into(),
+                        site: site.id,
+                    });
+                    edits.push(Edit {
+                        pos: end,
+                        end,
+                        phase: 0,
+                        order: wider,
+                        text: format!(
+                            ") {{ __tmt_v => {{ #[allow(unused_imports)] use {rt}::{{CastAny as _, CastPrim as _}}; \
+                             {rt}::record_cast({id}u32, {slot}u32, (&{rt}::W(&__tmt_v)).tmt_cast_bounds()); __tmt_v }} }})",
+                            id = site.id,
+                        ),
+                        site: site.id,
+                    });
+                }
                 edits.push(Edit {
                     pos: gap.0,
                     end: gap.1,

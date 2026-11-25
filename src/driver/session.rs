@@ -230,12 +230,15 @@ impl Session {
 
     /// `primitive` says of a byte range of the file whether it is an arithmetic
     /// operation that was run on primitive numbers.
+    /// `cast_bounds` returns the runtime-observed `[min, max]` bounds of a cast source
+    /// expression at `(start, end)` when every test binary agreed on its primitive type.
     pub(super) fn plan<'a>(
         &'a self,
         file: &str,
         site: &'a Site,
         verify: bool,
         primitive: &dyn Fn(usize, usize) -> bool,
+        cast_bounds: &dyn Fn(usize, usize) -> Option<(i128, i128)>,
     ) -> Planned<'a> {
         let id = site.id;
         let reach_plan = |mutation: Mutation| SitePlan {
@@ -540,6 +543,7 @@ impl Session {
                         gap,
                         local_types,
                         shadowed_prims,
+                        ..
                     } if op.second(*assign).is_some() => {
                         let disjoint_or_xor = !*assign
                             && !merged.differs2
@@ -563,6 +567,7 @@ impl Session {
                                     primitive,
                                     local_types,
                                     shadowed_prims,
+                                    cast_bounds,
                                 )
                             };
                         if disjoint_or_xor {

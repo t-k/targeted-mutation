@@ -891,12 +891,22 @@ pub(super) fn run_cargo_with_progress_interval(
         let (done_tx, done_rx) = mpsc::channel::<()>();
         let state_ref = &state;
         let reporter = scope.spawn(move || {
+            let started = std::time::Instant::now();
+            let mut last_line: Option<String> = None;
             while done_rx.recv_timeout(interval) == Err(mpsc::RecvTimeoutError::Timeout) {
                 let line = state_ref
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .format_line();
-                emit(&line);
+                if last_line.as_deref() == Some(line.as_str()) {
+                    emit(&format!(
+                        "{line} ({}s elapsed)",
+                        started.elapsed().as_secs()
+                    ));
+                } else {
+                    emit(&line);
+                    last_line = Some(line);
+                }
             }
         });
 

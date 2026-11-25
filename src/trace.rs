@@ -37,6 +37,9 @@ pub struct Trace {
     /// Ranges `a..b` that some test ran with `b` at the largest value of its type.
     pub ranges_at_top: BTreeSet<u32>,
     pub bounds: BTreeMap<u32, TypeBounds>,
+    /// `(site, slot)` -> observed source type bounds for a cast/`from` operand inside `|`/`^`,
+    /// or `None` when observed as non-primitive or polymorphically across distinct types.
+    pub cast_bounds: BTreeMap<(u32, u32), Option<(i128, i128)>>,
     pub malformed_lines: usize,
 }
 
@@ -211,6 +214,24 @@ impl Trace {
                 };
                 self.bounds.insert(site.parse().ok()?, bounds);
             }
+            ["C", site, slot, min, max] => {
+                let key = (site.parse().ok()?, slot.parse().ok()?);
+                let observed = if min == "-" && max == "-" {
+                    None
+                } else {
+                    let lo: i128 = min.parse().ok()?;
+                    let hi: i128 = max.parse().ok()?;
+                    Some((lo <= hi).then_some((lo, hi))?)
+                };
+                self.cast_bounds
+                    .entry(key)
+                    .and_modify(|existing| {
+                        if *existing != observed {
+                            *existing = None;
+                        }
+                    })
+                    .or_insert(observed);
+            }
             _ => return None,
         }
         Some(())
@@ -287,6 +308,8 @@ mod tests {
             "A\t3\ttests::a\t1",
             "B\t3\ttests::a\t1",
             "T\t3\t0\t255\t0\t255",
+            "C\t3\t0\t0\t255",
+            "C\t3\t1\t-\t-",
         ] {
             let (short, _) = record.rsplit_once('\t').unwrap();
             let long = format!("{record}\t");
@@ -869,6 +892,30 @@ mod tests {
             (&tmt_rt::W(&'\u{e000}')).tmt_val(),
             Val::Int(0xD800, 0, 0x10_D7FF)
         );
+        {
+            use tmt_rt::{CastAny as _, CastPrim as _};
+            assert_eq!((&tmt_rt::W(&7u8)).tmt_cast_bounds(), Some((0, 255)));
+            assert_eq!((&tmt_rt::W(&-1i8)).tmt_cast_bounds(), Some((-128, 127)));
+            assert_eq!((&tmt_rt::W(&true)).tmt_cast_bounds(), Some((0, 1)));
+            assert_eq!((&tmt_rt::W(&'a')).tmt_cast_bounds(), Some((0, 0x1f_ffff)));
+            assert_eq!((&tmt_rt::W(&1.5f64)).tmt_cast_bounds(), None);
+            assert_eq!((&tmt_rt::W("text")).tmt_cast_bounds(), None);
+        }
+        // Polymorphic or conflicting cast bounds collapse to None; reversed bounds are malformed.
+        let poly = Trace::parse(
+            "C\t5\t0\t0\t255\n\
+             C\t5\t0\t0\t255\n\
+             C\t5\t1\t0\t255\n\
+             C\t5\t1\t0\t65535\n\
+             C\t5\t2\t0\t255\n\
+             C\t5\t2\t-\t-\n\
+             C\t5\t3\t10\t5\n",
+        );
+        assert_eq!(poly.malformed_lines, 1);
+        assert_eq!(poly.cast_bounds.get(&(5, 0)), Some(&Some((0, 255))));
+        assert_eq!(poly.cast_bounds.get(&(5, 1)), Some(&None));
+        assert_eq!(poly.cast_bounds.get(&(5, 2)), Some(&None));
+        assert!(!poly.cast_bounds.contains_key(&(5, 3)));
 
         for (a, b) in [(1, 2), (2, 2), (3, 2)] {
             assert_eq!(

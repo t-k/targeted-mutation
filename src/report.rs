@@ -2159,7 +2159,15 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
         out.push_str("(partial evaluation: some mutants were not built or evaluated)\n");
     }
     if report.evaluation == Some(Evaluation::NoMutantsExecuted) {
-        out.push_str("No mutants executed. See any skipped entries in --json. For a subprocess that clears the probe environment, try --source-only.\n");
+        if report.unreached.is_empty()
+            && report.mutants_not_evaluated == 0
+            && report.mutants_not_built == 0
+            && (report.unviable_mutants > 0 || report.skipped_sites > 0)
+        {
+            out.push_str("No mutants executed. See any skipped entries in --json.\n");
+        } else {
+            out.push_str("No mutants executed. See any skipped entries in --json. For a subprocess that clears the probe environment, try --source-only.\n");
+        }
     }
     if !show_unreached && !report.unreached.is_empty() {
         out.push_str("(--show-unreached lists the code no test executes)\n");
@@ -2181,6 +2189,24 @@ mod tests {
         report.record_evaluation();
         assert_eq!(report.evaluation, Some(Evaluation::NoMutantsExecuted));
         assert!(render_text(&report, false).contains("No mutants executed."));
+        assert!(render_text(&report, false).contains("--source-only"));
+        // When every candidate was skipped as unviable/uncompilable with no unreached,
+        // unbuilt, or unevaluated sites, suggesting --source-only would not help.
+        report.unviable_mutants = 1;
+        let unbuildable_text = render_text(&report, false);
+        assert!(unbuildable_text.contains("No mutants executed."));
+        assert!(
+            !unbuildable_text.contains("--source-only"),
+            "{unbuildable_text}"
+        );
+        // Mixed with unevaluated or unbuilt candidates keeps the --source-only hint.
+        report.mutants_not_evaluated = 1;
+        assert!(render_text(&report, false).contains("--source-only"));
+        report.mutants_not_evaluated = 0;
+        report.mutants_not_built = 1;
+        assert!(render_text(&report, false).contains("--source-only"));
+        report.mutants_not_built = 0;
+        report.unviable_mutants = 0;
         report.mutants_run = 1;
         report.mutants_killed = 1;
         report.record_evaluation();
@@ -2362,6 +2388,7 @@ mod tests {
             gap: (0, 0),
             local_types: vec![],
             shadowed_prims: vec![],
+            cast_probes: vec![],
         }
     }
 
@@ -2733,6 +2760,7 @@ mod tests {
                 gap: (0, 0),
                 local_types: vec![],
                 shadowed_prims: vec![],
+                cast_probes: vec![],
             },
             ..assign.clone()
         };

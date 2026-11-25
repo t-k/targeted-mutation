@@ -755,7 +755,24 @@ fn run_package(
             .iter()
             .filter(|candidate| !candidate.existing)
             .count();
-    note(&format!("{} sites in {} files", total_sites, files.len()));
+    let files_with_sites = files
+        .iter()
+        .filter(|f| {
+            !f.sites.is_empty()
+                || !f.rebuild_sites.is_empty()
+                || witness_candidates
+                    .iter()
+                    .any(|c| !c.existing && c.file == f.path)
+        })
+        .count();
+    note(&format!(
+        "{total_sites} sites in {files_with_sites} {}",
+        if files_with_sites == 1 {
+            "file"
+        } else {
+            "files"
+        }
+    ));
     if options.source_only {
         for file in &mut files {
             file.rebuild_sites.append(&mut file.sites);
@@ -1637,7 +1654,37 @@ fn run_package(
                         }
                 })
             };
-            let plan = match session.plan(&file.display, site, options.verify, &primitive) {
+            let cast_bounds = |from: usize, to: usize| -> Option<(i128, i128)> {
+                let (owner_id, slot) = file.sites.iter().find_map(|other| {
+                    if disabled.contains(&other.id) {
+                        return None;
+                    }
+                    let SiteKind::Arith { cast_probes, .. } = &other.kind else {
+                        return None;
+                    };
+                    cast_probes
+                        .iter()
+                        .find(|&&(_, start, end)| start == from && end == to)
+                        .map(|&(slot, _, _)| (other.id, slot))
+                })?;
+                let mut recorded = session
+                    .binaries
+                    .iter()
+                    .filter_map(|b| b.trace.cast_bounds.get(&(owner_id, slot)));
+                let first = recorded.next()?;
+                if recorded.all(|other| other == first) {
+                    *first
+                } else {
+                    None
+                }
+            };
+            let plan = match session.plan(
+                &file.display,
+                site,
+                options.verify,
+                &primitive,
+                &cast_bounds,
+            ) {
                 // Code that did not change is not said to be unreached here: that takes
                 // a run of the whole.
                 Planned::Unreached if beyond.contains(&site.id) => continue,
