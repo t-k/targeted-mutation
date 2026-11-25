@@ -904,6 +904,15 @@ impl LogicObs {
     fn rhs_decided(&self, and: bool) -> bool {
         if and { self.rhs_false } else { self.rhs_true }
     }
+
+    /// Every observed evaluation produced a boolean value where `a && b == a || b`
+    /// (all `(false, false)` for `||`, or all `(true, true)` for `&&`).
+    ///
+    /// When the right operand only started without producing a value (panic / early exit),
+    /// swapping the operator skips that evaluation, so this returns `false`.
+    pub fn swap_never_changes_value(&self, and: bool) -> bool {
+        !self.short && !self.rhs_decided(and) && (self.rhs_true || self.rhs_false)
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
@@ -2358,5 +2367,38 @@ mod tests {
         if op.is_ordering() && obs.reached() {
             assert!(infects(op, Mutation::Shift(1), obs), "{ctx}");
         }
+    }
+
+    #[test]
+    fn logic_swap_never_changes_value_matches_pict_table() {
+        let table = include_str!("../tests/data/logic-swap.pict.tsv");
+        let mut rows = 0;
+        for line in table.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+            let cols: Vec<&str> = line.split('\t').collect();
+            assert_eq!(cols.len(), 5, "unexpected row: {line}");
+            let and = match cols[0] {
+                "and" => true,
+                "or" => false,
+                other => panic!("unexpected LogicOp: {other}"),
+            };
+            let obs = LogicObs {
+                short: cols[1] == "true",
+                rhs_true: cols[2] == "true",
+                rhs_false: cols[3] == "true",
+                rhs_started: cols[4] == "true",
+            };
+            let expected = if and {
+                !obs.short && obs.rhs_true && !obs.rhs_false
+            } else {
+                !obs.short && !obs.rhs_true && obs.rhs_false
+            };
+            assert_eq!(
+                obs.swap_never_changes_value(and),
+                expected,
+                "row={line} obs={obs:?}"
+            );
+            rows += 1;
+        }
+        assert!(rows >= 9, "expected PICT table rows, got {rows}");
     }
 }

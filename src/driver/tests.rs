@@ -3743,3 +3743,61 @@ fn workspace_report_prefix_preserves_literal_backslashes_on_unix_and_keeps_crate
         r"crates/a\b/"
     );
 }
+
+#[test]
+fn describe_effects_skips_unknown_test_marker_in_multi_test_list() {
+    let source = "fn f(s: &mut S) -> bool { s.reset(); s.count > 1 }";
+    let discovered = instrument::discover(source, 0).unwrap();
+    let sites: BTreeMap<u32, (&str, &Site)> = discovered
+        .sites
+        .iter()
+        .map(|s| (s.id, ("src/lib.rs", s)))
+        .collect();
+    let set = |items: &[Change]| items.iter().cloned().collect::<BTreeSet<_>>();
+
+    let stmt_id = discovered
+        .sites
+        .iter()
+        .find(|s| matches!(s.kind, SiteKind::Stmt))
+        .expect("stmt site")
+        .id;
+    let cmp_id = discovered
+        .sites
+        .iter()
+        .find(|s| matches!(s.kind, SiteKind::Cmp { .. }))
+        .expect("cmp site")
+        .id;
+
+    // UNKNOWN_TEST ("?") sorts before alphabetic test names in BTreeMap, so mixed lists
+    // must pick the first named test as representative and never display raw `?`.
+    let mut mixed = BTreeMap::new();
+    mixed.insert(
+        UNKNOWN_TEST.to_string(),
+        set(&[Change::NowRuns { site: stmt_id }]),
+    );
+    mixed.insert(
+        "tests::alpha".to_string(),
+        set(&[Change::NowRuns { site: stmt_id }]),
+    );
+    mixed.insert(
+        "tests::beta".to_string(),
+        set(&[Change::NowRuns { site: stmt_id }]),
+    );
+    let lines = describe_effects(&mixed, &sites);
+    assert_eq!(
+        lines,
+        ["with the mutant, `tests::alpha` (and 2 more) now runs `s.reset();` (src/lib.rs:1)"]
+    );
+    assert!(lines.iter().all(|line| !line.contains("`?`")));
+
+    // Single UNKNOWN_TEST still renders as "a test".
+    let mut only_unknown = BTreeMap::new();
+    only_unknown.insert(
+        UNKNOWN_TEST.to_string(),
+        set(&[Change::NoLongerRuns { site: cmp_id }]),
+    );
+    assert_eq!(
+        describe_effects(&only_unknown, &sites),
+        ["with the mutant, a test no longer runs `s.count > 1` (src/lib.rs:1)"]
+    );
+}

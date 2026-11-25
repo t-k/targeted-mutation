@@ -169,6 +169,10 @@ pub(super) struct SitePlan<'a> {
     pub(super) cannot_differ: bool,
     /// The expression had a single value in every test.
     pub(super) constant: bool,
+    /// For `&&` / `||`, every observed evaluation produced a boolean value where
+    /// `a && b == a || b`: if `LogicSwap` survives, it is a redundant constant survivor
+    /// rather than an assertion gap.
+    pub(super) redundant_logic_swap: bool,
     /// Mutations some test observes differently.
     pub(super) run: Vec<Mutation>,
     /// Tests of a binary whose execution the mutation can change.
@@ -196,6 +200,7 @@ pub(super) struct SiteWork<'a> {
     pub(super) gaps: Vec<ConfirmedGap>,
     pub(super) constant: bool,
     pub(super) cannot_differ: bool,
+    pub(super) redundant_logic_swap: bool,
     pub(super) runs: Vec<(Mutation, usize)>,
 }
 
@@ -237,6 +242,7 @@ impl Session {
             gaps: vec![],
             constant: false,
             cannot_differ: false,
+            redundant_logic_swap: false,
             run: vec![mutation],
             infected: Box::new(move |bin, _| bin.trace.reach.get(&id).cloned().unwrap_or_default()),
             reaching: Box::new(move |bin| bin.trace.reach.get(&id).cloned().unwrap_or_default()),
@@ -281,6 +287,7 @@ impl Session {
                 SitePlan {
                     constant: false,
                     cannot_differ: false,
+                    redundant_logic_swap: false,
                     gaps,
                     run: guard_plan.run.into_iter().filter(allowed).collect(),
                     infected: Box::new(move |bin, m| {
@@ -441,6 +448,7 @@ impl Session {
                     gaps,
                     constant,
                     cannot_differ: cmp_plan.cannot_differ,
+                    redundant_logic_swap: false,
                     run: cmp_plan.run,
                     infected: Box::new(move |bin, m| {
                         tests_where(bin.trace.cmp.get(&id), |obs| plan::infects(op, m, obs))
@@ -484,6 +492,8 @@ impl Session {
                 SitePlan {
                     constant: merged.constant_value(and).is_some(),
                     cannot_differ: false,
+                    redundant_logic_swap: merged.swap_never_changes_value(and)
+                        && instrument::is_pure_logic_operand(rhs),
                     gaps,
                     run: logic_plan.run,
                     infected: Box::new(move |bin, m| {
@@ -522,10 +532,39 @@ impl Session {
                         (Mutation::RoundAlt1, merged),
                         (Mutation::RoundAlt2, merged.second()),
                     ],
-                    SiteKind::Arith { op, assign, .. } if op.second(*assign).is_some() => vec![
-                        (Mutation::ArithSwap, merged),
-                        (Mutation::ArithSwap2, merged.second()),
-                    ],
+                    SiteKind::Arith {
+                        op,
+                        assign,
+                        lhs,
+                        rhs,
+                        gap,
+                    } if op.second(*assign).is_some() => {
+                        let disjoint_or_xor = !*assign
+                            && !merged.differs2
+                            && matches!(
+                                op,
+                                instrument::ArithOp::BitOr | instrument::ArithOp::BitXor
+                            )
+                            && {
+                                let mut recorded =
+                                    self.binaries.iter().filter_map(|b| b.trace.bounds.get(&id));
+                                let bounds = recorded
+                                    .next()
+                                    .filter(|first| recorded.all(|other| other == *first))
+                                    .map(|b| b.lhs);
+                                instrument::disjoint_bits(
+                                    lhs, site.start, rhs, gap.1, bounds, primitive,
+                                )
+                            };
+                        if disjoint_or_xor {
+                            vec![(Mutation::ArithSwap, merged)]
+                        } else {
+                            vec![
+                                (Mutation::ArithSwap, merged),
+                                (Mutation::ArithSwap2, merged.second()),
+                            ]
+                        }
+                    }
                     _ => vec![(Mutation::ArithSwap, merged)],
                 };
                 // A `first()` that did not give the first element of the sequence is a
@@ -580,6 +619,7 @@ impl Session {
                     gaps,
                     constant: false,
                     cannot_differ: false,
+                    redundant_logic_swap: false,
                     run,
                     infected: Box::new(move |bin, m| {
                         tests_where(bin.trace.arith.get(&id), |obs| obs.infected_by(m))
@@ -620,6 +660,7 @@ impl Session {
                 SitePlan {
                     constant: false,
                     cannot_differ: false,
+                    redundant_logic_swap: false,
                     gaps,
                     run: return_plan.run,
                     infected: Box::new(move |bin, m| {

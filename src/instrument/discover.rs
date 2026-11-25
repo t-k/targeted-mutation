@@ -542,8 +542,8 @@ fn has_conditional_or_skip_attr(expr: &syn::Expr) -> bool {
 /// Statements whose removal is a plausible bug: a forgotten call, check or update.
 fn deletable(expr: &syn::Expr) -> bool {
     match expr {
-        syn::Expr::Call(e) => e.attrs.is_empty(),
-        syn::Expr::MethodCall(e) => e.attrs.is_empty(),
+        syn::Expr::Call(e) => e.attrs.is_empty() && !is_capacity_hint_reserve_call(e),
+        syn::Expr::MethodCall(e) => e.attrs.is_empty() && !is_capacity_hint_reserve_stmt(e),
         syn::Expr::Assign(e) => e.attrs.is_empty() && !has_conditional_or_skip_attr(&e.left),
         // An attribute in front of `a += 1` belongs to `a`, never to the operation.
         // Allow harmless lint attributes (`#[allow(..)]`), but never wrap `#[cfg(..)]`
@@ -649,9 +649,155 @@ pub(super) fn variable_name(receiver: &str) -> Option<String> {
     (!first.is_uppercase()).then_some(name)
 }
 
+/// Standard library and common ecosystem collection type names whose `with_capacity`,
+/// `with_capacity_and_hasher`, `reserve`, and `reserve_exact` calls take a non-functional
+/// capacity hint.
+const CAPACITY_HINT_TYPES: &[&str] = &[
+    "Vec",
+    "String",
+    "VecDeque",
+    "BinaryHeap",
+    "HashMap",
+    "HashSet",
+    "OsString",
+    "PathBuf",
+    "CString",
+    "BytesMut",
+    "SmallVec",
+    "IndexMap",
+    "IndexSet",
+];
+
+fn is_standard_capacity_path(path: &syn::Path) -> bool {
+    let len = path.segments.len();
+    if len < 2 {
+        return false;
+    }
+    let ty = path.segments[len - 2].ident.to_string();
+    if !CAPACITY_HINT_TYPES.contains(&ty.as_str()) {
+        return false;
+    }
+    // Reject local module prefixes like `domain::Vec::with_capacity` while allowing
+    // unqualified `Vec::...` and standard-library paths (`std::...`, `alloc::...`, `core::...`).
+    if len > 2 {
+        let root = path.segments[0].ident.to_string();
+        if !matches!(root.as_str(), "std" | "alloc" | "core") {
+            return false;
+        }
+    }
+    true
+}
+
+fn is_plain_mut_place(expr: &syn::Expr) -> bool {
+    match expr {
+        syn::Expr::Paren(e) => is_plain_mut_place(&e.expr),
+        syn::Expr::Group(e) => is_plain_mut_place(&e.expr),
+        syn::Expr::Reference(e) => is_plain_place(&e.expr),
+        other => is_plain_place(other),
+    }
+}
+
+fn is_pure_capacity_expr(expr: &syn::Expr) -> bool {
+    const PURE_CAP_METHODS: &[&str] = &[
+        "len",
+        "capacity",
+        "div_ceil",
+        "saturating_add",
+        "saturating_sub",
+        "saturating_mul",
+        "wrapping_add",
+        "wrapping_sub",
+        "wrapping_mul",
+        "max",
+        "min",
+        "clamp",
+        "next_power_of_two",
+        "count_ones",
+        "count_zeros",
+    ];
+    match expr {
+        syn::Expr::Lit(_) | syn::Expr::Path(_) => true,
+        syn::Expr::Paren(e) => is_pure_capacity_expr(&e.expr),
+        syn::Expr::Group(e) => is_pure_capacity_expr(&e.expr),
+        syn::Expr::Field(e) => is_pure_capacity_expr(&e.base),
+        syn::Expr::Cast(e) => is_pure_capacity_expr(&e.expr),
+        syn::Expr::Reference(e) => e.mutability.is_none() && is_pure_capacity_expr(&e.expr),
+        syn::Expr::Unary(e) => is_pure_capacity_expr(&e.expr),
+        syn::Expr::Binary(e) => {
+            !is_assign_op(&e.op)
+                && is_pure_capacity_expr(&e.left)
+                && is_pure_capacity_expr(&e.right)
+        }
+        syn::Expr::MethodCall(e) => {
+            PURE_CAP_METHODS.contains(&e.method.to_string().as_str())
+                && is_pure_capacity_expr(&e.receiver)
+                && e.args.iter().all(is_pure_capacity_expr)
+        }
+        _ => false,
+    }
+}
+
+fn is_capacity_hint_method(node: &syn::ExprMethodCall) -> bool {
+    // Only `reserve_exact` is unambiguous as a collection capacity hint on arbitrary
+    // receivers; `reserve` is common on domain types (e.g. `account.reserve(amount)`).
+    node.args.len() == 1 && node.method == "reserve_exact" && is_pure_capacity_expr(&node.args[0])
+}
+
+/// Returns the argument index of a standard capacity-hint associated call
+/// (e.g. `Vec::with_capacity(n)`, `HashMap::with_capacity_and_hasher(n, hasher)`,
+/// `Vec::reserve(&mut v, n)`, `Vec::reserve_exact(&mut v, n)`) when the capacity
+/// argument itself is a pure capacity expression.
+fn capacity_hint_arg_index(node: &syn::ExprCall) -> Option<usize> {
+    let mut func = &*node.func;
+    while let syn::Expr::Paren(syn::ExprParen { expr, .. })
+    | syn::Expr::Group(syn::ExprGroup { expr, .. }) = func
+    {
+        func = expr;
+    }
+    let syn::Expr::Path(path) = func else {
+        return None;
+    };
+    if !is_standard_capacity_path(&path.path) {
+        return None;
+    }
+    let method = path.path.segments.last()?.ident.to_string();
+    let idx = match (method.as_str(), node.args.len()) {
+        ("with_capacity", 1) | ("with_capacity_and_hasher", 2) => 0,
+        ("reserve" | "reserve_exact", 2) => 1,
+        _ => return None,
+    };
+    is_pure_capacity_expr(&node.args[idx]).then_some(idx)
+}
+
+fn is_capacity_hint_reserve_call(node: &syn::ExprCall) -> bool {
+    let mut func = &*node.func;
+    while let syn::Expr::Paren(syn::ExprParen { expr, .. })
+    | syn::Expr::Group(syn::ExprGroup { expr, .. }) = func
+    {
+        func = expr;
+    }
+    let syn::Expr::Path(path) = func else {
+        return false;
+    };
+    if !is_standard_capacity_path(&path.path) || node.args.len() != 2 {
+        return false;
+    }
+    let Some(method) = path.path.segments.last().map(|s| s.ident.to_string()) else {
+        return false;
+    };
+    matches!(method.as_str(), "reserve" | "reserve_exact")
+        && is_plain_mut_place(&node.args[0])
+        && is_pure_capacity_expr(&node.args[1])
+}
+
+fn is_capacity_hint_reserve_stmt(node: &syn::ExprMethodCall) -> bool {
+    is_capacity_hint_method(node) && is_plain_place(&node.receiver)
+}
+
 fn deletable_call(expr: &syn::Expr) -> bool {
     match expr {
-        syn::Expr::Call(_) | syn::Expr::MethodCall(_) => true,
+        syn::Expr::Call(call) => !is_capacity_hint_reserve_call(call),
+        syn::Expr::MethodCall(call) => !is_capacity_hint_reserve_stmt(call),
         syn::Expr::Await(e) => deletable_call(&e.base),
         _ => false,
     }
@@ -891,7 +1037,24 @@ impl<'ast> Visit<'ast> for Finder<'_> {
         visit::visit_block(self, node);
     }
 
+    fn visit_expr_call(&mut self, node: &'ast syn::ExprCall) {
+        if let Some(skip_arg) = capacity_hint_arg_index(node) {
+            self.visit_expr(&node.func);
+            for (index, arg) in node.args.iter().enumerate() {
+                if index != skip_arg {
+                    self.visit_expr(arg);
+                }
+            }
+            return;
+        }
+        visit::visit_expr_call(self, node);
+    }
+
     fn visit_expr_method_call(&mut self, node: &'ast syn::ExprMethodCall) {
+        if is_capacity_hint_method(node) {
+            self.visit_expr(&node.receiver);
+            return;
+        }
         let name = node.method.to_string();
         if (name == "max" || name == "min")
             && node.args.len() == 1

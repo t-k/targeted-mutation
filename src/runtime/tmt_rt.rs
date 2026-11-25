@@ -1039,6 +1039,10 @@ pub trait ArithNum: Copy {
     fn tmt_real(op: u8, a: Self, b: Self) -> Self;
     /// The result as bits, or `None` where the real operator would overflow or divide by zero.
     fn tmt_safe(op: u8, a: Self, b: Self) -> Option<u64>;
+    /// Inclusive `[min, max]` bounds for primitive integers, or `None` for floats.
+    fn tmt_bounds() -> Option<(i128, i128)> {
+        None
+    }
 
     /// Whether the swapped operator gives the same result on these operands.
     ///
@@ -1078,6 +1082,16 @@ pub trait ArithNum: Copy {
                 0
             };
         if st.tracer.is_some() && !bits_known(b'A', site, everything) {
+            if matches!(op, BITOR | BITXOR) {
+                if let Some((min, max)) = Self::tmt_bounds() {
+                    with_tracer(|t, _| {
+                        if t.typed.insert(site) {
+                            let line = format!("T\t{}\t{}\t{}\t{}\t{}\n", site, min, max, min, max);
+                            write_line(&mut t.out, &line);
+                        }
+                    });
+                }
+            }
             let mut bits = if Self::tmt_same(op, arith_swapped(op), a, b) {
                 ARITH_SAME
             } else {
@@ -1191,6 +1205,9 @@ macro_rules! tmt_arith_ints {
                     _ => amount.and_then(|n| a.checked_shr(n)),
                 }
                 .map(|v| v as u64)
+            }
+            fn tmt_bounds() -> Option<(i128, i128)> {
+                Some((<$t>::MIN as i128, <$t>::MAX as i128))
             }
         }
         impl BitPrim for Ar<$t, $t> {

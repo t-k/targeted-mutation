@@ -3280,3 +3280,166 @@ fn panicking_clamp(x: i32, d: i32) -> i32 {
             .any(|s| matches!(s.kind, SiteKind::LiteralSet { .. }))
     );
 }
+
+#[test]
+fn disjoint_bits_matches_pict_table() {
+    let table = include_str!("../../tests/data/bit-disjoint.pict.tsv");
+    let all_primitive = |_: usize, _: usize| true;
+    let no_primitive = |_: usize, _: usize| false;
+    let mut rows = 0;
+    for line in table.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let cols: Vec<&str> = line.split('\t').collect();
+        assert_eq!(cols.len(), 5, "unexpected row: {line}");
+        let (op, int_type, lhs_shape, rhs_shape) = (cols[0], cols[1], cols[2], cols[3]);
+        let bounds = match int_type {
+            "u8" => Some((u8::MIN as i128, u8::MAX as i128)),
+            "u16" => Some((u16::MIN as i128, u16::MAX as i128)),
+            "i8" => Some((i8::MIN as i128, i8::MAX as i128)),
+            "unknown" => None,
+            other => panic!("unexpected IntType: {other}"),
+        };
+        let lhs = match lhs_shape {
+            "shl4" => "a << 4",
+            "shl2" => "a << 2",
+            "mask_hi" => "a & 0xf0",
+            "cast_u8_shl8" => "((a as u8) as u16) << 8",
+            "plain" => "a",
+            other => panic!("unexpected LhsShape: {other}"),
+        };
+        let rhs = match rhs_shape {
+            "shr4" => "b >> 4",
+            "shr2" => "b >> 2",
+            "mask_lo" => "b & 0x0f",
+            "lit_low" => "0x03",
+            "rem_4" => "b % 4",
+            "plain" => "b",
+            other => panic!("unexpected RhsShape: {other}"),
+        };
+        let actual = super::disjoint_bits(lhs, 0, rhs, 100, bounds, &all_primitive);
+        let expected = match (int_type, lhs_shape, rhs_shape) {
+            // u8: shl4 => 0xF0, shl2 => 0xFC, mask_hi => 0xF0, cast_u8_shl8 => 0xFF (shift >= 8)
+            // u8 rhs: shr4 => 0x0F, shr2 => 0x3F, mask_lo => 0x0F, lit_low => 0x03, rem_4 => 0x03
+            ("u8", "shl4" | "mask_hi", "shr4" | "mask_lo" | "lit_low" | "rem_4") => true,
+            ("u8", "shl2", "lit_low" | "rem_4") => true,
+            // u16: shl4 => 0xFFF0, shl2 => 0xFFFC, mask_hi => 0x00F0, cast_u8_shl8 => 0xFF00
+            // u16 rhs: shr4 => 0x0FFF, shr2 => 0x3FFF, mask_lo => 0x000F, lit_low => 0x0003, rem_4 => 0x0003
+            ("u16", "shl4" | "mask_hi" | "cast_u8_shl8", "mask_lo" | "lit_low" | "rem_4") => true,
+            ("u16", "shl2", "lit_low" | "rem_4") => true,
+            // i8: arithmetic shr and rem are signed => conservative 0xFF; shl4 => 0xF0, mask_hi => 0xF0, shl2 => 0xFC
+            ("i8", "shl4" | "mask_hi", "mask_lo" | "lit_low") => true,
+            ("i8", "shl2", "lit_low") => true,
+            // unknown bounds: conservative false (no runtime type width proof)
+            _ => false,
+        };
+        assert_eq!(
+            actual, expected,
+            "op={op} type={int_type} lhs={lhs} rhs={rhs}"
+        );
+        rows += 1;
+    }
+    assert!(rows >= 30, "expected full PICT table, got {rows} rows");
+
+    // Non-primitive (overloaded) inner operators must never be assumed to mask bits.
+    assert!(!super::disjoint_bits(
+        "flags & 0xf0",
+        0,
+        "0x0f",
+        100,
+        Some((u8::MIN as i128, u8::MAX as i128)),
+        &no_primitive,
+    ));
+
+    // i128 bounds must not overflow during signed width detection.
+    assert!(super::disjoint_bits(
+        "a << 4",
+        0,
+        "0x0f",
+        100,
+        Some((i128::MIN, i128::MAX)),
+        &all_primitive,
+    ));
+    assert!(!super::disjoint_bits(
+        "a << 4",
+        0,
+        "b >> 4",
+        100,
+        Some((i128::MIN, i128::MAX)),
+        &all_primitive,
+    ));
+
+    // Pure vs side-effecting logic right-hand operands.
+    assert!(super::is_pure_logic_operand("value == \"$u\""));
+    assert!(super::is_pure_logic_operand("value.starts_with(\"$E\")"));
+    assert!(!super::is_pure_logic_operand("{ *count += 1; true }"));
+    assert!(!super::is_pure_logic_operand("side_effect()"));
+}
+
+#[test]
+fn capacity_hint_arguments_and_reserve_statements_are_skipped() {
+    let source = r#"
+use std::collections::{HashMap, HashSet, VecDeque};
+
+fn make(groups: usize, n: usize, a: usize, b: usize) {
+    let mut v: Vec<u8> = Vec::with_capacity(groups * 3);
+    let mut s = String::with_capacity(n + 8);
+    let _m: HashMap<usize, usize> = std::collections::HashMap::with_capacity(n * 2);
+    let _d: VecDeque<usize> = VecDeque::with_capacity(n + 1);
+    let _h: HashSet<usize> = HashSet::with_capacity_and_hasher(n * 4, make_hasher(a + b));
+    Vec::reserve(&mut v, n * 3);
+    Vec::reserve_exact(&mut v, n + 2);
+    s.reserve_exact(n + 4);
+    pick_vec(&mut v, a * 2).reserve_exact(n + 16);
+    let _side = Vec::with_capacity({ audit(); n + 11 });
+    let _custom = Quota::with_capacity(n + 7);
+    let _local_vec = domain::Vec::with_capacity(n + 13);
+    account.reserve(n + 9);
+    let _ = v.try_reserve(n * 5);
+    let _ = with_capacity(n * 6);
+}
+"#;
+    let found = discover(source, 0).unwrap();
+    let texts: Vec<&str> = found.sites.iter().map(|s| s.text.as_str()).collect();
+
+    // Standard capacity-hint arithmetic and plain-place reserve statements must be excluded.
+    for skipped in [
+        "groups * 3",
+        "n + 8",
+        "n * 2",
+        "n + 1",
+        "n * 4",
+        "n * 3",
+        "n + 2",
+        "n + 4",
+        "n + 16",
+        "Vec::reserve(&mut v, n * 3);",
+        "Vec::reserve_exact(&mut v, n + 2);",
+        "s.reserve_exact(n + 4);",
+    ] {
+        assert!(
+            !texts.contains(&skipped),
+            "expected `{skipped}` to be skipped, got {texts:?}"
+        );
+    }
+
+    // Non-capacity arguments, side-effecting argument blocks, side-effecting receiver
+    // statements, custom/local-module APIs, receivers, fallible try_reserve, and free
+    // functions stay active.
+    for kept in [
+        "a + b",
+        "a * 2",
+        "pick_vec(&mut v, a * 2).reserve_exact(n + 16);",
+        "audit();",
+        "n + 11",
+        "n + 7",
+        "n + 13",
+        "account.reserve(n + 9);",
+        "n + 9",
+        "n * 5",
+        "n * 6",
+    ] {
+        assert!(
+            texts.contains(&kept),
+            "expected `{kept}` to remain a site, got {texts:?}"
+        );
+    }
+}

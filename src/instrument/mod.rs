@@ -20,8 +20,8 @@ pub use body_values::{body_values, iterator_values};
 #[cfg(test)]
 use cfg::cfg_value;
 pub(crate) use cfg::{
-    cfg_possible_without_test, inactive_ranges, is_skipped, is_test_only, reach,
-    settled_cfg_attributes, test_only_ranges,
+    cfg_possible_without_test, disjoint_bits, inactive_ranges, is_pure_logic_operand, is_skipped,
+    is_test_only, reach, settled_cfg_attributes, test_only_ranges,
 };
 pub use discover::discover;
 #[allow(unused_imports)]

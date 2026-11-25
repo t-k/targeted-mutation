@@ -1696,6 +1696,7 @@ fn run_package(
                 gaps,
                 constant: plan.constant,
                 cannot_differ: plan.cannot_differ,
+                redundant_logic_swap: plan.redundant_logic_swap,
                 runs,
             });
         }
@@ -1744,7 +1745,12 @@ fn run_package(
             item.gaps
                 .iter()
                 .flat_map(|(_, confirm, _)| confirm.iter().copied())
-                .chain(item.runs.iter().map(|(_, job)| *job))
+                .chain(
+                    item.runs
+                        .iter()
+                        .filter(|(m, _)| !(*m == Mutation::LogicSwap && item.redundant_logic_swap))
+                        .map(|(_, job)| *job),
+                )
         })
         .filter(|job| results[*job].survived.is_some())
         .collect();
@@ -1957,6 +1963,10 @@ fn run_package(
         let mut passing_tests = BTreeSet::new();
         for (mutation, job) in &item.runs {
             if let Some(tests) = &results[*job].survived {
+                if *mutation == Mutation::LogicSwap && item.redundant_logic_swap {
+                    report.survivor_breakdown.redundant_constant += 1;
+                    continue;
+                }
                 if beyond.contains(&item.site.id) {
                     match earlier_verdict.get(job) {
                         Some(EarlierVerdict::Killed) => {}
@@ -1976,8 +1986,9 @@ fn run_package(
         }
         if !survivors.is_empty() {
             // The first survivor is traced below to see what it changes.
-            let first = item.runs.iter().find(|(_, job)| {
-                results[*job].survived.is_some()
+            let first = item.runs.iter().find(|(mutation, job)| {
+                !(*mutation == Mutation::LogicSwap && item.redundant_logic_swap)
+                    && results[*job].survived.is_some()
                     && (!beyond.contains(&item.site.id)
                         || earlier_verdict.get(job) == Some(&EarlierVerdict::Killed))
             });
@@ -3819,11 +3830,22 @@ fn describe_effects(
         };
         let code = report::location(file, site).code;
         let at = format!("{file}:{}", site.line);
-        let who = match tests[..] {
-            ["?"] => "a test".to_string(),
-            [one] => format!("`{one}`"),
-            [first, ..] => format!("`{first}` (and {} more)", tests.len() - 1),
-            [] => continue,
+        let who = if tests.is_empty() {
+            continue;
+        } else if let Some(first) = tests
+            .iter()
+            .copied()
+            .find(|test| *test != crate::trace::UNKNOWN_TEST)
+        {
+            if tests.len() == 1 {
+                format!("`{first}`")
+            } else {
+                format!("`{first}` (and {} more)", tests.len() - 1)
+            }
+        } else if tests.len() == 1 {
+            "a test".to_string()
+        } else {
+            format!("a test (and {} more)", tests.len() - 1)
         };
         out.push(match change {
             Change::Returns { value, .. } => {

@@ -1241,3 +1241,147 @@ fn slow_test() {
         "{stderr}"
     );
 }
+
+#[test]
+fn disjoint_bitops_capacity_hints_and_constant_logic_swap_do_not_emit_false_gaps() {
+    let path = package("router-native-noise-fixes");
+    write(
+        &path,
+        "src/lib.rs",
+        r#"pub fn pack_nibbles(hi: u8, lo: u8) -> u8 {
+    (hi << 4) | (lo >> 4)
+}
+
+pub fn build_buf(n: usize) -> String {
+    let mut v: Vec<u8> = Vec::with_capacity(n * 3);
+    v.reserve_exact(n * 2);
+    Vec::reserve(&mut v, n + 4);
+    let mut s = String::with_capacity(n + 8);
+    for _ in 0..n {
+        v.push(b'x');
+        s.push('x');
+    }
+    let _ = v.len();
+    s
+}
+
+pub fn matches_tag(s: &str) -> bool {
+    s == "$undefined" || s == "$u"
+}
+
+pub fn in_range(x: i32) -> bool {
+    x > 0 && x < 10
+}
+
+pub fn side_effect_and(ok: bool, count: &mut usize) -> bool {
+    ok && {
+        *count += 1;
+        true
+    }
+}
+
+#[test]
+fn covers_all() {
+    assert_eq!(pack_nibbles(0x0a, 0xb0), 0xab);
+    assert_eq!(pack_nibbles(0x05, 0x30), 0x53);
+    assert_eq!(build_buf(2), "xx");
+    assert!(!matches_tag("hello"));
+    assert!(in_range(5));
+    let mut c = 0;
+    assert!(side_effect_and(true, &mut c));
+}
+"#,
+    );
+    let run = command(&path, &["--quiet", "--json", "--no-effects"])
+        .output()
+        .unwrap();
+    let report = json(&run, 2);
+    let findings = report["findings"].as_array().unwrap();
+
+    // 1. Disjoint `(hi << 4) | (lo >> 4)` on u8 must not report `|` -> `^` as an INPUT GAP.
+    let bitop_gaps: Vec<&Value> = findings
+        .iter()
+        .filter(|f| f["code"].as_str() == Some("(hi << 4) | (lo >> 4)"))
+        .collect();
+    assert!(
+        bitop_gaps.is_empty(),
+        "unexpected bitop gaps: {bitop_gaps:#?}"
+    );
+
+    // 2. Standard capacity-hint arguments and reserve statements must not report gaps.
+    let cap_gaps: Vec<&Value> = findings
+        .iter()
+        .filter(|f| {
+            matches!(
+                f["code"].as_str(),
+                Some(
+                    "n * 3"
+                        | "n * 2"
+                        | "n + 4"
+                        | "n + 8"
+                        | "v.reserve_exact(n * 2);"
+                        | "Vec::reserve(&mut v, n + 4);"
+                )
+            )
+        })
+        .collect();
+    assert!(
+        cap_gaps.is_empty(),
+        "unexpected capacity gaps: {cap_gaps:#?}"
+    );
+
+    // 3. Pure constant-operand `||` and `&&` must not emit enclosing `ASSERTION GAP` for `||` <-> `&&`.
+    let logic_assertion_gaps: Vec<&Value> = findings
+        .iter()
+        .filter(|f| {
+            f["kind"].as_str() == Some("assertion_gap")
+                && matches!(
+                    f["code"].as_str(),
+                    Some("s == \"$undefined\" || s == \"$u\"" | "x > 0 && x < 10")
+                )
+        })
+        .collect();
+    assert!(
+        logic_assertion_gaps.is_empty(),
+        "unexpected enclosing logic assertion gaps: {logic_assertion_gaps:#?}"
+    );
+
+    // 4. Side-effecting RHS in `&&` must still emit an ASSERTION GAP when swap survives.
+    assert!(
+        findings.iter().any(|f| {
+            f["kind"].as_str() == Some("assertion_gap")
+                && f["item"].as_str() == Some("side_effect_and")
+                && f["survivors"]
+                    .as_array()
+                    .is_some_and(|s| s.iter().any(|v| v.as_str().unwrap_or("").contains("||")))
+        }),
+        "expected side-effecting logic swap assertion gap in {findings:#?}"
+    );
+
+    // 5. Inner constant INPUT GAPs are still reported, and survivor counts reconcile.
+    assert!(
+        findings
+            .iter()
+            .any(|f| f["kind"] == "input_gap" && f["code"].as_str() == Some("s == \"$undefined\"")),
+        "expected inner input gap in {findings:#?}"
+    );
+    assert!(
+        report["survivor_breakdown"]["redundant_constant"]
+            .as_u64()
+            .unwrap()
+            >= 2,
+        "expected redundant_constant to account for constant logic swaps: {report:#}"
+    );
+    let run_count = report["mutants_run"].as_u64().unwrap();
+    let killed = report["mutants_killed"].as_u64().unwrap();
+    let survived = report["mutants_survived"].as_u64().unwrap();
+    assert_eq!(run_count, killed + survived);
+    let b = &report["survivor_breakdown"];
+    let sum = b["reported"].as_u64().unwrap()
+        + b["suppressed"].as_u64().unwrap()
+        + b["redundant_constant"].as_u64().unwrap()
+        + b["preexisting_unchanged"].as_u64().unwrap()
+        + b["unchanged_not_compared"].as_u64().unwrap()
+        + b["unconfirmed_gap"].as_u64().unwrap();
+    assert_eq!(survived, sum);
+}
