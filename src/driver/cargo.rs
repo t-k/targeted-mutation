@@ -157,17 +157,23 @@ pub(super) fn validate_target_selection(
 ) -> Result<()> {
     let all_targets: Vec<&Target> = packages.iter().flat_map(|p| &p.targets).collect();
     if selection.lib && !all_targets.iter().any(|t| t.test && t.is_lib()) {
-        bail!("no tests matched: `--lib` was requested, but no selected package has a testable library target");
+        bail!(
+            "no tests matched: `--lib` was requested, but no selected package has a testable library target"
+        );
     }
     if selection.bins && !all_targets.iter().any(|t| t.test && t.is_bin()) {
-        bail!("no tests matched: `--bins` was requested, but no selected package has a testable binary target");
+        bail!(
+            "no tests matched: `--bins` was requested, but no selected package has a testable binary target"
+        );
     }
     for name in &selection.integration_tests {
         if !all_targets
             .iter()
             .any(|t| t.test && t.is_integration_test() && t.name == *name)
         {
-            bail!("no tests matched: `--test {name}` matched no integration test target in the selected packages");
+            bail!(
+                "no tests matched: `--test {name}` matched no integration test target in the selected packages"
+            );
         }
     }
     if !selection.targets.is_empty()
@@ -222,16 +228,17 @@ pub(super) fn no_tests_matched_hint(
             break;
         }
     }
-    if !selection.include.is_empty() && selection.filter.is_empty() {
-        if let Some(pattern) = selection.include.iter().find(|wanted| {
+    if !selection.include.is_empty()
+        && selection.filter.is_empty()
+        && let Some(pattern) = selection.include.iter().find(|wanted| {
             discovered_tests
                 .iter()
                 .any(|known| known.contains(wanted.as_str()))
-        }) {
-            hints.push(format!(
-                "\nhint: `--include-test` requires exact test names; pass `--test-filter {pattern}` for substring/module matching"
-            ));
-        }
+        })
+    {
+        hints.push(format!(
+            "\nhint: `--include-test` requires exact test names; pass `--test-filter {pattern}` for substring/module matching"
+        ));
     }
     hints.concat()
 }
@@ -298,6 +305,8 @@ pub(super) struct CargoMessage {
     pub(super) executable: Option<PathBuf>,
     #[serde(default)]
     pub(super) filenames: Vec<PathBuf>,
+    #[serde(default)]
+    pub(super) fresh: bool,
     /// The features the target was built with; absent from what is not an artifact.
     pub(super) features: Option<Vec<String>>,
     pub(super) message: Option<Diagnostic>,
@@ -790,6 +799,129 @@ impl BuiltSources {
                 )
             })
     }
+}
+
+#[derive(Default, Clone, Debug, PartialEq, Eq)]
+pub(super) struct BuildProgressState {
+    pub(super) compiled: usize,
+    pub(super) cached: usize,
+    pub(super) latest: String,
+}
+
+impl BuildProgressState {
+    pub(super) fn observe_line(&mut self, line: &str) {
+        let Ok(msg) = serde_json::from_str::<CargoMessage>(line) else {
+            return;
+        };
+        if msg.reason == "compiler-artifact"
+            && let Some(target) = msg.target
+        {
+            if msg.fresh {
+                self.cached += 1;
+            } else {
+                self.compiled += 1;
+            }
+            self.latest = target.name;
+        }
+    }
+
+    pub(super) fn format_line(&self) -> String {
+        let latest = crate::report::sanitize_inline(&self.latest);
+        if self.compiled > 0 && self.cached > 0 {
+            format!(
+                "building: {} compiled ({} cached, latest: {latest})",
+                self.compiled, self.cached
+            )
+        } else if self.compiled > 0 {
+            format!("building: {} compiled (latest: {latest})", self.compiled)
+        } else if self.cached > 0 {
+            format!("building: {} cached (latest: {latest})", self.cached)
+        } else {
+            "building: compiling...".to_string()
+        }
+    }
+}
+
+const BUILD_PROGRESS_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
+
+pub(super) fn run_cargo_with_progress(
+    command: &mut Command,
+    progress: bool,
+) -> Result<std::process::Output> {
+    run_cargo_with_progress_interval(command, progress, BUILD_PROGRESS_INTERVAL, |line| {
+        eprintln!("tmt: {line}");
+    })
+}
+
+pub(super) fn run_cargo_with_progress_interval(
+    command: &mut Command,
+    progress: bool,
+    interval: std::time::Duration,
+    mut emit: impl FnMut(&str) + Send,
+) -> Result<std::process::Output> {
+    use std::io::{BufRead, BufReader, Read};
+    use std::sync::{Mutex, mpsc};
+
+    if !progress {
+        return command.output().context("running cargo test --no-run");
+    }
+
+    let mut child = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .context("running cargo test --no-run")?;
+    let stdout = child.stdout.take().expect("stdout is piped");
+    let mut stderr = child.stderr.take().expect("stderr is piped");
+    let state = Mutex::new(BuildProgressState::default());
+
+    let (stdout_bytes, stderr_bytes) = std::thread::scope(|scope| -> Result<(Vec<u8>, Vec<u8>)> {
+        let stderr_thread = scope.spawn(move || -> std::io::Result<Vec<u8>> {
+            let mut buf = Vec::new();
+            stderr.read_to_end(&mut buf)?;
+            Ok(buf)
+        });
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let state_ref = &state;
+        let reporter = scope.spawn(move || {
+            while done_rx.recv_timeout(interval) == Err(mpsc::RecvTimeoutError::Timeout) {
+                let line = state_ref
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .format_line();
+                emit(&line);
+            }
+        });
+
+        let mut stdout_buf = Vec::new();
+        let mut reader = BufReader::new(stdout);
+        let mut line = String::new();
+        loop {
+            line.clear();
+            let read = reader.read_line(&mut line)?;
+            if read == 0 {
+                break;
+            }
+            stdout_buf.extend_from_slice(line.as_bytes());
+            state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .observe_line(&line);
+        }
+        drop(done_tx);
+        let _ = reporter.join();
+        let stderr_buf = stderr_thread
+            .join()
+            .expect("stderr reader thread panicked")?;
+        Ok((stdout_buf, stderr_buf))
+    })?;
+
+    let status = child.wait().context("waiting for cargo test --no-run")?;
+    Ok(std::process::Output {
+        status,
+        stdout: stdout_bytes,
+        stderr: stderr_bytes,
+    })
 }
 
 pub(super) fn cargo_metadata(dir: &Path, cargo: &CargoConfig) -> Result<Metadata> {

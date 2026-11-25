@@ -104,10 +104,7 @@ pub struct TestSelection {
 
 impl TestSelection {
     pub(crate) fn has_target_filters(&self) -> bool {
-        self.lib
-            || self.bins
-            || !self.integration_tests.is_empty()
-            || !self.targets.is_empty()
+        self.lib || self.bins || !self.integration_tests.is_empty() || !self.targets.is_empty()
     }
 
     fn enabled(&self) -> bool {
@@ -174,6 +171,7 @@ const MAX_REPAIR_ROUNDS: usize = 40;
 const MAX_TEST_FILTERS: usize = 200;
 
 mod cargo;
+mod repair_cache;
 mod runner;
 mod scope_blame;
 mod session;
@@ -1027,12 +1025,46 @@ fn run_package(
             .current_dir(&copy)
             .env("CARGO_TARGET_DIR", &build_target)
             .env("CARGO_BUILD_BUILD_DIR", &build_target)
-            .envs(profile_env(options.opt_level))
-            .stderr(Stdio::piped())
-            .output()
-            .context("running cargo test --no-run")
+            .envs(profile_env(options.opt_level));
+        run_cargo_with_progress(&mut command, options.progress && !observer)
     };
     let cargo_build = || build_test_binaries(false);
+    let has_probe_sites = !options.source_only && files.iter().any(|f| !f.sites.is_empty());
+    let repair_fingerprint = has_probe_sites.then(|| {
+        let test_pkg_names: Vec<&str> = test_packages.iter().map(|p| p.name.as_str()).collect();
+        repair_cache::compute_fingerprint(
+            &copy,
+            &package.name,
+            &test_pkg_names,
+            &options.cargo,
+            options.opt_level,
+            target_flags.as_deref(),
+            &error_values,
+            options.doc,
+            &files,
+        )
+    });
+    if let Some(fingerprint) = &repair_fingerprint {
+        let cached = repair_cache::load(&work, fingerprint);
+        if !cached.is_empty() {
+            for entry in cached {
+                if let Some(file) = files.iter().find(|f| f.display == entry.file)
+                    && let Some(site) = file.sites.iter().find(|s| {
+                        s.start == entry.start && s.end == entry.end && s.text == entry.text
+                    })
+                {
+                    disabled.insert(site.id);
+                    repairs.entry(site.id).or_insert(entry.reason);
+                }
+            }
+            if !disabled.is_empty() {
+                note(&format!(
+                    "reusing {} cached repair exclusion(s)",
+                    disabled.len()
+                ));
+            }
+        }
+    }
     let mut rounds = 0;
     let mut newly_disabled = HashSet::new();
     let build = loop {
@@ -1059,6 +1091,24 @@ fn run_package(
         let names: Vec<&str> = test_packages.iter().map(|p| p.name.as_str()).collect();
         let build = parse_build_output(&String::from_utf8_lossy(&output.stdout), &names);
         if output.status.success() {
+            if let Some(fingerprint) = &repair_fingerprint {
+                let cached_entries: Vec<repair_cache::CachedSite> = files
+                    .iter()
+                    .flat_map(|file| {
+                        file.sites
+                            .iter()
+                            .filter(|site| disabled.contains(&site.id))
+                            .map(|site| repair_cache::CachedSite {
+                                file: file.display.clone(),
+                                start: site.start,
+                                end: site.end,
+                                text: site.text.clone(),
+                                reason: repairs.get(&site.id).cloned().unwrap_or_default(),
+                            })
+                    })
+                    .collect();
+                let _ = repair_cache::save(&work, fingerprint, &cached_entries);
+            }
             break build;
         }
         let diagnostics = || {
@@ -3264,14 +3314,7 @@ fn prepare_work_copy(
             } else {
                 normalize(&workspace.join(&entry.from))
             };
-            copy_external_entry(
-                &src,
-                &dst,
-                &work,
-                &forbidden,
-                &state,
-                &mut BTreeSet::new(),
-            )?;
+            copy_external_entry(&src, &dst, &work, &forbidden, &state, &mut BTreeSet::new())?;
         }
         prune(&stage_root, &state)?;
         if options.git_index {

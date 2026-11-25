@@ -2778,7 +2778,10 @@ fn stage_external_parses_and_validates_parent_relative_specs() {
         "=../../proto",
         "../../proto\n",
     ] {
-        assert!(bad.parse::<StageExternal>().is_err(), "should reject {bad:?}");
+        assert!(
+            bad.parse::<StageExternal>().is_err(),
+            "should reject {bad:?}"
+        );
     }
 }
 
@@ -2838,22 +2841,33 @@ fn test_selection_matches_pict_table() {
         }
         match include {
             "none" => {}
-            "matching" => sel.include.push("presentation::pagination::page_one".into()),
+            "matching" => sel
+                .include
+                .push("presentation::pagination::page_one".into()),
             "unmatched" => sel.include.push("presentation::pagination".into()),
             _ => panic!("unknown include: {include}"),
         }
         match exclude {
             "none" => {}
-            "matching" => sel.exclude.push("presentation::pagination::page_one".into()),
+            "matching" => sel
+                .exclude
+                .push("presentation::pagination::page_one".into()),
             _ => panic!("unknown exclude: {exclude}"),
         }
         sel.include_ignored = ignored == "true";
 
         assert!(validate_target_selection(&[&pkg], &sel).is_ok(), "{row}");
-        let build_flags = test_build_flags(&[&pkg], &sel, Path::new("workspace"), &CargoConfig::default());
+        let build_flags = test_build_flags(
+            &[&pkg],
+            &sel,
+            Path::new("workspace"),
+            &CargoConfig::default(),
+        );
         match selector {
             "none" => assert_eq!(build_flags, None, "{row}"),
-            "lib" | "test_target_lib" => assert_eq!(build_flags, Some(vec!["--lib".into()]), "{row}"),
+            "lib" | "test_target_lib" => {
+                assert_eq!(build_flags, Some(vec!["--lib".into()]), "{row}")
+            }
             "bins" | "test_target_bin" => {
                 assert_eq!(build_flags, Some(vec!["--bin=my-api".into()]), "{row}")
             }
@@ -2869,7 +2883,10 @@ fn test_selection_matches_pict_table() {
             .map(|(name, _)| *name)
             .collect();
         if exclude == "matching" {
-            assert!(!matched.contains(&"presentation::pagination::page_one"), "{row}");
+            assert!(
+                !matched.contains(&"presentation::pagination::page_one"),
+                "{row}"
+            );
         }
         if !sel.include_ignored {
             assert!(!matched.contains(&"domain::auth::ignored_case"), "{row}");
@@ -2878,12 +2895,8 @@ fn test_selection_matches_pict_table() {
             assert!(matched.is_empty(), "{row}");
         }
         if selector == "test_target_bin" {
-            let hint = no_tests_matched_hint(
-                &[&pkg],
-                &sel,
-                &[("my-api".into(), "my-api".into())],
-                &[],
-            );
+            let hint =
+                no_tests_matched_hint(&[&pkg], &sel, &[("my-api".into(), "my-api".into())], &[]);
             assert!(hint.contains("--lib") && hint.contains("my_api"), "{hint}");
         }
         if include == "unmatched" && filter == "none" {
@@ -2939,6 +2952,124 @@ fn validate_target_selection_rejects_missing_targets_before_build() {
     )
     .unwrap_err();
     assert!(hyphen_err.to_string().contains("--lib"), "{hyphen_err}");
+}
+
+#[test]
+fn build_progress_tracks_compiled_and_cached_artifacts() {
+    let mut state = BuildProgressState::default();
+    assert_eq!(state.format_line(), "building: compiling...");
+    state.observe_line(
+        r#"{"reason":"compiler-artifact","target":{"name":"serde","kind":["lib"]},"fresh":true}"#,
+    );
+    assert_eq!(state.format_line(), "building: 1 cached (latest: serde)");
+    state.observe_line(
+        r#"{"reason":"compiler-artifact","target":{"name":"aws-sdk-s3","kind":["lib"]},"fresh":false}"#,
+    );
+    assert_eq!(
+        state.format_line(),
+        "building: 1 compiled (1 cached, latest: aws-sdk-s3)"
+    );
+}
+
+#[test]
+fn repair_cache_matches_pict_table() {
+    let dir = scratch("repair-cache-pict");
+    for (idx, row) in include_str!("../../tests/data/repair-cache.pict.tsv")
+        .lines()
+        .skip(1)
+        .enumerate()
+    {
+        let cols: Vec<_> = row.split('\t').collect();
+        let &[stage_ext, err_kind, cache_state, src_changed] = cols.as_slice() else {
+            panic!("invalid PICT row: {row}");
+        };
+        let work = dir.join(format!("row-{idx}"));
+        fs::create_dir_all(&work).unwrap();
+
+        match stage_ext {
+            "none" => {}
+            "shorthand_parent" => {
+                let parsed: StageExternal = "../../proto".parse().unwrap();
+                assert_eq!(parsed.rel, PathBuf::from("../../proto"));
+            }
+            "explicit_mapping" => {
+                let parsed: StageExternal = "/abs/proto=../../proto".parse().unwrap();
+                assert_eq!(parsed.from, PathBuf::from("/abs/proto"));
+            }
+            _ => panic!("unknown stage_ext: {stage_ext}"),
+        }
+
+        let err = match err_kind {
+            "none" => None,
+            "probe_error" => Some(CompileError {
+                code: Some("E0308".into()),
+                message: "mismatched types".into(),
+                primary: vec![],
+                secondary: vec![],
+                rendered: "error[E0308]: mismatched types".into(),
+            }),
+            "include_str_missing" => Some(CompileError {
+                code: None,
+                message: "couldn't read `../../missing`: No such file or directory".into(),
+                primary: vec![],
+                secondary: vec![],
+                rendered: "error: couldn't read `../../missing`: No such file or directory".into(),
+            }),
+            "env_missing" => Some(CompileError {
+                code: None,
+                message: "environment variable `FOO` not defined at compile time".into(),
+                primary: vec![],
+                secondary: vec![],
+                rendered: "error: environment variable `FOO` not defined at compile time".into(),
+            }),
+            "mod_missing" => Some(CompileError {
+                code: Some("E0583".into()),
+                message: "file not found for module `bar`".into(),
+                primary: vec![],
+                secondary: vec![],
+                rendered: "error[E0583]: file not found for module `bar`".into(),
+            }),
+            _ => panic!("unknown err_kind: {err_kind}"),
+        };
+        if let Some(err) = &err {
+            let expected_non_probe = err_kind != "probe_error";
+            assert_eq!(is_non_probe_error(err), expected_non_probe, "{row}");
+        }
+
+        let fp_old = "fp-old";
+        let fp_cur = if src_changed == "true" {
+            "fp-new"
+        } else {
+            fp_old
+        };
+        let site1 = repair_cache::CachedSite {
+            file: "src/lib.rs".into(),
+            start: 10,
+            end: 20,
+            text: "a < b".into(),
+            reason: "E0308".into(),
+        };
+        match cache_state {
+            "miss" => {}
+            "hit_exact" | "hit_stale_partial" => {
+                repair_cache::save(&work, fp_old, std::slice::from_ref(&site1)).unwrap();
+            }
+            "corrupt" => {
+                fs::write(work.join(".tmt-repair-cache.json"), "{not-valid-json").unwrap();
+            }
+            _ => panic!("unknown cache_state: {cache_state}"),
+        }
+
+        let loaded = repair_cache::load(&work, fp_cur);
+        if (cache_state == "hit_exact" || cache_state == "hit_stale_partial")
+            && src_changed == "false"
+        {
+            assert_eq!(loaded, vec![site1], "{row}");
+        } else {
+            assert!(loaded.is_empty(), "{row}");
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
 }
 
 #[test]

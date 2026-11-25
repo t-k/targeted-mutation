@@ -105,7 +105,7 @@ pub(super) fn since_diff(workspace: &Path, revision: &str) -> Result<String> {
 pub(super) fn is_non_probe_error(error: &CompileError) -> bool {
     let msg = error.message.as_str();
     let rendered = error.rendered.as_str();
-    if msg.starts_with("couldn't read ")
+    msg.starts_with("couldn't read ")
         || rendered.contains("error: couldn't read ")
         || (msg.starts_with("environment variable ")
             && msg.ends_with(" not defined at compile time"))
@@ -113,10 +113,6 @@ pub(super) fn is_non_probe_error(error: &CompileError) -> bool {
             && rendered.contains(" not defined at compile time"))
         || error.code.as_deref() == Some("E0583")
         || msg.starts_with("file not found for module ")
-    {
-        return true;
-    }
-    false
 }
 
 /// The sites to disable for one compile error, from the most to the least specific guess:

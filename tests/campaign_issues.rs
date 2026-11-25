@@ -390,7 +390,13 @@ fn checks_boundary() {
     .output()
     .unwrap();
     let report = json(&ok, 0);
-    assert_eq!(report["analysis"]["stage_external"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        report["analysis"]["stage_external"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
 }
 
 #[test]
@@ -461,7 +467,11 @@ mod unrelated {
         .as_array()
         .unwrap();
     assert_eq!(selected.len(), 2, "{selected:?}");
-    assert!(selected.iter().all(|t| t.as_str().unwrap().contains("pagination::tests")));
+    assert!(
+        selected
+            .iter()
+            .all(|t| t.as_str().unwrap().contains("pagination::tests"))
+    );
 
     // 2. --test smoke runs only the integration test target.
     let integration = command(
@@ -486,13 +496,22 @@ mod unrelated {
     // 3. --test-target my-api matches the empty bin target and prints a --lib hint.
     let bin_only = command(
         &path,
-        &["--test-target", "my-api", "--lines", "src/lib.rs:2-4", "--quiet"],
+        &[
+            "--test-target",
+            "my-api",
+            "--lines",
+            "src/lib.rs:2-4",
+            "--quiet",
+        ],
     )
     .output()
     .unwrap();
     assert_eq!(bin_only.status.code(), Some(1));
     let bin_err = String::from_utf8_lossy(&bin_only.stderr);
-    assert!(bin_err.contains("--lib") && bin_err.contains("my_api"), "{bin_err}");
+    assert!(
+        bin_err.contains("--lib") && bin_err.contains("my_api"),
+        "{bin_err}"
+    );
 
     // 4. --include-test with a module prefix fails with a --test-filter hint.
     let prefix = command(
@@ -510,7 +529,108 @@ mod unrelated {
     .unwrap();
     assert_eq!(prefix.status.code(), Some(1));
     let prefix_err = String::from_utf8_lossy(&prefix.stderr);
-    assert!(prefix_err.contains("--test-filter pagination::tests"), "{prefix_err}");
+    assert!(
+        prefix_err.contains("--test-filter pagination::tests"),
+        "{prefix_err}"
+    );
+}
+
+#[test]
+fn repair_cache_avoids_second_rebuild_on_repeat_run_and_invalidates_on_edit() {
+    let path = package("repair-cache-e2e");
+    // `late_init` triggers a definite-initialization error when instrumented with a probe,
+    // forcing a repair rebuild on the first run.
+    write(
+        &path,
+        "src/lib.rs",
+        r#"pub fn late_init(flag: bool) -> u32 {
+    let value;
+    if flag {
+        value = 1;
+    } else {
+        value = 2;
+    }
+    value
+}
+
+pub fn check(n: u32) -> bool {
+    n >= 4
+}
+
+#[test]
+fn covers_both() {
+    assert_eq!(late_init(true), 1);
+    assert_eq!(late_init(false), 2);
+    assert!(!check(3));
+    assert!(check(4));
+}
+"#,
+    );
+
+    let first = command(&path, &["--json"]).output().unwrap();
+    let first_report = json(&first, 0);
+    let first_stderr = String::from_utf8_lossy(&first.stderr);
+    assert!(
+        first_stderr.contains("rebuilding without the sites that failed to compile"),
+        "expected repair rebuild on first run: {first_stderr}"
+    );
+    assert!(
+        path.join("target/tmt/.tmt-repair-cache.json").is_file(),
+        "repair cache file should be written after successful build"
+    );
+
+    // Second identical run must reuse the cached exclusion and skip the repair rebuild.
+    let second = command(&path, &["--json"]).output().unwrap();
+    let second_report = json(&second, 0);
+    let second_stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        second_stderr.contains("reusing") && second_stderr.contains("cached repair exclusion"),
+        "expected cached repair reuse message: {second_stderr}"
+    );
+    assert!(
+        !second_stderr.contains("rebuilding without the sites that failed to compile"),
+        "repeat run should not trigger a repair rebuild: {second_stderr}"
+    );
+    assert_eq!(first_report["skipped"], second_report["skipped"]);
+
+    // Editing the source invalidates the cache so repair runs again cleanly.
+    write(
+        &path,
+        "src/lib.rs",
+        r#"pub fn late_init(flag: bool) -> u32 {
+    let value;
+    if flag {
+        value = 10;
+    } else {
+        value = 20;
+    }
+    value
+}
+
+pub fn check(n: u32) -> bool {
+    n >= 4
+}
+
+#[test]
+fn covers_both() {
+    assert_eq!(late_init(true), 10);
+    assert_eq!(late_init(false), 20);
+    assert!(!check(3));
+    assert!(check(4));
+}
+"#,
+    );
+    let edited = command(&path, &["--json"]).output().unwrap();
+    let _ = json(&edited, 0);
+    let edited_stderr = String::from_utf8_lossy(&edited.stderr);
+    assert!(
+        !edited_stderr.contains("cached repair exclusion"),
+        "source edit must invalidate repair cache: {edited_stderr}"
+    );
+    assert!(
+        edited_stderr.contains("rebuilding without the sites that failed to compile"),
+        "source edit should re-run repair: {edited_stderr}"
+    );
 }
 
 #[test]
