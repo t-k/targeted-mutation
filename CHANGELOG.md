@@ -5,6 +5,30 @@ All notable changes to `targeted-mutation` (`cargo tmt`) are documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.9.0] - 2026-11-25
+
+### Added
+
+- **Reconcilable report mutant counts (`mutants_survived`, `survivor_breakdown`, `Report::counts_reconcile`)**:
+  - Added top-level `mutants_survived` (`mutants_run - mutants_killed`) and `survivor_breakdown` (`reported`, `suppressed`, `redundant_constant`, `preexisting_unchanged`, `unchanged_not_compared`, `unconfirmed_gap`) to JSON reports so that every run satisfies `mutants_run == mutants_killed + mutants_survived`, `mutants_timed_out <= mutants_killed`, and `mutants_survived == sum(survivor_breakdown)`.
+  - Added text-output breakdown lines for surviving mutants intentionally not emitted as findings.
+  - Documented exact report count definitions, subset relationships, and evaluation statuses in `README.md` and `cargo tmt --help`.
+- **Explicit partial evaluation status (`Evaluation::Partial`)**:
+  - Added `evaluation: "partial"` in JSON/SARIF reports and `(partial evaluation: some mutants were not built or evaluated)` in text output whenever `mutants_run > 0` and any mutants remain unbuilt (`mutants_not_built > 0` without `--rebuild`), unevaluated (`mutants_not_evaluated > 0`), skipped (`skipped_sites > 0` or `UnparseableSource`), uncompared against earlier tests (`survivor_breakdown.unchanged_not_compared > 0`), unconfirmed timeouts, or `--source-only` timeouts.
+
+### Changed
+
+- **Public Rust API & JSON/SARIF `evaluation` compatibility**:
+  - `report::Evaluation` now includes `Evaluation::Partial` (`"partial"` in JSON/SARIF), and `report::Report` includes `mutants_survived` and `survivor_breakdown`. Exhaustive `match` arms on `Evaluation`, struct literals constructing `Report` without `..Report::default()`, and JSON/SARIF consumers validating a closed set of `evaluation` strings should be updated for `"partial"`.
+
+### Fixed
+
+- **`--since` earlier-test comparison & unbuilt revert accounting**:
+  - Distinguished confirmed preexisting survivors in unchanged code (`preexisting_unchanged`) from survivors whose earlier-test comparison could not be established (`unchanged_not_compared`, e.g. when earlier tests fail to build/pass or cannot all be restored) and marked the latter as `evaluation: "partial"`.
+  - Counted unbuilt `--since` revert mutants across all changed files (including const-only files without probe sites) in both early-return and normal paths so they are not hidden as `no_sites` or omitted from `mutants_not_built`.
+- **Witness evaluation accounting**:
+  - Classified `Outcome::Unable` and non-compiler build failures during witness trials under `mutants_not_evaluated` instead of `mutants_killed` or `unviable_mutants`, and avoided checkpointing `Outcome::Unable` witness trials so resumed runs retry them.
+
 ## [0.8.0] - 2026-11-25
 
 ### Added
