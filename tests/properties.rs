@@ -12,6 +12,7 @@ use proptest::prelude::*;
 use targeted_mutation::instrument::{
     Discovery, discover, keep_line_ends, offset_of, render, source_mutants,
 };
+use targeted_mutation::report::{Report, SurvivorBreakdown};
 
 /// What must hold for a source file the instrumenter accepts. `Err` says what does not.
 fn check(source: &str) -> Result<(), String> {
@@ -428,5 +429,52 @@ proptest! {
         if let Err(why) = check(&source) {
             return Err(TestCaseError::fail(format!("{why}\nin\n{source}")));
         }
+    }
+
+    #[test]
+    fn report_counts_reconcile_across_arbitrary_dispositions(
+        killed_by_test in 0usize..500,
+        timed_out in 0usize..100,
+        reported in 0usize..100,
+        suppressed in 0usize..100,
+        redundant_constant in 0usize..100,
+        preexisting_unchanged in 0usize..100,
+        unchanged_not_compared in 0usize..100,
+        unconfirmed_gap in 0usize..100,
+    ) {
+        let breakdown = SurvivorBreakdown {
+            reported,
+            suppressed,
+            redundant_constant,
+            preexisting_unchanged,
+            unchanged_not_compared,
+            unconfirmed_gap,
+        };
+        let mutants_killed = killed_by_test + timed_out;
+        let mutants_survived = breakdown.total();
+        let report = Report {
+            mutants_run: mutants_killed + mutants_survived,
+            mutants_killed,
+            mutants_timed_out: timed_out,
+            mutants_survived,
+            survivor_breakdown: breakdown,
+            ..Report::default()
+        };
+        prop_assert!(report.counts_reconcile());
+        let json = serde_json::to_value(&report).unwrap();
+        let run = json["mutants_run"].as_u64().unwrap();
+        let killed = json["mutants_killed"].as_u64().unwrap();
+        let timed = json["mutants_timed_out"].as_u64().unwrap();
+        let survived = json["mutants_survived"].as_u64().unwrap();
+        let sb = &json["survivor_breakdown"];
+        let sb_sum = sb["reported"].as_u64().unwrap()
+            + sb["suppressed"].as_u64().unwrap()
+            + sb["redundant_constant"].as_u64().unwrap()
+            + sb["preexisting_unchanged"].as_u64().unwrap()
+            + sb["unchanged_not_compared"].as_u64().unwrap()
+            + sb["unconfirmed_gap"].as_u64().unwrap();
+        prop_assert_eq!(run, killed + survived);
+        prop_assert!(timed <= killed);
+        prop_assert_eq!(survived, sb_sum);
     }
 }

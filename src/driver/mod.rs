@@ -627,6 +627,7 @@ fn run_package(
     let mut tests_changed: Vec<(PathBuf, Vec<scope::Hunk>)> = vec![];
     // Files with a change that is tried undone: they are looked at even with no site.
     let mut undo_paths: HashSet<PathBuf> = HashSet::new();
+    let mut not_built_reverts: usize = 0;
     let mut beyond_places: HashSet<(PathBuf, usize, usize)> = HashSet::new();
     // Only the requested lines, if any were requested.
     if let Some(scope) = &scope {
@@ -647,11 +648,13 @@ fn run_package(
                 .filter(|hunk| hunk.file == relative)
                 .cloned()
                 .collect();
-            if (options.rebuild || options.source_only)
-                && (!reverts::changes(&file.original, &of_file).is_empty()
-                    || reverts::mixed(&file.original, &of_file) > 0)
-            {
-                undo_paths.insert(file.path.clone());
+            let changes_count = reverts::changes(&file.original, &of_file).len();
+            if options.rebuild || options.source_only {
+                if changes_count > 0 || reverts::mixed(&file.original, &of_file) > 0 {
+                    undo_paths.insert(file.path.clone());
+                }
+            } else {
+                not_built_reverts += changes_count;
             }
             let of_tests = reverts::test_hunks(&file.original, &of_file);
             if of_tests.is_empty() {
@@ -894,6 +897,9 @@ fn run_package(
         }
         if let Some(path) = &options.write_baseline {
             crate::baseline::write(path, &[])?;
+        }
+        if !empty_shard {
+            report.mutants_not_built += not_built_reverts;
         }
         report.record_evaluation();
         if let Some(path) = report.analysis.checkpoint.as_deref() {
@@ -1605,7 +1611,13 @@ fn run_package(
     // 6c. In code that did not change, a mutant that passes says something about this
     // change only if the tests as they were found it out. They are built once, with
     // the program as it is, and run against those mutants.
-    let mut found_out_before: HashSet<usize> = HashSet::new();
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum EarlierVerdict {
+        Killed,
+        Survived,
+        Unknown,
+    }
+    let mut earlier_verdict: BTreeMap<usize, EarlierVerdict> = BTreeMap::new();
     let asked: Vec<usize> = site_work
         .iter()
         .filter(|item| beyond.contains(&item.site.id))
@@ -1631,9 +1643,9 @@ fn run_package(
             }
         };
         // The instrumented files with the old lines of their tests.
-        let earlier: Vec<(&SourceFile, String)> = tests_changed
+        let earlier: Option<Vec<(&SourceFile, String)>> = tests_changed
             .iter()
-            .filter_map(|(path, hunks)| {
+            .map(|(path, hunks)| {
                 let file = files.iter().find(|file| file.path == *path)?;
                 let rendered = file.rendered.as_ref()?;
                 let mut places = hunks
@@ -1651,49 +1663,66 @@ fn run_package(
                 Some((file, text))
             })
             .collect();
-        let attempted = (|| -> Result<Option<Vec<JobResult>>> {
-            for (file, text) in &earlier {
-                state.write(&file.path, &format!("{text}{}", suffix(file)))?;
+        let attempted = if let Some(earlier) = earlier {
+            let attempted = (|| -> Result<Option<Vec<JobResult>>> {
+                for (file, text) in &earlier {
+                    state.write(&file.path, &format!("{text}{}", suffix(file)))?;
+                }
+                if !cargo_build()?.status.success() {
+                    session.note(
+                        "the tests as they were do not build with the code as it is: what they found out is not known",
+                    );
+                    return Ok(None);
+                }
+                // They have to pass as they are, or a failure says nothing of a mutant.
+                let all: Vec<&TestBinary> = session.binaries.iter().collect();
+                if run_source_tests(&all)? != Outcome::Pass {
+                    session.note(
+                        "the tests as they were fail on the code as it is: what they found out is not known",
+                    );
+                    return Ok(None);
+                }
+                let against_all: Vec<Job> = asked
+                    .iter()
+                    .map(|job| Job {
+                        site: jobs[*job].site,
+                        mutation: jobs[*job].mutation,
+                        tests: (0..session.binaries.len()).map(|bin| (bin, None)).collect(),
+                    })
+                    .collect();
+                session
+                    .run_jobs(&against_all, options.jobs, "mutants, earlier tests", None)
+                    .map(Some)
+            })();
+            // The files and the binaries as they were, whatever went wrong.
+            for (file, _) in &earlier {
+                let rendered = file.rendered.as_ref().expect("rendered before building");
+                state.write(&file.path, &format!("{}{}", rendered.text, suffix(file)))?;
             }
             if !cargo_build()?.status.success() {
-                session.note(
-                    "the tests as they were do not build with the code as it is: what they found out is not known",
-                );
-                return Ok(None);
+                bail!("the crate does not build once its tests are put back as they are");
             }
-            // They have to pass as they are, or a failure says nothing of a mutant.
-            let all: Vec<&TestBinary> = session.binaries.iter().collect();
-            if run_source_tests(&all)? != Outcome::Pass {
-                session.note(
-                    "the tests as they were fail on the code as it is: what they found out is not known",
-                );
-                return Ok(None);
-            }
-            let against_all: Vec<Job> = asked
-                .iter()
-                .map(|job| Job {
-                    site: jobs[*job].site,
-                    mutation: jobs[*job].mutation,
-                    tests: (0..session.binaries.len()).map(|bin| (bin, None)).collect(),
-                })
-                .collect();
-            session
-                .run_jobs(&against_all, options.jobs, "mutants, earlier tests", None)
-                .map(Some)
-        })();
-        // The files and the binaries as they were, whatever went wrong.
-        for (file, _) in &earlier {
-            let rendered = file.rendered.as_ref().expect("rendered before building");
-            state.write(&file.path, &format!("{}{}", rendered.text, suffix(file)))?;
-        }
-        if !cargo_build()?.status.success() {
-            bail!("the crate does not build once its tests are put back as they are");
-        }
+            attempted
+        } else {
+            session.note(
+                "not all changed test files could be restored as they were: what they found out is not known",
+            );
+            Ok(None)
+        };
         if let Some(again) = attempted? {
             for (job, result) in asked.iter().zip(again) {
-                if result.survived.is_none() && !result.unable && !result.unconfirmed_timeout {
-                    found_out_before.insert(*job);
-                }
+                let verdict = if result.unable || result.unconfirmed_timeout {
+                    EarlierVerdict::Unknown
+                } else if result.survived.is_none() {
+                    EarlierVerdict::Killed
+                } else {
+                    EarlierVerdict::Survived
+                };
+                earlier_verdict.insert(*job, verdict);
+            }
+        } else {
+            for job in &asked {
+                earlier_verdict.insert(*job, EarlierVerdict::Unknown);
             }
         }
     }
@@ -1712,10 +1741,15 @@ fn run_package(
     }
     report.mutants_run = results.len() - unable;
     report.mutants_killed = results.iter().filter(|r| r.survived.is_none()).count() - unable;
+    report.mutants_survived = report.mutants_run - report.mutants_killed;
     report.mutants_timed_out = results
         .iter()
         .filter(|r| r.timed_out && !r.unconfirmed_timeout)
         .count();
+
+    // Parallel to `report.findings`: how many executed surviving mutants each finding
+    // represents (`0` for unverified predicted input gaps under `--no-verify`).
+    let mut finding_run_survivors: Vec<usize> = vec![];
 
     // Expressions known to be constant in the tests: comparisons with a confirmed
     // one-sided gap or that cannot differ at all, and `&&` / `||` with a single value.
@@ -1736,20 +1770,53 @@ fn run_package(
             // cannot differ, not worth saying at all).
             let repeats = constant_expr
                 .is_some_and(|(start, end)| constants.contains(&(item.file, start, end)));
+            let survived_count = confirm
+                .iter()
+                .filter(|j| results[**j].survived.is_some())
+                .count();
             if beyond.contains(&item.site.id) {
                 // Said only when the tests found it out before their change.
                 let confirmed = confirm.iter().all(|j| results[*j].survived.is_some());
-                if confirmed && !repeats && confirm.iter().any(|j| found_out_before.contains(j)) {
+                let killed_before = confirm
+                    .iter()
+                    .any(|j| earlier_verdict.get(j) == Some(&EarlierVerdict::Killed));
+                if confirmed && !repeats && killed_before {
                     report.weakened.push(finding.at().clone());
                     report.findings.push(finding.clone());
+                    finding_run_survivors.push(survived_count);
+                } else if !confirmed {
+                    report.survivor_breakdown.unconfirmed_gap += survived_count;
+                } else if repeats {
+                    report.survivor_breakdown.redundant_constant += survived_count;
+                } else {
+                    for job in confirm {
+                        if results[*job].survived.is_some() {
+                            if earlier_verdict.get(job) == Some(&EarlierVerdict::Survived) {
+                                report.survivor_breakdown.preexisting_unchanged += 1;
+                            } else {
+                                report.survivor_breakdown.unchanged_not_compared += 1;
+                            }
+                        }
+                    }
                 }
                 continue;
             }
             match Prediction::of(confirm.iter().map(|j| &results[*j])) {
-                Prediction::Refuted => report.unstable.push(at.clone()),
-                Prediction::Confirmed if !repeats => report.findings.push(finding.clone()),
+                Prediction::Refuted => {
+                    report.unstable.push(at.clone());
+                    report.survivor_breakdown.unconfirmed_gap += survived_count;
+                }
+                Prediction::Confirmed if !repeats => {
+                    report.findings.push(finding.clone());
+                    finding_run_survivors.push(survived_count);
+                }
+                Prediction::Confirmed => {
+                    report.survivor_breakdown.redundant_constant += survived_count;
+                }
                 // Not evaluated (counted above), or said elsewhere.
-                Prediction::Confirmed | Prediction::Unknown => {}
+                Prediction::Unknown => {
+                    report.survivor_breakdown.unconfirmed_gap += survived_count;
+                }
             }
         }
         // A body that is one expression, constant in the tests: replacing the body by
@@ -1760,15 +1827,30 @@ fn run_package(
         } = item.site.kind
             && constants.contains(&(item.file, start, end))
         {
+            report.survivor_breakdown.redundant_constant += item
+                .runs
+                .iter()
+                .filter(|(_, job)| results[*job].survived.is_some())
+                .count();
             continue;
         }
         let mut survivors = vec![];
         let mut passing_tests = BTreeSet::new();
         for (mutation, job) in &item.runs {
-            if beyond.contains(&item.site.id) && !found_out_before.contains(job) {
-                continue;
-            }
             if let Some(tests) = &results[*job].survived {
+                if beyond.contains(&item.site.id) {
+                    match earlier_verdict.get(job) {
+                        Some(EarlierVerdict::Killed) => {}
+                        Some(EarlierVerdict::Survived) => {
+                            report.survivor_breakdown.preexisting_unchanged += 1;
+                            continue;
+                        }
+                        Some(EarlierVerdict::Unknown) | None => {
+                            report.survivor_breakdown.unchanged_not_compared += 1;
+                            continue;
+                        }
+                    }
+                }
                 survivors.push(report::describe(item.site, *mutation));
                 passing_tests.extend(tests.iter().cloned());
             }
@@ -1777,12 +1859,14 @@ fn run_package(
             // The first survivor is traced below to see what it changes.
             let first = item.runs.iter().find(|(_, job)| {
                 results[*job].survived.is_some()
-                    && (!beyond.contains(&item.site.id) || found_out_before.contains(job))
+                    && (!beyond.contains(&item.site.id)
+                        || earlier_verdict.get(job) == Some(&EarlierVerdict::Killed))
             });
             if beyond.contains(&item.site.id) {
                 report.weakened.push(at.clone());
             }
             effect_jobs.push((report.findings.len(), first.expect("a survivor").1));
+            finding_run_survivors.push(survivors.len());
             report.findings.push(Finding::AssertionGap {
                 at,
                 survivors,
@@ -2063,6 +2147,7 @@ fn run_package(
                             report.mutants_run += 1;
                             report.mutants_killed += (outcome != Outcome::Pass) as usize;
                             report.mutants_timed_out += (outcome == Outcome::Timeout) as usize;
+                            report.mutants_survived += (outcome == Outcome::Pass) as usize;
                         }
                     }
                     let survived = outcome == Some(Outcome::Pass);
@@ -2099,17 +2184,16 @@ fn run_package(
         if let Some(phase) = &source_checkpoint {
             phase.finish_if_complete()?;
         }
-        report.findings.extend(
-            survivors
-                .into_iter()
-                .map(|(at, survivors)| Finding::Survivor {
-                    at,
-                    survivors,
-                    witness: None,
-                    change_since: None,
-                    advice: None,
-                }),
-        );
+        for (at, survivors) in survivors {
+            finding_run_survivors.push(survivors.len());
+            report.findings.push(Finding::Survivor {
+                at,
+                survivors,
+                witness: None,
+                change_since: None,
+                advice: None,
+            });
+        }
     }
 
     // Each change since the revision, undone: do the tests tell it from what was there?
@@ -2188,7 +2272,7 @@ fn run_package(
             ));
         }
         if !(options.rebuild || options.source_only) {
-            report.mutants_not_built += total;
+            report.mutants_not_built += not_built_reverts;
         } else if total > 0
             || changed.iter().any(|(_, changes)| {
                 changes.iter().filter(|change| !change.is_subhunk()).count() > 1
@@ -2236,9 +2320,11 @@ fn run_package(
                         report.mutants_run += 1;
                         report.mutants_killed += (outcome != Outcome::Pass) as usize;
                         report.mutants_timed_out += (outcome == Outcome::Timeout) as usize;
+                        report.mutants_survived += (outcome == Outcome::Pass) as usize;
                     }
                 }
                 if outcome == Some(Outcome::Pass) {
+                    finding_run_survivors.push(1);
                     report.findings.push(Finding::Survivor {
                         at,
                         survivors: vec![what],
@@ -2454,10 +2540,19 @@ fn run_package(
             Ok(true)
         };
         let suite = |edits: &[witness::Edit]| -> Result<Option<Outcome>> {
-            if !write_edits(edits)? || !cargo_build()?.status.success() {
+            if !write_edits(edits)? {
                 return Ok(None);
             }
-            run_source_tests(&by_speed).map(Some)
+            Ok(match source_build(&cargo_build()?) {
+                SourceBuild::Built => Some(run_source_tests(&by_speed)?),
+                SourceBuild::Refused => None,
+                SourceBuild::Failed(why) => {
+                    session.note(&format!(
+                        "a build failed without the compiler refusing the code; the mutant is not evaluated: {why}"
+                    ));
+                    Some(Outcome::Unable)
+                }
+            })
         };
         let compile_observer = |edits: &[witness::Edit]| -> Result<Option<PathBuf>> {
             if !write_edits(edits)? {
@@ -2611,8 +2706,12 @@ fn run_package(
                         let attempted = (|| -> Result<WitnessTrial> {
                             if paired {
                                 for edit in &candidate.edits {
-                                    if suite(std::slice::from_ref(edit))? != Some(Outcome::Fail) {
-                                        return Ok(WitnessTrial::Inapplicable);
+                                    match suite(std::slice::from_ref(edit))? {
+                                        Some(Outcome::Fail) => {}
+                                        Some(Outcome::Unable) => {
+                                            return Ok(WitnessTrial::Evaluated(Outcome::Unable));
+                                        }
+                                        _ => return Ok(WitnessTrial::Inapplicable),
                                     }
                                 }
                             }
@@ -2621,7 +2720,9 @@ fn run_package(
                         })();
                         state.write(&file.path, &restore)?;
                         let trial = attempted?;
-                        if let Some(phase) = &witness_checkpoint {
+                        if let Some(phase) = &witness_checkpoint
+                            && !matches!(trial, WitnessTrial::Evaluated(Outcome::Unable))
+                        {
                             phase.record(index, &trial)?;
                         }
                         trial
@@ -2640,9 +2741,22 @@ fn run_package(
                     };
                     progress.complete(outcome.into());
                     if !candidate.existing {
-                        report.mutants_run += 1;
-                        report.mutants_killed += usize::from(outcome != Outcome::Pass);
-                        report.mutants_timed_out += usize::from(outcome == Outcome::Timeout);
+                        match outcome {
+                            Outcome::Unable => report.mutants_not_evaluated += 1,
+                            Outcome::Pass => {
+                                report.mutants_run += 1;
+                                report.mutants_survived += 1;
+                            }
+                            Outcome::Fail => {
+                                report.mutants_run += 1;
+                                report.mutants_killed += 1;
+                            }
+                            Outcome::Timeout => {
+                                report.mutants_run += 1;
+                                report.mutants_killed += 1;
+                                report.mutants_timed_out += 1;
+                            }
+                        }
                     }
                     if outcome == Outcome::Pass {
                         survivors.push(WitnessSurvivor {
@@ -2847,6 +2961,7 @@ fn run_package(
                             }
                         }
                     } else {
+                        finding_run_survivors.push(1);
                         report.findings.push(Finding::Survivor {
                             at: survivor.at,
                             survivors: vec![survivor.candidate.description.clone()],
@@ -2866,7 +2981,19 @@ fn run_package(
     }
 
     report.record_evaluation();
-    report.sort_findings();
+    debug_assert_eq!(report.findings.len(), finding_run_survivors.len());
+    let mut paired_findings: Vec<(Finding, usize)> = report
+        .findings
+        .into_iter()
+        .zip(finding_run_survivors)
+        .collect();
+    paired_findings.sort_by(|(a, _), (b, _)| {
+        let (a, b) = (a.at(), b.at());
+        (&a.file, a.line, a.column).cmp(&(&b.file, b.line, b.column))
+    });
+    let (sorted_findings, finding_run_survivors): (Vec<_>, Vec<_>) =
+        paired_findings.into_iter().unzip();
+    report.findings = sorted_findings;
     let places: Vec<FilePlaces> = files
         .iter()
         .map(|file| FilePlaces {
@@ -2879,7 +3006,17 @@ fn run_package(
     name_findings(&mut report.findings, &places);
 
     // 8. Findings the user has already dealt with.
-    apply_suppressions_and_finish(options, &files, &mut report, checkpoint.as_ref())?;
+    apply_suppressions_and_finish(
+        options,
+        &files,
+        &mut report,
+        &finding_run_survivors,
+        checkpoint.as_ref(),
+    )?;
+    debug_assert!(
+        report.counts_reconcile(),
+        "report counts do not reconcile: {report:#?}"
+    );
     Ok(report)
 }
 
@@ -3230,6 +3367,7 @@ fn apply_suppressions_and_finish(
     options: &Options,
     files: &[SourceFile],
     report: &mut Report,
+    finding_run_survivors: &[usize],
     checkpoint: Option<&Checkpoint>,
 ) -> Result<()> {
     let files_with_findings: BTreeSet<&str> = report
@@ -3252,18 +3390,34 @@ fn apply_suppressions_and_finish(
         None => None,
     };
     let before = report.findings.len();
-    report.findings.retain(|finding| {
+    let mut after_inline: Vec<(Finding, usize)> = Vec::with_capacity(before);
+    for (finding, run_survivors) in report
+        .findings
+        .drain(..)
+        .zip(finding_run_survivors.iter().copied())
+    {
         let at = finding.at();
-        !ignored
+        if ignored
             .get(at.file.as_str())
             .is_some_and(|lines| lines.contains_key(&at.line))
-    });
-    if let Some(path) = &options.write_baseline {
-        crate::baseline::write(path, &report.findings)?;
+        {
+            report.survivor_breakdown.suppressed += run_survivors;
+        } else {
+            after_inline.push((finding, run_survivors));
+        }
     }
-    report
-        .findings
-        .retain(|finding| !known.as_ref().is_some_and(|known| known.knows(finding)));
+    if let Some(path) = &options.write_baseline {
+        let unignored: Vec<Finding> = after_inline.iter().map(|(f, _)| f.clone()).collect();
+        crate::baseline::write(path, &unignored)?;
+    }
+    for (finding, run_survivors) in after_inline {
+        if known.as_ref().is_some_and(|known| known.knows(&finding)) {
+            report.survivor_breakdown.suppressed += run_survivors;
+        } else {
+            report.survivor_breakdown.reported += run_survivors;
+            report.findings.push(finding);
+        }
+    }
     report.suppressed = before - report.findings.len();
     if let Some(checkpoint) = checkpoint {
         checkpoint.finish_if_complete()?;

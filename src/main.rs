@@ -33,7 +33,13 @@ Exit codes:
   0  No gaps found
   1  Analysis or CLI error (invalid arguments or baseline tests failed)
   2  Test gaps, unstable predictions, or audit discrepancies found
-  3  Incomplete evaluation (unconfirmed timeouts, no mutants executed, or source-only timeout/unevaluated)";
+  3  Incomplete evaluation (unconfirmed timeouts, no mutants executed, or source-only timeout/unevaluated)
+
+Report counts (JSON):
+  mutants_run = mutants_killed + mutants_survived
+  mutants_timed_out is a subset of mutants_killed (mutants_timed_out <= mutants_killed)
+  mutants_survived = survivor_breakdown.{reported + suppressed + redundant_constant + preexisting_unchanged + unchanged_not_compared + unconfirmed_gap}
+  evaluation is \"partial\" when mutants_not_built, mutants_not_evaluated, skipped_sites, unparseable_source, unchanged_not_compared, unconfirmed timeouts, or source-only timeouts remain";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, clap::ValueEnum)]
 enum OutputFormat {
@@ -1041,5 +1047,107 @@ mod tests {
         assert_eq!(report_exit(&rep), 2);
         rep.timeout_rechecks.unconfirmed = 1;
         assert_eq!(report_exit(&rep), 3);
+    }
+
+    #[test]
+    fn report_exit_pict_table() {
+        let table = include_str!("../tests/data/report_evaluation.pict.tsv");
+        let mut lines = table.lines();
+        let _header = lines.next().expect("header");
+        let dummy = || report::Location {
+            file: "src/lib.rs".into(),
+            line: 1,
+            column: 1,
+            code: "x".into(),
+            ..report::Location::default()
+        };
+        for line in lines.filter(|line| !line.trim().is_empty()) {
+            let cols: Vec<&str> = line.split('\t').collect();
+            assert_eq!(cols.len(), 11, "row: {line}");
+            let skipped = if cols[4] == "true" {
+                vec![report::SkippedSite {
+                    at: dummy(),
+                    end_line: 1,
+                    end_column: 2,
+                    reason: report::SkipReason::UnparseableSource,
+                    diagnostic: Some("parse error".into()),
+                }]
+            } else if cols[2] == "nonempty" {
+                vec![report::SkippedSite {
+                    at: dummy(),
+                    end_line: 1,
+                    end_column: 2,
+                    reason: report::SkipReason::RequiresSourceRebuild,
+                    diagnostic: None,
+                }]
+            } else {
+                vec![]
+            };
+            let source_only_timeout = cols[8] == "true";
+            let mut rep = report::Report {
+                sites: usize::from(cols[0] == "nonzero"),
+                mutants_run: usize::from(cols[1] == "nonzero"),
+                mutants_killed: usize::from(cols[1] == "nonzero"),
+                mutants_timed_out: usize::from(source_only_timeout),
+                skipped,
+                skipped_sites: usize::from(cols[3] == "nonzero"),
+                mutants_not_built: usize::from(cols[5] == "nonzero"),
+                mutants_not_evaluated: usize::from(cols[6] == "nonzero"),
+                timeout_rechecks: report::TimeoutRechecks {
+                    first_pass: usize::from(cols[7] == "nonzero"),
+                    unconfirmed: usize::from(cols[7] == "nonzero"),
+                    ..report::TimeoutRechecks::default()
+                },
+                unstable: if cols[9] == "true" {
+                    vec![dummy()]
+                } else {
+                    vec![]
+                },
+                analysis: report::Analysis {
+                    source_only: cols[10] == "true",
+                    ..report::Analysis::default()
+                },
+                ..report::Report::default()
+            };
+            rep.evaluation = match cols[1] {
+                "zero" => {
+                    if cols[0] == "zero"
+                        && cols[2] == "empty"
+                        && cols[5] == "zero"
+                        && cols[6] == "zero"
+                    {
+                        Some(report::Evaluation::NoSites)
+                    } else {
+                        Some(report::Evaluation::NoMutantsExecuted)
+                    }
+                }
+                "nonzero" => {
+                    if cols[3] == "nonzero"
+                        || cols[4] == "true"
+                        || cols[5] == "nonzero"
+                        || cols[6] == "nonzero"
+                        || cols[7] == "nonzero"
+                        || source_only_timeout
+                    {
+                        Some(report::Evaluation::Partial)
+                    } else {
+                        None
+                    }
+                }
+                other => panic!("unexpected mutants_run value: {other}"),
+            };
+            let expected = if cols[7] == "nonzero"
+                || (cols[10] == "true" && (source_only_timeout || cols[6] == "nonzero"))
+            {
+                3
+            } else if cols[9] == "true" {
+                2
+            } else if rep.evaluation == Some(report::Evaluation::NoMutantsExecuted) {
+                3
+            } else {
+                0
+            };
+            assert_eq!(report_exit(&rep), expected, "row: {line}");
+        }
     }
 }

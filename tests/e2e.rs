@@ -1962,6 +1962,8 @@ fn only_changed_code_is_analysed_on_request() {
         since["mutants_not_built"].as_u64().unwrap(),
         by_lines["mutants_not_built"].as_u64().unwrap() + 2
     );
+    assert_eq!(since["evaluation"], "partial");
+    since.as_object_mut().unwrap().remove("evaluation");
     since["mutants_not_built"] = by_lines["mutants_not_built"].clone();
     assert_eq!(but_how(by_lines), since);
     let bad = tmt(&dir, &["--quiet", "--lines", "src/lib.rs:9-2"]);
@@ -5807,4 +5809,329 @@ mod tests {
     let first_line: Value = serde_json::from_str(jsonl.stdout.lines().next().unwrap()).unwrap();
     assert_eq!(first_line["schema_version"], 1, "{first_line:#}");
     assert_eq!(first_line["report"]["schema_version"], 1, "{first_line:#}");
+}
+
+fn assert_json_counts_reconcile(report: &Value) {
+    let run = report["mutants_run"].as_u64().unwrap();
+    let killed = report["mutants_killed"].as_u64().unwrap();
+    let timed_out = report["mutants_timed_out"].as_u64().unwrap();
+    let survived = report["mutants_survived"].as_u64().unwrap();
+    let sb = &report["survivor_breakdown"];
+    let sb_sum = sb["reported"].as_u64().unwrap()
+        + sb["suppressed"].as_u64().unwrap()
+        + sb["redundant_constant"].as_u64().unwrap()
+        + sb["preexisting_unchanged"].as_u64().unwrap()
+        + sb["unchanged_not_compared"].as_u64().unwrap()
+        + sb["unconfirmed_gap"].as_u64().unwrap();
+    assert_eq!(run, killed + survived, "run != killed + survived: {report:#}");
+    assert!(timed_out <= killed, "timed_out > killed: {report:#}");
+    assert_eq!(
+        survived, sb_sum,
+        "survived != sum(survivor_breakdown): {report:#}"
+    );
+}
+
+#[test]
+fn report_counts_reconcile_and_mark_partial_evaluation() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("report-counts-reconcile");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"reconcile-demo\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub const fn doubled(x: i32) -> i32 {
+    x + x
+}
+
+pub fn always_true_in_tests(x: i32) -> bool {
+    x > 0
+}
+
+pub fn suppressed_gap(x: i32) -> i32 {
+    // tmt:ignore intentional weak test
+    x + 1
+}
+
+pub fn covered(x: i32) -> i32 {
+    x + 2
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exercises_functions() {
+        assert_eq!(doubled(3), 6);
+        assert!(always_true_in_tests(5));
+        let _ = suppressed_gap(1);
+        assert_eq!(covered(3), 5);
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    // Without `--rebuild`: `const fn doubled` leaves unbuilt mutants -> `evaluation: "partial"`.
+    let quick = tmt(&dir, &["--json", "--quiet", "--no-effects"]);
+    assert_eq!(quick.code, 2, "{}", quick.stderr);
+    let quick_json: Value = serde_json::from_str(&quick.stdout).unwrap();
+    assert_json_counts_reconcile(&quick_json);
+    assert_eq!(quick_json["evaluation"], "partial", "{quick_json:#}");
+    assert!(
+        quick_json["mutants_not_built"].as_u64().unwrap() > 0,
+        "{quick_json:#}"
+    );
+    assert!(
+        quick_json["survivor_breakdown"]["suppressed"]
+            .as_u64()
+            .unwrap()
+            > 0,
+        "{quick_json:#}"
+    );
+    assert!(
+        quick_json["survivor_breakdown"]["redundant_constant"]
+            .as_u64()
+            .unwrap()
+            > 0,
+        "{quick_json:#}"
+    );
+
+    // Text output also calls out both the partial evaluation and unreported survivors.
+    let quick_text = tmt(&dir, &["--quiet", "--no-effects"]);
+    assert!(
+        quick_text
+            .stdout
+            .contains("(partial evaluation: some mutants were not built or evaluated)"),
+        "{}",
+        quick_text.stdout
+    );
+    assert!(
+        quick_text
+            .stdout
+            .contains("surviving mutants not reported as findings:"),
+        "{}",
+        quick_text.stdout
+    );
+
+    // `--no-verify` does not run confirmation mutants for predicted input gaps, yet counts still reconcile.
+    let no_verify = tmt(&dir, &["--json", "--quiet", "--no-effects", "--no-verify"]);
+    let no_verify_json: Value = serde_json::from_str(&no_verify.stdout).unwrap();
+    assert_json_counts_reconcile(&no_verify_json);
+    assert_eq!(no_verify_json["evaluation"], "partial", "{no_verify_json:#}");
+
+    // With `--rebuild`: all mutants are built and evaluated -> `evaluation` is omitted (`null`).
+    let full = tmt(&dir, &["--json", "--quiet", "--no-effects", "--rebuild"]);
+    let full_json: Value = serde_json::from_str(&full.stdout).unwrap();
+    assert_json_counts_reconcile(&full_json);
+    assert_eq!(full_json["mutants_not_built"], 0, "{full_json:#}");
+    assert!(full_json["evaluation"].is_null(), "{full_json:#}");
+}
+
+#[test]
+fn since_preexisting_survivors_in_unchanged_code_reconcile() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("report-counts-since-preexisting");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"since-reconcile\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    let base_src = r#"
+pub fn unchanged_weak(x: i32) -> i32 {
+    if x > 0 {
+        x + 1
+    } else {
+        0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn weak_check() {
+        assert!(unchanged_weak(5) > 0);
+        assert_eq!(unchanged_weak(-1), 0);
+    }
+}
+"#;
+    fs::write(dir.join("src/lib.rs"), base_src).unwrap();
+    fs::write(dir.join(".gitignore"), "target/\nCargo.lock\n").unwrap();
+    git_output(&dir, &["init", "-q"]);
+    git_output(&dir, &["add", "-A"]);
+    let base = git_output(&dir, &["write-tree"]);
+
+    // Modify only the test so `unchanged_weak` is checked as unchanged code (`beyond`).
+    let updated_src = base_src.replace(
+        "assert_eq!(unchanged_weak(-1), 0);",
+        "assert_eq!(unchanged_weak(-1), 0);\n        assert_eq!(unchanged_weak(0), 0);",
+    );
+    fs::write(dir.join("src/lib.rs"), updated_src).unwrap();
+
+    let run = tmt(&dir, &["--since", &base, "--json", "--quiet", "--no-effects"]);
+    assert_eq!(run.code, 0, "{}\n{}", run.stdout, run.stderr);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_json_counts_reconcile(&report);
+    assert!(
+        report["findings"].as_array().unwrap().is_empty(),
+        "{report:#}"
+    );
+    assert!(
+        report["mutants_survived"].as_u64().unwrap() > 0,
+        "expected preexisting survivors in unchanged code: {report:#}"
+    );
+    assert_eq!(
+        report["survivor_breakdown"]["preexisting_unchanged"],
+        report["mutants_survived"],
+        "{report:#}"
+    );
+    // Only the test changed, so there are no unbuilt source-revert mutants -> complete evaluation.
+    assert!(report["evaluation"].is_null(), "{report:#}");
+
+    // When the earlier tests cannot build against the current code, unchanged survivors
+    // must be classified as `unchanged_not_compared` and mark `evaluation: "partial"`.
+    let broken_earlier = base_src
+        .replace(
+            "pub fn unchanged_weak(x: i32) -> i32 {",
+            "pub fn helper() -> i32 { 1 }\npub fn unchanged_weak(x: i32) -> i32 {",
+        )
+        .replace(
+            "assert_eq!(unchanged_weak(-1), 0);",
+            "assert_eq!(unchanged_weak(-1), 0);\n        assert_eq!(helper(), 1);",
+        );
+    fs::write(dir.join("src/lib.rs"), &broken_earlier).unwrap();
+    git_output(&dir, &["add", "-A"]);
+    let with_helper = git_output(&dir, &["write-tree"]);
+    // Remove `helper()` and its call so old tests calling `helper()` no longer build.
+    fs::write(dir.join("src/lib.rs"), base_src).unwrap();
+    let uncompared = tmt(
+        &dir,
+        &["--since", &with_helper, "--json", "--quiet", "--no-effects"],
+    );
+    assert_eq!(uncompared.code, 0, "{}\n{}", uncompared.stdout, uncompared.stderr);
+    let uncompared_json: Value = serde_json::from_str(&uncompared.stdout).unwrap();
+    assert_json_counts_reconcile(&uncompared_json);
+    assert!(
+        uncompared_json["survivor_breakdown"]["unchanged_not_compared"]
+            .as_u64()
+            .unwrap()
+            > 0,
+        "{uncompared_json:#}"
+    );
+    assert_eq!(
+        uncompared_json["evaluation"], "partial",
+        "{uncompared_json:#}"
+    );
+}
+
+#[test]
+fn since_const_only_change_without_rebuild_reports_unbuilt_and_no_mutants_executed() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("report-counts-since-const-only");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"const-only-since\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    let base_src = "pub const LIMIT: u32 = 10;\n#[test]\nfn ok() { assert!(LIMIT > 0); }\n";
+    fs::write(dir.join("src/lib.rs"), base_src).unwrap();
+    fs::write(dir.join(".gitignore"), "target/\nCargo.lock\n").unwrap();
+    git_output(&dir, &["init", "-q"]);
+    git_output(&dir, &["add", "-A"]);
+    let base = git_output(&dir, &["write-tree"]);
+
+    fs::write(
+        dir.join("src/lib.rs"),
+        base_src.replace("LIMIT: u32 = 10;", "LIMIT: u32 = 20;"),
+    )
+    .unwrap();
+    let run = tmt(&dir, &["--since", &base, "--json", "--quiet", "--no-effects"]);
+    assert_eq!(run.code, 3, "{}\n{}", run.stdout, run.stderr);
+    let report: Value = serde_json::from_str(&run.stdout).unwrap();
+    assert_json_counts_reconcile(&report);
+    assert!(
+        report["mutants_not_built"].as_u64().unwrap() > 0,
+        "{report:#}"
+    );
+    assert_eq!(report["evaluation"], "no_mutants_executed", "{report:#}");
+
+    // When a sibling module has a const-only change alongside a probed function change in
+    // `lib.rs`, the sibling module's unbuilt revert must still be counted and mark `partial`.
+    fs::write(dir.join("src/limits.rs"), "pub const MAX_ITEMS: u32 = 10;\n").unwrap();
+    fs::write(
+        dir.join("src/lib.rs"),
+        "pub mod limits;\npub fn add(a: i32, b: i32) -> i32 { a + b }\n#[test]\nfn ok() { assert_eq!(add(2, 3), 5); assert_eq!(limits::MAX_ITEMS, 10); }\n",
+    )
+    .unwrap();
+    git_output(&dir, &["add", "-A"]);
+    let with_sibling = git_output(&dir, &["write-tree"]);
+    fs::write(dir.join("src/limits.rs"), "pub const MAX_ITEMS: u32 = 20;\n").unwrap();
+    fs::write(
+        dir.join("src/lib.rs"),
+        "pub mod limits;\npub fn add(a: i32, b: i32) -> i32 { a + b + 1 }\n#[test]\nfn ok() { assert_eq!(add(2, 3), 6); assert_eq!(limits::MAX_ITEMS, 20); }\n",
+    )
+    .unwrap();
+    let mixed = tmt(
+        &dir,
+        &["--since", &with_sibling, "--json", "--quiet", "--no-effects"],
+    );
+    let mixed_json: Value = serde_json::from_str(&mixed.stdout).unwrap();
+    assert_json_counts_reconcile(&mixed_json);
+    assert!(mixed_json["mutants_run"].as_u64().unwrap() > 0, "{mixed_json:#}");
+    assert!(
+        mixed_json["mutants_not_built"].as_u64().unwrap() >= 2,
+        "expected unbuilt reverts from both lib.rs and sibling limits.rs: {mixed_json:#}"
+    );
+    assert_eq!(mixed_json["evaluation"], "partial", "{mixed_json:#}");
+}
+
+#[test]
+fn unparseable_sibling_module_marks_evaluation_partial_in_json_sarif_and_text() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("report-counts-unparseable-partial");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"unparseable-partial\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("src/lib.rs"),
+        "pub mod broken;\npub fn add(a: i32, b: i32) -> i32 { a + b }\n#[test]\nfn checks_add() { assert_eq!(add(2, 3), 5); }\n",
+    )
+    .unwrap();
+    // UTF-8 BOM makes syn reject `broken.rs` while rustc still compiles it.
+    fs::write(dir.join("src/broken.rs"), "\u{feff}pub fn ok() -> i32 { 1 }\n").unwrap();
+
+    let json_run = tmt(&dir, &["--json", "--quiet", "--no-effects"]);
+    assert_eq!(json_run.code, 0, "{}\n{}", json_run.stdout, json_run.stderr);
+    let report: Value = serde_json::from_str(&json_run.stdout).unwrap();
+    assert_json_counts_reconcile(&report);
+    assert!(report["mutants_run"].as_u64().unwrap() > 0, "{report:#}");
+    assert_eq!(report["evaluation"], "partial", "{report:#}");
+
+    let sarif_run = tmt(&dir, &["--sarif", "--quiet", "--no-effects"]);
+    let sarif: Value = serde_json::from_str(&sarif_run.stdout).unwrap();
+    assert_eq!(
+        sarif["runs"][0]["properties"]["evaluation"], "partial",
+        "{sarif:#}"
+    );
+
+    let text_run = tmt(&dir, &["--quiet", "--no-effects"]);
+    assert!(
+        text_run
+            .stdout
+            .contains("(partial evaluation: some mutants were not built or evaluated)"),
+        "{}",
+        text_run.stdout
+    );
 }

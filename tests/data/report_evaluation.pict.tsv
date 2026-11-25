@@ -1,0 +1,16 @@
+sites	mutants_run	skipped_entries	skipped_sites	unparseable_source	mutants_not_built	mutants_not_evaluated	unconfirmed_timeouts	source_only_timeout	has_gaps	source_only
+zero	zero	empty	zero	false	zero	zero	zero	false	false	false
+nonzero	nonzero	empty	zero	false	zero	zero	zero	false	false	false
+nonzero	nonzero	nonempty	zero	false	nonzero	zero	zero	false	false	false
+nonzero	nonzero	nonempty	zero	false	nonzero	zero	zero	false	true	false
+nonzero	zero	empty	zero	false	zero	zero	zero	false	false	false
+zero	zero	empty	zero	false	nonzero	zero	zero	false	false	false
+zero	zero	empty	zero	false	zero	nonzero	zero	false	false	false
+nonzero	nonzero	nonempty	zero	true	zero	zero	zero	false	false	false
+nonzero	nonzero	empty	zero	false	zero	zero	nonzero	false	false	false
+nonzero	nonzero	empty	zero	false	zero	nonzero	zero	false	false	true
+nonzero	nonzero	empty	zero	false	zero	zero	zero	true	false	true
+zero	nonzero	nonempty	nonzero	true	nonzero	zero	nonzero	true	true	true
+nonzero	nonzero	empty	zero	false	zero	nonzero	nonzero	true	true	true
+nonzero	zero	nonempty	nonzero	true	nonzero	nonzero	nonzero	false	true	true
+nonzero	nonzero	nonempty	nonzero	false	zero	zero	zero	false	false	false

@@ -316,6 +316,33 @@ cargo tmt --list --format json
 | **`2`** | Test gaps, unstable predictions, or `--audit` discrepancies found |
 | **`3`** | Incomplete evaluation (unconfirmed parallel timeouts, no mutants executed, or `--source-only` timeout/unevaluated) |
 
+### Report counts & evaluation status
+
+Every JSON report satisfies three exact accounting identities:
+
+- `mutants_run == mutants_killed + mutants_survived`
+- `mutants_timed_out <= mutants_killed` (`mutants_timed_out` is a subset of `mutants_killed`, not an additional bucket)
+- `mutants_survived == survivor_breakdown.reported + survivor_breakdown.suppressed + survivor_breakdown.redundant_constant + survivor_breakdown.preexisting_unchanged + survivor_breakdown.unchanged_not_compared + survivor_breakdown.unconfirmed_gap`
+
+| Field | Meaning |
+|---|---|
+| `mutants_run` | Evaluated mutants whose run completed (`Fail`, confirmed `Timeout`, or `Pass`). Excludes unbuilt, unviable, unable, and unconfirmed-timeout mutants. |
+| `mutants_killed` | Subset of `mutants_run` caught by a test failure or confirmed timeout. |
+| `mutants_timed_out` | Subset of `mutants_killed` stopped by the timeout limit. |
+| `mutants_survived` | Subset of `mutants_run` that passed all selected tests (`mutants_run - mutants_killed`). |
+| `survivor_breakdown.reported` | Surviving mutants emitted in `findings` (note that one finding can group multiple mutants at the same site, and unverified `--no-verify` input gaps contribute `0` here because no mutant was run). |
+| `survivor_breakdown.suppressed` | Surviving mutants whose finding was suppressed by `// tmt:ignore` or `--baseline`. |
+| `survivor_breakdown.redundant_constant` | Surviving mutants omitted because an enclosing or sole expression was already classified as constant in the tests. |
+| `survivor_breakdown.preexisting_unchanged` | Surviving mutants in unchanged code (reached by changed tests under `--since`) confirmed to have also survived the earlier tests. |
+| `survivor_breakdown.unchanged_not_compared` | Surviving mutants in unchanged code (under `--since`) that could not be compared against the earlier tests (e.g. earlier tests failed to build/pass or the rerun was unable/unconfirmed). |
+| `survivor_breakdown.unconfirmed_gap` | Surviving confirmation mutants whose predicted gap was not confirmed (another confirmation mutant for the same gap was refuted or unevaluated). |
+| `mutants_not_built` | Source-only mutants skipped because `--rebuild` was not passed. |
+| `mutants_not_evaluated` | Mutants that could not be evaluated (including `mutants_not_compiled`, unrepresentable probe ranges, unable runs, or unconfirmed timeouts). |
+| `unviable_mutants` | Candidate mutants rejected by the compiler (never counted in `mutants_run`). |
+| `evaluation` | Omitted (`null`) when every discovered mutant was evaluated (note: `--no-verify` still omits `evaluation` when all scheduled mutants ran; check `analysis.verified` if verification is required); `"partial"` when `mutants_run > 0` and any of `mutants_not_built`, `mutants_not_evaluated`, `skipped_sites`, `unparseable_source` in `skipped`, `survivor_breakdown.unchanged_not_compared`, `timeout_rechecks.unconfirmed`, or `--source-only` `mutants_timed_out` is non-zero; `"no_sites"` when there is nothing to mutate; `"no_mutants_executed"` when no mutant ran despite sites, skipped files/sites, unbuilt mutants, or unevaluated mutants (exits `3`). |
+
+> **CI tip:** Running without `--rebuild` exits `0` when all evaluated probe mutants are killed, even if `mutants_not_built > 0`. Check `evaluation == null` (or pass `--rebuild`) when you want a CI gate to require that no mutants were left unbuilt.
+
 ### Option reference
 
 Options are grouped into the same six workflow sections shown by `cargo tmt --help`:

@@ -238,11 +238,70 @@ pub enum TestBuildScope {
     SelectedTargets,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Evaluation {
     NoSites,
     NoMutantsExecuted,
+    /// At least one mutant ran, but other mutants were left unbuilt (`--rebuild`),
+    /// could not be evaluated, had skipped probes, or had unconfirmed timeouts.
+    Partial,
+}
+
+/// Partition of [`Report::mutants_survived`] by what happened to each surviving mutant.
+///
+/// The fields are mutually exclusive and exhaustive:
+/// `reported + suppressed + redundant_constant + preexisting_unchanged + unchanged_not_compared + unconfirmed_gap == mutants_survived`.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct SurvivorBreakdown {
+    /// Surviving mutants emitted in [`Report::findings`] (after suppressions).
+    /// Note that one finding can group multiple surviving mutants at the same site.
+    pub reported: usize,
+    /// Surviving mutants whose finding was suppressed by `// tmt:ignore` or `--baseline`.
+    pub suppressed: usize,
+    /// Surviving mutants omitted because an enclosing or sole expression was already
+    /// classified as constant in the tests.
+    pub redundant_constant: usize,
+    /// Surviving mutants in unchanged code (reached by changed tests under `--since`)
+    /// confirmed to have also survived the earlier tests, so they are not regressions.
+    pub preexisting_unchanged: usize,
+    /// Surviving mutants in unchanged code (under `--since`) whose status against the
+    /// earlier tests could not be evaluated (earlier tests failed to build/pass or the
+    /// mutant run was unable/unconfirmed).
+    pub unchanged_not_compared: usize,
+    /// Surviving confirmation mutants whose predicted gap was not confirmed
+    /// (another confirmation mutant for the same gap was refuted or not evaluated).
+    pub unconfirmed_gap: usize,
+}
+
+impl SurvivorBreakdown {
+    /// Total surviving mutants accounted for across all categories, returning `None` on overflow.
+    pub fn checked_total(&self) -> Option<usize> {
+        self.reported
+            .checked_add(self.suppressed)?
+            .checked_add(self.redundant_constant)?
+            .checked_add(self.preexisting_unchanged)?
+            .checked_add(self.unchanged_not_compared)?
+            .checked_add(self.unconfirmed_gap)
+    }
+
+    /// Total surviving mutants accounted for across all categories.
+    pub fn total(&self) -> usize {
+        self.reported
+            + self.suppressed
+            + self.redundant_constant
+            + self.preexisting_unchanged
+            + self.unchanged_not_compared
+            + self.unconfirmed_gap
+    }
+
+    /// Surviving mutants intentionally not emitted as findings (excluding suppressions).
+    pub fn unreported(&self) -> usize {
+        self.redundant_constant
+            + self.preexisting_unchanged
+            + self.unchanged_not_compared
+            + self.unconfirmed_gap
+    }
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Serialize)]
@@ -398,7 +457,12 @@ pub struct Report {
     pub mutants_run: usize,
     pub mutants_killed: usize,
     /// Killed mutants that were stopped by the timeout (typically an endless loop).
+    /// This is a subset of `mutants_killed`.
     pub mutants_timed_out: usize,
+    /// Evaluated mutants that passed the tests (`mutants_run - mutants_killed`).
+    pub mutants_survived: usize,
+    /// Complete accounting of `mutants_survived` by disposition.
+    pub survivor_breakdown: SurvivorBreakdown,
     #[serde(skip_serializing_if = "TimeoutRechecks::is_empty")]
     pub timeout_rechecks: TimeoutRechecks,
     pub findings: Vec<Finding>,
@@ -433,6 +497,8 @@ impl Default for Report {
             mutants_run: 0,
             mutants_killed: 0,
             mutants_timed_out: 0,
+            mutants_survived: 0,
+            survivor_breakdown: SurvivorBreakdown::default(),
             timeout_rechecks: TimeoutRechecks::default(),
             findings: Vec::new(),
             suppressed: 0,
@@ -445,11 +511,41 @@ impl Default for Report {
 
 impl Report {
     pub(crate) fn record_evaluation(&mut self) {
-        self.evaluation = match (self.sites, self.mutants_run, self.skipped.is_empty()) {
-            (_, 1.., _) => None,
-            (0, 0, true) => Some(Evaluation::NoSites),
-            _ => Some(Evaluation::NoMutantsExecuted),
+        self.evaluation = if self.mutants_run == 0 {
+            if self.sites == 0
+                && self.skipped.is_empty()
+                && self.mutants_not_built == 0
+                && self.mutants_not_evaluated == 0
+            {
+                Some(Evaluation::NoSites)
+            } else {
+                Some(Evaluation::NoMutantsExecuted)
+            }
+        } else if self.mutants_not_built > 0
+            || self.mutants_not_evaluated > 0
+            || self.skipped_sites > 0
+            || self.timeout_rechecks.unconfirmed > 0
+            || self.survivor_breakdown.unchanged_not_compared > 0
+            || (self.analysis.source_only && self.mutants_timed_out > 0)
+            || self
+                .skipped
+                .iter()
+                .any(|entry| entry.reason == SkipReason::UnparseableSource)
+        {
+            Some(Evaluation::Partial)
+        } else {
+            None
         };
+    }
+
+    /// Whether the mutant counts are internally consistent:
+    /// - `mutants_run == mutants_killed + mutants_survived`
+    /// - `mutants_timed_out <= mutants_killed`
+    /// - `mutants_survived == survivor_breakdown.checked_total()`
+    pub fn counts_reconcile(&self) -> bool {
+        self.mutants_killed.checked_add(self.mutants_survived) == Some(self.mutants_run)
+            && self.mutants_timed_out <= self.mutants_killed
+            && self.survivor_breakdown.checked_total() == Some(self.mutants_survived)
     }
 
     /// Puts the findings in reading order. Sites are numbered as they are discovered, and
@@ -1913,6 +2009,39 @@ pub fn render_text(report: &Report, show_unreached: bool) -> String {
             report.skipped.len()
         ));
     }
+    if report.survivor_breakdown.unreported() > 0 {
+        let breakdown = &report.survivor_breakdown;
+        let mut parts = vec![];
+        if breakdown.redundant_constant > 0 {
+            parts.push(format!("{} redundant constant", breakdown.redundant_constant));
+        }
+        if breakdown.preexisting_unchanged > 0 {
+            parts.push(format!(
+                "{} preexisting in unchanged code",
+                breakdown.preexisting_unchanged
+            ));
+        }
+        if breakdown.unchanged_not_compared > 0 {
+            parts.push(format!(
+                "{} in unchanged code (earlier tests could not be evaluated)",
+                breakdown.unchanged_not_compared
+            ));
+        }
+        if breakdown.unconfirmed_gap > 0 {
+            parts.push(format!(
+                "{} from unconfirmed gaps",
+                breakdown.unconfirmed_gap
+            ));
+        }
+        out.push_str(&format!(
+            "({} surviving mutants not reported as findings: {})\n",
+            breakdown.unreported(),
+            parts.join(", ")
+        ));
+    }
+    if report.evaluation == Some(Evaluation::Partial) {
+        out.push_str("(partial evaluation: some mutants were not built or evaluated)\n");
+    }
     if report.evaluation == Some(Evaluation::NoMutantsExecuted) {
         out.push_str("No mutants executed. See any skipped entries in --json. For a subprocess that clears the probe environment, try --source-only.\n");
     }
@@ -1928,7 +2057,7 @@ mod tests {
     use crate::instrument::discover;
 
     #[test]
-    fn evaluation_distinguishes_no_sites_no_mutants_and_completed_work() {
+    fn evaluation_distinguishes_no_sites_no_mutants_partial_and_completed_work() {
         let mut report = Report::default();
         report.record_evaluation();
         assert_eq!(report.evaluation, Some(Evaluation::NoSites));
@@ -1937,9 +2066,167 @@ mod tests {
         assert_eq!(report.evaluation, Some(Evaluation::NoMutantsExecuted));
         assert!(render_text(&report, false).contains("No mutants executed."));
         report.mutants_run = 1;
+        report.mutants_killed = 1;
         report.record_evaluation();
         assert_eq!(report.evaluation, None);
+        assert!(report.counts_reconcile());
         assert!(!render_text(&report, false).contains("No mutants executed."));
+        assert!(!render_text(&report, false).contains("partial evaluation"));
+
+        report.mutants_not_built = 3;
+        report.record_evaluation();
+        assert_eq!(report.evaluation, Some(Evaluation::Partial));
+        assert!(render_text(&report, false).contains("partial evaluation"));
+    }
+
+    #[test]
+    fn evaluation_pict_table() {
+        let table = include_str!("../tests/data/report_evaluation.pict.tsv");
+        let mut lines = table.lines();
+        let header = lines.next().expect("header");
+        assert_eq!(
+            header,
+            "sites\tmutants_run\tskipped_entries\tskipped_sites\tunparseable_source\tmutants_not_built\tmutants_not_evaluated\tunconfirmed_timeouts\tsource_only_timeout\thas_gaps\tsource_only"
+        );
+        let dummy = || Location {
+            file: "src/lib.rs".into(),
+            line: 1,
+            column: 1,
+            code: "x".into(),
+            ..Location::default()
+        };
+        let mut rows = 0;
+        for line in lines.filter(|line| !line.trim().is_empty()) {
+            rows += 1;
+            let cols: Vec<&str> = line.split('\t').collect();
+            assert_eq!(cols.len(), 11, "row: {line}");
+            let skipped = if cols[4] == "true" {
+                vec![SkippedSite::new(
+                    dummy(),
+                    (1, 2),
+                    SkipReason::UnparseableSource,
+                    Some("parse error".into()),
+                )]
+            } else if cols[2] == "nonempty" {
+                vec![SkippedSite::new(
+                    dummy(),
+                    (1, 2),
+                    SkipReason::ProbeReplacedBySourceRebuild,
+                    None,
+                )]
+            } else {
+                vec![]
+            };
+            let source_only_timeout = cols[8] == "true";
+            let mut report = Report {
+                sites: usize::from(cols[0] == "nonzero"),
+                mutants_run: usize::from(cols[1] == "nonzero"),
+                mutants_killed: usize::from(cols[1] == "nonzero"),
+                mutants_timed_out: usize::from(source_only_timeout),
+                skipped,
+                skipped_sites: usize::from(cols[3] == "nonzero"),
+                mutants_not_built: usize::from(cols[5] == "nonzero"),
+                mutants_not_evaluated: usize::from(cols[6] == "nonzero"),
+                timeout_rechecks: TimeoutRechecks {
+                    first_pass: usize::from(cols[7] == "nonzero"),
+                    unconfirmed: usize::from(cols[7] == "nonzero"),
+                    ..TimeoutRechecks::default()
+                },
+                analysis: Analysis {
+                    source_only: cols[10] == "true",
+                    ..Analysis::default()
+                },
+                ..Report::default()
+            };
+            report.record_evaluation();
+            let expected = match cols[1] {
+                "zero" => {
+                    if cols[0] == "zero"
+                        && cols[2] == "empty"
+                        && cols[5] == "zero"
+                        && cols[6] == "zero"
+                    {
+                        Some(Evaluation::NoSites)
+                    } else {
+                        Some(Evaluation::NoMutantsExecuted)
+                    }
+                }
+                "nonzero" => {
+                    if cols[3] == "nonzero"
+                        || cols[4] == "true"
+                        || cols[5] == "nonzero"
+                        || cols[6] == "nonzero"
+                        || cols[7] == "nonzero"
+                        || source_only_timeout
+                    {
+                        Some(Evaluation::Partial)
+                    } else {
+                        None
+                    }
+                }
+                other => panic!("unexpected mutants_run value: {other}"),
+            };
+            assert_eq!(report.evaluation, expected, "row: {line}");
+            assert!(report.counts_reconcile(), "row: {line}");
+            let text = render_text(&report, false);
+            assert_eq!(
+                text.contains("partial evaluation"),
+                expected == Some(Evaluation::Partial),
+                "row: {line}\n{text}"
+            );
+        }
+        assert!(rows >= 11, "expected PICT table rows, got {rows}");
+    }
+
+    #[test]
+    fn survivor_breakdown_reconciles_and_renders_unreported_reasons() {
+        let mut report = Report {
+            package: "demo".into(),
+            sites: 5,
+            mutants_run: 11,
+            mutants_killed: 4,
+            mutants_timed_out: 1,
+            mutants_survived: 7,
+            survivor_breakdown: SurvivorBreakdown {
+                reported: 1,
+                suppressed: 1,
+                redundant_constant: 2,
+                preexisting_unchanged: 1,
+                unchanged_not_compared: 1,
+                unconfirmed_gap: 1,
+            },
+            ..Report::default()
+        };
+        assert!(report.counts_reconcile());
+        report.record_evaluation();
+        assert_eq!(report.evaluation, Some(Evaluation::Partial));
+        let text = render_text(&report, false);
+        assert!(
+            text.contains(
+                "(5 surviving mutants not reported as findings: 2 redundant constant, 1 preexisting in unchanged code, 1 in unchanged code (earlier tests could not be evaluated), 1 from unconfirmed gaps)"
+            ),
+            "{text}"
+        );
+
+        report.survivor_breakdown.reported = 0;
+        assert!(!report.counts_reconcile());
+        report.survivor_breakdown.reported = 1;
+        report.mutants_timed_out = 5;
+        assert!(!report.counts_reconcile());
+
+        // Overflow in breakdown addition must not panic or wrap to a false match.
+        let overflow = Report {
+            mutants_run: 0,
+            mutants_killed: 0,
+            mutants_survived: 0,
+            survivor_breakdown: SurvivorBreakdown {
+                reported: usize::MAX,
+                suppressed: 1,
+                ..SurvivorBreakdown::default()
+            },
+            ..Report::default()
+        };
+        assert!(!overflow.counts_reconcile());
     }
 
     fn results_of(sarif: &serde_json::Value) -> &Vec<serde_json::Value> {
@@ -2970,6 +3257,11 @@ mod tests {
             mutants_run: 3,
             mutants_killed: 2,
             mutants_timed_out: 0,
+            mutants_survived: 1,
+            survivor_breakdown: SurvivorBreakdown {
+                reported: 1,
+                ..SurvivorBreakdown::default()
+            },
             timeout_rechecks: TimeoutRechecks::default(),
             suppressed: 0,
             findings: vec![Finding::AssertionGap {

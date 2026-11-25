@@ -1,0 +1,15 @@
+sites: zero, nonzero
+mutants_run: zero, nonzero
+skipped_entries: empty, nonempty
+skipped_sites: zero, nonzero
+unparseable_source: false, true
+mutants_not_built: zero, nonzero
+mutants_not_evaluated: zero, nonzero
+unconfirmed_timeouts: zero, nonzero
+source_only_timeout: false, true
+has_gaps: false, true
+source_only: false, true
+
+IF [skipped_sites] = "nonzero" THEN [skipped_entries] = "nonempty";
+IF [unparseable_source] = "true" THEN [skipped_entries] = "nonempty";
+IF [source_only_timeout] = "true" THEN [source_only] = "true" AND [mutants_run] = "nonzero";
