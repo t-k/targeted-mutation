@@ -249,9 +249,25 @@ struct Cli {
     #[arg(long, help_heading = HEADING_TESTS)]
     isolate_tests: bool,
 
+    /// Test only the package's library target.
+    #[arg(long, help_heading = HEADING_TESTS)]
+    lib: bool,
+
+    /// Test all binary targets.
+    #[arg(long, help_heading = HEADING_TESTS)]
+    bins: bool,
+
+    /// Test only the specified integration test target (repeatable).
+    #[arg(long = "test", value_name = "NAME", help_heading = HEADING_TESTS)]
+    integration_test: Vec<String>,
+
     /// Cargo test targets to run and build when possible (repeatable).
     #[arg(long, value_name = "TARGET", help_heading = HEADING_TESTS)]
     test_target: Vec<String>,
+
+    /// Include libtest tests whose name contains PATTERN (repeatable).
+    #[arg(long, value_name = "PATTERN", help_heading = HEADING_TESTS)]
+    test_filter: Vec<String>,
 
     /// Include exact libtest test names (repeatable).
     #[arg(long, value_name = "NAME", help_heading = HEADING_TESTS)]
@@ -552,8 +568,12 @@ fn main() -> ExitCode {
         }),
         test_selection: driver::TestSelection {
             isolate: cli.isolate_tests,
+            lib: cli.lib,
+            bins: cli.bins,
+            integration_tests: cli.integration_test,
             targets: cli.test_target,
             include: cli.include_test,
+            filter: cli.test_filter,
             exclude: cli.exclude_test,
             include_ignored: cli.include_ignored,
             wrapper: cli.test_wrapper,

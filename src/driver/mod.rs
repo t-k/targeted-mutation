@@ -91,21 +91,50 @@ pub struct Options {
 #[derive(Clone, Default)]
 pub struct TestSelection {
     pub isolate: bool,
+    pub lib: bool,
+    pub bins: bool,
+    pub integration_tests: Vec<String>,
     pub targets: Vec<String>,
     pub include: Vec<String>,
+    pub filter: Vec<String>,
     pub exclude: Vec<String>,
     pub include_ignored: bool,
     pub wrapper: Option<PathBuf>,
 }
 
 impl TestSelection {
+    pub(crate) fn has_target_filters(&self) -> bool {
+        self.lib
+            || self.bins
+            || !self.integration_tests.is_empty()
+            || !self.targets.is_empty()
+    }
+
     fn enabled(&self) -> bool {
         self.isolate
-            || !self.targets.is_empty()
+            || self.has_target_filters()
             || !self.include.is_empty()
+            || !self.filter.is_empty()
             || !self.exclude.is_empty()
             || self.include_ignored
             || self.wrapper.is_some()
+    }
+
+    pub(crate) fn matches_test(&self, test: &str, was_ignored: bool) -> bool {
+        if was_ignored && !self.include_ignored {
+            return false;
+        }
+        if self.exclude.iter().any(|name| name == test) {
+            return false;
+        }
+        if !self.include.is_empty() || !self.filter.is_empty() {
+            let exact = self.include.iter().any(|name| name == test);
+            let partial = self.filter.iter().any(|pat| test.contains(pat));
+            if !exact && !partial {
+                return false;
+            }
+        }
+        true
     }
 }
 
@@ -457,6 +486,9 @@ fn run_package(
                 test_packages.push(other);
             }
         }
+    }
+    if !options.list {
+        validate_target_selection(&test_packages, selection)?;
     }
     let is_kind = |t: &Target, kinds: &[&str]| t.kind.iter().any(|k| kinds.contains(&k.as_str()));
     let root_target = package
@@ -958,18 +990,13 @@ fn run_package(
     let mut disabled: HashSet<u32> = HashSet::new();
     let mut repairs = BTreeMap::new();
     let build_target = work_directory(&work, "target")?;
-    let target_flags = test_build_flags(
-        &test_packages,
-        &selection.targets,
-        &workspace,
-        &options.cargo,
-    );
+    let target_flags = test_build_flags(&test_packages, selection, &workspace, &options.cargo);
     let build_scope = if target_flags.is_some() {
         report::TestBuildScope::SelectedTargets
     } else {
         report::TestBuildScope::PackageWide
     };
-    let build_note = if !selection.targets.is_empty() && target_flags.is_none() {
+    let build_note = if selection.has_target_filters() && target_flags.is_none() {
         "Cargo is using a package-wide build because the selected test targets cannot be expressed exactly.\n"
     } else {
         ""
@@ -1148,6 +1175,8 @@ fn run_package(
     let root_exe = (!witness_candidates.is_empty())
         .then(|| root_test_exe(&build))
         .flatten();
+    let mut discovered_tests: Vec<String> = vec![];
+    let mut matched_bin_targets: Vec<(String, String)> = vec![];
     if let Some(nextest) = &options.nextest {
         let mut flags: Vec<_> = test_packages
             .iter()
@@ -1167,8 +1196,11 @@ fn run_package(
         ));
     } else {
         for (name, exe, owner, kind) in build.test_binaries {
-            if !selection.targets.is_empty() && !selection.targets.contains(&name) {
+            if !artifact_target_selected(&name, &kind, selection) {
                 continue;
+            }
+            if kind.first().map(String::as_str) == Some("bin") {
+                matched_bin_targets.push((owner.clone(), name.clone()));
             }
             let owner_package = test_packages
                 .iter()
@@ -1183,12 +1215,10 @@ fn run_package(
             if selection.enabled() {
                 let all = list_tests(&exe, &cwd, &work, false, true, work_lock.as_deref())?;
                 let ignored = list_tests(&exe, &cwd, &work, true, true, work_lock.as_deref())?;
+                discovered_tests.extend(all.iter().cloned());
                 for test in all {
                     let was_ignored = ignored.contains(&test);
-                    if (was_ignored && !selection.include_ignored)
-                        || (!selection.include.is_empty() && !selection.include.contains(&test))
-                        || selection.exclude.contains(&test)
-                    {
+                    if !selection.matches_test(&test, was_ignored) {
                         continue;
                     }
                     runners.push((
@@ -1214,7 +1244,13 @@ fn run_package(
         }
     }
     if selection.enabled() && runners.is_empty() {
-        bail!("{build_note}no tests matched the requested selection");
+        let hint = no_tests_matched_hint(
+            &test_packages,
+            selection,
+            &matched_bin_targets,
+            &discovered_tests,
+        );
+        bail!("{build_note}no tests matched the requested selection{hint}");
     }
     let selected_tests = selection.enabled().then(|| report::TestSelection {
         build_scope,

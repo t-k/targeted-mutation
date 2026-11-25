@@ -91,6 +91,18 @@ impl Target {
         matches!(self.test_build_arg(), Some(("--lib" | "--bin", _)))
     }
 
+    pub(super) fn is_lib(&self) -> bool {
+        matches!(self.test_build_arg(), Some(("--lib", None)))
+    }
+
+    pub(super) fn is_bin(&self) -> bool {
+        matches!(self.test_build_arg(), Some(("--bin", Some(_))))
+    }
+
+    pub(super) fn is_integration_test(&self) -> bool {
+        matches!(self.test_build_arg(), Some(("--test", Some(_))))
+    }
+
     /// The Cargo selector and its optional name. `--lib` selects every package's library.
     pub(super) fn test_build_arg(&self) -> Option<(&'static str, Option<&str>)> {
         match self.kind.first()?.as_str() {
@@ -106,17 +118,135 @@ impl Target {
     }
 }
 
+pub(super) fn target_selected(target: &Target, selection: &TestSelection) -> bool {
+    if !selection.has_target_filters() {
+        return true;
+    }
+    (selection.lib && target.is_lib())
+        || (selection.bins && target.is_bin())
+        || (target.is_integration_test() && selection.integration_tests.contains(&target.name))
+        || selection.targets.contains(&target.name)
+}
+
+pub(super) fn artifact_target_selected(
+    name: &str,
+    kind: &[String],
+    selection: &TestSelection,
+) -> bool {
+    if !selection.has_target_filters() {
+        return true;
+    }
+    let first = kind.first().map(String::as_str);
+    let is_lib = matches!(
+        first,
+        Some("lib" | "rlib" | "cdylib" | "dylib" | "staticlib" | "proc-macro")
+    );
+    let is_bin = first == Some("bin");
+    let is_test = first == Some("test");
+    (selection.lib && is_lib)
+        || (selection.bins && is_bin)
+        || (is_test && selection.integration_tests.iter().any(|t| t == name))
+        || selection.targets.iter().any(|t| t == name)
+}
+
+/// Validates requested target selectors against Cargo metadata before building, so
+/// misspelled or absent targets fail immediately rather than after a full compile.
+pub(super) fn validate_target_selection(
+    packages: &[&Package],
+    selection: &TestSelection,
+) -> Result<()> {
+    let all_targets: Vec<&Target> = packages.iter().flat_map(|p| &p.targets).collect();
+    if selection.lib && !all_targets.iter().any(|t| t.test && t.is_lib()) {
+        bail!("no tests matched: `--lib` was requested, but no selected package has a testable library target");
+    }
+    if selection.bins && !all_targets.iter().any(|t| t.test && t.is_bin()) {
+        bail!("no tests matched: `--bins` was requested, but no selected package has a testable binary target");
+    }
+    for name in &selection.integration_tests {
+        if !all_targets
+            .iter()
+            .any(|t| t.test && t.is_integration_test() && t.name == *name)
+        {
+            bail!("no tests matched: `--test {name}` matched no integration test target in the selected packages");
+        }
+    }
+    if !selection.targets.is_empty()
+        && !all_targets
+            .iter()
+            .any(|t| t.test && selection.targets.contains(&t.name))
+    {
+        let hint = selection
+            .targets
+            .iter()
+            .find_map(|name| {
+                let lib_name = name.replace('-', "_");
+                all_targets
+                    .iter()
+                    .find(|t| t.test && t.is_lib() && t.name == lib_name)
+                    .map(|_| {
+                        format!(
+                            " (hint: pass `--lib` or `--test-target {lib_name}` for the library target)"
+                        )
+                    })
+            })
+            .unwrap_or_default();
+        bail!(
+            "no tests matched: `--test-target` matched no test target in the selected packages{hint}"
+        );
+    }
+    Ok(())
+}
+
+/// Builds actionable hints when test selection matched zero tests.
+pub(super) fn no_tests_matched_hint(
+    packages: &[&Package],
+    selection: &TestSelection,
+    matched_bin_targets: &[(String, String)],
+    discovered_tests: &[String],
+) -> String {
+    let mut hints = Vec::new();
+    for (owner, bin_name) in matched_bin_targets {
+        if !selection.targets.iter().any(|t| t == bin_name) {
+            continue;
+        }
+        let lib_candidate = bin_name.replace('-', "_");
+        if let Some(pkg) = packages.iter().find(|p| p.name == *owner)
+            && pkg
+                .targets
+                .iter()
+                .any(|t| t.test && t.is_lib() && t.name == lib_candidate)
+        {
+            hints.push(format!(
+                "\nhint: target `{bin_name}` matched a binary target with no tests; pass `--lib` or `--test-target {lib_candidate}` to run library tests"
+            ));
+            break;
+        }
+    }
+    if !selection.include.is_empty() && selection.filter.is_empty() {
+        if let Some(pattern) = selection.include.iter().find(|wanted| {
+            discovered_tests
+                .iter()
+                .any(|known| known.contains(wanted.as_str()))
+        }) {
+            hints.push(format!(
+                "\nhint: `--include-test` requires exact test names; pass `--test-filter {pattern}` for substring/module matching"
+            ));
+        }
+    }
+    hints.concat()
+}
+
 /// Select only test targets that Cargo's flags can express without broadening the selection.
 pub(super) fn test_build_flags(
     packages: &[&Package],
-    names: &[String],
+    selection: &TestSelection,
     workspace: &Path,
     cargo: &CargoConfig,
 ) -> Option<Vec<String>> {
-    if names.is_empty() {
+    if !selection.has_target_filters() {
         return None;
     }
-    let selected = |target: &Target| target.test && names.contains(&target.name);
+    let selected = |target: &Target| target.test && target_selected(target, selection);
     let mut selectors = BTreeSet::new();
     for package in packages {
         let enabled_features = package.enabled_local_features(workspace, cargo);

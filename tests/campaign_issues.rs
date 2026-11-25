@@ -394,6 +394,126 @@ fn checks_boundary() {
 }
 
 #[test]
+fn lib_flag_test_filter_and_selection_hints_work_end_to_end() {
+    let path = package("test-filter-and-lib");
+    write(
+        &path,
+        "Cargo.toml",
+        "[package]\nname = \"my-api\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[workspace]\n",
+    );
+    write(
+        &path,
+        "src/lib.rs",
+        r#"pub mod pagination {
+    pub fn has_next(page: u32, total: u32) -> bool {
+        page < total
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn first_page_has_next() {
+            assert!(has_next(1, 2));
+        }
+
+        #[test]
+        fn last_page_stops() {
+            assert!(!has_next(2, 2));
+        }
+    }
+}
+
+#[cfg(test)]
+mod unrelated {
+    #[test]
+    fn other_test() {
+        assert_eq!(1 + 1, 2);
+    }
+}
+"#,
+    );
+    write(&path, "src/main.rs", "fn main() {}\n");
+    write(
+        &path,
+        "tests/smoke.rs",
+        "#[test]\nfn smoke_checks() { assert!(my_api::pagination::has_next(1, 2)); assert!(!my_api::pagination::has_next(2, 2)); }\n",
+    );
+
+    // 1. --lib + --test-filter selects only pagination module unit tests.
+    let filtered = command(
+        &path,
+        &[
+            "--lib",
+            "--test-filter",
+            "pagination::tests",
+            "--lines",
+            "src/lib.rs:2-4",
+            "--quiet",
+            "--json",
+        ],
+    )
+    .output()
+    .unwrap();
+    let report = json(&filtered, 0);
+    let selected = report["analysis"]["test_selection"]["tests"]
+        .as_array()
+        .unwrap();
+    assert_eq!(selected.len(), 2, "{selected:?}");
+    assert!(selected.iter().all(|t| t.as_str().unwrap().contains("pagination::tests")));
+
+    // 2. --test smoke runs only the integration test target.
+    let integration = command(
+        &path,
+        &[
+            "--test",
+            "smoke",
+            "--lines",
+            "src/lib.rs:2-4",
+            "--quiet",
+            "--json",
+        ],
+    )
+    .output()
+    .unwrap();
+    let int_report = json(&integration, 0);
+    assert_eq!(
+        int_report["analysis"]["test_selection"]["tests"],
+        serde_json::json!(["my-api::test::smoke::smoke_checks"])
+    );
+
+    // 3. --test-target my-api matches the empty bin target and prints a --lib hint.
+    let bin_only = command(
+        &path,
+        &["--test-target", "my-api", "--lines", "src/lib.rs:2-4", "--quiet"],
+    )
+    .output()
+    .unwrap();
+    assert_eq!(bin_only.status.code(), Some(1));
+    let bin_err = String::from_utf8_lossy(&bin_only.stderr);
+    assert!(bin_err.contains("--lib") && bin_err.contains("my_api"), "{bin_err}");
+
+    // 4. --include-test with a module prefix fails with a --test-filter hint.
+    let prefix = command(
+        &path,
+        &[
+            "--lib",
+            "--include-test",
+            "pagination::tests",
+            "--lines",
+            "src/lib.rs:2-4",
+            "--quiet",
+        ],
+    )
+    .output()
+    .unwrap();
+    assert_eq!(prefix.status.code(), Some(1));
+    let prefix_err = String::from_utf8_lossy(&prefix.stderr);
+    assert!(prefix_err.contains("--test-filter pagination::tests"), "{prefix_err}");
+}
+
+#[test]
 fn workspace_catalogue_has_one_snapshot_and_streamed_reports() {
     let path = package("catalogue-stream");
     write(

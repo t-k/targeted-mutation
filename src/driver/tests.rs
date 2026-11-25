@@ -354,9 +354,13 @@ fn test_build_scope_preserves_cargo_target_eligibility() {
         ],
     );
     let flags = |packages: &[&Package], names: &[&str], all| {
+        let selection = TestSelection {
+            targets: names.iter().map(|s| s.to_string()).collect(),
+            ..TestSelection::default()
+        };
         test_build_flags(
             packages,
-            &names.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            &selection,
             Path::new("workspace"),
             &CargoConfig {
                 all_features: all,
@@ -2776,6 +2780,165 @@ fn stage_external_parses_and_validates_parent_relative_specs() {
     ] {
         assert!(bad.parse::<StageExternal>().is_err(), "should reject {bad:?}");
     }
+}
+
+#[test]
+fn test_selection_matches_pict_table() {
+    let target = |name: &str, kind: &str| Target {
+        name: name.to_string(),
+        kind: vec![kind.to_string()],
+        src_path: PathBuf::from("src/lib.rs"),
+        test: true,
+        doctest: false,
+        required_features: vec![],
+    };
+    let pkg = Package {
+        name: "my-api".to_string(),
+        dependencies: vec![],
+        features: BTreeMap::new(),
+        manifest_path: PathBuf::from("workspace/Cargo.toml"),
+        targets: vec![
+            target("my_api", "lib"),
+            target("my-api", "bin"),
+            target("smoke", "test"),
+        ],
+    };
+    let tests = [
+        ("presentation::pagination::page_one", false),
+        ("presentation::pagination::page_two", false),
+        ("domain::auth::ignored_case", true),
+    ];
+    for row in include_str!("../../tests/data/test-selection-filter.pict.tsv")
+        .lines()
+        .skip(1)
+    {
+        let cols: Vec<_> = row.split('\t').collect();
+        let &[selector, filter, include, exclude, ignored] = cols.as_slice() else {
+            panic!("invalid PICT row: {row}");
+        };
+        let mut sel = TestSelection::default();
+        match selector {
+            "none" => {}
+            "lib" => sel.lib = true,
+            "bins" => sel.bins = true,
+            "integration_test" => sel.integration_tests.push("smoke".into()),
+            "test_target_lib" => sel.targets.push("my_api".into()),
+            "test_target_bin" => sel.targets.push("my-api".into()),
+            _ => panic!("unknown selector: {selector}"),
+        }
+        match filter {
+            "none" => {}
+            "matching_prefix" => sel.filter.push("presentation::pagination".into()),
+            "matching_multi" => {
+                sel.filter.push("page_one".into());
+                sel.filter.push("ignored_case".into());
+            }
+            "unmatched" => sel.filter.push("nonexistent::mod".into()),
+            _ => panic!("unknown filter: {filter}"),
+        }
+        match include {
+            "none" => {}
+            "matching" => sel.include.push("presentation::pagination::page_one".into()),
+            "unmatched" => sel.include.push("presentation::pagination".into()),
+            _ => panic!("unknown include: {include}"),
+        }
+        match exclude {
+            "none" => {}
+            "matching" => sel.exclude.push("presentation::pagination::page_one".into()),
+            _ => panic!("unknown exclude: {exclude}"),
+        }
+        sel.include_ignored = ignored == "true";
+
+        assert!(validate_target_selection(&[&pkg], &sel).is_ok(), "{row}");
+        let build_flags = test_build_flags(&[&pkg], &sel, Path::new("workspace"), &CargoConfig::default());
+        match selector {
+            "none" => assert_eq!(build_flags, None, "{row}"),
+            "lib" | "test_target_lib" => assert_eq!(build_flags, Some(vec!["--lib".into()]), "{row}"),
+            "bins" | "test_target_bin" => {
+                assert_eq!(build_flags, Some(vec!["--bin=my-api".into()]), "{row}")
+            }
+            "integration_test" => {
+                assert_eq!(build_flags, Some(vec!["--test=smoke".into()]), "{row}")
+            }
+            _ => unreachable!(),
+        }
+
+        let matched: Vec<&str> = tests
+            .iter()
+            .filter(|(name, is_ign)| sel.matches_test(name, *is_ign))
+            .map(|(name, _)| *name)
+            .collect();
+        if exclude == "matching" {
+            assert!(!matched.contains(&"presentation::pagination::page_one"), "{row}");
+        }
+        if !sel.include_ignored {
+            assert!(!matched.contains(&"domain::auth::ignored_case"), "{row}");
+        }
+        if filter == "unmatched" && include != "matching" {
+            assert!(matched.is_empty(), "{row}");
+        }
+        if selector == "test_target_bin" {
+            let hint = no_tests_matched_hint(
+                &[&pkg],
+                &sel,
+                &[("my-api".into(), "my-api".into())],
+                &[],
+            );
+            assert!(hint.contains("--lib") && hint.contains("my_api"), "{hint}");
+        }
+        if include == "unmatched" && filter == "none" {
+            let discovered: Vec<String> = tests.iter().map(|(n, _)| (*n).to_string()).collect();
+            let hint = no_tests_matched_hint(&[&pkg], &sel, &[], &discovered);
+            assert!(hint.contains("--test-filter"), "{hint}");
+        }
+    }
+}
+
+#[test]
+fn validate_target_selection_rejects_missing_targets_before_build() {
+    let pkg = Package {
+        name: "my-api".to_string(),
+        dependencies: vec![],
+        features: BTreeMap::new(),
+        manifest_path: PathBuf::from("workspace/Cargo.toml"),
+        targets: vec![Target {
+            name: "my_api".to_string(),
+            kind: vec!["lib".to_string()],
+            src_path: PathBuf::from("src/lib.rs"),
+            test: true,
+            doctest: false,
+            required_features: vec![],
+        }],
+    };
+    let bins_err = validate_target_selection(
+        &[&pkg],
+        &TestSelection {
+            bins: true,
+            ..TestSelection::default()
+        },
+    )
+    .unwrap_err();
+    assert!(bins_err.to_string().contains("--bins"), "{bins_err}");
+
+    let int_err = validate_target_selection(
+        &[&pkg],
+        &TestSelection {
+            integration_tests: vec!["missing".into()],
+            ..TestSelection::default()
+        },
+    )
+    .unwrap_err();
+    assert!(int_err.to_string().contains("--test missing"), "{int_err}");
+
+    let hyphen_err = validate_target_selection(
+        &[&pkg],
+        &TestSelection {
+            targets: vec!["my-api".into()],
+            ..TestSelection::default()
+        },
+    )
+    .unwrap_err();
+    assert!(hyphen_err.to_string().contains("--lib"), "{hyphen_err}");
 }
 
 #[test]
