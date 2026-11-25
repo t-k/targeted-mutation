@@ -294,6 +294,360 @@ exec "$@"
 }
 
 #[test]
+fn stage_external_supports_monorepo_parent_relative_paths_and_skips_repair_when_missing() {
+    let root = Path::new(env!("CARGO_TARGET_TMPDIR")).join("monorepo-parent-relative");
+    if root.exists() {
+        fs::remove_dir_all(&root).unwrap();
+    }
+    let pkg = root.join("apps/api");
+    fs::create_dir_all(pkg.join("src")).unwrap();
+    write(&root, "proto/contract.txt", "v1-contract");
+    write(&root, "testdata/cases.txt", "42");
+    write(
+        &pkg,
+        "Cargo.toml",
+        "[package]\nname = \"api\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[workspace]\n",
+    );
+    write(
+        &pkg,
+        "build.rs",
+        r#"fn main() {
+    let text = std::fs::read_to_string("../../proto/contract.txt").expect("proto missing");
+    println!("cargo:rustc-env=CONTRACT_VER={}", text.trim());
+}
+"#,
+    );
+    write(
+        &pkg,
+        "src/lib.rs",
+        r#"const CONTRACT: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../proto/contract.txt"));
+const CASE: &str = include_str!("../../../testdata/cases.txt");
+
+pub fn is_valid(n: u32) -> bool {
+    n >= 4
+}
+
+#[test]
+fn checks_boundary() {
+    assert_eq!(CONTRACT.trim(), "v1-contract");
+    assert_eq!(CASE.trim(), "42");
+    assert!(!is_valid(3));
+    assert!(is_valid(4));
+    assert_eq!(env!("CONTRACT_VER"), "v1-contract");
+}
+"#,
+    );
+
+    // Without --stage-external, build.rs fails or include_str! fails without a pointless repair rebuild.
+    let missing = command(&pkg, &["--lines", "src/lib.rs:4-6", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(missing.status.code(), Some(1));
+    let missing_err = String::from_utf8_lossy(&missing.stderr);
+    assert!(
+        !missing_err.contains("rebuilding without the sites that failed to compile"),
+        "should not trigger repair rebuild: {missing_err}"
+    );
+
+    // Also verify missing include_str! alone (when build.rs succeeds) skips repair rebuild.
+    let only_include_missing = command(
+        &pkg,
+        &[
+            "--stage-external",
+            "../../proto",
+            "--lines",
+            "src/lib.rs:4-6",
+            "--json",
+        ],
+    )
+    .output()
+    .unwrap();
+    assert_eq!(only_include_missing.status.code(), Some(1));
+    let include_err = String::from_utf8_lossy(&only_include_missing.stderr);
+    assert!(
+        include_err.contains("unrelated to instrumentation"),
+        "{include_err}"
+    );
+    assert!(
+        !include_err.contains("rebuilding without the sites that failed to compile"),
+        "include_str! failure must not trigger repair rebuild: {include_err}"
+    );
+
+    // With both external parent paths staged (shorthand + explicit mapping), build and tests succeed.
+    let ok = command(
+        &pkg,
+        &[
+            "--stage-external",
+            "../../proto",
+            "--stage-external",
+            &format!("{}=../../testdata", root.join("testdata").display()),
+            "--lines",
+            "src/lib.rs:4-6",
+            "--quiet",
+            "--json",
+        ],
+    )
+    .output()
+    .unwrap();
+    let report = json(&ok, 0);
+    assert_eq!(
+        report["analysis"]["stage_external"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2
+    );
+}
+
+#[test]
+fn lib_flag_test_filter_and_selection_hints_work_end_to_end() {
+    let path = package("test-filter-and-lib");
+    write(
+        &path,
+        "Cargo.toml",
+        "[package]\nname = \"my-api\"\nversion = \"0.0.0\"\nedition = \"2021\"\n[workspace]\n",
+    );
+    write(
+        &path,
+        "src/lib.rs",
+        r#"pub mod pagination {
+    pub fn has_next(page: u32, total: u32) -> bool {
+        page < total
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn first_page_has_next() {
+            assert!(has_next(1, 2));
+        }
+
+        #[test]
+        fn last_page_stops() {
+            assert!(!has_next(2, 2));
+        }
+    }
+}
+
+#[cfg(test)]
+mod unrelated {
+    #[test]
+    fn other_test() {
+        assert_eq!(1 + 1, 2);
+    }
+}
+"#,
+    );
+    write(&path, "src/main.rs", "fn main() {}\n");
+    write(
+        &path,
+        "tests/smoke.rs",
+        "#[test]\nfn smoke_checks() { assert!(my_api::pagination::has_next(1, 2)); assert!(!my_api::pagination::has_next(2, 2)); }\n",
+    );
+
+    // 1. --lib + --test-filter selects only pagination module unit tests.
+    let filtered = command(
+        &path,
+        &[
+            "--lib",
+            "--test-filter",
+            "pagination::tests",
+            "--lines",
+            "src/lib.rs:2-4",
+            "--quiet",
+            "--json",
+        ],
+    )
+    .output()
+    .unwrap();
+    let report = json(&filtered, 0);
+    let selected = report["analysis"]["test_selection"]["tests"]
+        .as_array()
+        .unwrap();
+    assert_eq!(selected.len(), 2, "{selected:?}");
+    assert!(
+        selected
+            .iter()
+            .all(|t| t.as_str().unwrap().contains("pagination::tests"))
+    );
+
+    // 2. --test smoke runs only the integration test target.
+    let integration = command(
+        &path,
+        &[
+            "--test",
+            "smoke",
+            "--lines",
+            "src/lib.rs:2-4",
+            "--quiet",
+            "--json",
+        ],
+    )
+    .output()
+    .unwrap();
+    let int_report = json(&integration, 0);
+    assert_eq!(
+        int_report["analysis"]["test_selection"]["tests"],
+        serde_json::json!(["my-api::test::smoke::smoke_checks"])
+    );
+
+    // 3. --test-target my-api matches the empty bin target and prints a --lib hint.
+    let bin_only = command(
+        &path,
+        &[
+            "--test-target",
+            "my-api",
+            "--lines",
+            "src/lib.rs:2-4",
+            "--quiet",
+        ],
+    )
+    .output()
+    .unwrap();
+    assert_eq!(bin_only.status.code(), Some(1));
+    let bin_err = String::from_utf8_lossy(&bin_only.stderr);
+    assert!(
+        bin_err.contains("--lib") && bin_err.contains("my_api"),
+        "{bin_err}"
+    );
+
+    // 4. --include-test with a module prefix fails with a --test-filter hint.
+    let prefix = command(
+        &path,
+        &[
+            "--lib",
+            "--include-test",
+            "pagination::tests",
+            "--lines",
+            "src/lib.rs:2-4",
+            "--quiet",
+        ],
+    )
+    .output()
+    .unwrap();
+    assert_eq!(prefix.status.code(), Some(1));
+    let prefix_err = String::from_utf8_lossy(&prefix.stderr);
+    assert!(
+        prefix_err.contains("--test-filter pagination::tests"),
+        "{prefix_err}"
+    );
+}
+
+#[test]
+fn repair_cache_avoids_second_rebuild_on_repeat_run_and_invalidates_on_edit() {
+    let path = package("repair-cache-e2e");
+    // `late_init` triggers a definite-initialization error when instrumented with a probe,
+    // forcing a repair rebuild on the first run.
+    write(
+        &path,
+        "src/lib.rs",
+        r#"pub fn late_init(flag: bool) -> u32 {
+    let value;
+    if flag {
+        value = 1;
+    } else {
+        value = 2;
+    }
+    value
+}
+
+pub fn check(n: u32) -> bool {
+    n >= 4
+}
+
+#[test]
+fn covers_both() {
+    assert_eq!(late_init(true), 1);
+    assert_eq!(late_init(false), 2);
+    assert!(!check(3));
+    assert!(check(4));
+}
+"#,
+    );
+
+    let first = command(&path, &["--json"]).output().unwrap();
+    let first_report = json(&first, 0);
+    let first_stderr = String::from_utf8_lossy(&first.stderr);
+    assert!(
+        first_stderr.contains("rebuilding without the sites that failed to compile"),
+        "expected repair rebuild on first run: {first_stderr}"
+    );
+    assert!(
+        path.join("target/tmt/.tmt-repair-cache.json").is_file(),
+        "repair cache file should be written after successful build"
+    );
+
+    // Second identical run must reuse the cached exclusion and skip the repair rebuild.
+    let second = command(&path, &["--json"]).output().unwrap();
+    let second_report = json(&second, 0);
+    let second_stderr = String::from_utf8_lossy(&second.stderr);
+    assert!(
+        second_stderr.contains("reusing") && second_stderr.contains("cached repair exclusion"),
+        "expected cached repair reuse message: {second_stderr}"
+    );
+    assert!(
+        !second_stderr.contains("rebuilding without the sites that failed to compile"),
+        "repeat run should not trigger a repair rebuild: {second_stderr}"
+    );
+    assert_eq!(first_report["skipped"], second_report["skipped"]);
+
+    // Editing the source invalidates the cache so repair runs again cleanly.
+    write(
+        &path,
+        "src/lib.rs",
+        r#"pub fn late_init(flag: bool) -> u32 {
+    let value;
+    if flag {
+        value = 10;
+    } else {
+        value = 20;
+    }
+    value
+}
+
+pub fn check(n: u32) -> bool {
+    n >= 4
+}
+
+#[test]
+fn covers_both() {
+    assert_eq!(late_init(true), 10);
+    assert_eq!(late_init(false), 20);
+    assert!(!check(3));
+    assert!(check(4));
+}
+"#,
+    );
+    let edited = command(&path, &["--json"]).output().unwrap();
+    let _ = json(&edited, 0);
+    let edited_stderr = String::from_utf8_lossy(&edited.stderr);
+    assert!(
+        !edited_stderr.contains("cached repair exclusion"),
+        "source edit must invalidate repair cache: {edited_stderr}"
+    );
+    assert!(
+        edited_stderr.contains("rebuilding without the sites that failed to compile"),
+        "source edit should re-run repair: {edited_stderr}"
+    );
+
+    // Changing build.rs alone (without touching src/lib.rs) must also invalidate the repair cache.
+    write(
+        &path,
+        "build.rs",
+        "fn main() { println!(\"cargo:rerun-if-changed=build.rs\"); }\n",
+    );
+    let build_rs_changed = command(&path, &["--json"]).output().unwrap();
+    let _ = json(&build_rs_changed, 0);
+    let build_rs_stderr = String::from_utf8_lossy(&build_rs_changed.stderr);
+    assert!(
+        !build_rs_stderr.contains("cached repair exclusion"),
+        "build.rs change must invalidate repair cache: {build_rs_stderr}"
+    );
+}
+
+#[test]
 fn workspace_catalogue_has_one_snapshot_and_streamed_reports() {
     let path = package("catalogue-stream");
     write(

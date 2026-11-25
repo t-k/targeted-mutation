@@ -354,9 +354,13 @@ fn test_build_scope_preserves_cargo_target_eligibility() {
         ],
     );
     let flags = |packages: &[&Package], names: &[&str], all| {
+        let selection = TestSelection {
+            targets: names.iter().map(|s| s.to_string()).collect(),
+            ..TestSelection::default()
+        };
         test_build_flags(
             packages,
-            &names.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
+            &selection,
             Path::new("workspace"),
             &CargoConfig {
                 all_features: all,
@@ -433,6 +437,8 @@ fn parses_cargo_json_messages() {
     assert_eq!(
         out.errors,
         [CompileError {
+            code: None,
+            message: String::new(),
             primary: vec![ErrorSpan {
                 file: "src/lib.rs".into(),
                 byte_start: 40,
@@ -562,6 +568,8 @@ fn a_primary_blame_does_not_inspect_later_fallbacks() {
         line: 1,
     };
     let error = CompileError {
+        code: None,
+        message: String::new(),
         primary: vec![span("primary.rs", probe)],
         secondary: vec![span("secondary.rs", 0)],
         rendered: String::new(),
@@ -2685,6 +2693,8 @@ fn an_error_is_blamed_on_the_file_it_names() {
     let blamed = rendered.inserted_by(probe).unwrap();
     assert!(blamed >= 100, "{blamed}");
     let error = CompileError {
+        code: None,
+        message: String::new(),
         primary: vec![ErrorSpan {
             file: "second.rs".to_string(),
             byte_start: probe,
@@ -2694,6 +2704,477 @@ fn an_error_is_blamed_on_the_file_it_names() {
         rendered: String::new(),
     };
     assert_eq!(blame_error(&error, &files, copy, &HashSet::new()), [blamed]);
+}
+
+#[test]
+fn non_probe_errors_are_detected_and_never_blamed() {
+    let copy = Path::new("/copy");
+    let source = "pub fn f(n: u32) -> bool { n >= 4 }\nconst S: &str = include_str!(\"../../missing.json\");\n";
+    let mut found = instrument::discover(source, 0).unwrap();
+    let rendered = instrument::render(source, &found.sites, &|_| true);
+    let files = [SourceFile {
+        display: "src/lib.rs".into(),
+        path: copy.join("src/lib.rs"),
+        owners: BTreeSet::new(),
+        original: source.into(),
+        lines: scope::LineIndex::new(source),
+        sites: std::mem::take(&mut found.sites),
+        rebuild_sites: vec![],
+        places: vec![],
+        rendered: Some(rendered),
+    }];
+    let span = ErrorSpan {
+        file: "src/lib.rs".into(),
+        byte_start: 0,
+        line: 2,
+    };
+    let cases = [
+        (
+            None,
+            "couldn't read `src/../../missing.json`: No such file or directory",
+            "error: couldn't read `src/../../missing.json`: No such file or directory",
+        ),
+        (
+            None,
+            "environment variable `MISSING_VAR` not defined at compile time",
+            "error: environment variable `MISSING_VAR` not defined at compile time",
+        ),
+        (
+            Some("E0583"),
+            "file not found for module `ghost`",
+            "error[E0583]: file not found for module `ghost`",
+        ),
+    ];
+    for (code, message, rendered) in cases {
+        let error = CompileError {
+            code: code.map(str::to_string),
+            message: message.to_string(),
+            primary: vec![span.clone()],
+            secondary: vec![],
+            rendered: rendered.to_string(),
+        };
+        assert!(is_non_probe_error(&error, &files, copy), "{message}");
+        assert!(blame_error(&error, &files, copy, &HashSet::new()).is_empty());
+    }
+
+    // An env! error originating inside probe-inserted text (e.g., --error 'env!("TMT_UNSET")')
+    // must still be treated as a probe error and blamed so repair can disable it.
+    let probe_offset = files[0]
+        .rendered
+        .as_ref()
+        .unwrap()
+        .text
+        .find("__tmt_rt::")
+        .unwrap();
+    let probe_env_error = CompileError {
+        code: None,
+        message: "environment variable `TMT_UNSET` not defined at compile time".into(),
+        primary: vec![ErrorSpan {
+            file: "src/lib.rs".into(),
+            byte_start: probe_offset,
+            line: 1,
+        }],
+        secondary: vec![],
+        rendered: "error: environment variable `TMT_UNSET` not defined at compile time".into(),
+    };
+    assert!(!is_non_probe_error(&probe_env_error, &files, copy));
+    assert!(!blame_error(&probe_env_error, &files, copy, &HashSet::new()).is_empty());
+}
+
+#[test]
+fn stage_external_parses_and_validates_parent_relative_specs() {
+    let shorthand: StageExternal = "../../proto".parse().unwrap();
+    assert_eq!(shorthand.from, PathBuf::from("../../proto"));
+    assert_eq!(shorthand.rel, PathBuf::from("../../proto"));
+
+    let explicit: StageExternal = "/abs/shared/proto=../../proto".parse().unwrap();
+    assert_eq!(explicit.from, PathBuf::from("/abs/shared/proto"));
+    assert_eq!(explicit.rel, PathBuf::from("../../proto"));
+
+    for bad in [
+        "",
+        "proto",
+        "./proto",
+        "../..",
+        "/abs/dest",
+        "src=/abs/dest",
+        "=../../proto",
+        "../../proto\n",
+    ] {
+        assert!(
+            bad.parse::<StageExternal>().is_err(),
+            "should reject {bad:?}"
+        );
+    }
+}
+
+#[test]
+fn test_selection_matches_pict_table() {
+    let target = |name: &str, kind: &str| Target {
+        name: name.to_string(),
+        kind: vec![kind.to_string()],
+        src_path: PathBuf::from("src/lib.rs"),
+        test: true,
+        doctest: false,
+        required_features: vec![],
+    };
+    let pkg = Package {
+        name: "my-api".to_string(),
+        dependencies: vec![],
+        features: BTreeMap::new(),
+        manifest_path: PathBuf::from("workspace/Cargo.toml"),
+        targets: vec![
+            target("my_api", "lib"),
+            target("my-api", "bin"),
+            target("smoke", "test"),
+        ],
+    };
+    let tests = [
+        ("presentation::pagination::page_one", false),
+        ("presentation::pagination::page_two", false),
+        ("domain::auth::ignored_case", true),
+    ];
+    for row in include_str!("../../tests/data/test-selection-filter.pict.tsv")
+        .lines()
+        .skip(1)
+    {
+        let cols: Vec<_> = row.split('\t').collect();
+        let &[selector, filter, include, exclude, ignored] = cols.as_slice() else {
+            panic!("invalid PICT row: {row}");
+        };
+        let mut sel = TestSelection::default();
+        match selector {
+            "none" => {}
+            "lib" => sel.lib = true,
+            "bins" => sel.bins = true,
+            "integration_test" => sel.integration_tests.push("smoke".into()),
+            "test_target_lib" => sel.targets.push("my_api".into()),
+            "test_target_bin" => sel.targets.push("my-api".into()),
+            _ => panic!("unknown selector: {selector}"),
+        }
+        match filter {
+            "none" => {}
+            "matching_prefix" => sel.filter.push("presentation::pagination".into()),
+            "matching_multi" => {
+                sel.filter.push("page_one".into());
+                sel.filter.push("ignored_case".into());
+            }
+            "unmatched" => sel.filter.push("nonexistent::mod".into()),
+            _ => panic!("unknown filter: {filter}"),
+        }
+        match include {
+            "none" => {}
+            "matching" => sel
+                .include
+                .push("presentation::pagination::page_one".into()),
+            "unmatched" => sel.include.push("presentation::pagination".into()),
+            _ => panic!("unknown include: {include}"),
+        }
+        match exclude {
+            "none" => {}
+            "matching" => sel
+                .exclude
+                .push("presentation::pagination::page_one".into()),
+            _ => panic!("unknown exclude: {exclude}"),
+        }
+        sel.include_ignored = ignored == "true";
+
+        assert!(validate_target_selection(&[&pkg], &sel).is_ok(), "{row}");
+        let build_flags = test_build_flags(
+            &[&pkg],
+            &sel,
+            Path::new("workspace"),
+            &CargoConfig::default(),
+        );
+        match selector {
+            "none" => assert_eq!(build_flags, None, "{row}"),
+            "lib" | "test_target_lib" => {
+                assert_eq!(build_flags, Some(vec!["--lib".into()]), "{row}")
+            }
+            "bins" | "test_target_bin" => {
+                assert_eq!(build_flags, Some(vec!["--bin=my-api".into()]), "{row}")
+            }
+            "integration_test" => {
+                assert_eq!(build_flags, Some(vec!["--test=smoke".into()]), "{row}")
+            }
+            _ => unreachable!(),
+        }
+
+        let matched: Vec<&str> = tests
+            .iter()
+            .filter(|(name, is_ign)| sel.matches_test(name, *is_ign))
+            .map(|(name, _)| *name)
+            .collect();
+        if exclude == "matching" {
+            assert!(
+                !matched.contains(&"presentation::pagination::page_one"),
+                "{row}"
+            );
+        }
+        if !sel.include_ignored {
+            assert!(!matched.contains(&"domain::auth::ignored_case"), "{row}");
+        }
+        if filter == "unmatched" && include != "matching" {
+            assert!(matched.is_empty(), "{row}");
+        }
+        if selector == "test_target_bin" {
+            let hint =
+                no_tests_matched_hint(&[&pkg], &sel, &[("my-api".into(), "my-api".into())], &[]);
+            assert!(hint.contains("--lib") && hint.contains("my_api"), "{hint}");
+        }
+        if include == "unmatched" && filter == "none" {
+            let discovered: Vec<String> = tests.iter().map(|(n, _)| (*n).to_string()).collect();
+            let hint = no_tests_matched_hint(&[&pkg], &sel, &[], &discovered);
+            assert!(hint.contains("--test-filter"), "{hint}");
+        }
+    }
+}
+
+#[test]
+fn validate_target_selection_rejects_missing_targets_before_build() {
+    let pkg = Package {
+        name: "my-api".to_string(),
+        dependencies: vec![],
+        features: BTreeMap::new(),
+        manifest_path: PathBuf::from("workspace/Cargo.toml"),
+        targets: vec![Target {
+            name: "my_api".to_string(),
+            kind: vec!["lib".to_string()],
+            src_path: PathBuf::from("src/lib.rs"),
+            test: true,
+            doctest: false,
+            required_features: vec![],
+        }],
+    };
+    let bins_err = validate_target_selection(
+        &[&pkg],
+        &TestSelection {
+            bins: true,
+            ..TestSelection::default()
+        },
+    )
+    .unwrap_err();
+    assert!(bins_err.to_string().contains("--bins"), "{bins_err}");
+
+    let int_err = validate_target_selection(
+        &[&pkg],
+        &TestSelection {
+            integration_tests: vec!["missing".into()],
+            ..TestSelection::default()
+        },
+    )
+    .unwrap_err();
+    assert!(int_err.to_string().contains("--test missing"), "{int_err}");
+
+    let hyphen_err = validate_target_selection(
+        &[&pkg],
+        &TestSelection {
+            targets: vec!["my-api".into()],
+            ..TestSelection::default()
+        },
+    )
+    .unwrap_err();
+    assert!(hyphen_err.to_string().contains("--lib"), "{hyphen_err}");
+}
+
+#[test]
+fn build_progress_tracks_compiled_and_cached_artifacts() {
+    let mut state = BuildProgressState::default();
+    assert_eq!(state.format_line(), "building: compiling...");
+    state.observe_line(
+        r#"{"reason":"compiler-artifact","target":{"name":"serde","kind":["lib"]},"fresh":true}"#,
+    );
+    assert_eq!(state.format_line(), "building: 1 cached (latest: serde)");
+    state.observe_line(
+        r#"{"reason":"compiler-artifact","target":{"name":"aws-sdk-s3","kind":["lib"]},"fresh":false}"#,
+    );
+    assert_eq!(
+        state.format_line(),
+        "building: 1 compiled (1 cached, latest: aws-sdk-s3)"
+    );
+}
+
+#[test]
+fn repair_cache_matches_pict_table() {
+    let dir = scratch("repair-cache-pict");
+    for (idx, row) in include_str!("../../tests/data/repair-cache.pict.tsv")
+        .lines()
+        .skip(1)
+        .enumerate()
+    {
+        let cols: Vec<_> = row.split('\t').collect();
+        let &[stage_ext, err_kind, cache_state, src_changed] = cols.as_slice() else {
+            panic!("invalid PICT row: {row}");
+        };
+        let work = dir.join(format!("row-{idx}"));
+        fs::create_dir_all(&work).unwrap();
+
+        match stage_ext {
+            "none" => {}
+            "shorthand_parent" => {
+                let parsed: StageExternal = "../../proto".parse().unwrap();
+                assert_eq!(parsed.rel, PathBuf::from("../../proto"));
+            }
+            "explicit_mapping" => {
+                let parsed: StageExternal = "/abs/proto=../../proto".parse().unwrap();
+                assert_eq!(parsed.from, PathBuf::from("/abs/proto"));
+            }
+            _ => panic!("unknown stage_ext: {stage_ext}"),
+        }
+
+        let err = match err_kind {
+            "none" => None,
+            "probe_error" => Some(CompileError {
+                code: Some("E0308".into()),
+                message: "mismatched types".into(),
+                primary: vec![],
+                secondary: vec![],
+                rendered: "error[E0308]: mismatched types".into(),
+            }),
+            "include_str_missing" => Some(CompileError {
+                code: None,
+                message: "couldn't read `../../missing`: No such file or directory".into(),
+                primary: vec![],
+                secondary: vec![],
+                rendered: "error: couldn't read `../../missing`: No such file or directory".into(),
+            }),
+            "env_missing" => Some(CompileError {
+                code: None,
+                message: "environment variable `FOO` not defined at compile time".into(),
+                primary: vec![],
+                secondary: vec![],
+                rendered: "error: environment variable `FOO` not defined at compile time".into(),
+            }),
+            "mod_missing" => Some(CompileError {
+                code: Some("E0583".into()),
+                message: "file not found for module `bar`".into(),
+                primary: vec![],
+                secondary: vec![],
+                rendered: "error[E0583]: file not found for module `bar`".into(),
+            }),
+            _ => panic!("unknown err_kind: {err_kind}"),
+        };
+        if let Some(err) = &err {
+            let expected_non_probe = err_kind != "probe_error";
+            assert_eq!(
+                is_non_probe_error(err, &[], Path::new("/copy")),
+                expected_non_probe,
+                "{row}"
+            );
+        }
+
+        let fp_old = "fp-old";
+        let fp_cur = if src_changed == "true" {
+            "fp-new"
+        } else {
+            fp_old
+        };
+        let site1 = repair_cache::CachedSite {
+            file: "src/lib.rs".into(),
+            site_index: 0,
+            start: 10,
+            end: 20,
+            text: "a < b".into(),
+            kind: "Cmp".into(),
+            reason: "E0308".into(),
+        };
+        match cache_state {
+            "miss" => {}
+            "hit_exact" | "hit_stale_partial" => {
+                repair_cache::save(&work, fp_old, std::slice::from_ref(&site1)).unwrap();
+            }
+            "corrupt" => {
+                fs::write(work.join(".tmt-repair-cache.json"), "{not-valid-json").unwrap();
+            }
+            _ => panic!("unknown cache_state: {cache_state}"),
+        }
+
+        let loaded = repair_cache::load(&work, fp_cur);
+        if (cache_state == "hit_exact" || cache_state == "hit_stale_partial")
+            && src_changed == "false"
+        {
+            assert_eq!(loaded, vec![site1], "{row}");
+        } else {
+            assert!(loaded.is_empty(), "{row}");
+        }
+    }
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn repair_cache_save_does_not_overwrite_hardlinked_outside_file() {
+    let dir = scratch("repair-cache-hardlink");
+    let work = dir.join("work");
+    fs::create_dir_all(&work).unwrap();
+    let victim = dir.join("victim.txt");
+    fs::write(&victim, "original-secret").unwrap();
+    fs::hard_link(&victim, work.join(".tmt-repair-cache.json")).unwrap();
+    fs::hard_link(&victim, work.join(".tmt-repair-cache.json.new")).unwrap();
+
+    repair_cache::save(&work, "fp", &[]).unwrap();
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "original-secret");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn stage_external_rejects_symlink_escaping_staged_root() {
+    let dir = scratch("stage-external-escape");
+    let ext = dir.join("ext");
+    let work = dir.join("work");
+    fs::create_dir_all(&ext).unwrap();
+    fs::create_dir_all(work.join("src")).unwrap();
+    let secret = dir.join("secret.txt");
+    fs::write(&secret, "top-secret").unwrap();
+    std::os::unix::fs::symlink(&secret, ext.join("leak.txt")).unwrap();
+
+    let state = WorkCopy::open(&work, &work.join("src"));
+    let err = copy_external_entry(
+        &ext,
+        &work.join("src/ext"),
+        None,
+        &work,
+        &|_| false,
+        &state,
+        &mut BTreeSet::new(),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("escapes its staged root"), "{err}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn stage_external_case_insensitive_collision_is_detected() {
+    assert!(paths_overlap_case_insensitive(
+        Path::new("_parent_0"),
+        Path::new("_PARENT_0")
+    ));
+    assert!(paths_overlap_case_insensitive(
+        Path::new("apps/api"),
+        Path::new("APPS")
+    ));
+    assert!(!paths_overlap_case_insensitive(
+        Path::new("apps/api"),
+        Path::new("proto")
+    ));
+}
+
+#[test]
+fn build_progress_handles_non_utf8_stdout_identically_to_quiet() {
+    #[cfg(unix)]
+    {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "printf '{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"demo\",\"kind\":[\"lib\"]}}\\n\\xff\\xfe\\n'"]);
+        let mut lines = Vec::new();
+        let out =
+            run_cargo_with_progress_interval(&mut cmd, true, Duration::from_secs(60), |line| {
+                lines.push(line.to_string())
+            })
+            .unwrap();
+        assert!(out.status.success());
+        assert!(out.stdout.windows(2).any(|w| w == [0xff, 0xfe]));
+    }
 }
 
 #[test]

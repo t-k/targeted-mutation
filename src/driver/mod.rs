@@ -82,6 +82,7 @@ pub struct Options {
     pub copy_fixtures: Vec<PathBuf>,
     pub copy_fixture_excludes: Vec<PathBuf>,
     pub output_fixtures: Vec<Fixture>,
+    pub stage_external: Vec<StageExternal>,
     pub checkpoint: bool,
     /// Also run the doc tests (slow: rustdoc recompiles them for every mutant they reach).
     pub doc: bool,
@@ -90,25 +91,52 @@ pub struct Options {
 #[derive(Clone, Default)]
 pub struct TestSelection {
     pub isolate: bool,
+    pub lib: bool,
+    pub bins: bool,
+    pub integration_tests: Vec<String>,
     pub targets: Vec<String>,
     pub include: Vec<String>,
+    pub filter: Vec<String>,
     pub exclude: Vec<String>,
     pub include_ignored: bool,
     pub wrapper: Option<PathBuf>,
 }
 
 impl TestSelection {
+    pub(crate) fn has_target_filters(&self) -> bool {
+        self.lib || self.bins || !self.integration_tests.is_empty() || !self.targets.is_empty()
+    }
+
     fn enabled(&self) -> bool {
         self.isolate
-            || !self.targets.is_empty()
+            || self.has_target_filters()
             || !self.include.is_empty()
+            || !self.filter.is_empty()
             || !self.exclude.is_empty()
             || self.include_ignored
             || self.wrapper.is_some()
     }
+
+    pub(crate) fn matches_test(&self, test: &str, was_ignored: bool) -> bool {
+        if was_ignored && !self.include_ignored {
+            return false;
+        }
+        if self.exclude.iter().any(|name| name == test) {
+            return false;
+        }
+        if !self.include.is_empty() || !self.filter.is_empty() {
+            let exact = self.include.iter().any(|name| name == test);
+            let partial = self.filter.iter().any(|pat| test.contains(pat));
+            if !exact && !partial {
+                return false;
+            }
+        }
+        true
+    }
 }
 
 pub use crate::report::CargoConfig;
+pub use workcopy::StageExternal;
 
 impl CargoConfig {
     /// The arguments that say the same to `cargo metadata`, `cargo test` and rustdoc.
@@ -143,6 +171,7 @@ const MAX_REPAIR_ROUNDS: usize = 40;
 const MAX_TEST_FILTERS: usize = 200;
 
 mod cargo;
+mod repair_cache;
 mod runner;
 mod scope_blame;
 mod session;
@@ -456,6 +485,9 @@ fn run_package(
             }
         }
     }
+    if !options.list {
+        validate_target_selection(&test_packages, selection)?;
+    }
     let is_kind = |t: &Target, kinds: &[&str]| t.kind.iter().any(|k| kinds.contains(&k.as_str()));
     let root_target = package
         .targets
@@ -476,6 +508,7 @@ fn run_package(
         work_lock,
         copy,
         state,
+        external_deps,
     } = prepare_work_copy(options, metadata, batch, catalogue, &note)?;
 
     let in_copy = |path: &Path| -> Result<PathBuf> {
@@ -824,6 +857,7 @@ fn run_package(
             copy_fixtures: options.copy_fixtures.clone(),
             copy_fixture_excludes: options.copy_fixture_excludes.clone(),
             output_fixtures: options.output_fixtures.clone(),
+            stage_external: options.stage_external.clone(),
             checkpoint: (options.checkpoint && !options.list)
                 .then(|| work.join("checkpoint.jsonl")),
         },
@@ -955,18 +989,13 @@ fn run_package(
     let mut disabled: HashSet<u32> = HashSet::new();
     let mut repairs = BTreeMap::new();
     let build_target = work_directory(&work, "target")?;
-    let target_flags = test_build_flags(
-        &test_packages,
-        &selection.targets,
-        &workspace,
-        &options.cargo,
-    );
+    let target_flags = test_build_flags(&test_packages, selection, &workspace, &options.cargo);
     let build_scope = if target_flags.is_some() {
         report::TestBuildScope::SelectedTargets
     } else {
         report::TestBuildScope::PackageWide
     };
-    let build_note = if !selection.targets.is_empty() && target_flags.is_none() {
+    let build_note = if selection.has_target_filters() && target_flags.is_none() {
         "Cargo is using a package-wide build because the selected test targets cannot be expressed exactly.\n"
     } else {
         ""
@@ -997,12 +1026,52 @@ fn run_package(
             .current_dir(&copy)
             .env("CARGO_TARGET_DIR", &build_target)
             .env("CARGO_BUILD_BUILD_DIR", &build_target)
-            .envs(profile_env(options.opt_level))
-            .stderr(Stdio::piped())
-            .output()
-            .context("running cargo test --no-run")
+            .envs(profile_env(options.opt_level));
+        run_cargo_with_progress(&mut command, options.progress && !observer)
     };
     let cargo_build = || build_test_binaries(false);
+    let has_probe_sites = !options.source_only && files.iter().any(|f| !f.sites.is_empty());
+    let repair_fingerprint = has_probe_sites.then(|| {
+        let test_pkg_names: Vec<&str> = test_packages.iter().map(|p| p.name.as_str()).collect();
+        repair_cache::compute_fingerprint(
+            &state.root,
+            &copy,
+            &workspace,
+            &state,
+            &external_deps,
+            &package.name,
+            &test_pkg_names,
+            &options.cargo,
+            options.opt_level,
+            target_flags.as_deref(),
+            &error_values,
+            options.doc,
+            &files,
+        )
+    });
+    if let Some(fingerprint) = &repair_fingerprint {
+        let cached = repair_cache::load(&work, fingerprint);
+        if !cached.is_empty() {
+            for entry in cached {
+                if let Some(file) = files.iter().find(|f| f.display == entry.file)
+                    && let Some(site) = file.sites.get(entry.site_index)
+                    && site.start == entry.start
+                    && site.end == entry.end
+                    && site.text == entry.text
+                    && format!("{:?}", site.kind) == entry.kind
+                {
+                    disabled.insert(site.id);
+                    repairs.entry(site.id).or_insert(entry.reason);
+                }
+            }
+            if !disabled.is_empty() {
+                note(&format!(
+                    "reusing {} cached repair exclusion(s)",
+                    disabled.len()
+                ));
+            }
+        }
+    }
     let mut rounds = 0;
     let mut newly_disabled = HashSet::new();
     let build = loop {
@@ -1029,6 +1098,27 @@ fn run_package(
         let names: Vec<&str> = test_packages.iter().map(|p| p.name.as_str()).collect();
         let build = parse_build_output(&String::from_utf8_lossy(&output.stdout), &names);
         if output.status.success() {
+            if let Some(fingerprint) = &repair_fingerprint {
+                let cached_entries: Vec<repair_cache::CachedSite> = files
+                    .iter()
+                    .flat_map(|file| {
+                        file.sites
+                            .iter()
+                            .enumerate()
+                            .filter(|(_, site)| disabled.contains(&site.id))
+                            .map(|(site_index, site)| repair_cache::CachedSite {
+                                file: file.display.clone(),
+                                site_index,
+                                start: site.start,
+                                end: site.end,
+                                text: site.text.clone(),
+                                kind: format!("{:?}", site.kind),
+                                reason: repairs.get(&site.id).cloned().unwrap_or_default(),
+                            })
+                    })
+                    .collect();
+                let _ = repair_cache::save(&work, fingerprint, &cached_entries);
+            }
             break build;
         }
         let diagnostics = || {
@@ -1043,6 +1133,16 @@ fn run_package(
         };
         if build.errors.is_empty() {
             bail!("the build failed:\n{build_note}{}", diagnostics());
+        }
+        if build
+            .errors
+            .iter()
+            .any(|error| is_non_probe_error(error, &files, &copy))
+        {
+            bail!(
+                "the build failed with an error unrelated to instrumentation:\n{build_note}{}",
+                diagnostics()
+            );
         }
         rounds += 1;
         let before = disabled.len();
@@ -1139,6 +1239,8 @@ fn run_package(
     let root_exe = (!witness_candidates.is_empty())
         .then(|| root_test_exe(&build))
         .flatten();
+    let mut discovered_tests: Vec<String> = vec![];
+    let mut empty_bin_targets: Vec<(String, String)> = vec![];
     if let Some(nextest) = &options.nextest {
         let mut flags: Vec<_> = test_packages
             .iter()
@@ -1158,7 +1260,7 @@ fn run_package(
         ));
     } else {
         for (name, exe, owner, kind) in build.test_binaries {
-            if !selection.targets.is_empty() && !selection.targets.contains(&name) {
+            if !artifact_target_selected(&name, &kind, selection) {
                 continue;
             }
             let owner_package = test_packages
@@ -1173,13 +1275,18 @@ fn run_package(
             )?;
             if selection.enabled() {
                 let all = list_tests(&exe, &cwd, &work, false, true, work_lock.as_deref())?;
+                if all.is_empty() && kind.first().map(String::as_str) == Some("bin") {
+                    empty_bin_targets.push((owner.clone(), name.clone()));
+                }
                 let ignored = list_tests(&exe, &cwd, &work, true, true, work_lock.as_deref())?;
                 for test in all {
                     let was_ignored = ignored.contains(&test);
-                    if (was_ignored && !selection.include_ignored)
-                        || (!selection.include.is_empty() && !selection.include.contains(&test))
-                        || selection.exclude.contains(&test)
+                    if (!was_ignored || selection.include_ignored)
+                        && !selection.exclude.iter().any(|name| name == &test)
                     {
+                        discovered_tests.push(test.clone());
+                    }
+                    if !selection.matches_test(&test, was_ignored) {
                         continue;
                     }
                     runners.push((
@@ -1205,7 +1312,13 @@ fn run_package(
         }
     }
     if selection.enabled() && runners.is_empty() {
-        bail!("{build_note}no tests matched the requested selection");
+        let hint = no_tests_matched_hint(
+            &test_packages,
+            selection,
+            &empty_bin_targets,
+            &discovered_tests,
+        );
+        bail!("{build_note}no tests matched the requested selection{hint}");
     }
     let selected_tests = selection.enabled().then(|| report::TestSelection {
         build_scope,
@@ -1277,6 +1390,12 @@ fn run_package(
                 .output_fixtures
                 .iter()
                 .map(|fixture| build_target.join(&fixture.to)),
+        );
+        inputs.extend(
+            options
+                .stage_external
+                .iter()
+                .map(|entry| normalize(&copy.join(&entry.rel))),
         );
         Some(crate::campaign_identity::compute(
             &copy,
@@ -3076,6 +3195,7 @@ struct PreparedWorkCopy {
     work_lock: Option<Arc<WorkLock>>,
     copy: PathBuf,
     state: WorkCopy,
+    external_deps: BTreeSet<PathBuf>,
 }
 
 fn prepare_work_copy(
@@ -3111,13 +3231,19 @@ fn prepare_work_copy(
     } else {
         None
     };
-    let copy = work.join("src");
+    let stage_root = work.join("src");
+    let copy_subdir = staged_copy_subdir(&workspace, &options.stage_external)?;
+    let copy = if copy_subdir.as_os_str().is_empty() {
+        stage_root.clone()
+    } else {
+        stage_root.join(&copy_subdir)
+    };
     let marker = work.join(WORK_MARKER);
-    if copy.exists() && !marker.exists() {
+    if stage_root.exists() && !marker.exists() {
         bail!(
             "{} exists and was not created by tmt; refusing to delete it. \
                  Choose another --work-dir or remove it yourself.",
-            copy.display()
+            stage_root.display()
         );
     }
     fs::write(
@@ -3133,7 +3259,7 @@ fn prepare_work_copy(
             || (path.parent() == Some(workspace.as_path())
                 && path.file_name().is_some_and(|n| n == "target"))
     };
-    let state = WorkCopy::open(&work, &copy);
+    let state = WorkCopy::open_with_copy_root(&work, &stage_root, &copy);
     let fixtures = options
         .copy_fixtures
         .iter()
@@ -3154,6 +3280,15 @@ fn prepare_work_copy(
     }
     if catalogue.is_none_or(|catalogue| !catalogue.ready.get()) {
         work_directory(&work, "src")?;
+        real_dir(&copy, &state)?;
+        if copy != stage_root {
+            for ancestor in copy.ancestors() {
+                if ancestor == stage_root || !ancestor.starts_with(&stage_root) {
+                    break;
+                }
+                state.kept.borrow_mut().insert(ancestor.to_path_buf());
+            }
+        }
         let visible = if options.all_files {
             None
         } else {
@@ -3180,10 +3315,65 @@ fn prepare_work_copy(
                 &mut BTreeSet::new(),
             )?;
         }
-        prune(&copy, &state)?;
+        let mut staged_destinations: Vec<PathBuf> = Vec::new();
+        let mut folded_ancestors: BTreeMap<String, PathBuf> = BTreeMap::new();
+        for entry in &options.stage_external {
+            let (rel, _) = parse_external_rel(&entry.rel)?;
+            let dst = normalize(&copy.join(&rel));
+            let copy_rel_in_stage = copy.strip_prefix(&stage_root).unwrap_or(&copy);
+            let dst_rel_in_stage = dst.strip_prefix(&stage_root).unwrap_or(&dst);
+            if !dst.starts_with(&stage_root)
+                || dst == stage_root
+                || copy.starts_with(&dst)
+                || dst.starts_with(&copy)
+                || paths_overlap_case_insensitive(copy_rel_in_stage, dst_rel_in_stage)
+                || staged_destinations.iter().any(|prev| {
+                    let prev_rel = prev.strip_prefix(&stage_root).unwrap_or(prev);
+                    paths_overlap_case_insensitive(prev_rel, dst_rel_in_stage)
+                })
+            {
+                bail!(
+                    "--stage-external destination collides with the workspace copy or another staged path: {}",
+                    entry.rel.display()
+                );
+            }
+            for ancestor in dst_rel_in_stage.ancestors() {
+                if ancestor.as_os_str().is_empty() {
+                    continue;
+                }
+                let folded = ancestor.to_string_lossy().to_lowercase();
+                if let Some(previous) = folded_ancestors.get(&folded)
+                    && previous != ancestor
+                {
+                    bail!(
+                        "--stage-external destinations differ only by case: {} and {}",
+                        previous.display(),
+                        ancestor.display()
+                    );
+                }
+                folded_ancestors.insert(folded, ancestor.to_path_buf());
+            }
+            staged_destinations.push(dst.clone());
+            let src = if entry.from.is_absolute() {
+                entry.from.clone()
+            } else {
+                workspace.join(&entry.from)
+            };
+            copy_external_entry(
+                &src,
+                &dst,
+                None,
+                &work,
+                &forbidden,
+                &state,
+                &mut BTreeSet::new(),
+            )?;
+        }
+        prune(&stage_root, &state)?;
         if options.git_index {
             git_index::snapshot(&workspace, &copy)?;
         }
+        let mut external_deps = BTreeSet::new();
         if !options.list {
             // Relative path dependencies that leave the workspace would point nowhere from the copy.
             let mut manifests: Vec<&Path> = metadata
@@ -3203,9 +3393,14 @@ fn prepare_work_copy(
                     continue;
                 };
                 let text = fs::read_to_string(&canonical)?;
-                if let Some(rewritten) =
-                    absolutize_path_dependencies(&text, manifest_dir, &workspace, &copy)?
-                {
+                let (rewritten, externals) = absolutize_path_dependencies_with_externals(
+                    &text,
+                    manifest_dir,
+                    &workspace,
+                    &copy,
+                )?;
+                external_deps.extend(externals);
+                if let Some(rewritten) = rewritten {
                     state.write(&copy.join(relative), &rewritten)?;
                 }
             }
@@ -3214,6 +3409,14 @@ fn prepare_work_copy(
             state.settle(&workspace)?;
             catalogue.ready.set(true);
         }
+        return Ok(PreparedWorkCopy {
+            workspace,
+            work,
+            work_lock,
+            copy,
+            state,
+            external_deps,
+        });
     }
     Ok(PreparedWorkCopy {
         workspace,
@@ -3221,6 +3424,7 @@ fn prepare_work_copy(
         work_lock,
         copy,
         state,
+        external_deps: BTreeSet::new(),
     })
 }
 
