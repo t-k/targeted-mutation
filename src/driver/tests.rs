@@ -3071,9 +3071,11 @@ fn repair_cache_matches_pict_table() {
         };
         let site1 = repair_cache::CachedSite {
             file: "src/lib.rs".into(),
+            site_index: 0,
             start: 10,
             end: 20,
             text: "a < b".into(),
+            kind: "Cmp".into(),
             reason: "E0308".into(),
         };
         match cache_state {

@@ -2,10 +2,10 @@
 //!
 //! Stored inside `--work-dir` as `.tmt-repair-cache.json` and keyed by a SHA-256
 //! fingerprint of the full staged source tree (using uninstrumented originals for
-//! instrumented files), Cargo configuration, and toolchain version. Stale or corrupt
-//! caches are ignored safely.
+//! instrumented files), external path dependencies, environment variables, Cargo
+//! configuration, and toolchain version. Stale or corrupt caches are ignored safely.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
@@ -20,14 +20,16 @@ use crate::instrument::RUNTIME_MOD;
 use super::{CargoConfig, SourceFile, WorkCopy};
 
 const CACHE_FILE: &str = ".tmt-repair-cache.json";
-const CACHE_VERSION: u32 = 1;
+const CACHE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(super) struct CachedSite {
     pub(super) file: String,
+    pub(super) site_index: usize,
     pub(super) start: usize,
     pub(super) end: usize,
     pub(super) text: String,
+    pub(super) kind: String,
     pub(super) reason: String,
 }
 
@@ -95,12 +97,55 @@ fn hash_tree(
     }
 }
 
+fn hash_external_dep(hash: &mut Sha256, root: &Path, dir: &Path, visited: &mut BTreeSet<PathBuf>) {
+    let Ok(canonical) = dir.canonicalize() else {
+        return;
+    };
+    if !visited.insert(canonical) {
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .filter_map(|entry| entry.ok().map(|e| e.path()))
+        .collect();
+    paths.sort();
+    for path in paths {
+        if path
+            .file_name()
+            .is_some_and(|n| n == ".git" || n == "target" || n == "node_modules")
+        {
+            continue;
+        }
+        let Ok(meta) = fs::symlink_metadata(&path) else {
+            continue;
+        };
+        let rel = path.strip_prefix(root).unwrap_or(&path);
+        if meta.is_dir() {
+            if path.join("CACHEDIR.TAG").exists() {
+                continue;
+            }
+            frame(hash, b"ext_dir");
+            frame(hash, rel.as_os_str().as_encoded_bytes());
+            hash_external_dep(hash, root, &path, visited);
+        } else if meta.is_file() {
+            frame(hash, b"ext_file");
+            frame(hash, rel.as_os_str().as_encoded_bytes());
+            if let Ok(bytes) = fs::read(&path) {
+                frame(hash, &bytes);
+            }
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn compute_fingerprint(
     stage_root: &Path,
     copy: &Path,
     workspace: &Path,
     state: &WorkCopy,
+    external_deps: &BTreeSet<PathBuf>,
     package_name: &str,
     test_packages: &[&str],
     cargo: &CargoConfig,
@@ -111,7 +156,7 @@ pub(super) fn compute_fingerprint(
     files: &[SourceFile],
 ) -> String {
     let mut hash = Sha256::new();
-    frame(&mut hash, b"tmt-repair-cache-v1");
+    frame(&mut hash, b"tmt-repair-cache-v2");
     frame(&mut hash, env!("CARGO_PKG_VERSION").as_bytes());
 
     if let Ok(output) = Command::new("rustc")
@@ -151,12 +196,12 @@ pub(super) fn compute_fingerprint(
     }
     frame(&mut hash, if doc { b"doc" } else { b"no_doc" });
 
-    let mut rustflags: Vec<_> = std::env::vars_os()
-        .filter(|(k, _)| k.to_string_lossy().ends_with("RUSTFLAGS"))
+    let mut env_vars: Vec<_> = std::env::vars_os()
+        .filter(|(k, _)| !k.to_string_lossy().starts_with("TMT_"))
         .collect();
-    rustflags.sort();
-    frame(&mut hash, b"rustflags");
-    for (k, v) in rustflags {
+    env_vars.sort();
+    frame(&mut hash, b"env");
+    for (k, v) in env_vars {
         frame(&mut hash, k.as_encoded_bytes());
         frame(&mut hash, v.as_encoded_bytes());
     }
@@ -176,6 +221,13 @@ pub(super) fn compute_fingerprint(
         &originals,
         &runtime_name,
     );
+
+    frame(&mut hash, b"external_deps");
+    let mut visited = BTreeSet::new();
+    for dep in external_deps {
+        frame(&mut hash, dep.as_os_str().as_encoded_bytes());
+        hash_external_dep(&mut hash, dep, dep, &mut visited);
+    }
 
     format!("{:x}", hash.finalize())
 }

@@ -156,14 +156,14 @@ pub(super) fn validate_target_selection(
     selection: &TestSelection,
 ) -> Result<()> {
     let all_targets: Vec<&Target> = packages.iter().flat_map(|p| &p.targets).collect();
-    if selection.lib && !all_targets.iter().any(|t| t.test && t.is_lib()) {
+    if selection.lib && !all_targets.iter().any(|t| t.is_lib()) {
         bail!(
-            "no tests matched: `--lib` was requested, but no selected package has a testable library target"
+            "no tests matched: `--lib` was requested, but no selected package has a library target"
         );
     }
-    if selection.bins && !all_targets.iter().any(|t| t.test && t.is_bin()) {
+    if selection.bins && !all_targets.iter().any(|t| t.is_bin()) {
         bail!(
-            "no tests matched: `--bins` was requested, but no selected package has a testable binary target"
+            "no tests matched: `--bins` was requested, but no selected package has a binary target"
         );
     }
     for name in &selection.integration_tests {
@@ -255,9 +255,10 @@ pub(super) fn test_build_flags(
         return None;
     }
     let selected = |target: &Target| {
-        let explicit_integration =
-            target.is_integration_test() && selection.integration_tests.contains(&target.name);
-        (target.test || explicit_integration) && target_selected(target, selection)
+        let explicit_cargo_selector = (selection.lib && target.is_lib())
+            || (selection.bins && target.is_bin())
+            || (target.is_integration_test() && selection.integration_tests.contains(&target.name));
+        (target.test || explicit_cargo_selector) && target_selected(target, selection)
     };
     let mut selectors = BTreeSet::new();
     for package in packages {

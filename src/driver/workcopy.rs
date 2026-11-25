@@ -156,7 +156,13 @@ impl WorkCopy {
     /// again (or gone, like its source), and only then leaves the log.
     pub(super) fn settle(&self, workspace: &Path) -> Result<()> {
         let written = self.written.borrow();
+        let kept = self.kept.borrow();
         for path in self.earlier.difference(&written) {
+            // If a previous run had a different staging layout and this run intentionally
+            // placed an external file at `path` outside `copy_root`, keep the new file.
+            if !path.starts_with(&self.copy_root) && kept.contains(path) {
+                continue;
+            }
             if fs::symlink_metadata(path).is_ok() {
                 fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
             }
@@ -907,16 +913,21 @@ pub(super) fn relative_source(path: &Path, package: &Path) -> PathBuf {
 }
 
 /// Rewrites `path = "../outside"` dependencies of a manifest to absolute paths when they
-/// point outside `workspace`. Returns `None` when nothing has to change.
-pub(super) fn absolutize_path_dependencies(
+/// point outside `workspace`. Returns `(rewritten_manifest, external_dep_paths)`.
+pub(super) fn absolutize_path_dependencies_with_externals(
     manifest: &str,
     manifest_dir: &Path,
     workspace: &Path,
     copy: &Path,
-) -> Result<Option<String>> {
+) -> Result<(Option<String>, Vec<PathBuf>)> {
     use toml_edit::{DocumentMut, Item, TableLike, value};
 
-    fn fix(deps: &mut dyn TableLike, dirs: (&Path, &Path, &Path), changed: &mut bool) {
+    fn fix(
+        deps: &mut dyn TableLike,
+        dirs: (&Path, &Path, &Path),
+        changed: &mut bool,
+        externals: &mut Vec<PathBuf>,
+    ) {
         let (manifest_dir, workspace, copy) = dirs;
         for (_, dep) in deps.iter_mut() {
             let Some(dep) = dep.as_table_like_mut() else {
@@ -929,7 +940,10 @@ pub(super) fn absolutize_path_dependencies(
             let target = normalize(&manifest_dir.join(path));
             let rewritten = match target.strip_prefix(workspace) {
                 // Outside the workspace: not copied, so point at the original.
-                Err(_) => target,
+                Err(_) => {
+                    externals.push(target.clone());
+                    target
+                }
                 // Inside, but spelled as an absolute path: that is the original too, and
                 // the build has to use the copy.
                 Ok(inside) if absolute => copy.join(inside),
@@ -940,20 +954,26 @@ pub(super) fn absolutize_path_dependencies(
         }
     }
     const SECTIONS: [&str; 3] = ["dependencies", "dev-dependencies", "build-dependencies"];
-    fn fix_sections(table: &mut dyn TableLike, dirs: (&Path, &Path, &Path), changed: &mut bool) {
+    fn fix_sections(
+        table: &mut dyn TableLike,
+        dirs: (&Path, &Path, &Path),
+        changed: &mut bool,
+        externals: &mut Vec<PathBuf>,
+    ) {
         for section in SECTIONS {
             if let Some(deps) = table.get_mut(section).and_then(Item::as_table_like_mut) {
-                fix(deps, dirs, changed);
+                fix(deps, dirs, changed, externals);
             }
         }
     }
 
     let mut doc: DocumentMut = manifest.parse().context("parsing Cargo.toml")?;
     let mut changed = false;
+    let mut externals = Vec::new();
     let dirs = (manifest_dir, workspace, copy);
-    fix_sections(doc.as_table_mut(), dirs, &mut changed);
+    fix_sections(doc.as_table_mut(), dirs, &mut changed, &mut externals);
     if let Some(ws) = doc.get_mut("workspace").and_then(Item::as_table_like_mut) {
-        fix_sections(ws, dirs, &mut changed);
+        fix_sections(ws, dirs, &mut changed, &mut externals);
     }
     for per_key in ["target", "patch"] {
         let Some(outer) = doc.get_mut(per_key).and_then(Item::as_table_like_mut) else {
@@ -964,13 +984,23 @@ pub(super) fn absolutize_path_dependencies(
                 continue;
             };
             if per_key == "target" {
-                fix_sections(inner, dirs, &mut changed);
+                fix_sections(inner, dirs, &mut changed, &mut externals);
             } else {
-                fix(inner, dirs, &mut changed);
+                fix(inner, dirs, &mut changed, &mut externals);
             }
         }
     }
-    Ok(changed.then(|| doc.to_string()))
+    Ok((changed.then(|| doc.to_string()), externals))
+}
+
+#[cfg(test)]
+pub(super) fn absolutize_path_dependencies(
+    manifest: &str,
+    manifest_dir: &Path,
+    workspace: &Path,
+    copy: &Path,
+) -> Result<Option<String>> {
+    Ok(absolutize_path_dependencies_with_externals(manifest, manifest_dir, workspace, copy)?.0)
 }
 
 /// The directory of the marks in a working directory: made if it is not there, used if

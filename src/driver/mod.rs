@@ -508,6 +508,7 @@ fn run_package(
         work_lock,
         copy,
         state,
+        external_deps,
     } = prepare_work_copy(options, metadata, batch, catalogue, &note)?;
 
     let in_copy = |path: &Path| -> Result<PathBuf> {
@@ -1037,6 +1038,7 @@ fn run_package(
             &copy,
             &workspace,
             &state,
+            &external_deps,
             &package.name,
             &test_pkg_names,
             &options.cargo,
@@ -1052,9 +1054,11 @@ fn run_package(
         if !cached.is_empty() {
             for entry in cached {
                 if let Some(file) = files.iter().find(|f| f.display == entry.file)
-                    && let Some(site) = file.sites.iter().find(|s| {
-                        s.start == entry.start && s.end == entry.end && s.text == entry.text
-                    })
+                    && let Some(site) = file.sites.get(entry.site_index)
+                    && site.start == entry.start
+                    && site.end == entry.end
+                    && site.text == entry.text
+                    && format!("{:?}", site.kind) == entry.kind
                 {
                     disabled.insert(site.id);
                     repairs.entry(site.id).or_insert(entry.reason);
@@ -1100,12 +1104,15 @@ fn run_package(
                     .flat_map(|file| {
                         file.sites
                             .iter()
-                            .filter(|site| disabled.contains(&site.id))
-                            .map(|site| repair_cache::CachedSite {
+                            .enumerate()
+                            .filter(|(_, site)| disabled.contains(&site.id))
+                            .map(|(site_index, site)| repair_cache::CachedSite {
                                 file: file.display.clone(),
+                                site_index,
                                 start: site.start,
                                 end: site.end,
                                 text: site.text.clone(),
+                                kind: format!("{:?}", site.kind),
                                 reason: repairs.get(&site.id).cloned().unwrap_or_default(),
                             })
                     })
@@ -1272,9 +1279,13 @@ fn run_package(
                     empty_bin_targets.push((owner.clone(), name.clone()));
                 }
                 let ignored = list_tests(&exe, &cwd, &work, true, true, work_lock.as_deref())?;
-                discovered_tests.extend(all.iter().cloned());
                 for test in all {
                     let was_ignored = ignored.contains(&test);
+                    if (!was_ignored || selection.include_ignored)
+                        && !selection.exclude.iter().any(|name| name == &test)
+                    {
+                        discovered_tests.push(test.clone());
+                    }
                     if !selection.matches_test(&test, was_ignored) {
                         continue;
                     }
@@ -3184,6 +3195,7 @@ struct PreparedWorkCopy {
     work_lock: Option<Arc<WorkLock>>,
     copy: PathBuf,
     state: WorkCopy,
+    external_deps: BTreeSet<PathBuf>,
 }
 
 fn prepare_work_copy(
@@ -3304,6 +3316,7 @@ fn prepare_work_copy(
             )?;
         }
         let mut staged_destinations: Vec<PathBuf> = Vec::new();
+        let mut folded_ancestors: BTreeMap<String, PathBuf> = BTreeMap::new();
         for entry in &options.stage_external {
             let (rel, _) = parse_external_rel(&entry.rel)?;
             let dst = normalize(&copy.join(&rel));
@@ -3323,6 +3336,22 @@ fn prepare_work_copy(
                     "--stage-external destination collides with the workspace copy or another staged path: {}",
                     entry.rel.display()
                 );
+            }
+            for ancestor in dst_rel_in_stage.ancestors() {
+                if ancestor.as_os_str().is_empty() {
+                    continue;
+                }
+                let folded = ancestor.to_string_lossy().to_lowercase();
+                if let Some(previous) = folded_ancestors.get(&folded)
+                    && previous != ancestor
+                {
+                    bail!(
+                        "--stage-external destinations differ only by case: {} and {}",
+                        previous.display(),
+                        ancestor.display()
+                    );
+                }
+                folded_ancestors.insert(folded, ancestor.to_path_buf());
             }
             staged_destinations.push(dst.clone());
             let src = if entry.from.is_absolute() {
@@ -3344,6 +3373,7 @@ fn prepare_work_copy(
         if options.git_index {
             git_index::snapshot(&workspace, &copy)?;
         }
+        let mut external_deps = BTreeSet::new();
         if !options.list {
             // Relative path dependencies that leave the workspace would point nowhere from the copy.
             let mut manifests: Vec<&Path> = metadata
@@ -3363,9 +3393,14 @@ fn prepare_work_copy(
                     continue;
                 };
                 let text = fs::read_to_string(&canonical)?;
-                if let Some(rewritten) =
-                    absolutize_path_dependencies(&text, manifest_dir, &workspace, &copy)?
-                {
+                let (rewritten, externals) = absolutize_path_dependencies_with_externals(
+                    &text,
+                    manifest_dir,
+                    &workspace,
+                    &copy,
+                )?;
+                external_deps.extend(externals);
+                if let Some(rewritten) = rewritten {
                     state.write(&copy.join(relative), &rewritten)?;
                 }
             }
@@ -3374,6 +3409,14 @@ fn prepare_work_copy(
             state.settle(&workspace)?;
             catalogue.ready.set(true);
         }
+        return Ok(PreparedWorkCopy {
+            workspace,
+            work,
+            work_lock,
+            copy,
+            state,
+            external_deps,
+        });
     }
     Ok(PreparedWorkCopy {
         workspace,
@@ -3381,6 +3424,7 @@ fn prepare_work_copy(
         work_lock,
         copy,
         state,
+        external_deps: BTreeSet::new(),
     })
 }
 
