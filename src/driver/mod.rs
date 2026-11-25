@@ -1033,7 +1033,10 @@ fn run_package(
     let repair_fingerprint = has_probe_sites.then(|| {
         let test_pkg_names: Vec<&str> = test_packages.iter().map(|p| p.name.as_str()).collect();
         repair_cache::compute_fingerprint(
+            &state.root,
             &copy,
+            &workspace,
+            &state,
             &package.name,
             &test_pkg_names,
             &options.cargo,
@@ -1124,7 +1127,11 @@ fn run_package(
         if build.errors.is_empty() {
             bail!("the build failed:\n{build_note}{}", diagnostics());
         }
-        if build.errors.iter().any(is_non_probe_error) {
+        if build
+            .errors
+            .iter()
+            .any(|error| is_non_probe_error(error, &files, &copy))
+        {
             bail!(
                 "the build failed with an error unrelated to instrumentation:\n{build_note}{}",
                 diagnostics()
@@ -1226,7 +1233,7 @@ fn run_package(
         .then(|| root_test_exe(&build))
         .flatten();
     let mut discovered_tests: Vec<String> = vec![];
-    let mut matched_bin_targets: Vec<(String, String)> = vec![];
+    let mut empty_bin_targets: Vec<(String, String)> = vec![];
     if let Some(nextest) = &options.nextest {
         let mut flags: Vec<_> = test_packages
             .iter()
@@ -1249,9 +1256,6 @@ fn run_package(
             if !artifact_target_selected(&name, &kind, selection) {
                 continue;
             }
-            if kind.first().map(String::as_str) == Some("bin") {
-                matched_bin_targets.push((owner.clone(), name.clone()));
-            }
             let owner_package = test_packages
                 .iter()
                 .find(|p| p.name == owner)
@@ -1264,6 +1268,9 @@ fn run_package(
             )?;
             if selection.enabled() {
                 let all = list_tests(&exe, &cwd, &work, false, true, work_lock.as_deref())?;
+                if all.is_empty() && kind.first().map(String::as_str) == Some("bin") {
+                    empty_bin_targets.push((owner.clone(), name.clone()));
+                }
                 let ignored = list_tests(&exe, &cwd, &work, true, true, work_lock.as_deref())?;
                 discovered_tests.extend(all.iter().cloned());
                 for test in all {
@@ -1297,7 +1304,7 @@ fn run_package(
         let hint = no_tests_matched_hint(
             &test_packages,
             selection,
-            &matched_bin_targets,
+            &empty_bin_targets,
             &discovered_tests,
         );
         bail!("{build_note}no tests matched the requested selection{hint}");
@@ -3296,25 +3303,42 @@ fn prepare_work_copy(
                 &mut BTreeSet::new(),
             )?;
         }
+        let mut staged_destinations: Vec<PathBuf> = Vec::new();
         for entry in &options.stage_external {
             let (rel, _) = parse_external_rel(&entry.rel)?;
             let dst = normalize(&copy.join(&rel));
+            let copy_rel_in_stage = copy.strip_prefix(&stage_root).unwrap_or(&copy);
+            let dst_rel_in_stage = dst.strip_prefix(&stage_root).unwrap_or(&dst);
             if !dst.starts_with(&stage_root)
                 || dst == stage_root
                 || copy.starts_with(&dst)
                 || dst.starts_with(&copy)
+                || paths_overlap_case_insensitive(copy_rel_in_stage, dst_rel_in_stage)
+                || staged_destinations.iter().any(|prev| {
+                    let prev_rel = prev.strip_prefix(&stage_root).unwrap_or(prev);
+                    paths_overlap_case_insensitive(prev_rel, dst_rel_in_stage)
+                })
             {
                 bail!(
-                    "--stage-external destination collides with the workspace copy or escapes staging: {}",
+                    "--stage-external destination collides with the workspace copy or another staged path: {}",
                     entry.rel.display()
                 );
             }
+            staged_destinations.push(dst.clone());
             let src = if entry.from.is_absolute() {
                 entry.from.clone()
             } else {
-                normalize(&workspace.join(&entry.from))
+                workspace.join(&entry.from)
             };
-            copy_external_entry(&src, &dst, &work, &forbidden, &state, &mut BTreeSet::new())?;
+            copy_external_entry(
+                &src,
+                &dst,
+                None,
+                &work,
+                &forbidden,
+                &state,
+                &mut BTreeSet::new(),
+            )?;
         }
         prune(&stage_root, &state)?;
         if options.git_index {

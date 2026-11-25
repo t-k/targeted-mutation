@@ -160,8 +160,10 @@ impl WorkCopy {
             if fs::symlink_metadata(path).is_ok() {
                 fs::remove_file(path).with_context(|| format!("removing {}", path.display()))?;
             }
-            if self.visited.borrow().contains(path) {
-                let source = workspace.join(path.strip_prefix(&self.copy_root).unwrap_or(path));
+            if self.visited.borrow().contains(path)
+                && let Ok(relative) = path.strip_prefix(&self.copy_root)
+            {
+                let source = workspace.join(relative);
                 copy_as_new(&source, path)?;
             }
         }
@@ -189,7 +191,7 @@ impl WorkCopy {
 /// recompiles what changed.
 pub(super) fn sync_file(src: &Path, dst: &Path, state: &WorkCopy) -> Result<()> {
     state.kept.borrow_mut().insert(dst.to_path_buf());
-    if state.earlier.contains(dst) {
+    if dst.starts_with(&state.copy_root) && state.earlier.contains(dst) {
         state.visited.borrow_mut().insert(dst.to_path_buf());
         if fs::symlink_metadata(dst).is_ok_and(|m| m.is_file()) {
             // Written by an earlier run: this one decides what becomes of it.
@@ -454,10 +456,28 @@ pub(super) fn staged_copy_subdir(workspace: &Path, staged: &[StageExternal]) -> 
     Ok(parts.into_iter().collect())
 }
 
+/// Case-folded component comparison to prevent collisions on case-insensitive filesystems.
+pub(super) fn paths_overlap_case_insensitive(a: &Path, b: &Path) -> bool {
+    let fold = |p: &Path| -> Vec<String> {
+        p.components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(name) => Some(name.to_string_lossy().to_lowercase()),
+                _ => None,
+            })
+            .collect()
+    };
+    let a = fold(a);
+    let b = fold(b);
+    let min_len = a.len().min(b.len());
+    min_len > 0 && a[..min_len] == b[..min_len]
+}
+
 /// Copies an external file or directory into the confined staging area under `<work>/src`.
+/// Symlinks inside a staged directory are confined to the canonical root of the staged source.
 pub(super) fn copy_external_entry(
     from: &Path,
     to: &Path,
+    external_root: Option<&Path>,
     work: &Path,
     forbidden: &dyn Fn(&Path) -> bool,
     state: &WorkCopy,
@@ -466,10 +486,16 @@ pub(super) fn copy_external_entry(
     let resolved = from
         .canonicalize()
         .with_context(|| format!("resolving external path {}", from.display()))?;
+    let confined_root = external_root.unwrap_or(&resolved);
+    if !resolved.starts_with(confined_root) {
+        bail!(
+            "--stage-external entry {} escapes its staged root {}",
+            from.display(),
+            confined_root.display()
+        );
+    }
     if resolved.starts_with(work)
-        || resolved
-            .components()
-            .any(|part| part.as_os_str() == ".git")
+        || resolved.components().any(|part| part.as_os_str() == ".git")
         || forbidden(&resolved)
     {
         bail!(
@@ -492,10 +518,14 @@ pub(super) fn copy_external_entry(
     }
     real_dir(to, state)?;
     state.kept.borrow_mut().insert(to.to_path_buf());
-    for entry in fs::read_dir(&resolved).with_context(|| format!("reading {}", resolved.display()))? {
+    for entry in
+        fs::read_dir(&resolved).with_context(|| format!("reading {}", resolved.display()))?
+    {
         let entry = entry?;
         let path = entry.path();
-        if path.file_name().is_some_and(|n| n == ".git" || n == "node_modules")
+        if path
+            .file_name()
+            .is_some_and(|n| n == ".git" || n == "node_modules")
             || (path.is_dir() && path.join("CACHEDIR.TAG").exists())
             || forbidden(&path)
         {
@@ -504,6 +534,7 @@ pub(super) fn copy_external_entry(
         copy_external_entry(
             &path,
             &to.join(entry.file_name()),
+            Some(confined_root),
             work,
             forbidden,
             state,

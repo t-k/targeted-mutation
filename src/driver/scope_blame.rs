@@ -102,7 +102,20 @@ pub(super) fn since_diff(workspace: &Path, revision: &str) -> Result<String> {
 
 /// Whether a compiler error is caused by a missing external file or compile-time
 /// environment variable that probe instrumentation cannot introduce or fix.
-pub(super) fn is_non_probe_error(error: &CompileError) -> bool {
+/// Errors whose primary span lies inside probe-inserted text (for example an
+/// `--error 'env!("...")'` expression) are treated as probe errors so repair can disable them.
+pub(super) fn is_non_probe_error(error: &CompileError, files: &[SourceFile], copy: &Path) -> bool {
+    let in_inserted_probe = error.primary.iter().any(|span| {
+        let path = copy.join(&span.file);
+        files
+            .iter()
+            .find(|f| f.path == path)
+            .and_then(|f| f.rendered.as_ref())
+            .is_some_and(|rendered| rendered.inserted_by(span.byte_start).is_some())
+    });
+    if in_inserted_probe {
+        return false;
+    }
     let msg = error.message.as_str();
     let rendered = error.rendered.as_str();
     msg.starts_with("couldn't read ")
@@ -124,7 +137,7 @@ pub(super) fn blame_error(
     copy: &Path,
     disabled: &HashSet<u32>,
 ) -> Vec<u32> {
-    if is_non_probe_error(error) {
+    if is_non_probe_error(error, files, copy) {
         return vec![];
     }
     let enabled = |id: u32| !disabled.contains(&id);

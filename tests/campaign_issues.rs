@@ -631,6 +631,20 @@ fn covers_both() {
         edited_stderr.contains("rebuilding without the sites that failed to compile"),
         "source edit should re-run repair: {edited_stderr}"
     );
+
+    // Changing build.rs alone (without touching src/lib.rs) must also invalidate the repair cache.
+    write(
+        &path,
+        "build.rs",
+        "fn main() { println!(\"cargo:rerun-if-changed=build.rs\"); }\n",
+    );
+    let build_rs_changed = command(&path, &["--json"]).output().unwrap();
+    let _ = json(&build_rs_changed, 0);
+    let build_rs_stderr = String::from_utf8_lossy(&build_rs_changed.stderr);
+    assert!(
+        !build_rs_stderr.contains("cached repair exclusion"),
+        "build.rs change must invalidate repair cache: {build_rs_stderr}"
+    );
 }
 
 #[test]

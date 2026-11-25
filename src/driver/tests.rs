@@ -2753,9 +2753,32 @@ fn non_probe_errors_are_detected_and_never_blamed() {
             secondary: vec![],
             rendered: rendered.to_string(),
         };
-        assert!(is_non_probe_error(&error), "{message}");
+        assert!(is_non_probe_error(&error, &files, copy), "{message}");
         assert!(blame_error(&error, &files, copy, &HashSet::new()).is_empty());
     }
+
+    // An env! error originating inside probe-inserted text (e.g., --error 'env!("TMT_UNSET")')
+    // must still be treated as a probe error and blamed so repair can disable it.
+    let probe_offset = files[0]
+        .rendered
+        .as_ref()
+        .unwrap()
+        .text
+        .find("__tmt_rt::")
+        .unwrap();
+    let probe_env_error = CompileError {
+        code: None,
+        message: "environment variable `TMT_UNSET` not defined at compile time".into(),
+        primary: vec![ErrorSpan {
+            file: "src/lib.rs".into(),
+            byte_start: probe_offset,
+            line: 1,
+        }],
+        secondary: vec![],
+        rendered: "error: environment variable `TMT_UNSET` not defined at compile time".into(),
+    };
+    assert!(!is_non_probe_error(&probe_env_error, &files, copy));
+    assert!(!blame_error(&probe_env_error, &files, copy, &HashSet::new()).is_empty());
 }
 
 #[test]
@@ -3033,7 +3056,11 @@ fn repair_cache_matches_pict_table() {
         };
         if let Some(err) = &err {
             let expected_non_probe = err_kind != "probe_error";
-            assert_eq!(is_non_probe_error(err), expected_non_probe, "{row}");
+            assert_eq!(
+                is_non_probe_error(err, &[], Path::new("/copy")),
+                expected_non_probe,
+                "{row}"
+            );
         }
 
         let fp_old = "fp-old";
@@ -3070,6 +3097,82 @@ fn repair_cache_matches_pict_table() {
         }
     }
     let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn repair_cache_save_does_not_overwrite_hardlinked_outside_file() {
+    let dir = scratch("repair-cache-hardlink");
+    let work = dir.join("work");
+    fs::create_dir_all(&work).unwrap();
+    let victim = dir.join("victim.txt");
+    fs::write(&victim, "original-secret").unwrap();
+    fs::hard_link(&victim, work.join(".tmt-repair-cache.json")).unwrap();
+    fs::hard_link(&victim, work.join(".tmt-repair-cache.json.new")).unwrap();
+
+    repair_cache::save(&work, "fp", &[]).unwrap();
+    assert_eq!(fs::read_to_string(&victim).unwrap(), "original-secret");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[cfg(unix)]
+#[test]
+fn stage_external_rejects_symlink_escaping_staged_root() {
+    let dir = scratch("stage-external-escape");
+    let ext = dir.join("ext");
+    let work = dir.join("work");
+    fs::create_dir_all(&ext).unwrap();
+    fs::create_dir_all(work.join("src")).unwrap();
+    let secret = dir.join("secret.txt");
+    fs::write(&secret, "top-secret").unwrap();
+    std::os::unix::fs::symlink(&secret, ext.join("leak.txt")).unwrap();
+
+    let state = WorkCopy::open(&work, &work.join("src"));
+    let err = copy_external_entry(
+        &ext,
+        &work.join("src/ext"),
+        None,
+        &work,
+        &|_| false,
+        &state,
+        &mut BTreeSet::new(),
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("escapes its staged root"), "{err}");
+    let _ = fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn stage_external_case_insensitive_collision_is_detected() {
+    assert!(paths_overlap_case_insensitive(
+        Path::new("_parent_0"),
+        Path::new("_PARENT_0")
+    ));
+    assert!(paths_overlap_case_insensitive(
+        Path::new("apps/api"),
+        Path::new("APPS")
+    ));
+    assert!(!paths_overlap_case_insensitive(
+        Path::new("apps/api"),
+        Path::new("proto")
+    ));
+}
+
+#[test]
+fn build_progress_handles_non_utf8_stdout_identically_to_quiet() {
+    #[cfg(unix)]
+    {
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-c", "printf '{\"reason\":\"compiler-artifact\",\"target\":{\"name\":\"demo\",\"kind\":[\"lib\"]}}\\n\\xff\\xfe\\n'"]);
+        let mut lines = Vec::new();
+        let out =
+            run_cargo_with_progress_interval(&mut cmd, true, Duration::from_secs(60), |line| {
+                lines.push(line.to_string())
+            })
+            .unwrap();
+        assert!(out.status.success());
+        assert!(out.stdout.windows(2).any(|w| w == [0xff, 0xfe]));
+    }
 }
 
 #[test]

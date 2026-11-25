@@ -169,7 +169,7 @@ pub(super) fn validate_target_selection(
     for name in &selection.integration_tests {
         if !all_targets
             .iter()
-            .any(|t| t.test && t.is_integration_test() && t.name == *name)
+            .any(|t| t.is_integration_test() && t.name == *name)
         {
             bail!(
                 "no tests matched: `--test {name}` matched no integration test target in the selected packages"
@@ -207,11 +207,11 @@ pub(super) fn validate_target_selection(
 pub(super) fn no_tests_matched_hint(
     packages: &[&Package],
     selection: &TestSelection,
-    matched_bin_targets: &[(String, String)],
+    empty_bin_targets: &[(String, String)],
     discovered_tests: &[String],
 ) -> String {
     let mut hints = Vec::new();
-    for (owner, bin_name) in matched_bin_targets {
+    for (owner, bin_name) in empty_bin_targets {
         if !selection.targets.iter().any(|t| t == bin_name) {
             continue;
         }
@@ -231,9 +231,10 @@ pub(super) fn no_tests_matched_hint(
     if !selection.include.is_empty()
         && selection.filter.is_empty()
         && let Some(pattern) = selection.include.iter().find(|wanted| {
-            discovered_tests
-                .iter()
-                .any(|known| known.contains(wanted.as_str()))
+            !discovered_tests.iter().any(|known| known == *wanted)
+                && discovered_tests
+                    .iter()
+                    .any(|known| known.contains(wanted.as_str()))
         })
     {
         hints.push(format!(
@@ -253,7 +254,11 @@ pub(super) fn test_build_flags(
     if !selection.has_target_filters() {
         return None;
     }
-    let selected = |target: &Target| target.test && target_selected(target, selection);
+    let selected = |target: &Target| {
+        let explicit_integration =
+            target.is_integration_test() && selection.integration_tests.contains(&target.name);
+        (target.test || explicit_integration) && target_selected(target, selection)
+    };
     let mut selectors = BTreeSet::new();
     for package in packages {
         let enabled_features = package.enabled_local_features(workspace, cargo);
@@ -867,6 +872,7 @@ pub(super) fn run_cargo_with_progress_interval(
     }
 
     let mut child = command
+        .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
@@ -895,18 +901,19 @@ pub(super) fn run_cargo_with_progress_interval(
 
         let mut stdout_buf = Vec::new();
         let mut reader = BufReader::new(stdout);
-        let mut line = String::new();
+        let mut raw_line = Vec::new();
         loop {
-            line.clear();
-            let read = reader.read_line(&mut line)?;
+            raw_line.clear();
+            let read = reader.read_until(b'\n', &mut raw_line)?;
             if read == 0 {
                 break;
             }
-            stdout_buf.extend_from_slice(line.as_bytes());
+            stdout_buf.extend_from_slice(&raw_line);
+            let lossy = String::from_utf8_lossy(&raw_line);
             state
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
-                .observe_line(&line);
+                .observe_line(&lossy);
         }
         drop(done_tx);
         let _ = reporter.join();
