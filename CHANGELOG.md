@@ -5,6 +5,18 @@ All notable changes to `targeted-mutation` (`cargo tmt`) are documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.10.2] - 2026-11-25
+
+### Improved
+
+- **Widening-cast bit-packing disjointness for `|` ↔ `^`**:
+  - Extended static `possible_ones` bit-disjointness analysis to track lexical primitive integer/slice bindings and handle widening casts (`as u32`, nested casts, slice/array indexing, and primitive `u32::from(...)`), skipping equivalent `|` ↔ `^` (`ArithSwap2`) mutants in common binary-encoder patterns such as `((first as u32) << 16) | ((second as u32) << 8) | third as u32`.
+  - Remained conservative on signed widening sign-extension, overloaded binary operators, shadowed bindings (`let`, `if let`/`while let` chains, inline `mod` namespaces, `#[cfg]` bindings), and shadowed primitive type names, and fixed parenthesis stripping in the driver's primitive-operand matcher so sibling parenthesized expressions like `(a << 16) | (b << 8)` are not mis-stripped.
+- **Byte and character literal formatting in `nearest values` and comparison gaps**:
+  - Recognized `b'...'` byte literals and `'...'` character literals as comparison `LiteralSide` values, instrumented `char` comparisons using an order-preserving bijection onto the contiguous scalar range `0..=0x10_D7FF` (eliminating the `0xD800..=0xDFFF` surrogate gap), and rendered observed values and suggested inputs with readable literal + numeric representations (e.g. `` `tag` = b'o' (111) ``, `` `ch` = 'o' (111) ``).
+- **Work-directory lock contention diagnostics**:
+  - Atomically recorded the lock holder's PID in `<work-dir>/.tmt-lock/pid` (best-effort) and read it safely without following symlinks or blocking on special files (`O_NOFOLLOW | O_NONBLOCK` on Unix, `FILE_FLAG_OPEN_REPARSE_POINT` on Windows), appending `(last recorded pid <PID>)` when available and hinting to pass a separate `--work-dir` for parallel runs.
+
 ## [0.10.1] - 2026-11-25
 
 ### Fixed
