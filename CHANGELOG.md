@@ -5,6 +5,16 @@ All notable changes to `targeted-mutation` (`cargo tmt`) are documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.0] - 2026-11-26
+
+### Added
+
+- **Project and workspace configuration file (`tmt.toml`)**:
+  - Added auto-discovery walking upward from the target directory to the workspace root (`[workspace]` in `Cargo.toml`) or `.git` boundary for `tmt.toml`, `.config/tmt.toml`, or `.cargo/tmt.toml` (failing explicitly if more than one candidate exists in the same directory), plus `--config <FILE>` and `--no-config` CLI flags.
+  - Supported declarative persistence of project-level mutation, test-selection, Cargo build, output, and fixture/work-directory options with `[package.<name>]` per-package overrides applied consistently across single-package runs (including single-member virtual workspaces with glob `members`) and `--workspace` / multi-`-p` runs (including per-package `work_dir`, copy/fixture differences, and per-package `source_only = true` sharding).
+  - Enforced `built-in defaults < top-level config < [package.<name>] < CLI flags` precedence with automatic cross-layer conflict resolution (e.g. CLI `--source-only` overriding `rebuild = true`, or `--features` overriding `all_features = true`) and empty-array clearing (`[]`).
+  - Hardened config loading with `#[serde(deny_unknown_fields)]`, 1 MiB read cap on opened regular files (`O_NONBLOCK` / `O_NOFOLLOW` on Unix to prevent FIFO hangs and symlink escapes outside the auto-discovered directory), NUL/control/BiDi character rejection across both raw text and TOML-decoded strings/paths/keys, and project-root-relative resolution for `baseline` and `work_dir`.
+
 ## [0.10.3] - 2026-11-25
 
 ### Improved
