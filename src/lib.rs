@@ -3,6 +3,7 @@
 pub mod baseline;
 mod campaign_identity;
 mod checkpoint;
+pub mod config;
 pub mod driver;
 mod git_index;
 pub mod instrument;
