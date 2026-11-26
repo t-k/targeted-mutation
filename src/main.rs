@@ -1,8 +1,9 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
+use anyhow::{Result, bail};
 use clap::Parser;
-use targeted_mutation::{driver, report};
+use targeted_mutation::{config, driver, report};
 
 const HEADING_TARGET: &str = "Target & Scope";
 const HEADING_MUTATION: &str = "Mutation Mode";
@@ -34,6 +35,12 @@ Exit codes:
   1  Analysis or CLI error (invalid arguments or baseline tests failed)
   2  Test gaps, unstable predictions, or audit discrepancies found
   3  Incomplete evaluation (unconfirmed timeouts, no mutants executed, or source-only timeout/unevaluated)
+
+Config file:
+  Auto-discovered from the target directory upward to the workspace or Git root:
+    tmt.toml, .config/tmt.toml, .cargo/tmt.toml
+  Precedence: built-in defaults < top-level config < [package.<name>] < CLI flags.
+  Use --config FILE to load a specific file, or --no-config to disable discovery.
 
 Report counts (JSON):
   mutants_run = mutants_killed + mutants_survived
@@ -124,6 +131,19 @@ struct Cli {
     #[arg(long, value_name = "FILE:FROM-TO", help_heading = HEADING_TARGET)]
     lines: Vec<String>,
 
+    /// Configuration file to load instead of auto-discovering `tmt.toml`.
+    #[arg(
+        long,
+        value_name = "FILE",
+        conflicts_with = "no_config",
+        help_heading = HEADING_TARGET
+    )]
+    config: Option<PathBuf>,
+
+    /// Disable automatic discovery of `tmt.toml`, `.config/tmt.toml`, and `.cargo/tmt.toml`.
+    #[arg(long, help_heading = HEADING_TARGET)]
+    no_config: bool,
+
     // ── Mutation Mode ─────────────────────────────────────────────────────────
     /// Also build source-only mutants and verify distinguishing witnesses (slower).
     ///
@@ -164,16 +184,11 @@ struct Cli {
     error_values: Vec<String>,
 
     /// Replace only the operator token without parenthesizing operands (`--source-only`).
-    #[arg(long, requires = "source_only", help_heading = HEADING_MUTATION)]
+    #[arg(long, help_heading = HEADING_MUTATION)]
     literal_operators: bool,
 
     /// Select zero-based source-only shard K/N (`--source-only`).
-    #[arg(
-        long,
-        requires = "source_only",
-        value_name = "K/N",
-        help_heading = HEADING_MUTATION
-    )]
+    #[arg(long, value_name = "K/N", help_heading = HEADING_MUTATION)]
     shard: Option<report::Shard>,
 
     /// Method for distributing candidates across shards (default: slice).
@@ -236,10 +251,9 @@ struct Cli {
         long,
         value_enum,
         value_name = "TOOL",
-        default_value = "cargo",
         help_heading = HEADING_TESTS
     )]
-    test_tool: TestTool,
+    test_tool: Option<TestTool>,
 
     /// Nextest profile for `--test-tool nextest`.
     #[arg(long, value_name = "PROFILE", help_heading = HEADING_TESTS)]
@@ -285,15 +299,9 @@ struct Cli {
     #[arg(long, value_name = "PATH", help_heading = HEADING_TESTS)]
     test_wrapper: Option<PathBuf>,
 
-    /// Grace period for `--test-wrapper` on Unix timeout (0 kills immediately).
-    #[arg(
-        long,
-        value_name = "SECONDS",
-        default_value_t = 2,
-        requires = "test_wrapper",
-        help_heading = HEADING_TESTS
-    )]
-    wrapper_grace: u64,
+    /// Grace period for `--test-wrapper` on Unix timeout (default: 2; 0 kills immediately).
+    #[arg(long, value_name = "SECONDS", help_heading = HEADING_TESTS)]
+    wrapper_grace: Option<u64>,
 
     // ── Output & Baselines ────────────────────────────────────────────────────
     /// Output format (default: text).
@@ -346,29 +354,27 @@ struct Cli {
     sarif: bool,
 
     // ── Performance & Cargo Build ─────────────────────────────────────────────
-    /// Mutants to run in parallel.
+    /// Mutants to run in parallel (default: 1).
     ///
     /// Raise this only when tests can run concurrently with themselves (no fixed ports
     /// or shared files).
     #[arg(
         short,
         long,
-        default_value_t = 1,
         value_name = "N",
         value_parser = clap::value_parser!(u32).range(1..),
         help_heading = HEADING_BUILD
     )]
-    jobs: u32,
+    jobs: Option<u32>,
 
-    /// Concurrent isolated baseline tests.
+    /// Concurrent isolated baseline tests (default: 1).
     #[arg(
         long,
         value_name = "N",
-        default_value_t = 1,
         value_parser = clap::value_parser!(u32).range(1..),
         help_heading = HEADING_BUILD
     )]
-    baseline_jobs: u32,
+    baseline_jobs: Option<u32>,
 
     /// Timeout per test runner invocation under a mutant, in seconds.
     #[arg(
@@ -379,15 +385,14 @@ struct Cli {
     )]
     timeout: Option<u64>,
 
-    /// Policy for rechecking parallel worker timeouts.
+    /// Policy for rechecking parallel worker timeouts (default: serial).
     #[arg(
         long,
         value_enum,
         value_name = "POLICY",
-        default_value = "serial",
         help_heading = HEADING_BUILD
     )]
-    timeout_recheck: TimeoutRecheck,
+    timeout_recheck: Option<TimeoutRecheck>,
 
     /// Save and resume completed mutant outcomes via `checkpoint.jsonl`.
     #[arg(long, conflicts_with = "list", help_heading = HEADING_BUILD)]
@@ -453,12 +458,7 @@ struct Cli {
     copy_fixture: Vec<PathBuf>,
 
     /// Exclude a workspace-relative path from `--copy-fixture` (repeatable).
-    #[arg(
-        long,
-        value_name = "PATH",
-        requires = "copy_fixture",
-        help_heading = HEADING_WORK
-    )]
+    #[arg(long, value_name = "PATH", help_heading = HEADING_WORK)]
     copy_fixture_exclude: Vec<PathBuf>,
 
     /// Stage workspace path FROM at TO relative to isolated Cargo output (repeatable).
@@ -473,25 +473,135 @@ struct Cli {
     stage_external: Vec<driver::StageExternal>,
 }
 
+impl From<OutputFormat> for config::OutputFormat {
+    fn from(value: OutputFormat) -> Self {
+        match value {
+            OutputFormat::Text => Self::Text,
+            OutputFormat::Json => Self::Json,
+            OutputFormat::Jsonl => Self::Jsonl,
+            OutputFormat::Sarif => Self::Sarif,
+        }
+    }
+}
+
+impl From<config::OutputFormat> for OutputFormat {
+    fn from(value: config::OutputFormat) -> Self {
+        match value {
+            config::OutputFormat::Text => Self::Text,
+            config::OutputFormat::Json => Self::Json,
+            config::OutputFormat::Jsonl => Self::Jsonl,
+            config::OutputFormat::Sarif => Self::Sarif,
+        }
+    }
+}
+
+impl From<TimeoutRecheck> for config::TimeoutRecheck {
+    fn from(value: TimeoutRecheck) -> Self {
+        match value {
+            TimeoutRecheck::Serial => Self::Serial,
+            TimeoutRecheck::None => Self::None,
+        }
+    }
+}
+
+impl From<TestTool> for config::TestTool {
+    fn from(value: TestTool) -> Self {
+        match value {
+            TestTool::Cargo => Self::Cargo,
+            TestTool::Nextest => Self::Nextest,
+        }
+    }
+}
+
 impl Cli {
-    fn output_format(&self) -> OutputFormat {
+    fn explicit_output_format(&self) -> Option<OutputFormat> {
         if let Some(format) = self.format {
-            format
+            Some(format)
         } else if self.json {
-            OutputFormat::Json
+            Some(OutputFormat::Json)
         } else if self.jsonl {
-            OutputFormat::Jsonl
+            Some(OutputFormat::Jsonl)
         } else if self.sarif {
-            OutputFormat::Sarif
+            Some(OutputFormat::Sarif)
         } else {
-            OutputFormat::Text
+            None
+        }
+    }
+
+    fn output_format(&self) -> OutputFormat {
+        self.explicit_output_format().unwrap_or_default()
+    }
+
+    fn target_dir(&self) -> PathBuf {
+        self.directory.clone().unwrap_or_else(|| self.dir.clone())
+    }
+
+    fn to_settings(&self) -> config::Settings {
+        let non_empty_vec = |v: &[String]| (!v.is_empty()).then(|| v.to_vec());
+        let non_empty_paths = |v: &[PathBuf]| (!v.is_empty()).then(|| v.to_vec());
+        config::Settings {
+            rebuild: self.rebuild.then_some(true),
+            source_only: self.source_only.then_some(true),
+            error: non_empty_vec(&self.error_values),
+            literal_operators: self.literal_operators.then_some(true),
+            verify: self.no_verify.then_some(false),
+            effects: self.no_effects.then_some(false),
+            audit: self.audit,
+            also_test: non_empty_vec(&self.also_test),
+            dependents: self.dependents.then_some(true),
+            test_workspace: self.test_workspace,
+            doc: self.doc.then_some(true),
+            test_tool: self.test_tool.map(Into::into),
+            nextest_profile: self.nextest_profile.clone(),
+            isolate_tests: self.isolate_tests.then_some(true),
+            lib: self.lib.then_some(true),
+            bins: self.bins.then_some(true),
+            test: non_empty_vec(&self.integration_test),
+            test_target: non_empty_vec(&self.test_target),
+            test_filter: non_empty_vec(&self.test_filter),
+            include_test: non_empty_vec(&self.include_test),
+            exclude_test: non_empty_vec(&self.exclude_test),
+            include_ignored: self.include_ignored.then_some(true),
+            test_wrapper: self.test_wrapper.clone(),
+            wrapper_grace: self.wrapper_grace,
+            format: self.explicit_output_format().map(Into::into),
+            show_unreached: self.show_unreached.then_some(true),
+            quiet: self.quiet.then_some(true),
+            baseline: self.baseline.clone(),
+            jobs: self.jobs,
+            baseline_jobs: self.baseline_jobs,
+            timeout: self.timeout,
+            timeout_recheck: self.timeout_recheck.map(Into::into),
+            checkpoint: self.checkpoint.then_some(true),
+            opt_level: self.opt_level,
+            features: non_empty_vec(&self.features),
+            all_features: self.all_features.then_some(true),
+            no_default_features: self.no_default_features.then_some(true),
+            locked: self.locked.then_some(true),
+            work_dir: self.work_dir.clone(),
+            all_files: self.all_files.then_some(true),
+            git_index: self.git_index.then_some(true),
+            copy_fixture: non_empty_paths(&self.copy_fixture),
+            copy_fixture_exclude: non_empty_paths(&self.copy_fixture_exclude),
+            copy_output_fixture: (!self.copy_output_fixture.is_empty()).then(|| {
+                self.copy_output_fixture
+                    .iter()
+                    .map(|f| format!("{}={}", f.from.display(), f.to.display()))
+                    .collect()
+            }),
+            stage_external: (!self.stage_external.is_empty()).then(|| {
+                self.stage_external
+                    .iter()
+                    .map(|s| format!("{}={}", s.from.display(), s.rel.display()))
+                    .collect()
+            }),
         }
     }
 
     fn validate(&self) -> Result<(), clap::Error> {
         use clap::{CommandFactory, error::ErrorKind};
 
-        if !matches!(self.test_tool, TestTool::Nextest) && self.nextest_profile.is_some() {
+        if matches!(self.test_tool, Some(TestTool::Cargo)) && self.nextest_profile.is_some() {
             return Err(Cli::command().error(
                 ErrorKind::MissingRequiredArgument,
                 "--nextest-profile requires --test-tool nextest",
@@ -504,6 +614,124 @@ impl Cli {
             ));
         }
         Ok(())
+    }
+}
+
+fn build_driver_options(
+    cli: &Cli,
+    effective: &config::Settings,
+    require_source_only_for_shard: bool,
+) -> Result<driver::Options> {
+    let source_only = effective.source_only.unwrap_or(false);
+    if require_source_only_for_shard && cli.shard.is_some() && !source_only {
+        bail!("--shard requires --source-only (or `source_only = true` in config)");
+    }
+    let output_format: OutputFormat = effective.format.unwrap_or_default().into();
+    if cli.list && output_format == OutputFormat::Sarif {
+        bail!("the argument '--list' cannot be used with '--format sarif'");
+    }
+    let nextest = matches!(effective.test_tool, Some(config::TestTool::Nextest));
+    let output_fixtures = if !cli.copy_output_fixture.is_empty() {
+        cli.copy_output_fixture.clone()
+    } else {
+        effective.parsed_output_fixtures()?
+    };
+    let stage_external = if !cli.stage_external.is_empty() {
+        cli.stage_external.clone()
+    } else {
+        effective.parsed_stage_external()?
+    };
+    Ok(driver::Options {
+        dir: cli.target_dir(),
+        package: cli.package.first().cloned(),
+        list: cli.list,
+        test_workspace: effective.test_workspace.unwrap_or(false),
+        verify: effective.verify.unwrap_or(true),
+        work_dir: effective.work_dir.clone(),
+        progress: !effective.quiet.unwrap_or(false),
+        since: cli.since.clone(),
+        lines: cli.lines.clone(),
+        baseline: if cli.list {
+            None
+        } else {
+            effective.baseline.clone()
+        },
+        write_baseline: cli.write_baseline.clone(),
+        also_test: effective.also_test.clone().unwrap_or_default(),
+        dependents: effective.dependents.unwrap_or(false),
+        effects: effective.effects.unwrap_or(true),
+        rebuild: effective.rebuild.unwrap_or(false),
+        error_values: effective.error.clone().unwrap_or_default(),
+        source_only,
+        literal_operators: effective.literal_operators.unwrap_or(false),
+        shard: cli.shard.map(|mut shard| {
+            shard.round_robin = matches!(cli.sharding, Some(Sharding::RoundRobin));
+            shard
+        }),
+        nextest: nextest.then_some(report::Nextest {
+            profile: effective.nextest_profile.clone(),
+        }),
+        test_selection: driver::TestSelection {
+            isolate: effective.isolate_tests.unwrap_or(false),
+            lib: effective.lib.unwrap_or(false),
+            bins: effective.bins.unwrap_or(false),
+            integration_tests: effective.test.clone().unwrap_or_default(),
+            targets: effective.test_target.clone().unwrap_or_default(),
+            include: effective.include_test.clone().unwrap_or_default(),
+            filter: effective.test_filter.clone().unwrap_or_default(),
+            exclude: effective.exclude_test.clone().unwrap_or_default(),
+            include_ignored: effective.include_ignored.unwrap_or(false),
+            wrapper: effective.test_wrapper.clone(),
+        },
+        opt_level: effective.opt_level,
+        timeout_seconds: effective.timeout,
+        baseline_jobs: effective.baseline_jobs.unwrap_or(1) as usize,
+        serial_timeout_rechecks: !matches!(
+            effective.timeout_recheck,
+            Some(config::TimeoutRecheck::None)
+        ),
+        wrapper_grace: std::time::Duration::from_secs(effective.wrapper_grace.unwrap_or(2)),
+        audit: effective.audit,
+        cargo: driver::CargoConfig {
+            features: effective.features.clone().unwrap_or_default(),
+            all_features: effective.all_features.unwrap_or(false),
+            no_default_features: effective.no_default_features.unwrap_or(false),
+            locked: effective.locked.unwrap_or(false),
+        },
+        jobs: effective.jobs.unwrap_or(1) as usize,
+        all_files: effective.all_files.unwrap_or(false),
+        git_index: effective.git_index.unwrap_or(false),
+        copy_fixtures: effective.copy_fixture.clone().unwrap_or_default(),
+        copy_fixture_excludes: effective.copy_fixture_exclude.clone().unwrap_or_default(),
+        output_fixtures,
+        stage_external,
+        checkpoint: if cli.list {
+            false
+        } else {
+            effective.checkpoint.unwrap_or(false)
+        },
+        doc: effective.doc.unwrap_or(false),
+    })
+}
+
+fn resolve_settings(
+    loaded: Option<&config::LoadedConfig>,
+    package: Option<&str>,
+    cli_settings: &config::Settings,
+) -> Result<config::Settings> {
+    match loaded {
+        Some(cfg) => cfg.resolve(package, cli_settings),
+        None => config::resolve_without_config(cli_settings),
+    }
+}
+
+fn resolve_workspace_base_settings(
+    loaded: Option<&config::LoadedConfig>,
+    cli_settings: &config::Settings,
+) -> Result<config::Settings> {
+    match loaded {
+        Some(cfg) => cfg.resolve_workspace_base(cli_settings),
+        None => config::resolve_workspace_base_without_config(cli_settings),
     }
 }
 
@@ -538,77 +766,79 @@ fn main() -> ExitCode {
         Ok(cli) => cli,
         Err(code) => return code,
     };
-    let output_format = cli.output_format();
-    let nextest = matches!(cli.test_tool, TestTool::Nextest);
-    let options = driver::Options {
-        dir: cli.directory.unwrap_or(cli.dir),
-        package: cli.package.first().cloned(),
-        list: cli.list,
-        test_workspace: cli.test_workspace.unwrap_or(false),
-        verify: !cli.no_verify,
-        work_dir: cli.work_dir,
-        progress: !cli.quiet,
-        since: cli.since,
-        lines: cli.lines,
-        baseline: cli.baseline,
-        write_baseline: cli.write_baseline,
-        also_test: cli.also_test,
-        dependents: cli.dependents,
-        effects: !cli.no_effects,
-        rebuild: cli.rebuild,
-        error_values: cli.error_values,
-        source_only: cli.source_only,
-        literal_operators: cli.literal_operators,
-        shard: cli.shard.map(|mut shard| {
-            shard.round_robin = matches!(cli.sharding, Some(Sharding::RoundRobin));
-            shard
-        }),
-        nextest: nextest.then_some(report::Nextest {
-            profile: cli.nextest_profile,
-        }),
-        test_selection: driver::TestSelection {
-            isolate: cli.isolate_tests,
-            lib: cli.lib,
-            bins: cli.bins,
-            integration_tests: cli.integration_test,
-            targets: cli.test_target,
-            include: cli.include_test,
-            filter: cli.test_filter,
-            exclude: cli.exclude_test,
-            include_ignored: cli.include_ignored,
-            wrapper: cli.test_wrapper,
-        },
-        opt_level: cli.opt_level,
-        timeout_seconds: cli.timeout,
-        baseline_jobs: cli.baseline_jobs as usize,
-        serial_timeout_rechecks: matches!(cli.timeout_recheck, TimeoutRecheck::Serial),
-        wrapper_grace: std::time::Duration::from_secs(cli.wrapper_grace),
-        audit: cli.audit,
-        cargo: driver::CargoConfig {
-            features: cli.features,
-            all_features: cli.all_features,
-            no_default_features: cli.no_default_features,
-            locked: cli.locked,
-        },
-        jobs: cli.jobs as usize,
-        all_files: cli.all_files,
-        git_index: cli.git_index,
-        copy_fixtures: cli.copy_fixture,
-        copy_fixture_excludes: cli.copy_fixture_exclude,
-        output_fixtures: cli.copy_output_fixture,
-        stage_external: cli.stage_external,
-        checkpoint: cli.checkpoint,
-        doc: cli.doc,
+    let target_dir = cli.target_dir();
+    let loaded = match config::load_for_dir(&target_dir, cli.config.as_deref(), cli.no_config) {
+        Ok(loaded) => loaded,
+        Err(err) => {
+            eprintln!(
+                "tmt: error: {}",
+                report::sanitize_terminal(&format!("{err:#}"))
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let cli_settings = cli.to_settings();
+    let is_workspace = cli.workspace || cli.package.len() > 1;
+    let mut single_package = if is_workspace {
+        None
+    } else {
+        cli.package
+            .first()
+            .cloned()
+            .or_else(|| config::detect_package_name(&target_dir))
+    };
+    // For a single-member virtual workspace using glob `members` (e.g. `crates/*`),
+    // ask Cargo which package is selected when the config has per-package overrides.
+    if !is_workspace
+        && single_package.is_none()
+        && loaded
+            .as_ref()
+            .is_some_and(|cfg| !cfg.file.package.is_empty())
+        && let Ok(base_eff) = resolve_workspace_base_settings(loaded.as_ref(), &cli_settings)
+    {
+        let base_cargo = driver::CargoConfig {
+            features: base_eff.features.unwrap_or_default(),
+            all_features: base_eff.all_features.unwrap_or(false),
+            no_default_features: base_eff.no_default_features.unwrap_or(false),
+            locked: base_eff.locked.unwrap_or(false),
+        };
+        single_package = driver::select_single_package_name(&target_dir, &base_cargo);
+    }
+    let effective = match if is_workspace {
+        resolve_workspace_base_settings(loaded.as_ref(), &cli_settings)
+    } else {
+        resolve_settings(loaded.as_ref(), single_package.as_deref(), &cli_settings)
+    } {
+        Ok(effective) => effective,
+        Err(err) => {
+            eprintln!(
+                "tmt: error: {}",
+                report::sanitize_terminal(&format!("{err:#}"))
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let output_format: OutputFormat = effective.format.unwrap_or_default().into();
+    let show_unreached = effective.show_unreached.unwrap_or(false);
+    let options = match build_driver_options(&cli, &effective, !is_workspace) {
+        Ok(options) => options,
+        Err(err) => {
+            eprintln!(
+                "tmt: error: {}",
+                report::sanitize_terminal(&format!("{err:#}"))
+            );
+            return ExitCode::FAILURE;
+        }
+    };
+    let per_package = |name: &str, _base: &driver::Options| -> Result<driver::Options> {
+        let member_effective = resolve_settings(loaded.as_ref(), Some(name), &cli_settings)?;
+        build_driver_options(&cli, &member_effective, true)
     };
     if output_format == OutputFormat::Jsonl {
-        return stream_reports(
-            &options,
-            &cli.package,
-            cli.workspace || cli.package.len() > 1,
-        );
+        return stream_reports(&options, &cli.package, is_workspace, per_package);
     }
-    if cli.workspace || cli.package.len() > 1 {
-        let members = match driver::run_packages(&options, &cli.package) {
+    if is_workspace {
+        let members = match driver::run_packages_with(&options, &cli.package, per_package) {
             Ok(members) => members,
             Err(err) => {
                 eprintln!(
@@ -618,11 +848,11 @@ fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
-        return show_workspace(members, output_format, cli.show_unreached);
+        return show_workspace(members, output_format, show_unreached);
     }
     match driver::run(&options) {
         Ok(result) => {
-            show_report(&result, output_format, cli.show_unreached);
+            show_report(&result, output_format, show_unreached);
             ExitCode::from(report_exit(&result))
         }
         Err(err) => {
@@ -706,7 +936,12 @@ fn show_report(result: &report::Report, format: OutputFormat, show_unreached: bo
     }
 }
 
-fn stream_reports(options: &driver::Options, packages: &[String], workspace: bool) -> ExitCode {
+fn stream_reports(
+    options: &driver::Options,
+    packages: &[String],
+    workspace: bool,
+    options_for_package: impl FnMut(&str, &driver::Options) -> Result<driver::Options>,
+) -> ExitCode {
     use std::io::Write as _;
     let mut stdout = std::io::stdout().lock();
     let mut status = (0, 0);
@@ -746,7 +981,7 @@ fn stream_reports(options: &driver::Options, packages: &[String], workspace: boo
         Ok(())
     };
     let result = if workspace {
-        driver::run_packages_each(options, packages, &mut emit)
+        driver::run_packages_each_with(options, packages, options_for_package, &mut emit)
     } else {
         emit(
             options.package.clone().unwrap_or_default(),
@@ -870,7 +1105,7 @@ mod tests {
         );
         // And what is left is what the options are read from.
         let cli = Cli::parse_from(given(&["cargo-tmt", "tmt", "crate", "--jobs", "3"]));
-        assert_eq!((cli.dir, cli.jobs), (PathBuf::from("crate"), 3));
+        assert_eq!((cli.dir, cli.jobs), (PathBuf::from("crate"), Some(3)));
         let cli = Cli::parse_from(given(&["cargo-tmt", "tmt"]));
         assert_eq!(cli.dir, PathBuf::from("."));
         assert!(Cli::try_parse_from(given(&["cargo-tmt", "tmt", "--jobs", "0"])).is_err());
@@ -930,7 +1165,7 @@ mod tests {
             &["--json", "--sarif"][..],
             &["--list", "--sarif"][..],
             &["--list", "--format", "sarif"][..],
-            &["--nextest-profile", "ci"][..],
+            &["--config", "tmt.toml", "--no-config"][..],
             &["--jobs", "0"][..],
             &["--baseline-jobs", "0"][..],
             &["--timeout", "0"][..],
@@ -942,6 +1177,27 @@ mod tests {
                 parse_cli(argv.iter().map(std::ffi::OsString::from)).err(),
                 Some(ExitCode::FAILURE),
                 "expected exit 1 for {bad:?}"
+            );
+        }
+
+        // Cross-option requirements validated once effective settings are resolved
+        // (so a config file can provide the companion setting, e.g. `test_tool = "nextest"`).
+        for bad_effective in [
+            &["--nextest-profile", "ci"][..],
+            &["--wrapper-grace", "5"][..],
+            &["--literal-operators"][..],
+            &["--shard", "0/2"][..],
+            &["--copy-fixture-exclude", "a"][..],
+        ] {
+            let mut argv = vec!["cargo-tmt", "tmt"];
+            argv.extend_from_slice(bad_effective);
+            let cli = parse_cli(argv.iter().map(std::ffi::OsString::from))
+                .expect("syntactically valid CLI");
+            let resolved = resolve_settings(None, None, &cli.to_settings())
+                .and_then(|eff| build_driver_options(&cli, &eff, true));
+            assert!(
+                resolved.is_err(),
+                "expected effective validation error for {bad_effective:?}"
             );
         }
 
@@ -1021,6 +1277,8 @@ mod tests {
             "show-unreached",
             "quiet",
             "format",
+            "config",
+            "no-config",
         ] {
             assert!(longs.contains(flag), "missing flag --{flag}");
         }
@@ -1046,8 +1304,67 @@ mod tests {
             );
         }
         assert!(long_help.contains("--format <FORMAT>"));
+        assert!(long_help.contains("--config <FILE>"));
+        assert!(long_help.contains("--no-config"));
+        assert!(long_help.contains("Config file:"));
         assert!(long_help.contains("Examples:"));
         assert!(long_help.contains("Exit codes:"));
+    }
+
+    #[test]
+    fn config_supplies_companion_flags_for_cli_and_list_ignores_baseline_and_checkpoint() {
+        let cfg = config::LoadedConfig {
+            path: PathBuf::from("tmt.toml"),
+            base_dir: PathBuf::from("."),
+            file: config::parse_config(
+                r#"
+                source_only = true
+                test_tool = "nextest"
+                baseline = ".tmt-baseline.json"
+                checkpoint = true
+                "#,
+                "tmt.toml",
+            )
+            .unwrap(),
+        };
+
+        // Companion flags work when the prerequisite is set in config.
+        let cli = parse_cli(
+            [
+                "cargo-tmt",
+                "tmt",
+                "--shard",
+                "0/2",
+                "--literal-operators",
+                "--nextest-profile",
+                "ci",
+            ]
+            .iter()
+            .map(std::ffi::OsString::from),
+        )
+        .unwrap();
+        let eff = resolve_settings(Some(&cfg), None, &cli.to_settings()).unwrap();
+        let opts = build_driver_options(&cli, &eff, true).unwrap();
+        assert!(opts.source_only);
+        assert!(opts.literal_operators);
+        assert_eq!(opts.shard.map(|s| (s.index, s.count)), Some((0, 2)));
+        assert_eq!(
+            opts.nextest.as_ref().and_then(|n| n.profile.as_deref()),
+            Some("ci")
+        );
+
+        // `--list` gracefully ignores config-supplied `baseline` and `checkpoint`.
+        let list_cli = parse_cli(
+            ["cargo-tmt", "tmt", "--list"]
+                .iter()
+                .map(std::ffi::OsString::from),
+        )
+        .unwrap();
+        let list_eff = resolve_settings(Some(&cfg), None, &list_cli.to_settings()).unwrap();
+        let list_opts = build_driver_options(&list_cli, &list_eff, true).unwrap();
+        assert!(list_opts.list);
+        assert_eq!(list_opts.baseline, None);
+        assert!(!list_opts.checkpoint);
     }
 
     #[test]

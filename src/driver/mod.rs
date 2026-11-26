@@ -246,10 +246,35 @@ struct WorkspaceBatch<'a> {
     catalogue: Option<CatalogueSnapshot>,
 }
 
+/// Returns the Cargo package name that `run` would select for `dir` when no `--package`
+/// is given (including a single-member virtual workspace with glob `members`).
+pub fn select_single_package_name(dir: &Path, cargo: &CargoConfig) -> Option<String> {
+    let canon = dir.canonicalize().ok()?;
+    let metadata = cargo_metadata(&canon, cargo).ok()?;
+    metadata
+        .packages
+        .iter()
+        .find(|p| p.manifest_path.parent() == Some(canon.as_path()))
+        .or(match &metadata.packages[..] {
+            [only] => Some(only),
+            _ => None,
+        })
+        .map(|p| p.name.clone())
+}
+
 /// Collect the original aggregate report for callers that want it.
 pub fn run_packages(options: &Options, names: &[String]) -> Result<Vec<(String, Result<Report>)>> {
+    run_packages_with(options, names, |_, base| Ok(base.clone()))
+}
+
+/// Collect the aggregate report, allowing per-package option customisation (e.g. from `tmt.toml`).
+pub fn run_packages_with(
+    options: &Options,
+    names: &[String],
+    options_for_package: impl FnMut(&str, &Options) -> Result<Options>,
+) -> Result<Vec<(String, Result<Report>)>> {
     let mut reports = vec![];
-    run_packages_each(options, names, |name, result| {
+    run_packages_each_with(options, names, options_for_package, |name, result| {
         reports.push((name, result));
         Ok(())
     })?;
@@ -260,6 +285,17 @@ pub fn run_packages(options: &Options, names: &[String]) -> Result<Vec<(String, 
 pub fn run_packages_each(
     options: &Options,
     names: &[String],
+    completed: impl FnMut(String, Result<Report>) -> Result<()>,
+) -> Result<()> {
+    run_packages_each_with(options, names, |_, base| Ok(base.clone()), completed)
+}
+
+/// Emit each completed package before starting the next one, resolving per-package options
+/// via `options_for_package`.
+pub fn run_packages_each_with(
+    options: &Options,
+    names: &[String],
+    mut options_for_package: impl FnMut(&str, &Options) -> Result<Options>,
     mut completed: impl FnMut(String, Result<Report>) -> Result<()>,
 ) -> Result<()> {
     if options.baseline.is_some() || options.write_baseline.is_some() {
@@ -281,13 +317,82 @@ pub fn run_packages_each(
         .unwrap_or_else(|| metadata.target_directory.join("tmt-workspace"));
     fs::create_dir_all(&base).with_context(|| format!("creating {}", base.display()))?;
     let base = base.canonicalize()?;
-    if metadata.workspace_root.canonicalize()?.starts_with(&base) {
+    let workspace_canon = metadata.workspace_root.canonicalize()?;
+    if workspace_canon.starts_with(&base) {
         bail!(
             "the work directory {} contains the workspace",
             base.display()
         );
     }
-    let catalogue = if options.list || options.shard.is_some() {
+    let mut member_options = Vec::with_capacity(selected.len());
+    let mut used_work_dirs: Vec<(String, PathBuf)> = Vec::new();
+    for name in selected {
+        let mut member = options_for_package(&name, options)?;
+        if member.baseline.is_some() || member.write_baseline.is_some() {
+            bail!("baseline files require a single package (configured for `{name}`)");
+        }
+        member.package = Some(name.clone());
+        let custom_work = member
+            .work_dir
+            .as_ref()
+            .is_some_and(|w| options.work_dir.as_ref() != Some(w));
+        let member_work = if custom_work {
+            let custom = member.work_dir.clone().expect("custom work_dir");
+            fs::create_dir_all(&custom)
+                .with_context(|| format!("creating {}", custom.display()))?;
+            let canon = custom.canonicalize()?;
+            if workspace_canon.starts_with(&canon) {
+                bail!(
+                    "the work directory {} for `{name}` contains the workspace",
+                    canon.display()
+                );
+            }
+            canon
+        } else {
+            base.join(&name)
+        };
+        for (other_name, other_dir) in &used_work_dirs {
+            if member_work == *other_dir
+                || member_work.starts_with(other_dir)
+                || other_dir.starts_with(&member_work)
+            {
+                bail!(
+                    "overlapping work directories for `{name}` ({}) and `{other_name}` ({})",
+                    member_work.display(),
+                    other_dir.display()
+                );
+            }
+        }
+        used_work_dirs.push((name.clone(), member_work.clone()));
+        member.work_dir = Some(member_work);
+        member_options.push((name, member));
+    }
+    let uniform_copy_settings = member_options
+        .first()
+        .map(|(_, first)| {
+            member_options.iter().all(|(_, m)| {
+                m.all_files == first.all_files
+                    && m.git_index == first.git_index
+                    && m.copy_fixtures == first.copy_fixtures
+                    && m.copy_fixture_excludes == first.copy_fixture_excludes
+                    && m.stage_external == first.stage_external
+            })
+        })
+        .unwrap_or(true);
+    let catalogue_dir = base.join(".catalogue");
+    let catalogue = if uniform_copy_settings && (options.list || options.shard.is_some()) {
+        for (name, member_dir) in &used_work_dirs {
+            if *member_dir == catalogue_dir
+                || member_dir.starts_with(&catalogue_dir)
+                || catalogue_dir.starts_with(member_dir)
+            {
+                bail!(
+                    "work directory {} for `{name}` overlaps shared workspace catalogue {}",
+                    member_dir.display(),
+                    catalogue_dir.display()
+                );
+            }
+        }
         let path = work_directory(&base, ".catalogue")?;
         Some(CatalogueSnapshot {
             _lock: WorkLock::take(&path)?,
@@ -302,12 +407,6 @@ pub fn run_packages_each(
         work: &base,
         catalogue,
     };
-    let member_options = selected.into_iter().map(|name| {
-        let mut member = options.clone();
-        member.package = Some(name.clone());
-        member.work_dir = Some(base.join(&name));
-        (name, member)
-    });
     let Some(shard) = options.shard else {
         for (name, member) in member_options {
             let result = run_package(&member, Some(&batch), None);
@@ -315,12 +414,13 @@ pub fn run_packages_each(
         }
         return Ok(());
     };
-    if !options.source_only || shard.index >= shard.count {
+    if shard.index >= shard.count || member_options.iter().any(|(_, m)| !m.source_only) {
         bail!("shards require --source-only and a valid shard index");
     }
     // A shard needs the counts of preceding members. For an executing batch
     // retain counts only: the entire catalogue need not stay in memory.
     let catalogues: Vec<_> = member_options
+        .into_iter()
         .map(|(name, member)| {
             let mut preview = member.clone();
             preview.list = true;

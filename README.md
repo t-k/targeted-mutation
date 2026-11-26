@@ -343,6 +343,33 @@ Every JSON report satisfies three exact accounting identities:
 
 > **CI tip:** Running without `--rebuild` exits `0` when all evaluated probe mutants are killed, even if `mutants_not_built > 0`. Check `evaluation == null` (or pass `--rebuild`) when you want a CI gate to require that no mutants were left unbuilt.
 
+### Configuration file (`tmt.toml`)
+
+Project- and workspace-wide defaults can be stored in TOML instead of repeating CLI flags. `cargo tmt` walks upward from the target directory to the workspace root (`[workspace]` in `Cargo.toml`) or `.git` boundary and auto-discovers one of:
+
+- `tmt.toml`
+- `.config/tmt.toml`
+- `.cargo/tmt.toml`
+
+If more than one candidate exists in the same directory, `cargo tmt` exits with an error so the active file is never ambiguous. Pass `--config <FILE>` to load an explicit file or `--no-config` to disable auto-discovery.
+
+```toml
+# Workspace-wide defaults
+opt_level = 1
+jobs = 4
+locked = true
+exclude_test = ["tests::slow_e2e"]
+
+# Per-package overrides (applied in both single-package and --workspace runs)
+[package.my-crate]
+lib = true
+copy_fixture = ["fixtures/data"]
+```
+
+- **Precedence:** built-in defaults `<` top-level config `<` `[package.<name>]` `<` CLI flags. Upper layers replace scalar and array values (use `[]` to clear an inherited list), and explicit mode switches (such as `--source-only` overriding `rebuild = true`, or `--features` overriding `all_features = true`) clear the conflicting lower-layer flag automatically.
+- **Relative paths:** `baseline` and `work_dir` resolve relative to the project directory holding the discovered config (or the explicit `--config` file's parent). In `--workspace` runs, a top-level `work_dir` serves as the shared parent directory (`<work_dir>/<member>`) while a per-package `[package.<name>].work_dir` overrides that member's work directory individually (overlapping directories are rejected). Workspace-relative options (`test_wrapper`, `copy_fixture`, `copy_fixture_exclude`) remain relative to the workspace root; `copy_output_fixture` maps workspace-relative `FROM` to isolated Cargo output `TO`, and `stage_external` maps `SRC` to a parent-relative `REL` anchored at the isolated workspace copy.
+- **Validation:** Unknown keys, NUL/control/BiDi characters (including TOML escapes), oversized files (> 1 MiB), non-regular files (such as FIFOs), and auto-discovered symlinks resolving outside the discovered directory are rejected. `format` and `show_unreached` are top-level only.
+
 ### Option reference
 
 Options are grouped into the same six workflow sections shown by `cargo tmt --help`:
@@ -356,6 +383,8 @@ Options are grouped into the same six workflow sections shown by `cargo tmt --he
 | `--workspace` | Analyse all workspace members |
 | `--since <REV>` | Analyse only code changed since `REV`, plus untracked files |
 | `--lines <FILE:FROM-TO>` | Analyse only specific lines (`FILE:FROM-TO`, `FILE:LINE`, or `FILE`, relative to each package; repeatable) |
+| `--config <FILE>` | Load configuration from `FILE` instead of auto-discovering `tmt.toml` |
+| `--no-config` | Disable automatic discovery of `tmt.toml`, `.config/tmt.toml`, and `.cargo/tmt.toml` |
 
 #### Mutation Mode
 

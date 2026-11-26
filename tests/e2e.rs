@@ -6172,3 +6172,243 @@ fn unparseable_sibling_module_marks_evaluation_partial_in_json_sarif_and_text() 
         text_run.stdout
     );
 }
+
+#[test]
+fn config_file_auto_discovery_explicit_and_cli_override() {
+    let dir = fixture("eligibility", "config-auto-discovery");
+    fs::write(
+        dir.join("tmt.toml"),
+        "format = \"json\"\nquiet = true\nverify = false\n",
+    )
+    .unwrap();
+
+    // Auto-discovered `tmt.toml` sets JSON format, quiet stderr, and verify = false.
+    let run = tmt(&dir, &[]);
+    assert_eq!(run.code, 2, "{}\n{}", run.stdout, run.stderr);
+    assert!(
+        run.stderr.is_empty(),
+        "expected quiet stderr: {}",
+        run.stderr
+    );
+    let report: Value = serde_json::from_str(&run.stdout)
+        .unwrap_or_else(|e| panic!("expected JSON from tmt.toml ({e}):\n{}", run.stdout));
+    assert_eq!(report["analysis"]["verified"], false, "{report:#}");
+
+    // CLI `--format text` overrides config `format = "json"`.
+    let text_override = tmt(&dir, &["--format", "text"]);
+    assert_eq!(
+        text_override.code, 2,
+        "{}\n{}",
+        text_override.stdout, text_override.stderr
+    );
+    assert!(
+        text_override.stdout.contains("INPUT GAP"),
+        "expected text report: {}",
+        text_override.stdout
+    );
+
+    // `--no-config` ignores `tmt.toml`, restoring text format and default verify = true.
+    let disabled = tmt(&dir, &["--no-config", "--json", "--quiet"]);
+    assert_eq!(disabled.code, 2, "{}\n{}", disabled.stdout, disabled.stderr);
+    let disabled_report: Value = serde_json::from_str(&disabled.stdout).unwrap();
+    assert_eq!(
+        disabled_report["analysis"]["verified"], true,
+        "{disabled_report:#}"
+    );
+
+    // `--config FILE` loads an explicit file instead of auto-discovered `tmt.toml`.
+    let custom = dir.join("custom-tmt.toml");
+    fs::write(&custom, "format = \"json\"\nquiet = true\nverify = true\n").unwrap();
+    let explicit = tmt(&dir, &["--config", custom.to_str().unwrap()]);
+    assert_eq!(explicit.code, 2, "{}\n{}", explicit.stdout, explicit.stderr);
+    let explicit_report: Value = serde_json::from_str(&explicit.stdout).unwrap();
+    assert_eq!(
+        explicit_report["analysis"]["verified"], true,
+        "{explicit_report:#}"
+    );
+}
+
+#[test]
+fn config_file_workspace_per_package_override() {
+    let dir = fixture("multi", "config-workspace-pkg");
+    let ws = dir.join("ws");
+    fs::create_dir_all(ws.join(".config")).unwrap();
+    fs::write(
+        ws.join(".config/tmt.toml"),
+        "format = \"json\"\nquiet = true\nverify = true\n\n[package.ws-core]\nverify = false\n",
+    )
+    .unwrap();
+
+    // Workspace run applies `[package.ws-core]` only to `ws-core`, leaving `ws-app` at `verify = true`.
+    let run = tmt(&ws, &["--workspace"]);
+    assert!(
+        run.code == 0 || run.code == 2,
+        "unexpected exit {}:\n{}\n{}",
+        run.code,
+        run.stdout,
+        run.stderr
+    );
+    let combined: Value = serde_json::from_str(&run.stdout)
+        .unwrap_or_else(|e| panic!("expected workspace JSON ({e}):\n{}", run.stdout));
+    let packages = combined["packages"].as_array().unwrap();
+    let by_name = |name: &str| {
+        packages
+            .iter()
+            .find(|p| p["package"] == name)
+            .unwrap_or_else(|| panic!("missing package {name} in {combined:#}"))
+    };
+    assert_eq!(by_name("ws-core")["analysis"]["verified"], false);
+    assert_eq!(by_name("ws-app")["analysis"]["verified"], true);
+
+    // Running directly inside member `ws/core` auto-discovers `ws/.config/tmt.toml`
+    // and applies `[package.ws-core]`.
+    let member_run = tmt(&ws.join("core"), &[]);
+    assert!(
+        member_run.code == 0 || member_run.code == 2,
+        "unexpected exit {}:\n{}\n{}",
+        member_run.code,
+        member_run.stdout,
+        member_run.stderr
+    );
+    let member_report: Value = serde_json::from_str(&member_run.stdout)
+        .unwrap_or_else(|e| panic!("expected member JSON ({e}):\n{}", member_run.stdout));
+    assert_eq!(member_report["package"], "ws-core");
+    assert_eq!(member_report["analysis"]["verified"], false);
+}
+
+#[test]
+fn config_file_errors_exit_one() {
+    let dir = fixture("eligibility", "config-errors");
+
+    // Unknown key in `tmt.toml`.
+    fs::write(dir.join("tmt.toml"), "nonexistent_option = 42\n").unwrap();
+    let unknown = tmt(&dir, &[]);
+    assert_eq!(unknown.code, 1, "{}\n{}", unknown.stdout, unknown.stderr);
+    assert!(
+        unknown.stderr.contains("unknown field"),
+        "expected unknown field error: {}",
+        unknown.stderr
+    );
+
+    // Duplicate candidates in the same directory.
+    fs::write(dir.join("tmt.toml"), "quiet = true\n").unwrap();
+    fs::create_dir_all(dir.join(".config")).unwrap();
+    fs::write(dir.join(".config/tmt.toml"), "quiet = true\n").unwrap();
+    let dup = tmt(&dir, &[]);
+    assert_eq!(dup.code, 1, "{}\n{}", dup.stdout, dup.stderr);
+    assert!(
+        dup.stderr.contains("multiple tmt config files"),
+        "expected duplicate error: {}",
+        dup.stderr
+    );
+
+    // Missing explicit `--config`.
+    let missing = tmt(&dir, &["--config", "does-not-exist.toml"]);
+    assert_eq!(missing.code, 1, "{}\n{}", missing.stdout, missing.stderr);
+}
+
+#[test]
+fn config_file_workspace_per_package_source_only_shard() {
+    let dir = fixture("multi", "config-workspace-shard");
+    let ws = dir.join("ws");
+    fs::write(
+        ws.join("tmt.toml"),
+        "format = \"json\"\nquiet = true\n\n[package.ws-app]\nsource_only = true\n\n[package.ws-core]\nsource_only = true\n",
+    )
+    .unwrap();
+
+    // Per-package `source_only = true` satisfies `--workspace --shard 0/2` without top-level `source_only`.
+    let run = tmt(&ws, &["--workspace", "--list", "--shard", "0/2"]);
+    assert_eq!(run.code, 0, "{}\n{}", run.stdout, run.stderr);
+    let combined: Value = serde_json::from_str(&run.stdout)
+        .unwrap_or_else(|e| panic!("expected workspace JSON ({e}):\n{}", run.stdout));
+    let packages = combined["packages"].as_array().unwrap();
+    assert_eq!(packages.len(), 2, "{combined:#}");
+    for pkg in packages {
+        assert_eq!(pkg["analysis"]["source_only"], true, "{pkg:#}");
+        assert_eq!(pkg["analysis"]["shard"]["index"], 0, "{pkg:#}");
+        assert_eq!(pkg["analysis"]["shard"]["count"], 2, "{pkg:#}");
+    }
+}
+
+#[test]
+fn config_file_workspace_deferred_prerequisites_work_dir_overlap_and_glob_virtual_ws() {
+    // 1. Top-level `copy_fixture_exclude` satisfied by per-package `copy_fixture` works under `--workspace`.
+    let dir = fixture("multi", "config-ws-deferred");
+    let ws = dir.join("ws");
+    fs::create_dir_all(ws.join("app/data/tmp")).unwrap();
+    fs::write(ws.join("app/data/keep.txt"), "ok").unwrap();
+    fs::write(ws.join("app/data/tmp/skip.txt"), "skip").unwrap();
+    fs::write(
+        ws.join("tmt.toml"),
+        "format = \"json\"\nquiet = true\ncopy_fixture_exclude = [\"app/data/tmp\"]\n\n[package.ws-app]\ncopy_fixture = [\"app/data\"]\n\n[package.ws-core]\ncopy_fixture = [\"app/data\"]\n",
+    )
+    .unwrap();
+    let deferred_run = tmt(&ws, &["--workspace", "--list"]);
+    assert_eq!(
+        deferred_run.code, 0,
+        "{}\n{}",
+        deferred_run.stdout, deferred_run.stderr
+    );
+
+    // 2. Member `work_dir` overlapping shared `.catalogue` is rejected before running.
+    let work_base = dir.join("shared-work");
+    fs::write(
+        ws.join("tmt.toml"),
+        format!(
+            "format = \"json\"\nquiet = true\nwork_dir = \"{}\"\n\n[package.ws-app]\nwork_dir = \"{}\"\n",
+            work_base.display().to_string().replace('\\', "\\\\"),
+            work_base
+                .join(".catalogue")
+                .display()
+                .to_string()
+                .replace('\\', "\\\\"),
+        ),
+    )
+    .unwrap();
+    let overlap_run = tmt(&ws, &["--workspace", "--list"]);
+    assert_eq!(
+        overlap_run.code, 1,
+        "{}\n{}",
+        overlap_run.stdout, overlap_run.stderr
+    );
+    assert!(
+        overlap_run.stderr.contains("overlaps"),
+        "expected overlap error: {}",
+        overlap_run.stderr
+    );
+
+    // 3. Single-member virtual workspace with glob `members = ["crates/*"]` applies `[package.<name>]`.
+    let glob_ws = Path::new(env!("CARGO_TARGET_TMPDIR")).join("config-glob-virtual-ws");
+    let _ = fs::remove_dir_all(&glob_ws);
+    fs::create_dir_all(glob_ws.join("crates/only/src")).unwrap();
+    fs::write(
+        glob_ws.join("Cargo.toml"),
+        "[workspace]\nresolver = \"2\"\nmembers = [\"crates/*\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        glob_ws.join("crates/only/Cargo.toml"),
+        "[package]\nname = \"only-glob\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(
+        glob_ws.join("crates/only/src/lib.rs"),
+        "pub fn ok(x: u32) -> bool { x >= 10 }\n#[test]\nfn t() { assert!(ok(15)); assert!(!ok(5)); }\n",
+    )
+    .unwrap();
+    fs::write(
+        glob_ws.join("tmt.toml"),
+        "format = \"json\"\nquiet = true\nverify = true\n\n[package.only-glob]\nverify = false\n",
+    )
+    .unwrap();
+    let implicit_run = tmt(&glob_ws, &[]);
+    assert_eq!(
+        implicit_run.code, 2,
+        "{}\n{}",
+        implicit_run.stdout, implicit_run.stderr
+    );
+    let implicit_report: Value = serde_json::from_str(&implicit_run.stdout).unwrap();
+    assert_eq!(implicit_report["package"], "only-glob");
+    assert_eq!(implicit_report["analysis"]["verified"], false);
+}
