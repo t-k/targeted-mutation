@@ -392,7 +392,8 @@ fn load_from_path(
         .take(MAX_CONFIG_BYTES + 1)
         .read_to_string(&mut text)
         .with_context(|| format!("reading config file {}", path.display()))?;
-    if text.len() as u64 > MAX_CONFIG_BYTES {
+    let text_len = text.len() as u64;
+    if text_len > MAX_CONFIG_BYTES {
         bail!(
             "config file {} exceeds maximum size of {} bytes",
             path.display(),
@@ -410,7 +411,8 @@ fn load_from_path(
 
 /// Parses and validates a `tmt.toml` string.
 pub fn parse_config(text: &str, source: &str) -> Result<ConfigFile> {
-    if text.len() as u64 > MAX_CONFIG_BYTES {
+    let text_len = text.len() as u64;
+    if text_len > MAX_CONFIG_BYTES {
         bail!("config {source} exceeds maximum size of {MAX_CONFIG_BYTES} bytes");
     }
     validate_text_characters(text, source)?;
@@ -485,11 +487,11 @@ fn validate_text_characters(text: &str, source: &str) -> Result<()> {
 fn validate_decoded_string(value: &str, context: &str) -> Result<()> {
     for ch in value.chars() {
         if ch == '\0' {
-            bail!("{context}: value must not contain NUL bytes");
+            bail!("{context}: value must be without control characters (found NUL byte)");
         }
         if ch.is_control() || is_disallowed_bidi(ch) {
             bail!(
-                "{context}: value contains disallowed control character U+{:04X}",
+                "{context}: value must be without control characters (found U+{:04X})",
                 ch as u32
             );
         }
