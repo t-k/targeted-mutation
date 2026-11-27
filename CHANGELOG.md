@@ -5,6 +5,21 @@ All notable changes to `targeted-mutation` (`cargo tmt`) are documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.11.1] - 2026-11-27
+
+### Improved
+
+- **Event-driven child process exit waiting (`kqueue` / `pidfd`)**:
+  - Replaced polling sleeps when waiting on test binaries with kernel exit notifications (`kqueue` `EVFILT_PROC`/`NOTE_EXIT` on macOS and `pidfd_open` + `poll` on Linux `x86_64` 64-bit, `aarch64`, `x86`, and `riscv64`, falling back to bounded sleep polling elsewhere), eliminating per-mutant wait latency while preserving timeout and interrupt handling.
+- **Copy-on-Write executable cloning for witness runs (`fclonefileat` / `FICLONE`)**:
+  - Used APFS `fclonefileat(2)` on macOS (falling back to regular copy when BSD file flags such as `UF_IMMUTABLE` are set) and `ioctl(FICLONE)` on Linux (`x86_64` 64-bit, `aarch64`, `x86`, `riscv64`) when staging witness test binaries, with a file-length mismatch short-circuit in `WorkCopy` byte comparisons.
+- **SIMD-accelerated line and trace scanning (NEON / SSE2)**:
+  - Accelerated newline and tab scanning in `LineIndex::new` and `Trace::parse` using `aarch64` NEON and `x86_64` SSE2 intrinsics, paired with borrow-first `BTreeMap` lookups and fast ASCII `u32` parsing while preserving exact `str::lines` and `str::parse` compatibility.
+  - Pre-indexed primitive arithmetic and cast-probe spans per file during planning to avoid repeated AST scans.
+- **Lean 4-verified planner and runtime probe optimizations**:
+  - Proved 4-bit comparison truth-table masks, `BitVec` disjoint-bit identities, domain-universal comparison equivalence, and zero-allocation `str::replace` vs `replacen(..., 1)` equivalence in `formal/lean/Planner.lean` (Lean 4 v4.36.0, zero warnings).
+  - Applied the verified bitmask table in `src/plan.rs` and `src/runtime/tmt_rt.rs`, added zero-allocation `str_replace_differs`, deferred `Val::tmt_val()` conversion behind `idle(site)` on comparison probes, added `bits_known` / `StrAffix` short-circuits, and batched per-thread trace backlog flushes.
+
 ## [0.11.0] - 2026-11-26
 
 ### Added

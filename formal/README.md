@@ -6,7 +6,7 @@ Core invariants of `targeted-mutation` — survivor interval arithmetic, combina
 
 | Model | What it verifies |
 |---|---|
-| `Planner.lean` | Over mathematical integers and complete observations, the survivor interval is sound and exact, the 3-value trace summary is sufficient, reachability filtering (power-of-two products, masks, remainders) is sound under wrapping, and sequence-end (`first`/`last`) separation holds |
+| `Planner.lean` | Over mathematical integers and complete observations, the survivor interval is sound and exact, the 3-value trace summary is sufficient, 4-bit comparison truth-table masks and `BitVec` disjoint-bit identities hold, reachability filtering (power-of-two products, masks, remainders) is sound under wrapping, zero-allocation `replace` vs `replacen(..., 1)` equivalence holds, and sequence-end (`first`/`last`) separation holds |
 
 ```sh
 lean formal/lean/Planner.lean
