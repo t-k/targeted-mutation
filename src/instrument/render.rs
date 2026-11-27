@@ -462,7 +462,7 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     end: call.1,
                     phase: 1,
                     order: 0,
-                    text: ").__tmt_quant_mut(), ".into(),
+                    text: format!(").__tmt_quant_mut())).tmt_pos({}u32, {forward}, ", site.id),
                     site: site.id,
                 });
                 edits.push(Edit {
@@ -470,15 +470,12 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     end: close.1,
                     phase: 1,
                     order: 0,
-                    text: format!(
-                        ") {{ (__tmt_q, __tmt_f) => (&__tmt_q).tmt_pos({}u32, {forward}, __tmt_f, |__tmt_i, __tmt_f| (*__tmt_i).{same}(__tmt_f)) }} }})",
-                        site.id
-                    ),
+                    text: format!(", |__tmt_i, __tmt_f| (*__tmt_i).{same}(__tmt_f)) }})"),
                     site: site.id,
                 });
                 (
                     format!(
-                        "({{ #[allow(unused_imports)] use {rt}::{{AnyPos as _, PosPrim as _, TmtQuantExt as _}}; match (("
+                        "({{ #[allow(unused_imports)] use {rt}::{{AnyPos as _, PosPrim as _, TmtQuantExt as _}}; (&(("
                     ),
                     String::new(),
                 )
