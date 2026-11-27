@@ -281,17 +281,11 @@ pub(crate) struct LineIndex(Vec<usize>);
 
 impl LineIndex {
     pub(crate) fn new(source: &str) -> Self {
-        Self(
-            std::iter::once(0)
-                .chain(
-                    source
-                        .bytes()
-                        .enumerate()
-                        .filter(|&(_, byte)| byte == b'\n')
-                        .map(|(offset, _)| offset + 1),
-                )
-                .collect(),
-        )
+        let bytes = source.as_bytes();
+        let mut starts = Vec::with_capacity(bytes.len() / 32 + 2);
+        starts.push(0);
+        push_newline_starts(bytes, &mut starts);
+        Self(starts)
     }
 
     pub(crate) fn line_of(&self, offset: usize) -> usize {
@@ -340,6 +334,64 @@ pub fn line_of(source: &str, offset: usize) -> usize {
         .filter(|b| **b == b'\n')
         .count()
         + 1
+}
+
+/// Appends `offset + 1` for every `b'\n'` byte in `bytes`, using NEON on `aarch64`
+/// and SSE2 on `x86_64` with a portable scalar tail/fallback.
+fn push_newline_starts(bytes: &[u8], out: &mut Vec<usize>) {
+    let mut i = 0usize;
+    let len = bytes.len();
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::*;
+        // SAFETY: NEON is mandatory on all aarch64 targets, and every load stays within `bytes[..len]`.
+        unsafe {
+            let nl = vdupq_n_u8(b'\n');
+            let bit_mask: uint8x16_t =
+                vld1q_u8([1u8, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128].as_ptr());
+            while i + 16 <= len {
+                let chunk = vld1q_u8(bytes.as_ptr().add(i));
+                let eq = vceqq_u8(chunk, nl);
+                if vmaxvq_u8(eq) != 0 {
+                    let masked = vandq_u8(eq, bit_mask);
+                    let lo = vaddv_u8(vget_low_u8(masked)) as u32;
+                    let hi = vaddv_u8(vget_high_u8(masked)) as u32;
+                    let mut bits = lo | (hi << 8);
+                    while bits != 0 {
+                        let tz = bits.trailing_zeros() as usize;
+                        out.push(i + tz + 1);
+                        bits &= bits - 1;
+                    }
+                }
+                i += 16;
+            }
+        }
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::*;
+        // SAFETY: SSE2 is mandatory on all x86_64 targets, and every load stays within `bytes[..len]`.
+        unsafe {
+            let nl = _mm_set1_epi8(b'\n' as i8);
+            while i + 16 <= len {
+                let chunk = _mm_loadu_si128(bytes.as_ptr().add(i).cast());
+                let eq = _mm_cmpeq_epi8(chunk, nl);
+                let mut bits = _mm_movemask_epi8(eq) as u32;
+                while bits != 0 {
+                    let tz = bits.trailing_zeros() as usize;
+                    out.push(i + tz + 1);
+                    bits &= bits - 1;
+                }
+                i += 16;
+            }
+        }
+    }
+    while i < len {
+        if bytes[i] == b'\n' {
+            out.push(i + 1);
+        }
+        i += 1;
+    }
 }
 
 #[cfg(test)]
@@ -848,5 +900,36 @@ diff --git a/src/a.rs b/src/a.rs
         assert_eq!(parsed.len(), 1, "{parsed:?}");
         assert_eq!(undo(new_blank, &[&parsed[0]]).as_deref(), Some(old_blank));
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn simd_line_index_matches_scalar_across_chunk_boundaries() {
+        let scalar = |source: &str| -> Vec<usize> {
+            std::iter::once(0)
+                .chain(
+                    source
+                        .bytes()
+                        .enumerate()
+                        .filter(|&(_, b)| b == b'\n')
+                        .map(|(i, _)| i + 1),
+                )
+                .collect()
+        };
+        for len in 0..=66 {
+            let mut buf = "a".repeat(len);
+            assert_eq!(LineIndex::new(&buf).0, scalar(&buf), "no-nl len={len}");
+            if len > 0 {
+                // Place a newline at every position to test lane 0..15 boundaries.
+                for pos in [0, len / 2, len - 1] {
+                    buf.replace_range(pos..pos + 1, "\n");
+                    assert_eq!(LineIndex::new(&buf).0, scalar(&buf), "len={len} pos={pos}");
+                    buf.replace_range(pos..pos + 1, "a");
+                }
+            }
+        }
+        let all_nl = "\n".repeat(35);
+        assert_eq!(LineIndex::new(&all_nl).0, scalar(&all_nl));
+        let mixed = "猫\r\nαβγ\n".repeat(12);
+        assert_eq!(LineIndex::new(&mixed).0, scalar(&mixed));
     }
 }

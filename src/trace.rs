@@ -43,6 +43,87 @@ pub struct Trace {
     pub malformed_lines: usize,
 }
 
+fn parse_u32_ascii(text: &str) -> Option<u32> {
+    let bytes = text.as_bytes();
+    let bytes = bytes.strip_prefix(b"+").unwrap_or(bytes);
+    if bytes.is_empty() {
+        return None;
+    }
+    let mut acc = 0u32;
+    for &b in bytes {
+        let d = b.wrapping_sub(b'0');
+        if d > 9 {
+            return None;
+        }
+        acc = acc.checked_mul(10)?.checked_add(u32::from(d))?;
+    }
+    Some(acc)
+}
+
+#[inline]
+fn find_byte(haystack: &[u8], needle: u8) -> Option<usize> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        use std::arch::aarch64::*;
+        let len = haystack.len();
+        let mut i = 0;
+        // SAFETY: NEON is mandatory on aarch64 and every load stays within `haystack[..len]`.
+        unsafe {
+            let n = vdupq_n_u8(needle);
+            let bit_mask: uint8x16_t =
+                vld1q_u8([1u8, 2, 4, 8, 16, 32, 64, 128, 1, 2, 4, 8, 16, 32, 64, 128].as_ptr());
+            while i + 16 <= len {
+                let chunk = vld1q_u8(haystack.as_ptr().add(i));
+                let eq = vceqq_u8(chunk, n);
+                if vmaxvq_u8(eq) != 0 {
+                    let masked = vandq_u8(eq, bit_mask);
+                    let lo = vaddv_u8(vget_low_u8(masked)) as u32;
+                    let hi = vaddv_u8(vget_high_u8(masked)) as u32;
+                    let bits = lo | (hi << 8);
+                    return Some(i + bits.trailing_zeros() as usize);
+                }
+                i += 16;
+            }
+        }
+        while i < len {
+            if haystack[i] == needle {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        use std::arch::x86_64::*;
+        let len = haystack.len();
+        let mut i = 0;
+        // SAFETY: SSE2 is mandatory on x86_64 and every load stays within `haystack[..len]`.
+        unsafe {
+            let n = _mm_set1_epi8(needle as i8);
+            while i + 16 <= len {
+                let chunk = _mm_loadu_si128(haystack.as_ptr().add(i).cast());
+                let mask = _mm_movemask_epi8(_mm_cmpeq_epi8(chunk, n)) as u32;
+                if mask != 0 {
+                    return Some(i + mask.trailing_zeros() as usize);
+                }
+                i += 16;
+            }
+        }
+        while i < len {
+            if haystack[i] == needle {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        haystack.iter().position(|&b| b == needle)
+    }
+}
+
 fn flag(text: &str) -> Option<bool> {
     match text {
         "0" => Some(false),
@@ -115,10 +196,22 @@ impl Trace {
 
     pub fn parse(text: &str) -> Trace {
         let mut trace = Trace::default();
-        for line in text.lines() {
-            if trace.parse_line(line).is_none() {
+        let bytes = text.as_bytes();
+        let mut pos = 0;
+        while pos < bytes.len() {
+            let line_end = find_byte(&bytes[pos..], b'\n').map_or(bytes.len(), |d| pos + d);
+            let mut end = line_end;
+            if line_end < bytes.len() && end > pos && bytes[end - 1] == b'\r' {
+                end -= 1;
+            }
+            if trace.parse_line(&text[pos..end]).is_none() {
                 trace.malformed_lines += 1;
             }
+            pos = if line_end < bytes.len() {
+                line_end + 1
+            } else {
+                bytes.len()
+            };
         }
         trace
     }
@@ -127,9 +220,22 @@ impl Trace {
         // The comparison record is the widest. Reject extra fields without allocating.
         let mut cols = [""; 10];
         let mut len = 0;
-        for field in line.split('\t') {
-            *cols.get_mut(len)? = field;
-            len += 1;
+        let lb = line.as_bytes();
+        let mut fstart = 0;
+        loop {
+            let slot = cols.get_mut(len)?;
+            match find_byte(&lb[fstart..], b'\t') {
+                Some(d) => {
+                    *slot = &line[fstart..fstart + d];
+                    len += 1;
+                    fstart += d + 1;
+                }
+                None => {
+                    *slot = &line[fstart..];
+                    len += 1;
+                    break;
+                }
+            }
         }
         match cols[..len] {
             [
@@ -144,7 +250,9 @@ impl Trace {
                 f_max_neg,
                 f_min_pos,
             ] => {
-                let rels: u8 = rels.parse().ok().filter(|r| *r < 16)?;
+                let rels: u8 = parse_u32_ascii(rels)
+                    .and_then(|r| u8::try_from(r).ok())
+                    .filter(|r| *r < 16)?;
                 let obs = Obs {
                     lt: rels & 1 != 0,
                     eq: rels & 2 != 0,
@@ -157,54 +265,64 @@ impl Trace {
                     f_max_neg: optional::<f64>(f_max_neg)?.filter(|d| d.is_finite() && *d < 0.0),
                     f_min_pos: optional::<f64>(f_min_pos)?.filter(|d| d.is_finite() && *d > 0.0),
                 };
-                let site = site.parse().ok()?;
+                let site = parse_u32_ascii(site)?;
                 (!test.is_empty()).then_some(())?;
-                self.cmp
-                    .entry(site)
-                    .or_default()
-                    .entry(test.to_string())
-                    .or_default()
-                    .merge(&obs);
+                let tests = self.cmp.entry(site).or_default();
+                if let Some(existing) = tests.get_mut(test) {
+                    existing.merge(&obs);
+                } else {
+                    tests.insert(test.to_owned(), obs);
+                }
             }
             [kind @ ("R" | "L" | "A" | "B"), site, test, bits] => {
-                let site: u32 = site.parse().ok()?;
+                let site = parse_u32_ascii(site)?;
                 let limit = match kind {
                     "B" => 4,
                     "A" => 32,
                     "L" => 16,
                     _ => 8,
                 };
-                let bits: u8 = bits.parse().ok().filter(|b| (1..limit).contains(b))?;
+                let bits: u8 = parse_u32_ascii(bits)
+                    .and_then(|b| u8::try_from(b).ok())
+                    .filter(|b| (1..limit).contains(b))?;
                 (!test.is_empty()).then_some(())?;
-                let test = test.to_string();
                 match kind {
                     "R" => {
                         if bits & 2 != 0 {
                             self.ranges_at_top.insert(site);
                         }
-                        self.reach.entry(site).or_default().insert(test);
+                        let tests = self.reach.entry(site).or_default();
+                        if !tests.contains(test) {
+                            tests.insert(test.to_owned());
+                        }
                     }
-                    "B" => self
-                        .returns
-                        .entry(site)
-                        .or_default()
-                        .entry(test)
-                        .or_default()
-                        .merge(&ReturnObs::from_bits(bits)),
-                    "L" => self
-                        .logic
-                        .entry(site)
-                        .or_default()
-                        .entry(test)
-                        .or_default()
-                        .merge(&LogicObs::from_bits(bits)),
-                    _ => self
-                        .arith
-                        .entry(site)
-                        .or_default()
-                        .entry(test)
-                        .or_default()
-                        .merge(&ArithObs::from_bits(bits)),
+                    "B" => {
+                        let obs = ReturnObs::from_bits(bits);
+                        let tests = self.returns.entry(site).or_default();
+                        if let Some(existing) = tests.get_mut(test) {
+                            existing.merge(&obs);
+                        } else {
+                            tests.insert(test.to_owned(), obs);
+                        }
+                    }
+                    "L" => {
+                        let obs = LogicObs::from_bits(bits);
+                        let tests = self.logic.entry(site).or_default();
+                        if let Some(existing) = tests.get_mut(test) {
+                            existing.merge(&obs);
+                        } else {
+                            tests.insert(test.to_owned(), obs);
+                        }
+                    }
+                    _ => {
+                        let obs = ArithObs::from_bits(bits);
+                        let tests = self.arith.entry(site).or_default();
+                        if let Some(existing) = tests.get_mut(test) {
+                            existing.merge(&obs);
+                        } else {
+                            tests.insert(test.to_owned(), obs);
+                        }
+                    }
                 }
             }
             ["T", site, lhs_min, lhs_max, rhs_min, rhs_max] => {
@@ -212,10 +330,10 @@ impl Trace {
                     lhs: (lhs_min.parse().ok()?, lhs_max.parse().ok()?),
                     rhs: (rhs_min.parse().ok()?, rhs_max.parse().ok()?),
                 };
-                self.bounds.insert(site.parse().ok()?, bounds);
+                self.bounds.insert(parse_u32_ascii(site)?, bounds);
             }
             ["C", site, slot, min, max] => {
-                let key = (site.parse().ok()?, slot.parse().ok()?);
+                let key = (parse_u32_ascii(site)?, parse_u32_ascii(slot)?);
                 let observed = if min == "-" && max == "-" {
                     None
                 } else {
@@ -1220,5 +1338,82 @@ mod tests {
         assert!(!tmt_rt::float_min_max_same(-0.0, 0.0));
         assert!(!tmt_rt::float_min_max_same(f64::NAN, f64::NAN));
         assert!(!tmt_rt::float_min_max_same(f64::NAN, 1.0));
+    }
+
+    #[test]
+    fn zero_alloc_str_replace_and_affix_match_std() {
+        use tmt_rt::TmtStrPat as _;
+        let haystacks = [
+            "",
+            "a",
+            "aa",
+            "aaa",
+            "aaaa",
+            "abc/def/ghi",
+            "abc/def",
+            "猫/犬/猫",
+            "猫猫猫",
+            "prefix_middle_suffix",
+        ];
+        let patterns = [
+            "", "a", "aa", "/", "猫", "prefix", "suffix", "middle", "xyz",
+        ];
+        let targets = ["", "a", "b", "aa", "bb", "/", "-", "猫", "犬"];
+        for s in haystacks {
+            for p in patterns {
+                for t in targets {
+                    assert_eq!(
+                        tmt_rt::str_replace_differs(s, p, t),
+                        s.replace(p, t) != s.replacen(p, t, 1),
+                        "replace s={s:?} p={p:?} t={t:?}"
+                    );
+                }
+                for starts in [true, false] {
+                    let expected = if starts {
+                        s.starts_with(p) != s.contains(p)
+                    } else {
+                        s.ends_with(p) != s.contains(p)
+                    };
+                    assert_eq!(
+                        p.tmt_affix_differs(s, starts),
+                        expected,
+                        "affix s={s:?} p={p:?} starts={starts}"
+                    );
+                }
+            }
+            for c in ['a', '/', '猫', 'z'] {
+                for t in ["", "a", "b", "/", "猫", "犬"] {
+                    assert_eq!(
+                        c.tmt_replace_differs(s, t),
+                        s.replace(c, t) != s.replacen(c, t, 1),
+                        "char replace s={s:?} c={c:?} t={t:?}"
+                    );
+                }
+                for starts in [true, false] {
+                    let expected = if starts {
+                        s.starts_with(c) != s.contains(c)
+                    } else {
+                        s.ends_with(c) != s.contains(c)
+                    };
+                    assert_eq!(
+                        c.tmt_affix_differs(s, starts),
+                        expected,
+                        "char affix s={s:?} c={c:?} starts={starts}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn trace_parser_preserves_plus_prefix_and_bare_cr_semantics() {
+        // Leading `+` is accepted by `str::parse::<u32>()`.
+        let plus = Trace::parse("R\t+3\tt\t+1\n");
+        assert_eq!(plus.malformed_lines, 0);
+        assert!(plus.reach[&3].contains("t"));
+        // A bare `\r` without `\n` is NOT stripped by `str::lines()`, so the bits field fails to parse.
+        let bare_cr = Trace::parse("R\t3\tt\t1\r");
+        assert_eq!(bare_cr.malformed_lines, 1);
+        assert!(bare_cr.reach.is_empty());
     }
 }
