@@ -1584,3 +1584,353 @@ fn exercises_encoders() {
         "expected generic_from_fallback | -> ^ input gap in {findings:#?}"
     );
 }
+
+#[test]
+fn targeted_value_mutations_detect_input_gaps_and_respect_custom_types_e2e() {
+    let path = package("targeted-value-mutations");
+    write(
+        &path,
+        "src/lib.rs",
+        r#"
+use std::io::Read;
+
+// 1. Saturating / wrapping arithmetic
+pub fn sat_gap(a: u8, b: u8) -> u8 {
+    a.saturating_sub(b)
+}
+
+pub fn sat_killed(a: u8, b: u8) -> u8 {
+    a.saturating_add(b)
+}
+
+// 2. String trim (including local variable borrow lifetime)
+pub fn trim_gap(s: &str) -> &str {
+    let trimmed = s.trim_start();
+    trimmed
+}
+
+pub fn trim_both_gap(s: String) -> usize {
+    s.trim().len()
+}
+
+// 3. ASCII case-insensitive equality (str, [u8], u8)
+pub fn case_eq_gap(a: &str, b: &str) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
+pub fn case_eq_killed(a: &[u8], b: &[u8]) -> bool {
+    a.eq_ignore_ascii_case(b)
+}
+
+pub fn case_eq_byte_gap(a: u8, b: u8) -> bool {
+    a.eq_ignore_ascii_case(&b)
+}
+
+// 4. Absolute value (signed int & float)
+pub fn abs_int_gap(x: i32) -> i32 {
+    x.abs()
+}
+
+pub fn abs_float_killed(x: f64) -> f64 {
+    x.abs()
+}
+
+// 5. Iterator take / skip
+pub fn skip_zero_gap(xs: &[u32], n: usize) -> Vec<u32> {
+    xs.iter().copied().skip(n).collect()
+}
+
+pub fn take_survives(xs: &[u32]) -> Vec<u32> {
+    xs.iter().copied().take(5).collect()
+}
+
+pub fn take_killed(xs: &[u32]) -> Vec<u32> {
+    xs.iter().copied().take(2).collect()
+}
+
+// std::io::Read::take takes u64, not Iterator::take(usize): must stay opaque without error.
+pub fn io_read_take(data: &[u8]) -> usize {
+    let mut buf = Vec::new();
+    data.take(2).read_to_end(&mut buf).unwrap()
+}
+
+// 6. Endian conversion (multi-byte vs 1-byte u8)
+pub fn endian_gap(x: u16) -> [u8; 2] {
+    x.to_be_bytes()
+}
+
+pub fn endian_killed(x: u32) -> u32 {
+    x.to_be()
+}
+
+pub fn endian_u8_opaque(x: u8) -> [u8; 1] {
+    x.to_be_bytes()
+}
+
+// 7. Bit counts
+pub fn bitcount_gap(x: u32) -> u32 {
+    x.leading_zeros()
+}
+
+pub fn bitcount_killed(x: u16) -> u32 {
+    x.trailing_ones()
+}
+
+// 8. Loop control (break <-> continue), plus labeled/value break exclusions
+pub fn loop_break_survives(xs: &[u32]) -> u32 {
+    let mut out = 0;
+    for &x in xs {
+        if x == 99 {
+            break;
+        }
+        out += x;
+    }
+    out
+}
+
+pub fn loop_labeled_and_value_break(xs: &[u32]) -> u32 {
+    let mut res = 0;
+    'blk: {
+        if xs.is_empty() {
+            break 'blk;
+        }
+        let mut idx = 0;
+        res = loop {
+            if idx < xs.len() && xs[idx] == 0 {
+                idx += 1;
+                continue;
+            }
+            break xs[idx];
+        };
+    }
+    res
+}
+
+pub fn abs_neg_zero_bits(x: f64) -> u64 {
+    x.abs().to_bits()
+}
+
+pub fn byte_array_case_eq() -> bool {
+    b"Ab".eq_ignore_ascii_case(b"aB")
+}
+
+pub fn endian_mut_and_double_ref(x: &mut u32) -> u32 {
+    let r: &&u32 = &&*x;
+    x.to_be().wrapping_add(r.leading_zeros())
+}
+
+// Custom type implementing same method names: must stay opaque with 0 false findings.
+pub struct Custom(pub i32);
+
+impl Custom {
+    pub fn saturating_add(&self, other: i32) -> i32 { self.0 + other }
+    pub fn trim(&self) -> i32 { self.0 }
+    pub fn eq_ignore_ascii_case(&self, other: i32) -> bool { self.0 == other }
+    pub fn abs(&self) -> i32 { self.0 }
+    pub fn to_be_bytes(&self) -> i32 { self.0 }
+    pub fn leading_zeros(&self) -> i32 { self.0 }
+}
+
+pub fn custom_methods(c: &Custom) -> i32 {
+    let _ = c.eq_ignore_ascii_case(1);
+    c.saturating_add(1) + c.trim() + c.abs() + c.to_be_bytes() + c.leading_zeros()
+}
+
+#[test]
+fn exercises_all_rules() {
+    assert_eq!(sat_gap(10, 3), 7);
+    assert_eq!(sat_killed(250, 20), 255);
+
+    assert_eq!(trim_gap("  hi"), "hi");
+    assert_eq!(trim_both_gap("  hi".to_string()), 2);
+
+    assert!(case_eq_gap("abc", "abc"));
+    assert!(!case_eq_gap("abc", "xyz"));
+    assert!(case_eq_killed(b"AbC", b"aBc"));
+    assert!(case_eq_byte_gap(b'a', b'a'));
+
+    assert_eq!(abs_int_gap(5), 5);
+    assert_eq!(abs_float_killed(-2.5), 2.5);
+
+    assert_eq!(skip_zero_gap(&[1, 2, 3], 0), vec![1, 2, 3]);
+    assert_eq!(take_survives(&[1, 2]), vec![1, 2]);
+    assert_eq!(take_killed(&[1, 2, 3]), vec![1, 2]);
+    assert_eq!(io_read_take(b"abcd"), 2);
+
+    assert_eq!(endian_gap(0x0101), [0x01, 0x01]);
+    assert_eq!(endian_killed(0x0102_0304), 0x0102_0304u32.to_be());
+    assert_eq!(endian_u8_opaque(0x42), [0x42]);
+
+    assert_eq!(bitcount_gap(0), 32);
+    assert_eq!(bitcount_killed(0x0003), 2);
+
+    // 99 is at the very last element, so `break` -> `continue` produces the same sum!
+    assert_eq!(loop_break_survives(&[1, 2, 99]), 3);
+    assert_eq!(loop_labeled_and_value_break(&[0, 7]), 7);
+    assert_eq!(loop_labeled_and_value_break(&[]), 0);
+
+    assert_eq!(abs_neg_zero_bits(-0.0), 0.0f64.to_bits());
+    assert!(byte_array_case_eq());
+    let mut m = 0x0102_0304u32;
+    assert_eq!(endian_mut_and_double_ref(&mut m), m.to_be().wrapping_add(m.leading_zeros()));
+
+    assert_eq!(custom_methods(&Custom(1)), 6);
+}
+"#,
+    );
+    let run = command(&path, &["--quiet", "--json", "--no-effects"])
+        .output()
+        .unwrap();
+    let report = json(&run, 2);
+    assert_eq!(
+        report["skipped_sites"].as_u64(),
+        Some(0),
+        "expected 0 skipped sites: {report:#}"
+    );
+    let findings = report["findings"].as_array().unwrap();
+    let has = |item: &str, kind: &str, needle: &str| {
+        findings.iter().any(|f| {
+            f["item"].as_str() == Some(item)
+                && f["kind"].as_str() == Some(kind)
+                && f["survivors"]
+                    .as_array()
+                    .is_some_and(|s| s.iter().any(|v| v.as_str().unwrap_or("").contains(needle)))
+        })
+    };
+
+    // Provable INPUT GAPs
+    assert!(has("sat_gap", "input_gap", "wrapping_sub"), "{findings:#?}");
+    assert!(
+        !has("sat_killed", "input_gap", "wrapping_add"),
+        "{findings:#?}"
+    );
+    assert!(
+        !has("sat_killed", "assertion_gap", "wrapping_add"),
+        "{findings:#?}"
+    );
+
+    assert!(has("trim_gap", "input_gap", "trim()"), "{findings:#?}");
+    assert!(
+        has("trim_both_gap", "input_gap", "trim_start()"),
+        "{findings:#?}"
+    );
+    assert!(
+        !has("trim_both_gap", "input_gap", "trim_end()"),
+        "{findings:#?}"
+    );
+
+    assert!(has("case_eq_gap", "input_gap", "=="), "{findings:#?}");
+    assert!(has("case_eq_byte_gap", "input_gap", "=="), "{findings:#?}");
+    assert!(!has("case_eq_killed", "input_gap", "=="), "{findings:#?}");
+    assert!(
+        !has("case_eq_killed", "assertion_gap", "=="),
+        "{findings:#?}"
+    );
+
+    assert!(
+        has("abs_int_gap", "input_gap", "without `.abs()`"),
+        "{findings:#?}"
+    );
+    assert!(
+        !has("abs_float_killed", "input_gap", "without `.abs()`"),
+        "{findings:#?}"
+    );
+    assert!(
+        !has("abs_float_killed", "assertion_gap", "without `.abs()`"),
+        "{findings:#?}"
+    );
+
+    assert!(
+        has("skip_zero_gap", "input_gap", "skip(0)"),
+        "{findings:#?}"
+    );
+    assert!(
+        has("take_survives", "assertion_gap", "take(usize::MAX)"),
+        "{findings:#?}"
+    );
+    assert!(
+        !has("take_killed", "assertion_gap", "take(usize::MAX)"),
+        "{findings:#?}"
+    );
+    assert!(
+        !has("io_read_take", "input_gap", "take(usize::MAX)"),
+        "{findings:#?}"
+    );
+    assert!(
+        !has("io_read_take", "assertion_gap", "take(usize::MAX)"),
+        "{findings:#?}"
+    );
+
+    assert!(
+        has("endian_gap", "input_gap", "to_le_bytes()"),
+        "{findings:#?}"
+    );
+    assert!(
+        !has("endian_killed", "input_gap", "to_le()"),
+        "{findings:#?}"
+    );
+    assert!(
+        !has("endian_killed", "assertion_gap", "to_le()"),
+        "{findings:#?}"
+    );
+    assert!(
+        !has("endian_u8_opaque", "input_gap", "to_le_bytes()"),
+        "{findings:#?}"
+    );
+
+    assert!(
+        has("bitcount_gap", "input_gap", "trailing_zeros()"),
+        "{findings:#?}"
+    );
+    assert!(
+        !has("bitcount_killed", "input_gap", "leading_ones()"),
+        "{findings:#?}"
+    );
+    assert!(
+        !has("bitcount_killed", "assertion_gap", "leading_ones()"),
+        "{findings:#?}"
+    );
+
+    assert!(
+        !has("abs_neg_zero_bits", "input_gap", "without `.abs()`"),
+        "{findings:#?}"
+    );
+    assert!(
+        !has("abs_neg_zero_bits", "assertion_gap", "without `.abs()`"),
+        "{findings:#?}"
+    );
+    assert!(
+        !has("byte_array_case_eq", "input_gap", "=="),
+        "{findings:#?}"
+    );
+    assert!(
+        !has("endian_mut_and_double_ref", "input_gap", "to_le()"),
+        "{findings:#?}"
+    );
+    assert!(
+        !has("endian_mut_and_double_ref", "input_gap", "trailing_zeros()"),
+        "{findings:#?}"
+    );
+
+    assert!(
+        has("loop_break_survives", "assertion_gap", "continue"),
+        "{findings:#?}"
+    );
+
+    // Custom methods with identical names must not produce any findings for those methods.
+    for needle in [
+        "wrapping_add",
+        "trim_start",
+        "trim_end",
+        "==",
+        "without `.abs()`",
+        "to_le_bytes",
+        "trailing_zeros",
+    ] {
+        assert!(
+            !has("custom_methods", "input_gap", needle)
+                && !has("custom_methods", "assertion_gap", needle),
+            "unexpected custom_methods finding for {needle}: {findings:#?}"
+        );
+    }
+}

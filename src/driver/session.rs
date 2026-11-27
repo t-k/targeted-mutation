@@ -307,6 +307,8 @@ impl Session {
             SiteKind::Arm { .. } if reached() => reach_plan(Mutation::Delete),
             SiteKind::Arm { .. } => return Planned::Unreached,
             SiteKind::Quantifier { .. } if reached() => reach_plan(Mutation::QuantifierSwap),
+            SiteKind::LoopCtrl { .. } if reached() => reach_plan(Mutation::LoopCtrlSwap),
+            SiteKind::LoopCtrl { .. } => return Planned::Unreached,
             SiteKind::LiteralSet { .. } => return Planned::Nothing,
             SiteKind::Not { .. } if reached() => reach_plan(Mutation::DropNot),
             // `a..=b` with `b` the largest value of its type is no range the probe could
@@ -515,7 +517,14 @@ impl Session {
             | SiteKind::StrAffix { .. }
             | SiteKind::StrReplace { .. }
             | SiteKind::Clamp { .. }
-            | SiteKind::Rounding { .. } => {
+            | SiteKind::Rounding { .. }
+            | SiteKind::SaturatingArith { .. }
+            | SiteKind::StrTrim { .. }
+            | SiteKind::StrCaseEq { .. }
+            | SiteKind::Abs { .. }
+            | SiteKind::IterLimit { .. }
+            | SiteKind::EndianSwap { .. }
+            | SiteKind::BitCount { .. } => {
                 // `max` / `min` and other value-aware method probes share the 1- or 2-slot
                 // `ArithObs` recording protocol: they agree when the original and replacement
                 // compute identical values on every observed input.
@@ -535,6 +544,19 @@ impl Session {
                         (Mutation::RoundAlt1, merged),
                         (Mutation::RoundAlt2, merged.second()),
                     ],
+                    SiteKind::SaturatingArith { .. } => vec![(Mutation::SaturatingSwap, merged)],
+                    SiteKind::StrTrim { op, .. } => {
+                        let mut out = vec![(Mutation::TrimAlt1, merged)];
+                        if op.alt2().is_some() {
+                            out.push((Mutation::TrimAlt2, merged.second()));
+                        }
+                        out
+                    }
+                    SiteKind::StrCaseEq { .. } => vec![(Mutation::StrExactEq, merged)],
+                    SiteKind::Abs { .. } => vec![(Mutation::DropAbs, merged)],
+                    SiteKind::IterLimit { .. } => vec![(Mutation::IterLimitDrop, merged)],
+                    SiteKind::EndianSwap { .. } => vec![(Mutation::EndianSwap, merged)],
+                    SiteKind::BitCount { .. } => vec![(Mutation::BitCountSwap, merged)],
                     SiteKind::Arith {
                         op,
                         assign,
@@ -590,6 +612,13 @@ impl Session {
                         | SiteKind::StrReplace { .. }
                         | SiteKind::Clamp { .. }
                         | SiteKind::Rounding { .. }
+                        | SiteKind::SaturatingArith { .. }
+                        | SiteKind::StrTrim { .. }
+                        | SiteKind::StrCaseEq { .. }
+                        | SiteKind::Abs { .. }
+                        | SiteKind::IterLimit { .. }
+                        | SiteKind::EndianSwap { .. }
+                        | SiteKind::BitCount { .. }
                 ) && merged.opaque
                 {
                     return Planned::Nothing;
@@ -617,6 +646,25 @@ impl Session {
                                 }
                                 Mutation::RoundAlt1 | Mutation::RoundAlt2 => {
                                     report::rounding_gap_finding(file, site, mutation, verify)
+                                }
+                                Mutation::SaturatingSwap => {
+                                    report::saturating_gap_finding(file, site, verify)
+                                }
+                                Mutation::TrimAlt1 | Mutation::TrimAlt2 => {
+                                    report::str_trim_gap_finding(file, site, mutation, verify)
+                                }
+                                Mutation::StrExactEq => {
+                                    report::str_case_eq_gap_finding(file, site, verify)
+                                }
+                                Mutation::DropAbs => report::abs_gap_finding(file, site, verify),
+                                Mutation::IterLimitDrop => {
+                                    report::iter_limit_gap_finding(file, site, verify)
+                                }
+                                Mutation::EndianSwap => {
+                                    report::endian_gap_finding(file, site, verify)
+                                }
+                                Mutation::BitCountSwap => {
+                                    report::bit_count_gap_finding(file, site, verify)
                                 }
                                 _ => report::arith_gap_finding(file, site, mutation, verify),
                             };

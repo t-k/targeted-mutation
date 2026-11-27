@@ -3915,6 +3915,20 @@ fn mutation_of(site: &Site, mutant: &instrument::SourceMutant) -> Mutation {
             }
         }
         SiteKind::Quantifier { .. } => Mutation::QuantifierSwap,
+        SiteKind::SaturatingArith { .. } => Mutation::SaturatingSwap,
+        SiteKind::StrTrim { op, .. } => {
+            if mutant.into == op.alt1().name() {
+                Mutation::TrimAlt1
+            } else {
+                Mutation::TrimAlt2
+            }
+        }
+        SiteKind::StrCaseEq { .. } => Mutation::StrExactEq,
+        SiteKind::Abs { .. } => Mutation::DropAbs,
+        SiteKind::IterLimit { .. } => Mutation::IterLimitDrop,
+        SiteKind::EndianSwap { .. } => Mutation::EndianSwap,
+        SiteKind::BitCount { .. } => Mutation::BitCountSwap,
+        SiteKind::LoopCtrl { .. } => Mutation::LoopCtrlSwap,
         // The other kinds have one mutant of the source: a statement, an arm, a field or
         // a minus that is not there, a body that is another.
         _ => Mutation::Delete,

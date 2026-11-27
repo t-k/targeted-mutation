@@ -359,6 +359,87 @@ pub fn source_mutants(site: &Site) -> Vec<SourceMutant> {
             let (from, to) = if *all { ("all", "any") } else { ("any", "all") };
             vec![change(method.0, method.1, to.into(), from, to)]
         }
+        SiteKind::SaturatingArith { op, method, .. } => {
+            let to = op.swapped().name();
+            vec![change(method.0, method.1, to.into(), op.name(), to)]
+        }
+        SiteKind::StrTrim { op, method, .. } => {
+            let mut out = vec![change(
+                method.0,
+                method.1,
+                op.alt1().name().into(),
+                op.name(),
+                op.alt1().name(),
+            )];
+            if let Some(alt2) = op.alt2() {
+                out.push(change(
+                    method.0,
+                    method.1,
+                    alt2.name().into(),
+                    op.name(),
+                    alt2.name(),
+                ));
+            }
+            out
+        }
+        SiteKind::StrCaseEq { method, .. } => {
+            // Method-call `.eq(...)` preserves the same auto-deref/auto-ref resolution as
+            // `.eq_ignore_ascii_case(...)` across `&str`, `&String`, `u8` + `&u8`, and `&[u8]`.
+            vec![change(
+                method.0,
+                method.1,
+                "eq".into(),
+                "eq_ignore_ascii_case",
+                "eq",
+            )]
+        }
+        SiteKind::Abs { call, .. } => {
+            vec![change(call.0, call.1, String::new(), ".abs()", "")]
+        }
+        SiteKind::IterLimit {
+            take,
+            count,
+            call,
+            close,
+            ..
+        } => {
+            let (from, target) = if *take {
+                ("take", "usize::MAX")
+            } else {
+                ("skip", "0")
+            };
+            let count_slice = call
+                .1
+                .checked_sub(site.start)
+                .zip(close.0.checked_sub(site.start))
+                .and_then(|(s, e)| site.text.get(s..e))
+                .unwrap_or(count.as_str());
+            let pure_count = syn::parse_str::<syn::Expr>(count_slice)
+                .ok()
+                .is_some_and(|e| matches!(e, syn::Expr::Lit(_) | syn::Expr::Path(_)));
+            let replacement = if pure_count {
+                target.to_string()
+            } else {
+                format!("{{ let _ = ({count_slice}); {target} }}")
+            };
+            vec![change(call.1, close.0, replacement, from, target)]
+        }
+        SiteKind::EndianSwap { op, method, .. } => {
+            let to = op.swapped().name();
+            vec![change(method.0, method.1, to.into(), op.name(), to)]
+        }
+        SiteKind::BitCount { op, method, .. } => {
+            let to = op.swapped().name();
+            vec![change(method.0, method.1, to.into(), op.name(), to)]
+        }
+        SiteKind::LoopCtrl { is_break } => {
+            let (from, to) = if *is_break {
+                ("break", "continue")
+            } else {
+                ("continue", "break")
+            };
+            vec![change(site.start, site.end, to.into(), from, to)]
+        }
         SiteKind::LiteralSet { elements, .. } => elements
             .iter()
             .map(|(elem, start, end)| change(*start, *end, String::new(), "literal_set", elem))

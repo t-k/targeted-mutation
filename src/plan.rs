@@ -350,6 +350,24 @@ pub enum Mutation {
     RoundAlt2,
     /// `iter.all(f)` <-> `iter.any(f)`.
     QuantifierSwap,
+    /// `a.saturating_{add,sub,mul}(b)` <-> `a.wrapping_{add,sub,mul}(b)`.
+    SaturatingSwap,
+    /// First alternative trim method (`trim` -> `trim_start`, `trim_start`/`trim_end` -> `trim`).
+    TrimAlt1,
+    /// Second alternative trim method (`trim` -> `trim_end`).
+    TrimAlt2,
+    /// `a.eq_ignore_ascii_case(b)` -> `a == b`.
+    StrExactEq,
+    /// `x.abs()` -> `x`.
+    DropAbs,
+    /// `iter.take(n)` -> `iter.take(usize::MAX)` / `iter.skip(n)` -> `iter.skip(0)`.
+    IterLimitDrop,
+    /// `x.to_be_bytes()` <-> `x.to_le_bytes()`, `x.to_be()` <-> `x.to_le()`.
+    EndianSwap,
+    /// `x.leading_zeros()` <-> `x.trailing_zeros()`, `leading_ones` <-> `trailing_ones`.
+    BitCountSwap,
+    /// `break` <-> `continue`.
+    LoopCtrlSwap,
 }
 
 impl Mutation {
@@ -378,6 +396,15 @@ impl Mutation {
             Mutation::RoundAlt1 => "rd1".to_string(),
             Mutation::RoundAlt2 => "rd2".to_string(),
             Mutation::QuantifierSwap => "qsw".to_string(),
+            Mutation::SaturatingSwap => "sat".to_string(),
+            Mutation::TrimAlt1 => "tr1".to_string(),
+            Mutation::TrimAlt2 => "tr2".to_string(),
+            Mutation::StrExactEq => "seq".to_string(),
+            Mutation::DropAbs => "abs".to_string(),
+            Mutation::IterLimitDrop => "ilp".to_string(),
+            Mutation::EndianSwap => "edn".to_string(),
+            Mutation::BitCountSwap => "btc".to_string(),
+            Mutation::LoopCtrlSwap => "lpc".to_string(),
         }
     }
 }
@@ -1068,7 +1095,10 @@ impl ArithObs {
     pub fn infected_by(&self, m: Mutation) -> bool {
         if matches!(
             m,
-            Mutation::ArithSwap2 | Mutation::ClampDropUpper | Mutation::RoundAlt2
+            Mutation::ArithSwap2
+                | Mutation::ClampDropUpper
+                | Mutation::RoundAlt2
+                | Mutation::TrimAlt2
         ) {
             self.differs2
         } else {

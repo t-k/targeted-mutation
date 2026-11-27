@@ -760,6 +760,48 @@ pub fn describe(site: &Site, m: Mutation) -> String {
             let other = if *all { "any" } else { "all" };
             format!("`{}.{other}({})`", one_line(receiver), one_line(predicate))
         }
+        SiteKind::SaturatingArith {
+            op,
+            receiver,
+            argument,
+            ..
+        } => format!(
+            "`{}.{}({})`",
+            one_line(receiver),
+            op.swapped().name(),
+            one_line(argument)
+        ),
+        SiteKind::StrTrim { op, receiver, .. } => {
+            let alt = match m {
+                Mutation::TrimAlt2 => op.alt2().unwrap_or_else(|| op.alt1()),
+                _ => op.alt1(),
+            };
+            format!("`{}.{}()`", one_line(receiver), alt.name())
+        }
+        SiteKind::StrCaseEq {
+            receiver, argument, ..
+        } => format!("`{} == {}`", one_line(receiver), one_line(argument)),
+        SiteKind::Abs { receiver, .. } => format!("`{}` (without `.abs()`)", one_line(receiver)),
+        SiteKind::IterLimit { take, receiver, .. } => {
+            if *take {
+                format!("`{}.take(usize::MAX)`", one_line(receiver))
+            } else {
+                format!("`{}.skip(0)`", one_line(receiver))
+            }
+        }
+        SiteKind::EndianSwap { op, receiver, .. } => {
+            format!("`{}.{}()`", one_line(receiver), op.swapped().name())
+        }
+        SiteKind::BitCount { op, receiver, .. } => {
+            format!("`{}.{}()`", one_line(receiver), op.swapped().name())
+        }
+        SiteKind::LoopCtrl { is_break } => {
+            if *is_break {
+                "`continue`".to_string()
+            } else {
+                "`break`".to_string()
+            }
+        }
         SiteKind::LiteralSet {
             receiver, argument, ..
         } => format!(
@@ -1275,6 +1317,165 @@ pub fn rounding_gap_finding(
             "`{}` that is {}",
             one_line(receiver),
             op.differs_for(alt)
+        )],
+        observed: None,
+        verified,
+    })
+}
+
+/// Input gap at `a.saturating_{add,sub,mul}(b)` / `a.wrapping_{add,sub,mul}(b)`:
+/// no test produced a different result under the swapped arithmetic mode.
+pub fn saturating_gap_finding(file: &str, site: &Site, verified: bool) -> Option<Finding> {
+    let SiteKind::SaturatingArith {
+        op,
+        receiver,
+        argument,
+        ..
+    } = &site.kind
+    else {
+        return None;
+    };
+    Some(Finding::InputGap {
+        at: location(file, site),
+        survivors: vec![describe(site, Mutation::SaturatingSwap)],
+        survivor_count: 1,
+        add_tests: vec![format!(
+            "`{}` and `{}` where `{}` differs from `{}` ({})",
+            one_line(receiver),
+            one_line(argument),
+            op.name(),
+            op.swapped().name(),
+            op.overflow_phrase()
+        )],
+        observed: None,
+        verified,
+    })
+}
+
+/// Input gap at `s.trim()` / `.trim_start()` / `.trim_end()`: no test had whitespace on the dropped side.
+pub fn str_trim_gap_finding(
+    file: &str,
+    site: &Site,
+    mutation: Mutation,
+    verified: bool,
+) -> Option<Finding> {
+    let SiteKind::StrTrim { op, receiver, .. } = &site.kind else {
+        return None;
+    };
+    let alt = if mutation == Mutation::TrimAlt2 {
+        op.alt2().unwrap_or_else(|| op.alt1())
+    } else {
+        op.alt1()
+    };
+    Some(Finding::InputGap {
+        at: location(file, site),
+        survivors: vec![describe(site, mutation)],
+        survivor_count: 1,
+        add_tests: vec![format!(
+            "`{}` with {}",
+            one_line(receiver),
+            op.whitespace_phrase(alt)
+        )],
+        observed: None,
+        verified,
+    })
+}
+
+/// Input gap at `a.eq_ignore_ascii_case(b)`: no test matched only when ignoring ASCII case.
+pub fn str_case_eq_gap_finding(file: &str, site: &Site, verified: bool) -> Option<Finding> {
+    let SiteKind::StrCaseEq {
+        receiver, argument, ..
+    } = &site.kind
+    else {
+        return None;
+    };
+    Some(Finding::InputGap {
+        at: location(file, site),
+        survivors: vec![describe(site, Mutation::StrExactEq)],
+        survivor_count: 1,
+        add_tests: vec![format!(
+            "`{}` and `{}` that match only when ignoring ASCII case",
+            one_line(receiver),
+            one_line(argument)
+        )],
+        observed: None,
+        verified,
+    })
+}
+
+/// Input gap at `x.abs()`: no test passed a negative value.
+pub fn abs_gap_finding(file: &str, site: &Site, verified: bool) -> Option<Finding> {
+    let SiteKind::Abs { receiver, .. } = &site.kind else {
+        return None;
+    };
+    Some(Finding::InputGap {
+        at: location(file, site),
+        survivors: vec![describe(site, Mutation::DropAbs)],
+        survivor_count: 1,
+        add_tests: vec![format!("negative `{}`", one_line(receiver))],
+        observed: None,
+        verified,
+    })
+}
+
+/// Input gap at `iter.take(n)` / `iter.skip(n)`: count was always `usize::MAX` / `0`.
+pub fn iter_limit_gap_finding(file: &str, site: &Site, verified: bool) -> Option<Finding> {
+    let SiteKind::IterLimit { take, count, .. } = &site.kind else {
+        return None;
+    };
+    let advice = if *take {
+        format!(
+            "`{}` smaller than `usize::MAX` with more elements than `{}`",
+            one_line(count),
+            one_line(count)
+        )
+    } else {
+        format!("non-zero `{}`", one_line(count))
+    };
+    Some(Finding::InputGap {
+        at: location(file, site),
+        survivors: vec![describe(site, Mutation::IterLimitDrop)],
+        survivor_count: 1,
+        add_tests: vec![advice],
+        observed: None,
+        verified,
+    })
+}
+
+/// Input gap at `x.to_be_bytes()` / `to_le_bytes()` / `to_be()` / `to_le()`:
+/// every observed value was byte-palindromic (`x == x.swap_bytes()`).
+pub fn endian_gap_finding(file: &str, site: &Site, verified: bool) -> Option<Finding> {
+    let SiteKind::EndianSwap { receiver, .. } = &site.kind else {
+        return None;
+    };
+    Some(Finding::InputGap {
+        at: location(file, site),
+        survivors: vec![describe(site, Mutation::EndianSwap)],
+        survivor_count: 1,
+        add_tests: vec![format!(
+            "`{}` with asymmetric bytes (e.g. `0x0102`)",
+            one_line(receiver)
+        )],
+        observed: None,
+        verified,
+    })
+}
+
+/// Input gap at `x.leading_zeros()` / `trailing_zeros()` / `leading_ones()` / `trailing_ones()`:
+/// every observed value had equal leading and trailing counts.
+pub fn bit_count_gap_finding(file: &str, site: &Site, verified: bool) -> Option<Finding> {
+    let SiteKind::BitCount { op, receiver, .. } = &site.kind else {
+        return None;
+    };
+    Some(Finding::InputGap {
+        at: location(file, site),
+        survivors: vec![describe(site, Mutation::BitCountSwap)],
+        survivor_count: 1,
+        add_tests: vec![format!(
+            "`{}` where `{}` differs from `{}`",
+            one_line(receiver),
+            op.name(),
+            op.swapped().name()
         )],
         observed: None,
         verified,
