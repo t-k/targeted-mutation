@@ -1070,22 +1070,15 @@ fn guard_reaching_tests(bin: &TestBinary, id: u32) -> BTreeSet<String> {
 }
 
 /// Strictly side-effect-free guard expression: no calls, no methods, no indexing, no
-/// `Deref`, no user-overloaded operators. A top-level binary comparison is accepted only
-/// when runtime `trace.bounds` proved it compared primitive numbers/chars and both
-/// operands are plain literals/paths/fields.
+/// `Deref` (including implicit field `Deref`), and no user-overloaded operators (including
+/// `!`). A top-level binary comparison is accepted only when runtime `trace.bounds` proved
+/// it compared primitive numbers/chars and both operands are plain literals or paths.
 fn is_strictly_pure_guard(expr_text: &str, is_prim_cmp: bool) -> bool {
     fn is_trivial_value(expr: &syn::Expr) -> bool {
         match expr {
             syn::Expr::Lit(_) | syn::Expr::Path(_) => true,
             syn::Expr::Paren(e) => is_trivial_value(&e.expr),
             syn::Expr::Group(e) => is_trivial_value(&e.expr),
-            syn::Expr::Field(e) => is_trivial_value(&e.base),
-            syn::Expr::Reference(e) => e.mutability.is_none() && is_trivial_value(&e.expr),
-            syn::Expr::Unary(syn::ExprUnary {
-                op: syn::UnOp::Not(_),
-                expr,
-                ..
-            }) => is_trivial_value(expr),
             _ => false,
         }
     }

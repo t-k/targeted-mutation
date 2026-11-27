@@ -666,13 +666,18 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     text: "), (".into(),
                     site: site.id,
                 });
+                let (sv, ev) = if idx.base.contains("__tmt_s") || idx.base.contains("__tmt_e") {
+                    ("__tmt_rs", "__tmt_re")
+                } else {
+                    ("__tmt_s", "__tmt_e")
+                };
                 edits.push(Edit {
                     pos: idx.close_bracket.0,
                     end: idx.close_bracket.1,
                     phase: 1,
                     order: 0,
                     text: format!(
-                        ")) {{ (__tmt_s, __tmt_e) => if {rt}::range_end({id}u32) {{ {borrow}({base})[__tmt_s{mut_dots}__tmt_e] }} else {{ {borrow}({base})[__tmt_s{orig_dots}__tmt_e] }} }}){extra_close}",
+                        ")) {{ ({sv}, {ev}) => if {rt}::range_end({id}u32) {{ {borrow}({base})[{sv}{mut_dots}{ev}] }} else {{ {borrow}({base})[{sv}{orig_dots}{ev}] }} }}){extra_close}",
                         id = site.id,
                         base = idx.base,
                     ),
@@ -774,7 +779,7 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
             }
             SiteKind::Guard { .. } => (
                 format!(
-                    "(match {rt}::guard_override({id}u32) {{ Some(__tmt_g) => __tmt_g, None => {rt}::guard_record({id}u32, ",
+                    "(match {rt}::guard_override({id}u32) {{ ::core::option::Option::Some(__tmt_g) => __tmt_g, ::core::option::Option::None => {rt}::guard_record({id}u32, ",
                     id = site.id
                 ),
                 ") })".to_string(),

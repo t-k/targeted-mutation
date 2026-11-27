@@ -2054,7 +2054,7 @@ fn minus_guards_and_fields() {
         "u32) { -5 } else { 5 })",
         // A guard and the comparison it consists of: the guard goes around and short-circuits.
         "Kind::A(n) if (match crate::__tmt_rt::guard_override(",
-        "None => crate::__tmt_rt::guard_record(",
+        "::core::option::Option::None => crate::__tmt_rt::guard_record(",
         "u32, (match (&(n), &(1))",
         "n if crate::__tmt_rt::arm(",
         ") && ((match crate::__tmt_rt::guard_override(",

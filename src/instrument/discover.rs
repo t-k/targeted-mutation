@@ -2981,6 +2981,7 @@ impl Finder<'_> {
             || !in_order(base_end, range_start)
             || !in_order(lhs_end, rhs_start)
             || !in_order(range_end, outer_end)
+            || self.source[base_start..base_end].contains('\n')
         {
             return;
         }
