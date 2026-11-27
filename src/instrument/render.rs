@@ -645,27 +645,17 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                 } else {
                     ("..", "..=")
                 };
-                let (borrow, open_str, open_br_text, extra_close) = match idx.mode {
-                    RangeIndexMode::Ref => ("&", "(match (&(", "), (", ""),
-                    RangeIndexMode::RefMut => ("&mut ", "(match (&mut (", ")[..], (", ""),
-                    RangeIndexMode::Deref => ("&", "(*(match (&(", "), (", ")"),
+                let (borrow, open_str, extra_close) = match idx.mode {
+                    RangeIndexMode::Ref => ("&", "(match ((", ""),
+                    RangeIndexMode::RefMut => ("&mut ", "(match ((", ""),
+                    RangeIndexMode::Deref => ("&", "(*(match ((", ")"),
                 };
-                if idx.prefix.0 < idx.prefix.1 {
-                    edits.push(Edit {
-                        pos: idx.prefix.0,
-                        end: idx.prefix.1,
-                        phase: 1,
-                        order: 0,
-                        text: String::new(),
-                        site: site.id,
-                    });
-                }
                 edits.push(Edit {
-                    pos: idx.open_bracket.0,
-                    end: idx.open_bracket.1,
+                    pos: idx.head.0,
+                    end: idx.head.1,
                     phase: 1,
                     order: 0,
-                    text: open_br_text.into(),
+                    text: String::new(),
                     site: site.id,
                 });
                 edits.push(Edit {
@@ -682,8 +672,9 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     phase: 1,
                     order: 0,
                     text: format!(
-                        ")) {{ (__tmt_c, __tmt_s, __tmt_e) => if {rt}::range_end({id}u32) {{ {borrow}(*__tmt_c)[__tmt_s{mut_dots}__tmt_e] }} else {{ {borrow}(*__tmt_c)[__tmt_s{orig_dots}__tmt_e] }} }}){extra_close}",
+                        ")) {{ (__tmt_s, __tmt_e) => if {rt}::range_end({id}u32) {{ {borrow}({base})[__tmt_s{mut_dots}__tmt_e] }} else {{ {borrow}({base})[__tmt_s{orig_dots}__tmt_e] }} }}){extra_close}",
                         id = site.id,
+                        base = idx.base,
                     ),
                     site: site.id,
                 });

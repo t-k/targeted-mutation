@@ -2030,13 +2030,22 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                         close: (arg_end, end),
                         elements,
                     };
+                    // Probe only explicit shared-reference arguments (`&x`) so we never
+                    // move a `&mut T` that would have been reborrowed or hide a `Deref`
+                    // coercion behind `AnyLitSet`.
+                    let probe = matches!(
+                        strip_parens_ref(&node.args[0]),
+                        syn::Expr::Reference(r) if r.mutability.is_none()
+                    );
+                    self.const_depth += (!probe) as usize;
                     self.push(kind, start, end, node.receiver.span());
+                    self.const_depth -= (!probe) as usize;
                 }
             }
         }
         if is_read_only_slice_method(&name)
             && node.attrs.is_empty()
-            && let syn::Expr::Index(idx) = strip_parens_ref(&node.receiver)
+            && let syn::Expr::Index(idx) = &*node.receiver
             && let Some((idx_start, _)) = self.range(idx.span())
         {
             self.try_record_indexed_range(RangeIndexMode::Deref, idx_start, idx.span(), idx);
@@ -2046,7 +2055,7 @@ impl<'ast> Visit<'ast> for Finder<'_> {
 
     fn visit_expr_reference(&mut self, node: &'ast syn::ExprReference) {
         if node.attrs.is_empty()
-            && let syn::Expr::Index(idx) = strip_parens_ref(&node.expr)
+            && let syn::Expr::Index(idx) = &*node.expr
             && let Some((ref_start, _)) = self.range(node.span())
         {
             let mode = if node.mutability.is_some() {
@@ -2775,7 +2784,7 @@ fn literal_key(mut expr: &syn::Expr) -> Option<(String, Option<String>)> {
             syn::Lit::ByteStr(b) => Some((format!("bstr:{:?}", b.value()), None)),
             syn::Lit::CStr(c) => Some((format!("cstr:{:?}", c.value()), None)),
             syn::Lit::Char(c) => Some((format!("char:{}", c.value()), None)),
-            syn::Lit::Byte(b) => Some((format!("byte:{}", b.value()), None)),
+            syn::Lit::Byte(b) => Some((format!("int:{}", b.value()), None)),
             syn::Lit::Bool(b) => Some((format!("bool:{}", b.value()), None)),
             _ => None,
         },
@@ -2876,23 +2885,61 @@ fn is_read_only_slice_method(name: &str) -> bool {
     )
 }
 
-fn expr_contains_mut_borrow(expr: &syn::Expr) -> bool {
-    struct HasMut(bool);
-    impl<'ast> Visit<'ast> for HasMut {
-        fn visit_expr_reference(&mut self, node: &'ast syn::ExprReference) {
-            if node.mutability.is_some() {
-                self.0 = true;
-                return;
-            }
-            visit::visit_expr_reference(self, node);
-        }
-        fn visit_expr_assign(&mut self, _: &'ast syn::ExprAssign) {
-            self.0 = true;
-        }
+/// A place made only of variable paths and field accesses (no temporaries, no calls,
+/// no `*` derefs, no inner probe sites), so naming it in both branches of an indexed-range
+/// probe preserves temporary lifetimes, borrow mode, and evaluation semantics.
+fn is_simple_place(expr: &syn::Expr) -> bool {
+    if has_conditional_or_skip_attr(expr) {
+        return false;
     }
-    let mut check = HasMut(false);
-    check.visit_expr(expr);
-    check.0
+    match expr {
+        syn::Expr::Path(e) => e.attrs.is_empty(),
+        syn::Expr::Field(e) => e.attrs.is_empty() && is_simple_place(&e.base),
+        syn::Expr::Paren(e) => e.attrs.is_empty() && is_simple_place(&e.expr),
+        syn::Expr::Group(e) => e.attrs.is_empty() && is_simple_place(&e.expr),
+        _ => false,
+    }
+}
+
+/// A range bound expression with no calls, method calls, assignments, or mutable borrows,
+/// so evaluating the bounds before indexing cannot reorder observable side effects with
+/// a custom `Deref` on the indexed container.
+fn is_pure_range_bound(expr: &syn::Expr) -> bool {
+    if has_conditional_or_skip_attr(expr) {
+        return false;
+    }
+    match expr {
+        syn::Expr::Lit(e) => e.attrs.is_empty(),
+        syn::Expr::Path(e) => e.attrs.is_empty(),
+        syn::Expr::Field(e) => e.attrs.is_empty() && is_pure_range_bound(&e.base),
+        syn::Expr::Paren(e) => e.attrs.is_empty() && is_pure_range_bound(&e.expr),
+        syn::Expr::Group(e) => e.attrs.is_empty() && is_pure_range_bound(&e.expr),
+        syn::Expr::Cast(e) => e.attrs.is_empty() && is_pure_range_bound(&e.expr),
+        syn::Expr::Unary(e) => {
+            e.attrs.is_empty()
+                && !matches!(e.op, syn::UnOp::Deref(_))
+                && is_pure_range_bound(&e.expr)
+        }
+        syn::Expr::Binary(e) => {
+            e.attrs.is_empty()
+                && !matches!(
+                    e.op,
+                    syn::BinOp::AddAssign(_)
+                        | syn::BinOp::SubAssign(_)
+                        | syn::BinOp::MulAssign(_)
+                        | syn::BinOp::DivAssign(_)
+                        | syn::BinOp::RemAssign(_)
+                        | syn::BinOp::BitXorAssign(_)
+                        | syn::BinOp::BitAndAssign(_)
+                        | syn::BinOp::BitOrAssign(_)
+                        | syn::BinOp::ShlAssign(_)
+                        | syn::BinOp::ShrAssign(_)
+                )
+                && is_pure_range_bound(&e.left)
+                && is_pure_range_bound(&e.right)
+        }
+        _ => false,
+    }
 }
 
 impl Finder<'_> {
@@ -2903,7 +2950,7 @@ impl Finder<'_> {
         outer_span: Span,
         idx: &syn::ExprIndex,
     ) {
-        if self.const_depth > 0 || !idx.attrs.is_empty() {
+        if self.const_depth > 0 || !idx.attrs.is_empty() || !is_simple_place(&idx.expr) {
             return;
         }
         let syn::Expr::Range(range) = strip_parens_ref(&idx.index) else {
@@ -2912,8 +2959,7 @@ impl Finder<'_> {
         let (Some(from), Some(to)) = (&range.start, &range.end) else {
             return;
         };
-        if !range.attrs.is_empty() || expr_contains_mut_borrow(from) || expr_contains_mut_borrow(to)
-        {
+        if !range.attrs.is_empty() || !is_pure_range_bound(from) || !is_pure_range_bound(to) {
             return;
         }
         let (
@@ -2947,8 +2993,8 @@ impl Finder<'_> {
             gap: (lhs_end, rhs_start),
             index: Some(RangeIndex {
                 mode,
-                prefix: (outer_start, base_start),
-                open_bracket: (base_end, range_start),
+                base: self.source[base_start..base_end].to_string(),
+                head: (outer_start, range_start),
                 close_bracket: (range_end, outer_end),
             }),
         };

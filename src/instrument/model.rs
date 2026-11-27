@@ -576,13 +576,13 @@ pub enum RangeIndexMode {
     Deref,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[derive(Clone, PartialEq, Eq, Debug)]
 pub struct RangeIndex {
     pub mode: RangeIndexMode,
-    /// Leading `&` / `&mut ` before the indexed base expression (empty for `Deref`).
-    pub prefix: (usize, usize),
-    /// Byte range from base end to range start (`[` and surrounding whitespace).
-    pub open_bracket: (usize, usize),
+    /// Source text of the plain-place base expression (e.g. `xs`, `self.source`).
+    pub base: String,
+    /// Byte range from outer expression start to range start (`&xs[`, `&mut xs[`, or `xs[`).
+    pub head: (usize, usize),
     /// Byte range from range end to closing `]` end.
     pub close_bracket: (usize, usize),
 }

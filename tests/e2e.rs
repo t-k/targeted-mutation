@@ -6453,6 +6453,63 @@ pub fn vec_mut_fill(mut xs: Vec<u8>, a: usize, b: usize) -> Vec<u8> {
     xs
 }
 
+pub struct OnlyRangeMut([u8; 4]);
+impl std::ops::Index<std::ops::Range<usize>> for OnlyRangeMut {
+    type Output = [u8];
+    fn index(&self, r: std::ops::Range<usize>) -> &[u8] { &self.0[r] }
+}
+impl std::ops::Index<std::ops::RangeInclusive<usize>> for OnlyRangeMut {
+    type Output = [u8];
+    fn index(&self, r: std::ops::RangeInclusive<usize>) -> &[u8] { &self.0[r] }
+}
+impl std::ops::IndexMut<std::ops::Range<usize>> for OnlyRangeMut {
+    fn index_mut(&mut self, r: std::ops::Range<usize>) -> &mut [u8] { &mut self.0[r] }
+}
+impl std::ops::IndexMut<std::ops::RangeInclusive<usize>> for OnlyRangeMut {
+    fn index_mut(&mut self, r: std::ops::RangeInclusive<usize>) -> &mut [u8] { &mut self.0[r] }
+}
+
+pub fn custom_range_mut_fill(mut xs: OnlyRangeMut, a: usize, b: usize) -> [u8; 4] {
+    let part = &mut xs[a..b];
+    for x in part {
+        *x = 5;
+    }
+    xs.0
+}
+
+pub fn early_return_guard(b: bool, early: bool) -> u32 {
+    match b {
+        true if {
+            if early {
+                return 7;
+            }
+            true
+        } => 5,
+        true => 9,
+        false => 3,
+    }
+}
+
+pub struct SpyEmpty {
+    empty: bool,
+    hits: Cell<u32>,
+}
+impl SpyEmpty {
+    pub fn is_empty(&self) -> bool {
+        if self.empty {
+            self.hits.set(self.hits.get() + 1);
+        }
+        self.empty
+    }
+}
+
+pub fn spy_method_guard(spy: &SpyEmpty) -> u32 {
+    match 1 {
+        1 if spy.is_empty() => 10,
+        _ => 10,
+    }
+}
+
 pub fn slice_deref_nested(s: &str, a: usize, b: usize) -> bool {
     s[a + 1..b - 1].trim().is_empty()
 }
@@ -6512,6 +6569,7 @@ mod tests {
         slice_mut_fill(&mut buf, 1, 3);
         assert_eq!(buf, [0, 9, 9, 0, 0]);
         assert_eq!(vec_mut_fill(vec![0, 0, 0, 0], 1, 2), vec![0, 7, 7, 0]);
+        assert_eq!(custom_range_mut_fill(OnlyRangeMut([0; 4]), 1, 3), [0, 5, 5, 0]);
         assert!(!slice_deref_nested("  x  ", 0, 5));
         assert_eq!(slice_lit_bounds(&[10, 20, 30]), &[10, 20]);
     }
@@ -6539,6 +6597,19 @@ mod tests {
         assert_eq!(impure_guard(3, &hits), "hit");
         assert_eq!(hits.get(), 1);
         assert_eq!(impure_guard(0, &hits), "zero");
+
+        // Early-returning guard: replacing guard with true/false changes return 7 -> 5/9.
+        assert_eq!(early_return_guard(true, true), 7);
+        assert_eq!(early_return_guard(false, false), 3);
+
+        // User-defined `is_empty()` with side effect when true: both true and false are
+        // observed, and only the true call catches `Const(true)` via `spy.hits`.
+        let spy_t = SpyEmpty { empty: true, hits: Cell::new(0) };
+        assert_eq!(spy_method_guard(&spy_t), 10);
+        assert_eq!(spy_t.hits.get(), 1);
+        let spy_f = SpyEmpty { empty: false, hits: Cell::new(0) };
+        assert_eq!(spy_method_guard(&spy_f), 10);
+        assert_eq!(spy_f.hits.get(), 0);
     }
 }
 "#,
@@ -6607,5 +6678,15 @@ mod tests {
     assert!(
         !findings.iter().any(|f| f["code"] == "bump(hits)"),
         "impure guard must be caught by probe: {report:#}"
+    );
+    assert!(
+        !findings.iter().any(|f| f["code"] == "spy.is_empty()"),
+        "side-effecting custom `is_empty()` guard must be caught by probe: {report:#}"
+    );
+    assert!(
+        !findings
+            .iter()
+            .any(|f| f["code"].as_str().unwrap_or("").contains("if early")),
+        "early-returning guard must be reached and caught by probe: {report:#}"
     );
 }

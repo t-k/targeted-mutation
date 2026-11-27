@@ -4100,32 +4100,61 @@ fn probe_lowering_matches_pict_table() {
     }
     assert!(rows >= 15, "expected full PICT table, got {rows} rows");
 
-    // Non-read-only method and mutable-borrow range bounds stay in rebuild_sites.
+    // Non-read-only methods, parenthesized `&(...)`, temporaries, impure bounds, and
+    // non-`&expr` LiteralSet arguments stay in rebuild_sites; `[b'a', 97u8]` is deduplicated.
     let conservative = r#"
 fn mut_method(xs: &mut [u8], a: usize, b: usize) {
     xs[a..b].sort();
 }
-fn mut_bound(xs: &[u8], i: &mut usize) -> &[u8] {
+fn impure_bound(xs: &[u8], i: &mut usize) -> &[u8] {
     &xs[take(i)..3]
 }
 fn take(i: &mut usize) -> usize { *i }
-fn mut_ref_bound(xs: &[u8], i: &mut usize) -> &[u8] {
-    &xs[take(&mut *i)..3]
+fn paren_ref(xs: &[u8]) -> &[u8] {
+    &(xs[0..1])
+}
+fn temp_lifetime() -> usize {
+    let r = &vec![1, 2, 3][0..2];
+    r.len()
+}
+fn dup_byte_int(x: u8) -> bool {
+    [b'a', 97u8].contains(&x)
+}
+fn mut_reborrow_litset(x: &mut u8) -> bool {
+    let hit = [1u8, 2].contains(x);
+    *x += 1;
+    hit
 }
 "#;
     let found = discover(conservative, 0).unwrap();
-    let probed_lines: Vec<usize> = found
+    let probed_ranges: Vec<usize> = found
         .sites
         .iter()
         .filter(|s| matches!(s.kind, SiteKind::Range { .. }))
         .map(|s| s.line)
         .collect();
-    let rebuilt_lines: Vec<usize> = found
+    let rebuilt_ranges: Vec<usize> = found
         .rebuild_sites
         .iter()
         .filter(|s| matches!(s.kind, SiteKind::Range { .. }))
         .map(|s| s.line)
         .collect();
-    assert_eq!(probed_lines, [6]);
-    assert_eq!(rebuilt_lines, [3, 10]);
+    assert!(probed_ranges.is_empty(), "{probed_ranges:?}");
+    assert_eq!(rebuilt_ranges, [3, 6, 10, 13]);
+    assert!(
+        !found
+            .sites
+            .iter()
+            .any(|s| matches!(s.kind, SiteKind::LiteralSet { .. })),
+        "duplicate `[b'a', 97u8]` must be skipped and non-`&expr` must stay in rebuild_sites"
+    );
+    let rebuilt_litsets: Vec<usize> = found
+        .rebuild_sites
+        .iter()
+        .filter(|s| matches!(s.kind, SiteKind::LiteralSet { .. }))
+        .map(|s| s.line)
+        .collect();
+    assert_eq!(rebuilt_litsets, [20]);
+    let rendered = render(conservative, &found.sites, &|_| true);
+    assert!(syn::parse_file(&rendered.text).is_ok(), "{}", rendered.text);
 }

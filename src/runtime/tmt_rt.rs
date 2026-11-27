@@ -1534,7 +1534,8 @@ pub fn ret(site: u32, value: bool) -> bool {
 
 /// Before evaluating a match guard: returns `Some(c)` when the active mutant replaces
 /// the guard with constant `c` (so the original guard expression is not evaluated),
-/// or `None` when the guard should be evaluated normally.
+/// or `None` when the guard should be evaluated normally (recording reachability so
+/// guards that return early or panic are still attributed to the test).
 #[inline(always)]
 pub fn guard_override(site: u32) -> Option<bool> {
     if idle(site) {
@@ -1543,6 +1544,7 @@ pub fn guard_override(site: u32) -> Option<bool> {
     if let Some(Mutant::Const(c)) = mutant_at(site) {
         return Some(c);
     }
+    record_bits(b'R', site, 1);
     None
 }
 
@@ -3381,9 +3383,14 @@ pub trait AnyLitSet<'a, A: ?Sized + 'a, X> {
 }
 
 #[inline(always)]
-fn eval_lit_set<T: LitSetElem>(site: u32, slice: &[T], target: &T) -> bool {
+fn eval_lit_set<T: LitSetElem>(
+    site: u32,
+    slice: &[T],
+    target: &T,
+    orig: impl FnOnce() -> bool,
+) -> bool {
     if idle(site) {
-        return slice.contains(target);
+        return orig();
     }
     if let Some(Mutant::DropLiteralElem(drop_idx)) = mutant_at(site) {
         return slice
@@ -3391,29 +3398,31 @@ fn eval_lit_set<T: LitSetElem>(site: u32, slice: &[T], target: &T) -> bool {
             .enumerate()
             .any(|(i, elem)| i != drop_idx as usize && elem == target);
     }
-    match slice.iter().position(|elem| elem == target) {
+    let matched = slice.iter().position(|elem| elem == target);
+    let actual = orig();
+    if actual != matched.is_some() {
+        // A trait in scope overrode `.contains(...)` with non-slice semantics.
+        record_bits_u16(b'S', site, LITSET_OPAQUE);
+        return actual;
+    }
+    match matched {
         Some(idx) if idx < 8 => {
             record_bits_u16(b'S', site, LITSET_REACHED | (1u16 << idx));
-            true
         }
-        Some(_) => {
+        _ => {
             record_bits_u16(b'S', site, LITSET_REACHED);
-            true
-        }
-        None => {
-            record_bits_u16(b'S', site, LITSET_REACHED);
-            false
         }
     }
+    actual
 }
 
 impl<'a, 'b, const N: usize, T: LitSetElem> LitSetPrim<'a, [T; N], &'b T>
     for Lst<'a, [T; N], &'b T>
 {
     #[inline(always)]
-    fn tmt_lit_set<F: FnOnce(&'a [T; N], &'b T) -> bool>(&self, site: u32, _orig: F) -> bool {
+    fn tmt_lit_set<F: FnOnce(&'a [T; N], &'b T) -> bool>(&self, site: u32, orig: F) -> bool {
         let (a, x) = self.take();
-        eval_lit_set(site, a.as_slice(), x)
+        eval_lit_set(site, a.as_slice(), x, || orig(a, x))
     }
 }
 
@@ -3421,9 +3430,9 @@ impl<'a, 'b, 'c, const N: usize, T: LitSetElem> LitSetPrim<'a, &'c [T; N], &'b T
     for Lst<'a, &'c [T; N], &'b T>
 {
     #[inline(always)]
-    fn tmt_lit_set<F: FnOnce(&'a &'c [T; N], &'b T) -> bool>(&self, site: u32, _orig: F) -> bool {
+    fn tmt_lit_set<F: FnOnce(&'a &'c [T; N], &'b T) -> bool>(&self, site: u32, orig: F) -> bool {
         let (a, x) = self.take();
-        eval_lit_set(site, (*a).as_slice(), x)
+        eval_lit_set(site, (*a).as_slice(), x, || orig(a, x))
     }
 }
 
@@ -3431,9 +3440,33 @@ impl<'a, 'b, const N: usize, T: LitSetElem> LitSetPrim<'a, [T; N], &'b mut T>
     for Lst<'a, [T; N], &'b mut T>
 {
     #[inline(always)]
-    fn tmt_lit_set<F: FnOnce(&'a [T; N], &'b mut T) -> bool>(&self, site: u32, _orig: F) -> bool {
+    fn tmt_lit_set<F: FnOnce(&'a [T; N], &'b mut T) -> bool>(&self, site: u32, orig: F) -> bool {
         let (a, x) = self.take();
-        eval_lit_set(site, a.as_slice(), &*x)
+        if idle(site) {
+            return orig(a, x);
+        }
+        if let Some(Mutant::DropLiteralElem(drop_idx)) = mutant_at(site) {
+            return a
+                .as_slice()
+                .iter()
+                .enumerate()
+                .any(|(i, elem)| i != drop_idx as usize && elem == &*x);
+        }
+        let matched = a.as_slice().iter().position(|elem| elem == &*x);
+        let actual = orig(a, x);
+        if actual != matched.is_some() {
+            record_bits_u16(b'S', site, LITSET_OPAQUE);
+            return actual;
+        }
+        match matched {
+            Some(idx) if idx < 8 => {
+                record_bits_u16(b'S', site, LITSET_REACHED | (1u16 << idx));
+            }
+            _ => {
+                record_bits_u16(b'S', site, LITSET_REACHED);
+            }
+        }
+        actual
     }
 }
 
@@ -3444,10 +3477,34 @@ impl<'a, 'b, 'c, const N: usize, T: LitSetElem> LitSetPrim<'a, &'c [T; N], &'b m
     fn tmt_lit_set<F: FnOnce(&'a &'c [T; N], &'b mut T) -> bool>(
         &self,
         site: u32,
-        _orig: F,
+        orig: F,
     ) -> bool {
         let (a, x) = self.take();
-        eval_lit_set(site, (*a).as_slice(), &*x)
+        if idle(site) {
+            return orig(a, x);
+        }
+        if let Some(Mutant::DropLiteralElem(drop_idx)) = mutant_at(site) {
+            return (*a)
+                .as_slice()
+                .iter()
+                .enumerate()
+                .any(|(i, elem)| i != drop_idx as usize && elem == &*x);
+        }
+        let matched = (*a).as_slice().iter().position(|elem| elem == &*x);
+        let actual = orig(a, x);
+        if actual != matched.is_some() {
+            record_bits_u16(b'S', site, LITSET_OPAQUE);
+            return actual;
+        }
+        match matched {
+            Some(idx) if idx < 8 => {
+                record_bits_u16(b'S', site, LITSET_REACHED | (1u16 << idx));
+            }
+            _ => {
+                record_bits_u16(b'S', site, LITSET_REACHED);
+            }
+        }
+        actual
     }
 }
 

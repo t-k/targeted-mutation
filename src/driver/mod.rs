@@ -1721,9 +1721,18 @@ fn run_package(
         // Pre-index active arithmetic and cast-probe spans once per file to avoid O(sites^2)
         // linear scans and repeated `syn::parse_str` during site planning.
         let mut primitive_arith_spans: HashSet<(usize, usize)> = HashSet::new();
+        let mut primitive_cmp_spans: HashSet<(usize, usize)> = HashSet::new();
         let mut cast_probe_spans: std::collections::HashMap<(usize, usize), (u32, u32)> =
             std::collections::HashMap::new();
         for other in file.sites.iter().filter(|s| !disabled.contains(&s.id)) {
+            if matches!(other.kind, SiteKind::Cmp { .. })
+                && session
+                    .binaries
+                    .iter()
+                    .any(|b| b.trace.bounds.contains_key(&other.id))
+            {
+                primitive_cmp_spans.insert((other.start, other.end));
+            }
             if let SiteKind::Arith { cast_probes, .. } = &other.kind {
                 let seen = session.merged(|t| t.arith.get(&other.id), plan::ArithObs::merge);
                 if !seen.opaque && (seen.same || seen.differs || seen.same2 || seen.differs2) {
@@ -1773,12 +1782,14 @@ fn run_package(
                 None
             }
         };
+        let primitive_cmp = |from: usize, to: usize| primitive_cmp_spans.contains(&(from, to));
         for site in file.sites.iter().filter(|s| !disabled.contains(&s.id)) {
             let plan = match session.plan(
                 &file.display,
                 site,
                 options.verify,
                 &primitive,
+                &primitive_cmp,
                 &cast_bounds,
             ) {
                 // Code that did not change is not said to be unreached here: that takes
