@@ -702,6 +702,21 @@ pub fn describe(site: &Site, m: Mutation) -> String {
             let dots = if *inclusive { ".." } else { "..=" };
             format!("`{}{dots}{}`", one_line(lhs), one_line(rhs))
         }
+        SiteKind::RangeContains {
+            inclusive,
+            lhs,
+            rhs,
+            argument,
+            ..
+        } => {
+            let dots = if *inclusive { ".." } else { "..=" };
+            format!(
+                "`({}{dots}{}).contains({})`",
+                one_line(lhs),
+                one_line(rhs),
+                one_line(argument)
+            )
+        }
         SiteKind::Arm { pattern, .. } => format!("remove the arm `{} => ..`", one_line(pattern)),
         SiteKind::MinMax {
             max,
@@ -758,6 +773,15 @@ pub fn describe(site: &Site, m: Mutation) -> String {
             ..
         } => {
             let other = if *all { "any" } else { "all" };
+            format!("`{}.{other}({})`", one_line(receiver), one_line(predicate))
+        }
+        SiteKind::Position {
+            forward,
+            receiver,
+            predicate,
+            ..
+        } => {
+            let other = if *forward { "rposition" } else { "position" };
             format!("`{}.{other}({})`", one_line(receiver), one_line(predicate))
         }
         SiteKind::SaturatingArith {
@@ -1523,6 +1547,32 @@ pub fn return_gap_finding(
         survivors: vec![describe(site, Mutation::Const(always))],
         survivor_count: 1,
         add_tests: vec![format!("a case where `{name}` returns {other}")],
+        observed: None,
+        verified,
+    })
+}
+
+/// Input gap at a `(a..b).contains(x)` / `(a..=b).contains(x)` site where no test passed
+/// an input equal to the upper endpoint `b` (with `a <= b`), so flipping `..` <-> `..=`
+/// cannot change the result for any test.
+pub fn range_contains_gap_finding(file: &str, site: &Site, verified: bool) -> Option<Finding> {
+    let SiteKind::RangeContains {
+        lhs, rhs, argument, ..
+    } = &site.kind
+    else {
+        return None;
+    };
+    Some(Finding::InputGap {
+        at: location(file, site),
+        survivors: vec![describe(site, Mutation::RangeEnd)],
+        survivor_count: 1,
+        add_tests: vec![format!(
+            "a case where `{}` equals `{}` (with `{} <= {}`)",
+            one_line(argument),
+            one_line(rhs),
+            one_line(lhs),
+            one_line(rhs)
+        )],
         observed: None,
         verified,
     })

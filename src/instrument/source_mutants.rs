@@ -208,7 +208,7 @@ pub fn source_mutants(site: &Site) -> Vec<SourceMutant> {
         }
         SiteKind::Stmt => vec![change(site.start, site.end, String::new(), "statement", "")],
         // The end taken in or left out: the two dots and the `=` are all that changes.
-        SiteKind::Range { inclusive, gap, .. } => {
+        SiteKind::Range { inclusive, gap, .. } | SiteKind::RangeContains { inclusive, gap, .. } => {
             let (from, to) = if *inclusive {
                 ("..=", "..")
             } else {
@@ -357,6 +357,16 @@ pub fn source_mutants(site: &Site) -> Vec<SourceMutant> {
         ],
         SiteKind::Quantifier { all, method, .. } => {
             let (from, to) = if *all { ("all", "any") } else { ("any", "all") };
+            vec![change(method.0, method.1, to.into(), from, to)]
+        }
+        SiteKind::Position {
+            forward, method, ..
+        } => {
+            let (from, to) = if *forward {
+                ("position", "rposition")
+            } else {
+                ("rposition", "position")
+            };
             vec![change(method.0, method.1, to.into(), from, to)]
         }
         SiteKind::SaturatingArith { op, method, .. } => {

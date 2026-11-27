@@ -1333,6 +1333,7 @@ fn labelled(src: &str) -> Vec<String> {
                 SiteKind::Clamp { .. } => "clamp",
                 SiteKind::Rounding { .. } => "rounding",
                 SiteKind::Quantifier { .. } => "quantifier",
+                SiteKind::Position { .. } => "position",
                 SiteKind::SaturatingArith { .. } => "saturating",
                 SiteKind::StrTrim { .. } => "strtrim",
                 SiteKind::StrCaseEq { .. } => "strcaseeq",
@@ -1342,6 +1343,7 @@ fn labelled(src: &str) -> Vec<String> {
                 SiteKind::BitCount { .. } => "bitcount",
                 SiteKind::LoopCtrl { .. } => "loopctrl",
                 SiteKind::LiteralSet { .. } => "literalset",
+                SiteKind::RangeContains { .. } => "rangecontains",
                 SiteKind::Range { .. } => "range",
                 SiteKind::Arm { .. } => "arm",
                 SiteKind::Stmt => "stmt",
@@ -4157,4 +4159,135 @@ fn mut_reborrow_litset(x: &mut u8) -> bool {
     assert_eq!(rebuilt_litsets, [20]);
     let rendered = render(conservative, &found.sites, &|_| true);
     assert!(syn::parse_file(&rendered.text).is_ok(), "{}", rendered.text);
+}
+
+#[test]
+fn probe_v14_matches_pict_table() {
+    let table = include_str!("../../tests/data/probe-v14.pict.tsv");
+    let mut rows = 0;
+    for line in table.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let cols: Vec<&str> = line.split('\t').collect();
+        assert_eq!(cols.len(), 4, "unexpected row: {line}");
+        let (feature, context, direction, _obs) = (cols[0], cols[1], cols[2], cols[3]);
+        let src = match (feature, context, direction) {
+            ("range_contains", "const_fn", "forward") => {
+                "const fn f(x: u32) -> bool { (1..5).contains(&x) }".to_string()
+            }
+            ("range_contains", "const_fn", _) => {
+                "const fn f(x: u32) -> bool { (1..=5).contains(&x) }".to_string()
+            }
+            ("range_contains", "nested_probe", "forward") => {
+                "fn f(a: u32, b: u32, x: u32) -> bool { (a + 1..b - 1).contains(&x) }".to_string()
+            }
+            ("range_contains", "nested_probe", _) => {
+                "fn f(a: u32, b: u32, x: u32) -> bool { (a + 1..=b - 1).contains(&x) }".to_string()
+            }
+            ("range_contains", "non_eligible", _) => {
+                "fn f(x: &mut u32) -> bool { (1..5).contains(&mut *x) }".to_string()
+            }
+            ("range_contains", _, "forward") => {
+                "fn f(x: u32) -> bool { (1..5).contains(&x) }".to_string()
+            }
+            ("range_contains", _, _) => {
+                "fn f(x: u32) -> bool { (1..=5).contains(&x) }".to_string()
+            }
+            ("range_get", "const_fn", _) => {
+                "const fn f(s: &[u8], a: usize, b: usize) -> Option<&[u8]> { s.get(a..b) }"
+                    .to_string()
+            }
+            ("range_get", "nested_probe", "forward") => {
+                "fn f(s: &[u8], a: usize, b: usize) -> Option<&[u8]> { s.get(a + 1..b - 1) }"
+                    .to_string()
+            }
+            ("range_get", "nested_probe", _) => {
+                "fn f(s: &mut [u8], a: usize, b: usize) -> Option<&mut [u8]> { s.get_mut(a + 1..=b - 1) }"
+                    .to_string()
+            }
+            ("range_get", "non_eligible", _) => {
+                "fn f(s: &[u8], a: usize) -> Option<&[u8]> { s.get(a..s.len()) }".to_string()
+            }
+            ("range_get", _, "forward") => {
+                "fn f(s: &[u8], a: usize, b: usize) -> Option<&[u8]> { s.get(a..b) }".to_string()
+            }
+            ("range_get", _, _) => {
+                "fn f(s: &mut [u8], a: usize, b: usize) -> Option<&mut [u8]> { s.get_mut(a..=b) }"
+                    .to_string()
+            }
+            ("clamp_cast", "const_fn", _) => {
+                "const fn f(x: u128) -> u128 { x.clamp(1, i32::MAX as u128) }".to_string()
+            }
+            ("clamp_cast", "nested_probe", _) => {
+                "fn f(x: u128) -> u128 { (x + 1).clamp(1, i32::MAX as u128) }".to_string()
+            }
+            ("clamp_cast", "non_eligible", _) => {
+                "fn f(x: u128) -> u128 { x.clamp(1, hi_fn() as u128) }".to_string()
+            }
+            ("clamp_cast", _, _) => {
+                "fn f(x: u128) -> u128 { x.clamp(1, i32::MAX as u128) }".to_string()
+            }
+            ("position_swap", "const_fn", _) => {
+                "const fn f(xs: &[u8]) -> Option<usize> { xs.iter().position(|&b| b == 1) }"
+                    .to_string()
+            }
+            ("position_swap", "nested_probe", "forward") => {
+                "fn f(xs: &[u8], t: u8) -> Option<usize> { xs.iter().position(|&b| b == t + 1) }"
+                    .to_string()
+            }
+            ("position_swap", "nested_probe", _) => {
+                "fn f(xs: &[u8], t: u8) -> Option<usize> { xs.iter().rposition(|&b| b == t + 1) }"
+                    .to_string()
+            }
+            ("position_swap", "non_eligible", _) => {
+                "fn f(s: &str) -> Option<usize> { s.chars().position(|c| c == 'a') }".to_string()
+            }
+            ("position_swap", _, "forward") => {
+                "fn f(xs: &[u8]) -> Option<usize> { xs.iter().position(|&b| b == 1) }".to_string()
+            }
+            ("position_swap", _, _) => {
+                "fn f(xs: &[u8]) -> Option<usize> { xs.iter().rposition(|&b| b == 1) }".to_string()
+            }
+            _ => unreachable!("unexpected PICT row: {line}"),
+        };
+        let found = discover(&src, 0).unwrap();
+        let is_target = |s: &Site| match feature {
+            "range_contains" => matches!(
+                s.kind,
+                SiteKind::RangeContains { .. } | SiteKind::Range { .. }
+            ),
+            "range_get" => matches!(s.kind, SiteKind::Range { .. }),
+            "clamp_cast" => matches!(s.kind, SiteKind::Clamp { .. }),
+            "position_swap" => matches!(s.kind, SiteKind::Position { .. }),
+            _ => false,
+        };
+        let expect_rebuild =
+            context == "const_fn" || (context == "non_eligible" && feature != "position_swap");
+        if expect_rebuild {
+            assert!(
+                found.rebuild_sites.iter().any(is_target),
+                "expected rebuild_site for {line}: {src}"
+            );
+            assert!(
+                !found.sites.iter().any(is_target),
+                "unexpected probe site for {line}: {src}"
+            );
+        } else {
+            assert!(
+                found.sites.iter().any(is_target),
+                "expected probe site for {line}: {src}"
+            );
+            let rendered = render(&src, &found.sites, &|_| true);
+            assert_eq!(
+                rendered.text.matches('\n').count(),
+                src.matches('\n').count(),
+                "line count changed for {line}"
+            );
+            assert!(
+                syn::parse_file(&rendered.text).is_ok(),
+                "invalid probe syntax for {line}:\n{}",
+                rendered.text
+            );
+        }
+        rows += 1;
+    }
+    assert!(rows >= 20, "expected full PICT table, got {rows} rows");
 }
