@@ -14,7 +14,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use crate::plan::{ArithObs, LogicObs, Obs, ReturnObs};
+use crate::plan::{ArithObs, LitSetObs, LogicObs, Obs, ReturnObs};
 
 /// Test name used when the observing thread is not a libtest test thread.
 pub const UNKNOWN_TEST: &str = "?";
@@ -32,6 +32,7 @@ pub struct Trace {
     pub logic: BTreeMap<u32, BTreeMap<String, LogicObs>>,
     pub arith: BTreeMap<u32, BTreeMap<String, ArithObs>>,
     pub returns: BTreeMap<u32, BTreeMap<String, ReturnObs>>,
+    pub lit_set: BTreeMap<u32, BTreeMap<String, LitSetObs>>,
     /// site -> tests that executed the statement
     pub reach: BTreeMap<u32, BTreeSet<String>>,
     /// Ranges `a..b` that some test ran with `b` at the largest value of its type.
@@ -191,6 +192,7 @@ impl Trace {
             + differing(records(&self.logic), records(&other.logic))
             + differing(records(&self.arith), records(&other.arith))
             + differing(records(&self.returns), records(&other.returns))
+            + differing(records(&self.lit_set), records(&other.lit_set))
             + differing(reached_records(&self.reach), reached_records(&other.reach))
     }
 
@@ -323,6 +325,20 @@ impl Trace {
                             tests.insert(test.to_owned(), obs);
                         }
                     }
+                }
+            }
+            ["S", site, test, bits] => {
+                let site = parse_u32_ascii(site)?;
+                let bits: u16 = parse_u32_ascii(bits)
+                    .and_then(|b| u16::try_from(b).ok())
+                    .filter(|b| (1..1024).contains(b))?;
+                (!test.is_empty()).then_some(())?;
+                let obs = LitSetObs::from_bits(bits);
+                let tests = self.lit_set.entry(site).or_default();
+                if let Some(existing) = tests.get_mut(test) {
+                    existing.merge(&obs);
+                } else {
+                    tests.insert(test.to_owned(), obs);
                 }
             }
             ["T", site, lhs_min, lhs_max, rhs_min, rhs_max] => {
@@ -1415,5 +1431,39 @@ mod tests {
         let bare_cr = Trace::parse("R\t3\tt\t1\r");
         assert_eq!(bare_cr.malformed_lines, 1);
         assert!(bare_cr.reach.is_empty());
+    }
+
+    #[test]
+    fn parses_lit_set_records_and_encodes_drop_literal_elem() {
+        let trace = Trace::parse(
+            "S\t4\ttests::a\t257\n\
+             S\t4\ttests::a\t260\n\
+             S\t4\ttests::b\t256\n\
+             S\t5\ttests::c\t512\n\
+             S\t6\ttests::bad\t0\n\
+             S\t6\ttests::bad\t1024\n",
+        );
+        assert_eq!(trace.malformed_lines, 2);
+        let a = trace.lit_set[&4]["tests::a"];
+        assert!(a.reached && !a.opaque);
+        assert!(a.matched_elem(0));
+        assert!(!a.matched_elem(1));
+        assert!(a.matched_elem(2));
+        let b = trace.lit_set[&4]["tests::b"];
+        assert!(b.reached && b.matched == 0);
+        let c = trace.lit_set[&5]["tests::c"];
+        assert!(!c.reached && c.opaque);
+
+        let other = Trace::parse("S\t4\ttests::a\t257\nS\t4\ttests::b\t256\nS\t5\ttests::c\t512\n");
+        assert_eq!(trace.differences(&other), 1);
+
+        for idx in 0..8u8 {
+            let encoded = format!("7:{}", Mutation::DropLiteralElem(idx).encode());
+            assert_eq!(
+                tmt_rt::parse_mutant(&encoded),
+                Some((7, tmt_rt::Mutant::DropLiteralElem(idx)))
+            );
+        }
+        assert_eq!(tmt_rt::parse_mutant("7:dle8"), None);
     }
 }

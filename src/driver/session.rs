@@ -238,6 +238,7 @@ impl Session {
         site: &'a Site,
         verify: bool,
         primitive: &dyn Fn(usize, usize) -> bool,
+        primitive_cmp: &dyn Fn(usize, usize) -> bool,
         cast_bounds: &dyn Fn(usize, usize) -> Option<(i128, i128)>,
     ) -> Planned<'a> {
         let id = site.id;
@@ -273,35 +274,69 @@ impl Session {
                 let allowed = move |m: &Mutation| can_be_false || *m != Mutation::Const(false);
                 let merged = self.merged(|t| t.returns.get(&id), plan::ReturnObs::merge);
                 let guard_plan = plan::plan_return(&merged);
-                if guard_plan.unreached {
+                let any_reached = !guard_plan.unreached || reached();
+                if !any_reached {
                     return Planned::Unreached;
                 }
-                let gaps = guard_plan
-                    .always
-                    .filter(|always| allowed(&Mutation::Const(*always)))
-                    .map(|always| PlannedGap {
-                        finding: report::guard_gap_finding(file, site, always, verify),
-                        survivors: vec![Mutation::Const(always)],
-                        // The guard is the condition it consists of.
-                        constant_expr: Some((site.start, site.end)),
+                // Any test that reached `guard_override` without reaching `guard_record`
+                // exited early (e.g. `return`, `?`, panic) inside the guard expression:
+                // replacing the guard with a constant changes that control flow.
+                let has_early_exit = self.binaries.iter().any(|bin| {
+                    let Some(reached_tests) = bin.trace.reach.get(&id) else {
+                        return false;
+                    };
+                    let returned = bin.trace.returns.get(&id);
+                    reached_tests.iter().any(|t| {
+                        returned
+                            .and_then(|m| m.get(t))
+                            .is_none_or(|obs| !obs.reached())
                     })
-                    .into_iter()
-                    .collect();
-                SitePlan {
-                    constant: false,
-                    cannot_differ: false,
-                    redundant_logic_swap: false,
-                    gaps,
-                    run: guard_plan.run.into_iter().filter(allowed).collect(),
-                    infected: Box::new(move |bin, m| {
-                        tests_where(bin.trace.returns.get(&id), |obs| match m {
-                            Mutation::Const(value) => obs.infected_by_const(value),
-                            _ => obs.reached(),
+                });
+                let pure = !has_early_exit
+                    && is_strictly_pure_guard(&site.text, primitive_cmp(site.start, site.end));
+                if pure {
+                    let gaps = guard_plan
+                        .always
+                        .filter(|always| allowed(&Mutation::Const(*always)))
+                        .map(|always| PlannedGap {
+                            finding: report::guard_gap_finding(file, site, always, verify),
+                            survivors: vec![Mutation::Const(always)],
+                            // The guard is the condition it consists of.
+                            constant_expr: Some((site.start, site.end)),
                         })
-                    }),
-                    reaching: Box::new(move |bin| {
-                        tests_where(bin.trace.returns.get(&id), plan::ReturnObs::reached)
-                    }),
+                        .into_iter()
+                        .collect();
+                    SitePlan {
+                        constant: false,
+                        cannot_differ: false,
+                        redundant_logic_swap: false,
+                        gaps,
+                        run: guard_plan.run.into_iter().filter(allowed).collect(),
+                        infected: Box::new(move |bin, m| {
+                            tests_where(bin.trace.returns.get(&id), |obs| match m {
+                                Mutation::Const(value) => obs.infected_by_const(value),
+                                _ => obs.reached(),
+                            })
+                        }),
+                        reaching: Box::new(move |bin| guard_reaching_tests(bin, id)),
+                    }
+                } else {
+                    // A guard that may have side effects, overloaded ops/methods, or early
+                    // exits cannot be proved equivalent to a constant solely from its return
+                    // value: run all reaching tests (including early-exit tests).
+                    let run = [Mutation::Const(true), Mutation::Const(false)]
+                        .into_iter()
+                        .filter(allowed)
+                        .collect();
+                    SitePlan {
+                        constant: false,
+                        cannot_differ: false,
+                        redundant_logic_swap: false,
+                        gaps: vec![],
+                        run,
+                        infected: Box::new(move |bin, _| guard_reaching_tests(bin, id)),
+                        reaching: Box::new(move |bin| guard_reaching_tests(bin, id)),
+                    }
                 }
             }
             SiteKind::Arm { .. } if reached() => reach_plan(Mutation::Delete),
@@ -309,7 +344,48 @@ impl Session {
             SiteKind::Quantifier { .. } if reached() => reach_plan(Mutation::QuantifierSwap),
             SiteKind::LoopCtrl { .. } if reached() => reach_plan(Mutation::LoopCtrlSwap),
             SiteKind::LoopCtrl { .. } => return Planned::Unreached,
-            SiteKind::LiteralSet { .. } => return Planned::Nothing,
+            SiteKind::LiteralSet { elements, .. } => {
+                let merged = self.merged(|t| t.lit_set.get(&id), plan::LitSetObs::merge);
+                if merged.opaque {
+                    return Planned::Nothing;
+                }
+                if !merged.reached {
+                    return Planned::Unreached;
+                }
+                let mut gaps = vec![];
+                let mut run = vec![];
+                for i in 0..elements.len().min(8) {
+                    let idx = i as u8;
+                    let m = Mutation::DropLiteralElem(idx);
+                    if merged.matched_elem(idx) {
+                        run.push(m);
+                    } else if let Some(finding) =
+                        report::literal_set_gap_finding(file, site, idx, verify)
+                    {
+                        gaps.push(PlannedGap {
+                            finding,
+                            survivors: vec![m],
+                            constant_expr: None,
+                        });
+                    }
+                }
+                SitePlan {
+                    constant: false,
+                    cannot_differ: false,
+                    redundant_logic_swap: false,
+                    gaps,
+                    run,
+                    infected: Box::new(move |bin, m| {
+                        tests_where(bin.trace.lit_set.get(&id), |obs| match m {
+                            Mutation::DropLiteralElem(idx) => obs.matched_elem(idx),
+                            _ => obs.reached,
+                        })
+                    }),
+                    reaching: Box::new(move |bin| {
+                        tests_where(bin.trace.lit_set.get(&id), |obs| obs.reached)
+                    }),
+                }
+            }
             SiteKind::Not { .. } if reached() => reach_plan(Mutation::DropNot),
             // `a..=b` with `b` the largest value of its type is no range the probe could
             // return in place of `a..b`: the mutant would run as the original and pass.
@@ -982,6 +1058,44 @@ pub(super) fn evaluate_jobs(
         phase.finish()?;
     }
     Ok(results.into_iter().map(|(result, _)| result).collect())
+}
+
+/// Tests that reached a `match` guard (either returning a bool or exiting early).
+fn guard_reaching_tests(bin: &TestBinary, id: u32) -> BTreeSet<String> {
+    let mut tests = tests_where(bin.trace.returns.get(&id), plan::ReturnObs::reached);
+    if let Some(reached) = bin.trace.reach.get(&id) {
+        tests.extend(reached.iter().cloned());
+    }
+    tests
+}
+
+/// Strictly side-effect-free guard expression: no calls, no methods, no indexing, no
+/// `Deref` (including implicit field `Deref`), and no user-overloaded operators (including
+/// `!`). A top-level binary comparison is accepted only when runtime `trace.bounds` proved
+/// it compared primitive numbers/chars and both operands are plain literals or paths.
+fn is_strictly_pure_guard(expr_text: &str, is_prim_cmp: bool) -> bool {
+    fn is_trivial_value(expr: &syn::Expr) -> bool {
+        match expr {
+            syn::Expr::Lit(_) | syn::Expr::Path(_) => true,
+            syn::Expr::Paren(e) => is_trivial_value(&e.expr),
+            syn::Expr::Group(e) => is_trivial_value(&e.expr),
+            _ => false,
+        }
+    }
+    let Ok(expr) = syn::parse_str::<syn::Expr>(expr_text) else {
+        return false;
+    };
+    if is_trivial_value(&expr) {
+        return true;
+    }
+    if is_prim_cmp
+        && let syn::Expr::Binary(bin) = &expr
+        && is_trivial_value(&bin.left)
+        && is_trivial_value(&bin.right)
+    {
+        return true;
+    }
+    false
 }
 
 impl std::str::FromStr for report::Shard {

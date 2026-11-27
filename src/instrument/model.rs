@@ -243,19 +243,27 @@ pub enum SiteKind {
     },
     /// Unlabeled, value-less `break` <-> `continue` directly inside a loop.
     LoopCtrl { is_break: bool },
-    /// `[lit1, lit2, ...].contains(&x)`: drop one literal element at a time (source-built).
+    /// `[lit1, lit2, ...].contains(&x)`: drop one literal element at a time.
     LiteralSet {
         receiver: String,
         argument: String,
+        /// Byte range from receiver end to argument start (`.contains(`).
+        call: (usize, usize),
+        /// Byte range from argument end to closing `)` end.
+        close: (usize, usize),
         /// `(element text, removal start, removal end)` for each element.
         elements: Vec<(String, usize, usize)>,
     },
-    /// `lhs..rhs` or `lhs..=rhs` on integers: the end moves by one.
+    /// `lhs..rhs` or `lhs..=rhs` on integers (or inside an indexing expression): the end
+    /// moves by one.
     Range {
         inclusive: bool,
         lhs: String,
         rhs: String,
         gap: (usize, usize),
+        /// Present when the range is probed by switching an enclosing indexing expression
+        /// (`&xs[a..b]`, `&mut xs[a..b]`, or `xs[a..b].read_method(...)`).
+        index: Option<RangeIndex>,
     },
     /// An arm of a `match` that ends in a catch-all arm: without this arm the value falls
     /// through to the arms below.
@@ -556,6 +564,27 @@ impl BitCountOp {
             BitCountOp::TrailingOnes => BitCountOp::LeadingOnes,
         }
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum RangeIndexMode {
+    /// `&xs[a..b]`
+    Ref,
+    /// `&mut xs[a..b]`
+    RefMut,
+    /// `xs[a..b]` used as the receiver of a known `&self` read-only method.
+    Deref,
+}
+
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct RangeIndex {
+    pub mode: RangeIndexMode,
+    /// Source text of the plain-place base expression (e.g. `xs`, `self.source`).
+    pub base: String,
+    /// Byte range from outer expression start to range start (`&xs[`, `&mut xs[`, or `xs[`).
+    pub head: (usize, usize),
+    /// Byte range from range end to closing `]` end.
+    pub close_bracket: (usize, usize),
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]

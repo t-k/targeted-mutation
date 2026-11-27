@@ -197,8 +197,8 @@ For each assertion gap, `cargo tmt` replays one surviving mutant with tracing on
 | `x.to_be_bytes()`, `.to_le_bytes()`, `.to_be()`, `.to_le()` (multi-byte ints) | swapped BE ↔ LE | every observed value was byte-palindromic |
 | `x.leading_zeros()`, `.trailing_zeros()`, `.leading_ones()`, `.trailing_ones()` (integers) | swapped leading ↔ trailing | leading and trailing counts agreed on every test |
 | `break`, `continue` (unlabeled, value-less inside loops) | swapped `break` ↔ `continue` | always run (reaching tests only) |
-| `[lit1, lit2, ...].contains(&x)` (2–8 distinct literals) | one element removed at a time (`--rebuild` / `--source-only`) | source-built |
-| `a..b`, `a..=b` (integers) | inclusive ↔ exclusive end | always run |
+| `[lit1, lit2, ...].contains(&x)` (2–8 distinct literals) | one element removed at a time | no test matched that literal element (non-`&expr` / `const` uses `--rebuild`) |
+| `a..b`, `a..=b` (integers / indexed slices) | inclusive ↔ exclusive end | always run (`for` loops and simple `&xs[a..b]`/`&mut xs[a..b]`/`xs[a..b].read_method()`; others use `--rebuild`) |
 | `f(x);`, `check()?;`, `x += 1;`, `x = y;` | statement deleted | always run |
 
 - Arithmetic on non-primitive types (`String + &str`, `Duration + Duration`) and `!` on non-`bool` types are left untouched.
@@ -503,7 +503,7 @@ The idea of generating mutants using test observations is known as *test-aware m
 - **`i128` and `u128`:** Outside the probe runtime's integer specialization (`i8`..`i64`/`isize`, `u8`..`u64`/`usize`). Comparisons fall back to general ordering checks (`<` vs `<=` and negation without shifted boundaries), and `i128`/`u128` arithmetic, bitwise, range, and `min`/`max` probes pass through unmutated. Use `--source-only` to mutate `i128`/`u128` operations directly.
 - **Floats & non-numeric types:** Float gaps are reported only while no test compares equal operands (rounding-distance thresholds after that are not reported). Non-numeric `PartialOrd` types check `<` vs `<=` and negation only.
 - **Compile-time & unsupported syntax:** Inline `const` blocks, array lengths, enum discriminants, const generics, `const fn`, and constant initializers require `--rebuild` or `--source-only`. Files starting with a BOM or `#!` line are not instrumented. Casts are not mutated. Functions returning `impl Trait` (other than `impl Iterator`) cannot have synthetic body replacements. Result probes for `bool`/`Option` require observable exits (omitted when `return`, `?`, or an unexpanded macro could bypass them). Macro shadowing is recognized only for top-level definitions in the same file.
-- **Ranges, `min`/`max`, and `first`/`last`:** Range probes apply only directly in `for` loops (other ranges and literal pairs like `0..3` need `--rebuild`); `a..b` at `T::MAX` cannot be probed as `a..=b` and is reported as not evaluated (handled by `--rebuild`). `a.max(b)`/`a.min(b)` borrow `a` (non-`Copy` by-value types like `String` are left untouched). `v.first()`/`v.last()` target slices, `Vec`, arrays of length ≥ 2, and `BTreeSet` (by-value iterators and `&mut` receivers need `--rebuild`).
+- **Ranges, `min`/`max`, and `first`/`last`:** Range probes apply directly in `for` loops (with non-literal bounds) and in simple indexed expressions (`&xs[a..b]`, `&mut xs[a..b]`, or `xs[a..b]` with a read-only slice/string method and pure bounds); other ranges need `--rebuild`. `a..b` at `T::MAX` in a `for` loop cannot be probed as `a..=b` and is reported as not evaluated (handled by `--rebuild`). `a.max(b)`/`a.min(b)` borrow `a` (non-`Copy` by-value types like `String` are left untouched). `v.first()`/`v.last()` target slices, `Vec`, arrays of length ≥ 2, and `BTreeSet` (by-value iterators and `&mut` receivers need `--rebuild`).
 - **Duplicate/equivalent mutants:** A body replaced by `true` and an exit replaced by `true` can be reported together on the same line. Equivalent mutants (`a >= b` in `max(a, b)`, compile-time-constant operands) are not always eliminated.
 
 ### Tracing, threads & determinism
@@ -515,7 +515,7 @@ The idea of generating mutants using test observations is known as *test-aware m
 
 ### Evaluation semantics & probes
 
-- **Constant replacement & struct base evaluation:** Probed constant replacements still evaluate operands/guards, and probed struct-field omission evaluates `..base` twice (`--source-only` removes the field and evaluates `base` once).
+- **Constant replacement & struct base evaluation:** Match guard probes short-circuit before evaluating the guard expression (matching source replacements even when a guard has side effects). Other probed constant replacements still evaluate operands/bodies, and probed struct-field omission evaluates `..base` twice (`--source-only` removes the field and evaluates `base` once).
 - **Drop order & `DerefMut`:** Two edge cases differ from uninstrumented code: a temporary with a `Drop` impl inside a struct field with `..base` drops before the next field, and `*p += f()` evaluates `*p` before `f()`.
 - **`unused_parens` & columns:** Source operator replacements parenthesize operands when precedence changes (`8 - (2 + 3)`), which crates denying `unused_parens` may reject as non-compiling. Probes and source mutants preserve line numbers (`line!()`) but not column numbers (`column!()`).
 

@@ -17,7 +17,7 @@ use super::cfg::{
 };
 use super::model::{
     ArithOp, ArmGuard, BitCountOp, Discovery, EndianOp, LiteralSide, LocalBitType, NO_ID,
-    RoundingOp, SaturatingOp, Site, SiteKind, TestModule, TrimOp,
+    RangeIndex, RangeIndexMode, RoundingOp, SaturatingOp, Site, SiteKind, TestModule, TrimOp,
 };
 
 /// Finds the sites in one source file, numbering them from `first_id`.
@@ -70,6 +70,7 @@ pub(crate) fn discover_parsed(
         loop_allows_unit_break: false,
         error_values,
         for_ranges: std::collections::HashSet::new(),
+        indexed_ranges: std::collections::HashSet::new(),
         probed_cast_spans: std::collections::HashSet::new(),
         type_scopes: vec![HashMap::new()],
         shadowed_prims,
@@ -95,6 +96,8 @@ struct Finder<'s> {
     loop_allows_unit_break: bool,
     /// Where the ranges start that a `for` runs through directly.
     for_ranges: std::collections::HashSet<usize>,
+    /// Where the ranges start that an enclosing indexing probe already claimed.
+    indexed_ranges: std::collections::HashSet<usize>,
     /// Source byte spans `(start, end)` already wrapped with a runtime cast-type probe.
     probed_cast_spans: std::collections::HashSet<(usize, usize)>,
     /// Lexical stack of static primitive-type bindings for disjoint bitop analysis.
@@ -2020,24 +2023,49 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                             (self.source[es..ee].to_string(), rem_start, rem_end)
                         })
                         .collect();
-                    let at = node.receiver.span().start();
-                    self.found.rebuild_sites.push(Site {
-                        id: NO_ID,
-                        kind: SiteKind::LiteralSet {
-                            receiver: self.source[start..receiver_end].to_string(),
-                            argument: self.source[arg_start..arg_end].to_string(),
-                            elements,
-                        },
-                        line: at.line,
-                        column: at.column + 1,
-                        start,
-                        end,
-                        text: self.source[start..end].to_string(),
-                    });
+                    let kind = SiteKind::LiteralSet {
+                        receiver: self.source[start..receiver_end].to_string(),
+                        argument: self.source[arg_start..arg_end].to_string(),
+                        call: (receiver_end, arg_start),
+                        close: (arg_end, end),
+                        elements,
+                    };
+                    // Probe only explicit shared-reference arguments (`&x`) so we never
+                    // move a `&mut T` that would have been reborrowed or hide a `Deref`
+                    // coercion behind `AnyLitSet`.
+                    let probe = matches!(
+                        strip_parens_ref(&node.args[0]),
+                        syn::Expr::Reference(r) if r.mutability.is_none()
+                    );
+                    self.const_depth += (!probe) as usize;
+                    self.push(kind, start, end, node.receiver.span());
+                    self.const_depth -= (!probe) as usize;
                 }
             }
         }
+        if is_read_only_slice_method(&name)
+            && node.attrs.is_empty()
+            && let syn::Expr::Index(idx) = &*node.receiver
+            && let Some((idx_start, _)) = self.range(idx.span())
+        {
+            self.try_record_indexed_range(RangeIndexMode::Deref, idx_start, idx.span(), idx);
+        }
         visit::visit_expr_method_call(self, node);
+    }
+
+    fn visit_expr_reference(&mut self, node: &'ast syn::ExprReference) {
+        if node.attrs.is_empty()
+            && let syn::Expr::Index(idx) = &*node.expr
+            && let Some((ref_start, _)) = self.range(node.span())
+        {
+            let mode = if node.mutability.is_some() {
+                RangeIndexMode::RefMut
+            } else {
+                RangeIndexMode::Ref
+            };
+            self.try_record_indexed_range(mode, ref_start, node.span(), idx);
+        }
+        visit::visit_expr_reference(self, node);
     }
 
     fn visit_expr_for_loop(&mut self, node: &'ast syn::ExprForLoop) {
@@ -2199,12 +2227,14 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             && let (Some((start, lhs_end)), Some((rhs_start, end))) =
                 (self.range(from.span()), self.range(to.span()))
             && in_order(lhs_end, rhs_start)
+            && !self.indexed_ranges.contains(&start)
         {
             let kind = SiteKind::Range {
                 inclusive: matches!(node.limits, syn::RangeLimits::Closed(_)),
                 lhs: self.source[start..lhs_end].to_string(),
                 rhs: self.source[rhs_start..end].to_string(),
                 gap: (lhs_end, rhs_start),
+                index: None,
             };
             // `a..b + 1` in place of `a..=b` gives a `for` the same numbers, and that is
             // all a `for` takes from its range. Anywhere else the two are told apart (by
@@ -2754,7 +2784,7 @@ fn literal_key(mut expr: &syn::Expr) -> Option<(String, Option<String>)> {
             syn::Lit::ByteStr(b) => Some((format!("bstr:{:?}", b.value()), None)),
             syn::Lit::CStr(c) => Some((format!("cstr:{:?}", c.value()), None)),
             syn::Lit::Char(c) => Some((format!("char:{}", c.value()), None)),
-            syn::Lit::Byte(b) => Some((format!("byte:{}", b.value()), None)),
+            syn::Lit::Byte(b) => Some((format!("int:{}", b.value()), None)),
             syn::Lit::Bool(b) => Some((format!("bool:{}", b.value()), None)),
             _ => None,
         },
@@ -2778,5 +2808,205 @@ fn literal_key(mut expr: &syn::Expr) -> Option<(String, Option<String>)> {
             _ => None,
         },
         _ => None,
+    }
+}
+
+fn strip_parens_ref(mut expr: &syn::Expr) -> &syn::Expr {
+    while let syn::Expr::Paren(syn::ExprParen {
+        attrs, expr: inner, ..
+    })
+    | syn::Expr::Group(syn::ExprGroup {
+        attrs, expr: inner, ..
+    }) = expr
+    {
+        if !attrs.is_empty() {
+            break;
+        }
+        expr = inner;
+    }
+    expr
+}
+
+fn is_read_only_slice_method(name: &str) -> bool {
+    matches!(
+        name,
+        "len"
+            | "is_empty"
+            | "trim"
+            | "trim_start"
+            | "trim_end"
+            | "trim_matches"
+            | "trim_start_matches"
+            | "trim_end_matches"
+            | "to_string"
+            | "to_owned"
+            | "as_bytes"
+            | "as_str"
+            | "bytes"
+            | "chars"
+            | "char_indices"
+            | "lines"
+            | "split"
+            | "rsplit"
+            | "split_once"
+            | "rsplit_once"
+            | "split_inclusive"
+            | "split_whitespace"
+            | "split_ascii_whitespace"
+            | "iter"
+            | "starts_with"
+            | "ends_with"
+            | "contains"
+            | "find"
+            | "rfind"
+            | "strip_prefix"
+            | "strip_suffix"
+            | "parse"
+            | "eq_ignore_ascii_case"
+            | "to_ascii_lowercase"
+            | "to_ascii_uppercase"
+            | "to_lowercase"
+            | "to_uppercase"
+            | "replace"
+            | "replacen"
+            | "matches"
+            | "rmatches"
+            | "first"
+            | "last"
+            | "get"
+            | "windows"
+            | "chunks"
+            | "chunks_exact"
+            | "rchunks"
+            | "rchunks_exact"
+            | "to_vec"
+            | "is_ascii"
+            | "is_char_boundary"
+    )
+}
+
+/// A place made only of variable paths and field accesses (no temporaries, no calls,
+/// no `*` derefs, no inner probe sites), so naming it in both branches of an indexed-range
+/// probe preserves temporary lifetimes, borrow mode, and evaluation semantics.
+fn is_simple_place(expr: &syn::Expr) -> bool {
+    if has_conditional_or_skip_attr(expr) {
+        return false;
+    }
+    match expr {
+        syn::Expr::Path(e) => e.attrs.is_empty(),
+        syn::Expr::Field(e) => e.attrs.is_empty() && is_simple_place(&e.base),
+        syn::Expr::Paren(e) => e.attrs.is_empty() && is_simple_place(&e.expr),
+        syn::Expr::Group(e) => e.attrs.is_empty() && is_simple_place(&e.expr),
+        _ => false,
+    }
+}
+
+/// A range bound expression with no calls, method calls, assignments, or mutable borrows,
+/// so evaluating the bounds before indexing cannot reorder observable side effects with
+/// a custom `Deref` on the indexed container.
+fn is_pure_range_bound(expr: &syn::Expr) -> bool {
+    if has_conditional_or_skip_attr(expr) {
+        return false;
+    }
+    match expr {
+        syn::Expr::Lit(e) => e.attrs.is_empty(),
+        syn::Expr::Path(e) => e.attrs.is_empty(),
+        syn::Expr::Field(e) => e.attrs.is_empty() && is_pure_range_bound(&e.base),
+        syn::Expr::Paren(e) => e.attrs.is_empty() && is_pure_range_bound(&e.expr),
+        syn::Expr::Group(e) => e.attrs.is_empty() && is_pure_range_bound(&e.expr),
+        syn::Expr::Cast(e) => e.attrs.is_empty() && is_pure_range_bound(&e.expr),
+        syn::Expr::Unary(e) => {
+            e.attrs.is_empty()
+                && !matches!(e.op, syn::UnOp::Deref(_))
+                && is_pure_range_bound(&e.expr)
+        }
+        syn::Expr::Binary(e) => {
+            e.attrs.is_empty()
+                && !matches!(
+                    e.op,
+                    syn::BinOp::AddAssign(_)
+                        | syn::BinOp::SubAssign(_)
+                        | syn::BinOp::MulAssign(_)
+                        | syn::BinOp::DivAssign(_)
+                        | syn::BinOp::RemAssign(_)
+                        | syn::BinOp::BitXorAssign(_)
+                        | syn::BinOp::BitAndAssign(_)
+                        | syn::BinOp::BitOrAssign(_)
+                        | syn::BinOp::ShlAssign(_)
+                        | syn::BinOp::ShrAssign(_)
+                )
+                && is_pure_range_bound(&e.left)
+                && is_pure_range_bound(&e.right)
+        }
+        _ => false,
+    }
+}
+
+impl Finder<'_> {
+    fn try_record_indexed_range(
+        &mut self,
+        mode: RangeIndexMode,
+        outer_start: usize,
+        outer_span: Span,
+        idx: &syn::ExprIndex,
+    ) {
+        if self.const_depth > 0 || !idx.attrs.is_empty() || !is_simple_place(&idx.expr) {
+            return;
+        }
+        let syn::Expr::Range(range) = strip_parens_ref(&idx.index) else {
+            return;
+        };
+        let (Some(from), Some(to)) = (&range.start, &range.end) else {
+            return;
+        };
+        if !range.attrs.is_empty() || !is_pure_range_bound(from) || !is_pure_range_bound(to) {
+            return;
+        }
+        let (
+            Some((base_start, base_end)),
+            Some((range_start, lhs_end)),
+            Some((rhs_start, range_end)),
+            Some((_, outer_end)),
+        ) = (
+            self.range(idx.expr.span()),
+            self.range(from.span()),
+            self.range(to.span()),
+            self.range(idx.bracket_token.span.close()),
+        )
+        else {
+            return;
+        };
+        if self.indexed_ranges.contains(&range_start)
+            || !in_order(outer_start, base_start)
+            || !in_order(base_end, range_start)
+            || !in_order(lhs_end, rhs_start)
+            || !in_order(range_end, outer_end)
+            || self.source[base_start..base_end].contains('\n')
+        {
+            return;
+        }
+        self.indexed_ranges.insert(range_start);
+        let at = outer_span.start();
+        let kind = SiteKind::Range {
+            inclusive: matches!(range.limits, syn::RangeLimits::Closed(_)),
+            lhs: self.source[range_start..lhs_end].to_string(),
+            rhs: self.source[rhs_start..range_end].to_string(),
+            gap: (lhs_end, rhs_start),
+            index: Some(RangeIndex {
+                mode,
+                base: self.source[base_start..base_end].to_string(),
+                head: (outer_start, range_start),
+                close_bracket: (range_end, outer_end),
+            }),
+        };
+        self.add(Site {
+            id: 0,
+            kind,
+            line: at.line,
+            column: at.column + 1,
+            start: outer_start,
+            end: outer_end,
+            text: self.source[range_start..range_end].to_string(),
+        });
     }
 }

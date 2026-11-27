@@ -803,12 +803,33 @@ pub fn describe(site: &Site, m: Mutation) -> String {
             }
         }
         SiteKind::LiteralSet {
-            receiver, argument, ..
-        } => format!(
-            "without a literal element in `{}.contains({})`",
-            one_line(receiver),
-            one_line(argument)
-        ),
+            receiver,
+            argument,
+            elements,
+            ..
+        } => match m {
+            Mutation::DropLiteralElem(idx) => {
+                if let Some((elem, _, _)) = elements.get(idx as usize) {
+                    format!(
+                        "without `{}` in `{}.contains({})`",
+                        one_line(elem),
+                        one_line(receiver),
+                        one_line(argument)
+                    )
+                } else {
+                    format!(
+                        "without a literal element in `{}.contains({})`",
+                        one_line(receiver),
+                        one_line(argument)
+                    )
+                }
+            }
+            _ => format!(
+                "without a literal element in `{}.contains({})`",
+                one_line(receiver),
+                one_line(argument)
+            ),
+        },
         SiteKind::Logic { and, lhs, rhs, .. } => {
             let (lhs, rhs) = (one_line(lhs), one_line(rhs));
             match m {
@@ -1502,6 +1523,35 @@ pub fn return_gap_finding(
         survivors: vec![describe(site, Mutation::Const(always))],
         survivor_count: 1,
         add_tests: vec![format!("a case where `{name}` returns {other}")],
+        observed: None,
+        verified,
+    })
+}
+
+/// Input gap at a `[lit1, lit2, ...].contains(&x)` site where no test matched one of the
+/// literal elements, so removing that element cannot change the result for any test.
+pub fn literal_set_gap_finding(
+    file: &str,
+    site: &Site,
+    elem_idx: u8,
+    verified: bool,
+) -> Option<Finding> {
+    let SiteKind::LiteralSet {
+        argument, elements, ..
+    } = &site.kind
+    else {
+        return None;
+    };
+    let (elem, _, _) = elements.get(elem_idx as usize)?;
+    Some(Finding::InputGap {
+        at: location(file, site),
+        survivors: vec![describe(site, Mutation::DropLiteralElem(elem_idx))],
+        survivor_count: 1,
+        add_tests: vec![format!(
+            "a case where `{}` matches `{}`",
+            one_line(argument),
+            one_line(elem)
+        )],
         observed: None,
         verified,
     })
@@ -3033,6 +3083,7 @@ mod tests {
                 lhs: "0".into(),
                 rhs: "n".into(),
                 gap: (0, 0),
+                index: None,
             },
             ..assign.clone()
         };
@@ -3043,6 +3094,7 @@ mod tests {
                 lhs: "1".into(),
                 rhs: "n".into(),
                 gap: (0, 0),
+                index: None,
             },
             ..assign.clone()
         };
