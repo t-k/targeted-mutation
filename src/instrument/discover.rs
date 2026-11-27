@@ -2825,7 +2825,7 @@ fn is_infallible_bound(expr: &syn::Expr) -> bool {
     match expr {
         syn::Expr::Paren(e) => is_infallible_bound(&e.expr),
         syn::Expr::Group(e) => is_infallible_bound(&e.expr),
-        syn::Expr::Cast(e) if e.attrs.is_empty() => is_infallible_bound(&e.expr),
+        syn::Expr::Cast(e) if e.attrs.is_empty() => is_infallible_cast_source(&e.expr),
         syn::Expr::Lit(e) => e.attrs.is_empty(),
         syn::Expr::Unary(syn::ExprUnary {
             attrs,
@@ -2839,6 +2839,26 @@ fn is_infallible_bound(expr: &syn::Expr) -> bool {
             ..
         }) if attrs.is_empty() => is_infallible_bound(expr),
         other => is_plain_place(other),
+    }
+}
+
+/// A cast source that cannot trigger user-defined `Deref` or any side effect.
+fn is_infallible_cast_source(expr: &syn::Expr) -> bool {
+    if has_conditional_or_skip_attr(expr) {
+        return false;
+    }
+    match expr {
+        syn::Expr::Paren(e) => is_infallible_cast_source(&e.expr),
+        syn::Expr::Group(e) => is_infallible_cast_source(&e.expr),
+        syn::Expr::Lit(e) => e.attrs.is_empty(),
+        syn::Expr::Path(e) => e.attrs.is_empty(),
+        syn::Expr::Cast(e) => e.attrs.is_empty() && is_infallible_cast_source(&e.expr),
+        syn::Expr::Unary(syn::ExprUnary {
+            attrs,
+            op: syn::UnOp::Neg(_),
+            expr,
+        }) if attrs.is_empty() => matches!(expr.as_ref(), syn::Expr::Lit(_)),
+        _ => false,
     }
 }
 

@@ -2298,7 +2298,7 @@ macro_rules! tmt_clamp_ints {
         }
     )*};
 }
-tmt_clamp_ints!(i8 i16 i32 i64 isize u8 u16 u32 u64 usize);
+tmt_clamp_ints!(i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize);
 
 macro_rules! tmt_clamp_floats {
     ($($t:ty)*) => {$(

@@ -699,7 +699,7 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     end: call.1,
                     phase: 1,
                     order: 0,
-                    text: "), (".into(),
+                    text: "), &*(".into(),
                     site: site.id,
                 });
                 edits.push(Edit {

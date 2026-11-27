@@ -6712,6 +6712,12 @@ pub fn in_open_range_gap(x: u32) -> bool {
     (1..10).contains(&x)
 }
 
+pub fn range_contains_mut_reborrow(x: &mut u32) -> bool {
+    let hit = (1..=5).contains(x);
+    *x += 1;
+    hit
+}
+
 pub fn get_slice(xs: &[u8], a: usize, b: usize) -> Option<&[u8]> {
     xs.get(a..b)
 }
@@ -6728,6 +6734,10 @@ pub fn get_mut_slice(xs: &mut [u8], a: usize, b: usize) -> bool {
 }
 
 pub fn clamp_with_cast(x: u128) -> u128 {
+    x.clamp(1, i16::MAX as u128)
+}
+
+pub fn clamp_with_cast_gap(x: u128) -> u128 {
     x.clamp(1, i16::MAX as u128)
 }
 
@@ -6768,6 +6778,13 @@ mod tests {
         assert_eq!(clamp_with_cast(0), 1);
         assert_eq!(clamp_with_cast(100), 100);
         assert_eq!(clamp_with_cast(100_000), i16::MAX as u128);
+        // Never exceeds upper bound -> proves `u128` ClampPrim is active (not opaque).
+        assert_eq!(clamp_with_cast_gap(0), 1);
+        assert_eq!(clamp_with_cast_gap(100), 100);
+
+        let mut v = 5u32;
+        assert!(range_contains_mut_reborrow(&mut v));
+        assert_eq!(v, 6);
 
         assert_eq!(first_match(&[1, 2, 1], 1), Some(0));
         assert_eq!(last_match(&[1, 2, 1], 1), Some(2));
@@ -6813,17 +6830,32 @@ mod tests {
             .any(|f| f["code"] == "('0'..='9').contains(&c)"),
         "expected digit range contains to be caught: {report:#}"
     );
+    // `clamp_with_cast_gap` never exceeds upper bound -> provable input_gap on `u128`.
+    assert!(
+        findings.iter().any(|f| {
+            f["kind"] == "input_gap"
+                && f["item"] == "clamp_with_cast_gap"
+                && f["survivors"]
+                    .as_array()
+                    .is_some_and(|s| s.iter().any(|v| v == "`x.max(1)`"))
+        }),
+        "expected u128 clamp input_gap on clamp_with_cast_gap: {report:#}"
+    );
     // `first_match`, `last_match`, `get_slice`, `get_mut_slice`, `clamp_with_cast` all caught.
     for caught_code in [
         "xs.iter().position(|&b| b == target)",
         "xs.iter().rposition(|&b| b == target)",
         "a..b",
         "a..=b",
-        "x.clamp(1, i16::MAX as u128)",
+        "(1..=5).contains(x)",
     ] {
         assert!(
             !findings.iter().any(|f| f["code"] == caught_code),
             "expected `{caught_code}` to be caught: {report:#}"
         );
     }
+    assert!(
+        !findings.iter().any(|f| f["item"] == "clamp_with_cast"),
+        "expected clamp_with_cast to be fully caught: {report:#}"
+    );
 }
