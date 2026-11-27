@@ -7,6 +7,8 @@
 
 **Targeted mutation testing for Rust (`cargo tmt`)**: finds the realistic wrong implementations your tests would let through — and tells you the **exact input or assertion** that catches them.
 
+> Other languages: [JavaScript and TypeScript](https://github.com/t-k/targeted-mutation-ts) · [Go](https://github.com/t-k/targeted-mutation-go) · [Swift](https://github.com/t-k/targeted-mutation-swift) · [Python](https://github.com/t-k/targeted-mutation-python)
+
 ## Why targeted mutation testing?
 
 Classic mutation testing mutates code blindly (`<` → `<=`), recompiles the crate for every mutant, runs the whole test suite each time, and leaves you with *"mutant survived"* to diagnose by hand.
