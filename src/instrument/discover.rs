@@ -16,8 +16,8 @@ use super::cfg::{
     infer_bit_value_type, is_prim_type_name, is_skipped, is_test_only, parse_local_bit_type,
 };
 use super::model::{
-    ArithOp, ArmGuard, Discovery, LiteralSide, LocalBitType, NO_ID, RoundingOp, Site, SiteKind,
-    TestModule,
+    ArithOp, ArmGuard, BitCountOp, Discovery, EndianOp, LiteralSide, LocalBitType, NO_ID,
+    RoundingOp, SaturatingOp, Site, SiteKind, TestModule, TrimOp,
 };
 
 /// Finds the sites in one source file, numbering them from `first_id`.
@@ -66,6 +66,8 @@ pub(crate) fn discover_parsed(
         found: Discovery::default(),
         local_macros,
         const_depth: 0,
+        in_loop: false,
+        loop_allows_unit_break: false,
         error_values,
         for_ranges: std::collections::HashSet::new(),
         probed_cast_spans: std::collections::HashSet::new(),
@@ -85,6 +87,12 @@ struct Finder<'s> {
     found: Discovery,
     /// How many `const fn` the visitor is inside of.
     const_depth: usize,
+    /// Whether the visitor is directly inside a loop body (reset across functions/closures).
+    in_loop: bool,
+    /// Whether the innermost enclosing loop is a `for` or `while` (always unit-typed, so
+    /// inserting a value-less `break;` for a `continue` mutation cannot conflict with a
+    /// value-bearing `break expr;` or diverging `loop`).
+    loop_allows_unit_break: bool,
     /// Where the ranges start that a `for` runs through directly.
     for_ranges: std::collections::HashSet<usize>,
     /// Source byte spans `(start, end)` already wrapped with a runtime cast-type probe.
@@ -1464,6 +1472,10 @@ impl<'ast> Visit<'ast> for Finder<'_> {
         if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) {
             // Nothing in a `const fn` can ask at run time which mutant is on.
             let constant = node.sig.constness.is_some() as usize;
+            let prev_in_loop = self.in_loop;
+            let prev_unit_break = self.loop_allows_unit_break;
+            self.in_loop = false;
+            self.loop_allows_unit_break = false;
             self.const_depth += constant;
             self.function_sites(&node.attrs, &node.sig, &node.block);
             self.push_type_scope();
@@ -1471,6 +1483,8 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             visit::visit_item_fn(self, node);
             self.pop_type_scope();
             self.const_depth -= constant;
+            self.in_loop = prev_in_loop;
+            self.loop_allows_unit_break = prev_unit_break;
         }
     }
 
@@ -1478,6 +1492,10 @@ impl<'ast> Visit<'ast> for Finder<'_> {
         if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) {
             // Nothing in a `const fn` can ask at run time which mutant is on.
             let constant = node.sig.constness.is_some() as usize;
+            let prev_in_loop = self.in_loop;
+            let prev_unit_break = self.loop_allows_unit_break;
+            self.in_loop = false;
+            self.loop_allows_unit_break = false;
             self.const_depth += constant;
             self.function_sites(&node.attrs, &node.sig, &node.block);
             self.push_type_scope();
@@ -1485,12 +1503,18 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             visit::visit_impl_item_fn(self, node);
             self.pop_type_scope();
             self.const_depth -= constant;
+            self.in_loop = prev_in_loop;
+            self.loop_allows_unit_break = prev_unit_break;
         }
     }
 
     fn visit_trait_item_fn(&mut self, node: &'ast syn::TraitItemFn) {
         if !is_test_only(&node.attrs) && !is_skipped(&node.attrs) {
             let constant = node.sig.constness.is_some() as usize;
+            let prev_in_loop = self.in_loop;
+            let prev_unit_break = self.loop_allows_unit_break;
+            self.in_loop = false;
+            self.loop_allows_unit_break = false;
             self.const_depth += constant;
             if let Some(body) = &node.default {
                 self.function_sites(&node.attrs, &node.sig, body);
@@ -1500,6 +1524,8 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             visit::visit_trait_item_fn(self, node);
             self.pop_type_scope();
             self.const_depth -= constant;
+            self.in_loop = prev_in_loop;
+            self.loop_allows_unit_break = prev_unit_break;
         }
     }
 
@@ -1511,6 +1537,10 @@ impl<'ast> Visit<'ast> for Finder<'_> {
 
     fn visit_expr_closure(&mut self, node: &'ast syn::ExprClosure) {
         if node.constness.is_none() {
+            let prev_in_loop = self.in_loop;
+            let prev_unit_break = self.loop_allows_unit_break;
+            self.in_loop = false;
+            self.loop_allows_unit_break = false;
             self.push_type_scope();
             for pat in &node.inputs {
                 if let syn::Pat::Type(typed) = pat {
@@ -1521,7 +1551,19 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             }
             visit::visit_expr_closure(self, node);
             self.pop_type_scope();
+            self.in_loop = prev_in_loop;
+            self.loop_allows_unit_break = prev_unit_break;
         }
+    }
+
+    fn visit_expr_async(&mut self, node: &'ast syn::ExprAsync) {
+        let prev_in_loop = self.in_loop;
+        let prev_unit_break = self.loop_allows_unit_break;
+        self.in_loop = false;
+        self.loop_allows_unit_break = false;
+        visit::visit_expr_async(self, node);
+        self.in_loop = prev_in_loop;
+        self.loop_allows_unit_break = prev_unit_break;
     }
 
     fn visit_block(&mut self, node: &'ast syn::Block) {
@@ -1769,6 +1811,171 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             };
             self.push(kind, start, end, node.receiver.span());
         }
+        if let Some(op) = saturating_op(&name)
+            && node.args.len() == 1
+            && node.turbofish.is_none()
+            && node.attrs.is_empty()
+            && let (
+                Some((start, receiver_end)),
+                Some(method),
+                Some((arg_start, arg_end)),
+                Some((_, end)),
+            ) = (
+                self.range(node.receiver.span()),
+                self.range(node.method.span()),
+                self.range(node.args[0].span()),
+                self.range(node.paren_token.span.close()),
+            )
+            && in_order(receiver_end, method.0)
+            && in_order(method.1, arg_start)
+            && in_order(arg_end, end)
+        {
+            let kind = SiteKind::SaturatingArith {
+                op,
+                receiver: self.source[start..receiver_end].to_string(),
+                argument: self.source[arg_start..arg_end].to_string(),
+                call: (receiver_end, arg_start),
+                close: (arg_end, end),
+                method,
+            };
+            self.push(kind, start, end, node.receiver.span());
+        }
+        if let Some(op) = trim_op(&name)
+            && node.args.is_empty()
+            && node.turbofish.is_none()
+            && node.attrs.is_empty()
+            && let (Some((start, receiver_end)), Some(method), Some((_, end))) = (
+                self.range(node.receiver.span()),
+                self.range(node.method.span()),
+                self.range(node.paren_token.span.close()),
+            )
+            && in_order(receiver_end, method.0)
+            && in_order(method.1, end)
+        {
+            let kind = SiteKind::StrTrim {
+                op,
+                receiver: self.source[start..receiver_end].to_string(),
+                call: (receiver_end, end),
+                method,
+            };
+            self.push(kind, start, end, node.receiver.span());
+        }
+        if name == "eq_ignore_ascii_case"
+            && node.args.len() == 1
+            && node.turbofish.is_none()
+            && node.attrs.is_empty()
+            && let (
+                Some((start, receiver_end)),
+                Some(method),
+                Some((arg_start, arg_end)),
+                Some((_, end)),
+            ) = (
+                self.range(node.receiver.span()),
+                self.range(node.method.span()),
+                self.range(node.args[0].span()),
+                self.range(node.paren_token.span.close()),
+            )
+            && in_order(receiver_end, method.0)
+            && in_order(method.1, arg_start)
+            && in_order(arg_end, end)
+        {
+            let kind = SiteKind::StrCaseEq {
+                receiver: self.source[start..receiver_end].to_string(),
+                argument: self.source[arg_start..arg_end].to_string(),
+                call: (receiver_end, arg_start),
+                close: (arg_end, end),
+                method,
+            };
+            self.push(kind, start, end, node.receiver.span());
+        }
+        if name == "abs"
+            && node.args.is_empty()
+            && node.turbofish.is_none()
+            && node.attrs.is_empty()
+            && let (Some((start, receiver_end)), Some(method), Some((_, end))) = (
+                self.range(node.receiver.span()),
+                self.range(node.method.span()),
+                self.range(node.paren_token.span.close()),
+            )
+            && in_order(receiver_end, method.0)
+            && in_order(method.1, end)
+        {
+            let kind = SiteKind::Abs {
+                receiver: self.source[start..receiver_end].to_string(),
+                call: (receiver_end, end),
+                method,
+            };
+            self.push(kind, start, end, node.receiver.span());
+        }
+        if (name == "take" || name == "skip")
+            && node.args.len() == 1
+            && node.turbofish.is_none()
+            && node.attrs.is_empty()
+            && let (
+                Some((start, receiver_end)),
+                Some(method),
+                Some((cnt_start, cnt_end)),
+                Some((_, end)),
+            ) = (
+                self.range(node.receiver.span()),
+                self.range(node.method.span()),
+                self.range(node.args[0].span()),
+                self.range(node.paren_token.span.close()),
+            )
+            && in_order(receiver_end, method.0)
+            && in_order(method.1, cnt_start)
+            && in_order(cnt_end, end)
+        {
+            let kind = SiteKind::IterLimit {
+                take: name == "take",
+                receiver: self.source[start..receiver_end].to_string(),
+                count: self.source[cnt_start..cnt_end].to_string(),
+                call: (receiver_end, cnt_start),
+                close: (cnt_end, end),
+                method,
+            };
+            self.push(kind, start, end, node.receiver.span());
+        }
+        if let Some(op) = endian_op(&name)
+            && node.args.is_empty()
+            && node.turbofish.is_none()
+            && node.attrs.is_empty()
+            && let (Some((start, receiver_end)), Some(method), Some((_, end))) = (
+                self.range(node.receiver.span()),
+                self.range(node.method.span()),
+                self.range(node.paren_token.span.close()),
+            )
+            && in_order(receiver_end, method.0)
+            && in_order(method.1, end)
+        {
+            let kind = SiteKind::EndianSwap {
+                op,
+                receiver: self.source[start..receiver_end].to_string(),
+                call: (receiver_end, end),
+                method,
+            };
+            self.push(kind, start, end, node.receiver.span());
+        }
+        if let Some(op) = bit_count_op(&name)
+            && node.args.is_empty()
+            && node.turbofish.is_none()
+            && node.attrs.is_empty()
+            && let (Some((start, receiver_end)), Some(method), Some((_, end))) = (
+                self.range(node.receiver.span()),
+                self.range(node.method.span()),
+                self.range(node.paren_token.span.close()),
+            )
+            && in_order(receiver_end, method.0)
+            && in_order(method.1, end)
+        {
+            let kind = SiteKind::BitCount {
+                op,
+                receiver: self.source[start..receiver_end].to_string(),
+                call: (receiver_end, end),
+                method,
+            };
+            self.push(kind, start, end, node.receiver.span());
+        }
         if name == "contains"
             && node.args.len() == 1
             && node.turbofish.is_none()
@@ -1881,7 +2088,13 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             _ => self.bind_pat_unknown(&node.pat),
         }
         self.visit_pat(&node.pat);
+        let prev_in_loop = self.in_loop;
+        let prev_unit_break = self.loop_allows_unit_break;
+        self.in_loop = true;
+        self.loop_allows_unit_break = true;
         self.visit_block(&node.body);
+        self.in_loop = prev_in_loop;
+        self.loop_allows_unit_break = prev_unit_break;
         self.pop_type_scope();
     }
 
@@ -1916,8 +2129,66 @@ impl<'ast> Visit<'ast> for Finder<'_> {
         }
         self.push_type_scope();
         self.visit_expr(&node.cond);
+        let prev_in_loop = self.in_loop;
+        let prev_unit_break = self.loop_allows_unit_break;
+        self.in_loop = true;
+        self.loop_allows_unit_break = true;
         self.visit_block(&node.body);
+        self.in_loop = prev_in_loop;
+        self.loop_allows_unit_break = prev_unit_break;
         self.pop_type_scope();
+    }
+
+    fn visit_expr_loop(&mut self, node: &'ast syn::ExprLoop) {
+        for attr in &node.attrs {
+            self.visit_attribute(attr);
+        }
+        if let Some(label) = &node.label {
+            self.visit_label(label);
+        }
+        let prev_in_loop = self.in_loop;
+        let prev_unit_break = self.loop_allows_unit_break;
+        self.in_loop = true;
+        // `loop` may return a non-unit value via `break expr;` or diverge (`!`), so
+        // mutating `continue` into a value-less `break;` could fail to type-check.
+        self.loop_allows_unit_break = false;
+        self.visit_block(&node.body);
+        self.in_loop = prev_in_loop;
+        self.loop_allows_unit_break = prev_unit_break;
+    }
+
+    fn visit_expr_break(&mut self, node: &'ast syn::ExprBreak) {
+        if self.in_loop
+            && node.label.is_none()
+            && node.expr.is_none()
+            && node.attrs.is_empty()
+            && let Some((start, end)) = self.range(node.span())
+        {
+            self.push(
+                SiteKind::LoopCtrl { is_break: true },
+                start,
+                end,
+                node.span(),
+            );
+        }
+        visit::visit_expr_break(self, node);
+    }
+
+    fn visit_expr_continue(&mut self, node: &'ast syn::ExprContinue) {
+        if self.in_loop
+            && self.loop_allows_unit_break
+            && node.label.is_none()
+            && node.attrs.is_empty()
+            && let Some((start, end)) = self.range(node.span())
+        {
+            self.push(
+                SiteKind::LoopCtrl { is_break: false },
+                start,
+                end,
+                node.span(),
+            );
+        }
+        visit::visit_expr_continue(self, node);
     }
 
     fn visit_expr_range(&mut self, node: &'ast syn::ExprRange) {
@@ -2308,6 +2579,47 @@ fn rounding_op(name: &str) -> Option<RoundingOp> {
         "ceil" => Some(RoundingOp::Ceil),
         "round" => Some(RoundingOp::Round),
         "trunc" => Some(RoundingOp::Trunc),
+        _ => None,
+    }
+}
+
+fn saturating_op(name: &str) -> Option<SaturatingOp> {
+    match name {
+        "saturating_add" => Some(SaturatingOp::SatAdd),
+        "saturating_sub" => Some(SaturatingOp::SatSub),
+        "saturating_mul" => Some(SaturatingOp::SatMul),
+        "wrapping_add" => Some(SaturatingOp::WrapAdd),
+        "wrapping_sub" => Some(SaturatingOp::WrapSub),
+        "wrapping_mul" => Some(SaturatingOp::WrapMul),
+        _ => None,
+    }
+}
+
+fn trim_op(name: &str) -> Option<TrimOp> {
+    match name {
+        "trim" => Some(TrimOp::Trim),
+        "trim_start" => Some(TrimOp::TrimStart),
+        "trim_end" => Some(TrimOp::TrimEnd),
+        _ => None,
+    }
+}
+
+fn endian_op(name: &str) -> Option<EndianOp> {
+    match name {
+        "to_be_bytes" => Some(EndianOp::ToBeBytes),
+        "to_le_bytes" => Some(EndianOp::ToLeBytes),
+        "to_be" => Some(EndianOp::ToBe),
+        "to_le" => Some(EndianOp::ToLe),
+        _ => None,
+    }
+}
+
+fn bit_count_op(name: &str) -> Option<BitCountOp> {
+    match name {
+        "leading_zeros" => Some(BitCountOp::LeadingZeros),
+        "trailing_zeros" => Some(BitCountOp::TrailingZeros),
+        "leading_ones" => Some(BitCountOp::LeadingOnes),
+        "trailing_ones" => Some(BitCountOp::TrailingOnes),
         _ => None,
     }
 }

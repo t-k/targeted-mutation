@@ -374,7 +374,7 @@ fn awkward_constructs() {
     // The verdicts match after the extra timeout rechecks.
     let parallel = tmt(&dir, &["--json", "--quiet", "--rebuild", "--jobs", "4"]);
     let parallel: Value = serde_json::from_str(&parallel.stdout).unwrap();
-    assert_eq!(after_confirmed_timeouts(parallel, 2), report);
+    assert_eq!(after_confirmed_timeouts(parallel, 3), report);
     assert_eq!(
         report["unstable"].as_array().unwrap().len(),
         0,

@@ -253,6 +253,24 @@ pub enum Mutant {
     RoundAlt2,
     /// `iter.all(f)` <-> `iter.any(f)`.
     QuantifierSwap,
+    /// `a.saturating_{add,sub,mul}(b)` <-> `a.wrapping_{add,sub,mul}(b)`.
+    SaturatingSwap,
+    /// First alternative trim method (`trim` -> `trim_start`, `trim_start`/`trim_end` -> `trim`).
+    TrimAlt1,
+    /// Second alternative trim method (`trim` -> `trim_end`).
+    TrimAlt2,
+    /// `a.eq_ignore_ascii_case(b)` -> `a == b`.
+    StrExactEq,
+    /// `x.abs()` -> `x`.
+    DropAbs,
+    /// `iter.take(n)` -> `iter.take(usize::MAX)` / `iter.skip(n)` -> `iter.skip(0)`.
+    IterLimitDrop,
+    /// `x.to_be_bytes()` <-> `x.to_le_bytes()`, `x.to_be()` <-> `x.to_le()`.
+    EndianSwap,
+    /// `x.leading_zeros()` <-> `x.trailing_zeros()`, `leading_ones` <-> `trailing_ones`.
+    BitCountSwap,
+    /// `break` <-> `continue`.
+    LoopCtrlSwap,
 }
 
 pub fn parse_mutant(spec: &str) -> Option<(u32, Mutant)> {
@@ -279,6 +297,15 @@ pub fn parse_mutant(spec: &str) -> Option<(u32, Mutant)> {
         "rd1" => Mutant::RoundAlt1,
         "rd2" => Mutant::RoundAlt2,
         "qsw" => Mutant::QuantifierSwap,
+        "sat" => Mutant::SaturatingSwap,
+        "tr1" => Mutant::TrimAlt1,
+        "tr2" => Mutant::TrimAlt2,
+        "seq" => Mutant::StrExactEq,
+        "abs" => Mutant::DropAbs,
+        "ilp" => Mutant::IterLimitDrop,
+        "edn" => Mutant::EndianSwap,
+        "btc" => Mutant::BitCountSwap,
+        "lpc" => Mutant::LoopCtrlSwap,
         _ if m.starts_with("op") => Mutant::Op(m[2..].parse().ok().filter(|c| *c <= NE)?),
         _ if m.starts_with("shf") => {
             Mutant::ShiftF(m[3..].parse().ok().filter(|s: &f64| s.is_finite())?)
@@ -2426,4 +2453,831 @@ impl<'r, 'a, I: ?Sized> AnyQuant<'a, I> for &'r Qnt<'a, I> {
         }
         orig(iter, pred)
     }
+}
+
+/// `a.saturating_{add,sub,mul}(b)` <-> `a.wrapping_{add,sub,mul}(b)`.
+pub struct Sat<'a, A: ?Sized, B>(Cell<Option<(&'a A, B)>>);
+
+impl<'a, A: ?Sized, B> Sat<'a, A, B> {
+    #[inline(always)]
+    pub fn new(a: &'a A, b: B) -> Self {
+        Sat(Cell::new(Some((a, b))))
+    }
+
+    #[inline(always)]
+    fn take(&self) -> (&'a A, B) {
+        self.0.take().expect("operands are taken once")
+    }
+}
+
+pub trait SaturatingPrim<'a, A: ?Sized + 'a, B> {
+    type Out;
+    fn tmt_sat<F: FnOnce(&'a A, B) -> Self::Out>(&self, site: u32, op: u8, orig: F) -> Self::Out;
+}
+
+pub trait AnySaturating<'a, A: ?Sized + 'a, B> {
+    fn tmt_sat<R, F: FnOnce(&'a A, B) -> R>(&self, site: u32, op: u8, orig: F) -> R;
+}
+
+impl<'r, 'a, A: ?Sized, B> AnySaturating<'a, A, B> for &'r Sat<'a, A, B> {
+    fn tmt_sat<R, F: FnOnce(&'a A, B) -> R>(&self, site: u32, _op: u8, orig: F) -> R {
+        let (a, b) = self.take();
+        if !idle(site) {
+            record_bits(b'A', site, ARITH_OPAQUE);
+        }
+        orig(a, b)
+    }
+}
+
+macro_rules! tmt_sat_ints {
+    ($($t:ty)*) => {$(
+        impl<'a> SaturatingPrim<'a, $t, $t> for Sat<'a, $t, $t> {
+            type Out = $t;
+            #[inline(always)]
+            fn tmt_sat<F: FnOnce(&'a $t, $t) -> $t>(&self, site: u32, op: u8, orig: F) -> $t {
+                let (a, b) = self.take();
+                if idle(site) {
+                    return orig(a, b);
+                }
+                let x = *a;
+                let swapped = match op {
+                    0 => x.wrapping_add(b),
+                    1 => x.wrapping_sub(b),
+                    2 => x.wrapping_mul(b),
+                    3 => x.saturating_add(b),
+                    4 => x.saturating_sub(b),
+                    _ => x.saturating_mul(b),
+                };
+                if mutant_at(site) == Some(Mutant::SaturatingSwap) {
+                    return swapped;
+                }
+                let original = orig(a, b);
+                if !bits_known(b'A', site, ARITH_SAME | ARITH_DIFFERS) {
+                    record_bits(
+                        b'A',
+                        site,
+                        if original == swapped { ARITH_SAME } else { ARITH_DIFFERS },
+                    );
+                }
+                original
+            }
+        }
+        impl<'a, 'b> SaturatingPrim<'a, &'b $t, $t> for Sat<'a, &'b $t, $t> {
+            type Out = $t;
+            #[inline(always)]
+            fn tmt_sat<F: FnOnce(&'a &'b $t, $t) -> $t>(&self, site: u32, op: u8, orig: F) -> $t {
+                let (a, b) = self.take();
+                (&Sat::new(*a, b)).tmt_sat(site, op, |_, b| orig(a, b))
+            }
+        }
+        impl<'a, 'b> SaturatingPrim<'a, &'b mut $t, $t> for Sat<'a, &'b mut $t, $t> {
+            type Out = $t;
+            #[inline(always)]
+            fn tmt_sat<F: FnOnce(&'a &'b mut $t, $t) -> $t>(&self, site: u32, op: u8, orig: F) -> $t {
+                let (a, b) = self.take();
+                (&Sat::new(&**a, b)).tmt_sat(site, op, |_, b| orig(a, b))
+            }
+        }
+        impl<'a, 'b, 'c> SaturatingPrim<'a, &'b &'c $t, $t> for Sat<'a, &'b &'c $t, $t> {
+            type Out = $t;
+            #[inline(always)]
+            fn tmt_sat<F: FnOnce(&'a &'b &'c $t, $t) -> $t>(&self, site: u32, op: u8, orig: F) -> $t {
+                let (a, b) = self.take();
+                (&Sat::new(**a, b)).tmt_sat(site, op, |_, b| orig(a, b))
+            }
+        }
+    )*};
+}
+tmt_sat_ints!(i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize);
+
+/// `s.trim()` / `.trim_start()` / `.trim_end()` on strings.
+pub struct Trm<'a, A: ?Sized>(pub &'a A);
+
+pub trait StrTrimPrim<'a, A: ?Sized + 'a> {
+    type Out;
+    fn tmt_str_trim<F: FnOnce(&'a A) -> Self::Out>(&self, site: u32, op: u8, orig: F) -> Self::Out;
+}
+
+pub trait AnyStrTrim<'a, A: ?Sized + 'a> {
+    fn tmt_str_trim<R, F: FnOnce(&'a A) -> R>(&self, site: u32, op: u8, orig: F) -> R;
+}
+
+#[inline(always)]
+fn eval_str_trim<'s>(site: u32, op: u8, s: &'s str) -> Option<&'s str> {
+    match mutant_at(site) {
+        Some(Mutant::TrimAlt1) => {
+            return Some(match op {
+                0 => s.trim_start(),
+                _ => s.trim(),
+            });
+        }
+        Some(Mutant::TrimAlt2) => {
+            return Some(s.trim_end());
+        }
+        _ => {}
+    }
+    let want = if op == 0 {
+        ARITH_SAME | ARITH_DIFFERS | ARITH_SAME2 | ARITH_DIFFERS2
+    } else {
+        ARITH_SAME | ARITH_DIFFERS
+    };
+    if !bits_known(b'A', site, want) {
+        let same_slice =
+            |a: &str, b: &str| a.len() == b.len() && core::ptr::eq(a.as_ptr(), b.as_ptr());
+        let trimmed = s.trim();
+        let bits = match op {
+            0 => {
+                let b1 = if same_slice(trimmed, s.trim_start()) {
+                    ARITH_SAME
+                } else {
+                    ARITH_DIFFERS
+                };
+                let b2 = if same_slice(trimmed, s.trim_end()) {
+                    ARITH_SAME2
+                } else {
+                    ARITH_DIFFERS2
+                };
+                b1 | b2
+            }
+            1 => {
+                if same_slice(s.trim_start(), trimmed) {
+                    ARITH_SAME
+                } else {
+                    ARITH_DIFFERS
+                }
+            }
+            _ => {
+                if same_slice(s.trim_end(), trimmed) {
+                    ARITH_SAME
+                } else {
+                    ARITH_DIFFERS
+                }
+            }
+        };
+        record_bits(b'A', site, bits);
+    }
+    None
+}
+
+impl<'a> StrTrimPrim<'a, str> for Trm<'a, str> {
+    type Out = &'a str;
+    #[inline(always)]
+    fn tmt_str_trim<F: FnOnce(&'a str) -> &'a str>(&self, site: u32, op: u8, orig: F) -> &'a str {
+        if idle(site) {
+            return orig(self.0);
+        }
+        if let Some(m) = eval_str_trim(site, op, self.0) {
+            return m;
+        }
+        orig(self.0)
+    }
+}
+
+impl<'a> StrTrimPrim<'a, String> for Trm<'a, String> {
+    type Out = &'a str;
+    #[inline(always)]
+    fn tmt_str_trim<F: FnOnce(&'a String) -> &'a str>(
+        &self,
+        site: u32,
+        op: u8,
+        orig: F,
+    ) -> &'a str {
+        if idle(site) {
+            return orig(self.0);
+        }
+        if let Some(m) = eval_str_trim(site, op, self.0.as_str()) {
+            return m;
+        }
+        orig(self.0)
+    }
+}
+
+impl<'a, 'b> StrTrimPrim<'a, &'b str> for Trm<'a, &'b str> {
+    type Out = &'b str;
+    #[inline(always)]
+    fn tmt_str_trim<F: FnOnce(&'a &'b str) -> &'b str>(
+        &self,
+        site: u32,
+        op: u8,
+        orig: F,
+    ) -> &'b str {
+        if idle(site) {
+            return orig(self.0);
+        }
+        if let Some(m) = eval_str_trim(site, op, *self.0) {
+            return m;
+        }
+        orig(self.0)
+    }
+}
+
+impl<'a, 'b> StrTrimPrim<'a, &'b String> for Trm<'a, &'b String> {
+    type Out = &'b str;
+    #[inline(always)]
+    fn tmt_str_trim<F: FnOnce(&'a &'b String) -> &'b str>(
+        &self,
+        site: u32,
+        op: u8,
+        orig: F,
+    ) -> &'b str {
+        if idle(site) {
+            return orig(self.0);
+        }
+        if let Some(m) = eval_str_trim(site, op, (*self.0).as_str()) {
+            return m;
+        }
+        orig(self.0)
+    }
+}
+
+impl<'a, 'b> StrTrimPrim<'a, &'b mut String> for Trm<'a, &'b mut String> {
+    type Out = &'a str;
+    #[inline(always)]
+    fn tmt_str_trim<F: FnOnce(&'a &'b mut String) -> &'a str>(
+        &self,
+        site: u32,
+        op: u8,
+        orig: F,
+    ) -> &'a str {
+        if idle(site) {
+            return orig(self.0);
+        }
+        if let Some(m) = eval_str_trim(site, op, self.0.as_str()) {
+            return m;
+        }
+        orig(self.0)
+    }
+}
+
+impl<'a, 'b, 'c> StrTrimPrim<'a, &'b &'c str> for Trm<'a, &'b &'c str> {
+    type Out = &'c str;
+    #[inline(always)]
+    fn tmt_str_trim<F: FnOnce(&'a &'b &'c str) -> &'c str>(
+        &self,
+        site: u32,
+        op: u8,
+        orig: F,
+    ) -> &'c str {
+        if idle(site) {
+            return orig(self.0);
+        }
+        if let Some(m) = eval_str_trim(site, op, **self.0) {
+            return m;
+        }
+        orig(self.0)
+    }
+}
+
+impl<'r, 'a, A: ?Sized> AnyStrTrim<'a, A> for &'r Trm<'a, A> {
+    fn tmt_str_trim<R, F: FnOnce(&'a A) -> R>(&self, site: u32, _op: u8, orig: F) -> R {
+        if !idle(site) {
+            record_bits(b'A', site, ARITH_OPAQUE);
+        }
+        orig(self.0)
+    }
+}
+
+/// `a.eq_ignore_ascii_case(b)` -> `a == b`.
+pub trait TmtAsciiBytes {
+    fn tmt_ascii_bytes(&self) -> &[u8];
+}
+
+impl TmtAsciiBytes for str {
+    #[inline(always)]
+    fn tmt_ascii_bytes(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl TmtAsciiBytes for String {
+    #[inline(always)]
+    fn tmt_ascii_bytes(&self) -> &[u8] {
+        self.as_bytes()
+    }
+}
+
+impl TmtAsciiBytes for [u8] {
+    #[inline(always)]
+    fn tmt_ascii_bytes(&self) -> &[u8] {
+        self
+    }
+}
+
+impl TmtAsciiBytes for Vec<u8> {
+    #[inline(always)]
+    fn tmt_ascii_bytes(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl TmtAsciiBytes for u8 {
+    #[inline(always)]
+    fn tmt_ascii_bytes(&self) -> &[u8] {
+        std::slice::from_ref(self)
+    }
+}
+
+impl<const N: usize> TmtAsciiBytes for [u8; N] {
+    #[inline(always)]
+    fn tmt_ascii_bytes(&self) -> &[u8] {
+        self.as_slice()
+    }
+}
+
+impl<T: ?Sized + TmtAsciiBytes> TmtAsciiBytes for &T {
+    #[inline(always)]
+    fn tmt_ascii_bytes(&self) -> &[u8] {
+        (*self).tmt_ascii_bytes()
+    }
+}
+
+impl<T: ?Sized + TmtAsciiBytes> TmtAsciiBytes for &mut T {
+    #[inline(always)]
+    fn tmt_ascii_bytes(&self) -> &[u8] {
+        (**self).tmt_ascii_bytes()
+    }
+}
+
+pub struct Ceq<'a, A: ?Sized, B>(Cell<Option<(&'a A, B)>>);
+
+impl<'a, A: ?Sized, B> Ceq<'a, A, B> {
+    #[inline(always)]
+    pub fn new(a: &'a A, b: B) -> Self {
+        Ceq(Cell::new(Some((a, b))))
+    }
+
+    #[inline(always)]
+    fn take(&self) -> (&'a A, B) {
+        self.0.take().expect("operands are taken once")
+    }
+}
+
+pub trait CaseEqPrim<'a, A: ?Sized + 'a, B> {
+    fn tmt_case_eq<F: FnOnce(&'a A, B) -> bool>(&self, site: u32, orig: F) -> bool;
+}
+
+pub trait AnyCaseEq<'a, A: ?Sized + 'a, B> {
+    fn tmt_case_eq<R, F: FnOnce(&'a A, B) -> R>(&self, site: u32, orig: F) -> R;
+}
+
+impl<'a, A: ?Sized + TmtAsciiBytes, B: TmtAsciiBytes> CaseEqPrim<'a, A, B> for Ceq<'a, A, B> {
+    #[inline(always)]
+    fn tmt_case_eq<F: FnOnce(&'a A, B) -> bool>(&self, site: u32, orig: F) -> bool {
+        let (a, b) = self.take();
+        if idle(site) {
+            return orig(a, b);
+        }
+        let exact = a.tmt_ascii_bytes() == b.tmt_ascii_bytes();
+        if mutant_at(site) == Some(Mutant::StrExactEq) {
+            return exact;
+        }
+        let original = orig(a, b);
+        if !bits_known(b'A', site, ARITH_SAME | ARITH_DIFFERS) {
+            record_bits(
+                b'A',
+                site,
+                if original == exact {
+                    ARITH_SAME
+                } else {
+                    ARITH_DIFFERS
+                },
+            );
+        }
+        original
+    }
+}
+
+impl<'r, 'a, A: ?Sized, B> AnyCaseEq<'a, A, B> for &'r Ceq<'a, A, B> {
+    fn tmt_case_eq<R, F: FnOnce(&'a A, B) -> R>(&self, site: u32, orig: F) -> R {
+        let (a, b) = self.take();
+        if !idle(site) {
+            record_bits(b'A', site, ARITH_OPAQUE);
+        }
+        orig(a, b)
+    }
+}
+
+/// `x.abs()` -> `x` on signed integers and floats.
+pub struct AbsWrap<'a, A: ?Sized>(pub &'a A);
+
+pub trait AbsPrim {
+    type Out;
+    fn tmt_abs<F: FnOnce() -> Self::Out>(&self, site: u32, orig: F) -> Self::Out;
+}
+
+pub trait AnyAbs {
+    fn tmt_abs<R, F: FnOnce() -> R>(&self, site: u32, orig: F) -> R;
+}
+
+impl<'r, 'a, A: ?Sized> AnyAbs for &'r AbsWrap<'a, A> {
+    fn tmt_abs<R, F: FnOnce() -> R>(&self, site: u32, orig: F) -> R {
+        if !idle(site) {
+            record_bits(b'A', site, ARITH_OPAQUE);
+        }
+        orig()
+    }
+}
+
+macro_rules! tmt_abs_signed {
+    ($($t:ty)*) => {$(
+        impl<'a> AbsPrim for AbsWrap<'a, $t> {
+            type Out = $t;
+            #[inline(always)]
+            fn tmt_abs<F: FnOnce() -> $t>(&self, site: u32, orig: F) -> $t {
+                if idle(site) {
+                    return orig();
+                }
+                let x = *self.0;
+                if mutant_at(site) == Some(Mutant::DropAbs) {
+                    return x;
+                }
+                if !bits_known(b'A', site, ARITH_SAME | ARITH_DIFFERS) {
+                    // `MIN.abs()` panics with overflow checks enabled, and wraps back to
+                    // `MIN` (matching `x`) when overflow checks are disabled.
+                    let differs = if x == <$t>::MIN {
+                        cfg!(debug_assertions)
+                    } else {
+                        x < 0
+                    };
+                    record_bits(b'A', site, if differs { ARITH_DIFFERS } else { ARITH_SAME });
+                }
+                orig()
+            }
+        }
+        impl<'a, 'b> AbsPrim for AbsWrap<'a, &'b $t> {
+            type Out = $t;
+            #[inline(always)]
+            fn tmt_abs<F: FnOnce() -> $t>(&self, site: u32, orig: F) -> $t {
+                (&AbsWrap::<$t>(*self.0)).tmt_abs(site, orig)
+            }
+        }
+        impl<'a, 'b> AbsPrim for AbsWrap<'a, &'b mut $t> {
+            type Out = $t;
+            #[inline(always)]
+            fn tmt_abs<F: FnOnce() -> $t>(&self, site: u32, orig: F) -> $t {
+                (&AbsWrap::<$t>(&**self.0)).tmt_abs(site, orig)
+            }
+        }
+        impl<'a, 'b, 'c> AbsPrim for AbsWrap<'a, &'b &'c $t> {
+            type Out = $t;
+            #[inline(always)]
+            fn tmt_abs<F: FnOnce() -> $t>(&self, site: u32, orig: F) -> $t {
+                (&AbsWrap::<$t>(**self.0)).tmt_abs(site, orig)
+            }
+        }
+    )*};
+}
+tmt_abs_signed!(i8 i16 i32 i64 i128 isize);
+
+macro_rules! tmt_abs_floats {
+    ($($t:ty)*) => {$(
+        impl<'a> AbsPrim for AbsWrap<'a, $t> {
+            type Out = $t;
+            #[inline(always)]
+            fn tmt_abs<F: FnOnce() -> $t>(&self, site: u32, orig: F) -> $t {
+                if idle(site) {
+                    return orig();
+                }
+                let x = *self.0;
+                if mutant_at(site) == Some(Mutant::DropAbs) {
+                    return x;
+                }
+                if !bits_known(b'A', site, ARITH_SAME | ARITH_DIFFERS) {
+                    // Use bitwise comparison so `-0.0` and `-NaN` (distinguishable via
+                    // `to_bits()` or `1.0 / x`) are treated as differing.
+                    let differs = x.abs().to_bits() != x.to_bits();
+                    record_bits(b'A', site, if differs { ARITH_DIFFERS } else { ARITH_SAME });
+                }
+                orig()
+            }
+        }
+        impl<'a, 'b> AbsPrim for AbsWrap<'a, &'b $t> {
+            type Out = $t;
+            #[inline(always)]
+            fn tmt_abs<F: FnOnce() -> $t>(&self, site: u32, orig: F) -> $t {
+                (&AbsWrap::<$t>(*self.0)).tmt_abs(site, orig)
+            }
+        }
+        impl<'a, 'b> AbsPrim for AbsWrap<'a, &'b mut $t> {
+            type Out = $t;
+            #[inline(always)]
+            fn tmt_abs<F: FnOnce() -> $t>(&self, site: u32, orig: F) -> $t {
+                (&AbsWrap::<$t>(&**self.0)).tmt_abs(site, orig)
+            }
+        }
+        impl<'a, 'b, 'c> AbsPrim for AbsWrap<'a, &'b &'c $t> {
+            type Out = $t;
+            #[inline(always)]
+            fn tmt_abs<F: FnOnce() -> $t>(&self, site: u32, orig: F) -> $t {
+                (&AbsWrap::<$t>(**self.0)).tmt_abs(site, orig)
+            }
+        }
+    )*};
+}
+tmt_abs_floats!(f32 f64);
+
+/// `iter.take(n)` -> `iter.take(usize::MAX)` / `iter.skip(n)` -> `iter.skip(0)`.
+pub struct Ilm<I, N>(Cell<Option<(I, N)>>);
+
+impl<I, N> Ilm<I, N> {
+    #[inline(always)]
+    pub fn new(iter: I, n: N) -> Self {
+        Ilm(Cell::new(Some((iter, n))))
+    }
+
+    #[inline(always)]
+    fn take(&self) -> (I, N) {
+        self.0.take().expect("operands are taken once")
+    }
+}
+
+pub trait IterLimitPrim<I, N> {
+    fn tmt_iter_limit<R, F: FnOnce(I, N) -> R>(&self, site: u32, take: bool, orig: F) -> R;
+}
+
+pub trait AnyIterLimit<I, N> {
+    fn tmt_iter_limit<R, F: FnOnce(I, N) -> R>(&self, site: u32, take: bool, orig: F) -> R;
+}
+
+impl<I: Iterator> IterLimitPrim<I, usize> for Ilm<I, usize> {
+    #[inline(always)]
+    fn tmt_iter_limit<R, F: FnOnce(I, usize) -> R>(&self, site: u32, take: bool, orig: F) -> R {
+        let (iter, n) = self.take();
+        if idle(site) {
+            return orig(iter, n);
+        }
+        let drop_val = if take { usize::MAX } else { 0 };
+        if mutant_at(site) == Some(Mutant::IterLimitDrop) {
+            return orig(iter, drop_val);
+        }
+        if !bits_known(b'A', site, ARITH_SAME | ARITH_DIFFERS) {
+            record_bits(
+                b'A',
+                site,
+                if n == drop_val {
+                    ARITH_SAME
+                } else {
+                    ARITH_DIFFERS
+                },
+            );
+        }
+        orig(iter, n)
+    }
+}
+
+impl<'r, I, N> AnyIterLimit<I, N> for &'r Ilm<I, N> {
+    fn tmt_iter_limit<R, F: FnOnce(I, N) -> R>(&self, site: u32, _take: bool, orig: F) -> R {
+        let (iter, n) = self.take();
+        if !idle(site) {
+            record_bits(b'A', site, ARITH_OPAQUE);
+        }
+        orig(iter, n)
+    }
+}
+
+/// `x.to_be_bytes()` <-> `x.to_le_bytes()`, `x.to_be()` <-> `x.to_le()` on multi-byte ints.
+pub struct Endn<'a, A: ?Sized>(pub &'a A);
+
+pub trait EndianPrim {
+    type Bytes;
+    type Int;
+    fn tmt_endian_bytes<F: FnOnce() -> Self::Bytes>(
+        &self,
+        site: u32,
+        to_be: bool,
+        orig: F,
+    ) -> Self::Bytes;
+    fn tmt_endian_int<F: FnOnce() -> Self::Int>(
+        &self,
+        site: u32,
+        to_be: bool,
+        orig: F,
+    ) -> Self::Int;
+}
+
+pub trait AnyEndian {
+    fn tmt_endian_bytes<R, F: FnOnce() -> R>(&self, site: u32, to_be: bool, orig: F) -> R;
+    fn tmt_endian_int<R, F: FnOnce() -> R>(&self, site: u32, to_be: bool, orig: F) -> R;
+}
+
+impl<'r, 'a, A: ?Sized> AnyEndian for &'r Endn<'a, A> {
+    fn tmt_endian_bytes<R, F: FnOnce() -> R>(&self, site: u32, _to_be: bool, orig: F) -> R {
+        if !idle(site) {
+            record_bits(b'A', site, ARITH_OPAQUE);
+        }
+        orig()
+    }
+
+    fn tmt_endian_int<R, F: FnOnce() -> R>(&self, site: u32, _to_be: bool, orig: F) -> R {
+        if !idle(site) {
+            record_bits(b'A', site, ARITH_OPAQUE);
+        }
+        orig()
+    }
+}
+
+macro_rules! tmt_endian_ints {
+    ($($t:ty),* $(,)?) => {$(
+        impl<'a> EndianPrim for Endn<'a, $t> {
+            type Bytes = [u8; core::mem::size_of::<$t>()];
+            type Int = $t;
+            #[inline(always)]
+            fn tmt_endian_bytes<F: FnOnce() -> Self::Bytes>(
+                &self,
+                site: u32,
+                to_be: bool,
+                orig: F,
+            ) -> Self::Bytes {
+                if idle(site) {
+                    return orig();
+                }
+                let x = *self.0;
+                if mutant_at(site) == Some(Mutant::EndianSwap) {
+                    return if to_be { x.to_le_bytes() } else { x.to_be_bytes() };
+                }
+                if !bits_known(b'A', site, ARITH_SAME | ARITH_DIFFERS) {
+                    record_bits(
+                        b'A',
+                        site,
+                        if x == x.swap_bytes() { ARITH_SAME } else { ARITH_DIFFERS },
+                    );
+                }
+                orig()
+            }
+            #[inline(always)]
+            fn tmt_endian_int<F: FnOnce() -> Self::Int>(
+                &self,
+                site: u32,
+                to_be: bool,
+                orig: F,
+            ) -> Self::Int {
+                if idle(site) {
+                    return orig();
+                }
+                let x = *self.0;
+                if mutant_at(site) == Some(Mutant::EndianSwap) {
+                    return if to_be { x.to_le() } else { x.to_be() };
+                }
+                if !bits_known(b'A', site, ARITH_SAME | ARITH_DIFFERS) {
+                    record_bits(
+                        b'A',
+                        site,
+                        if x == x.swap_bytes() { ARITH_SAME } else { ARITH_DIFFERS },
+                    );
+                }
+                orig()
+            }
+        }
+        impl<'a, 'b> EndianPrim for Endn<'a, &'b $t> {
+            type Bytes = [u8; core::mem::size_of::<$t>()];
+            type Int = $t;
+            #[inline(always)]
+            fn tmt_endian_bytes<F: FnOnce() -> Self::Bytes>(
+                &self,
+                site: u32,
+                to_be: bool,
+                orig: F,
+            ) -> Self::Bytes {
+                (&Endn::<$t>(*self.0)).tmt_endian_bytes(site, to_be, orig)
+            }
+            #[inline(always)]
+            fn tmt_endian_int<F: FnOnce() -> Self::Int>(
+                &self,
+                site: u32,
+                to_be: bool,
+                orig: F,
+            ) -> Self::Int {
+                (&Endn::<$t>(*self.0)).tmt_endian_int(site, to_be, orig)
+            }
+        }
+        impl<'a, 'b> EndianPrim for Endn<'a, &'b mut $t> {
+            type Bytes = [u8; core::mem::size_of::<$t>()];
+            type Int = $t;
+            #[inline(always)]
+            fn tmt_endian_bytes<F: FnOnce() -> Self::Bytes>(
+                &self,
+                site: u32,
+                to_be: bool,
+                orig: F,
+            ) -> Self::Bytes {
+                (&Endn::<$t>(&**self.0)).tmt_endian_bytes(site, to_be, orig)
+            }
+            #[inline(always)]
+            fn tmt_endian_int<F: FnOnce() -> Self::Int>(
+                &self,
+                site: u32,
+                to_be: bool,
+                orig: F,
+            ) -> Self::Int {
+                (&Endn::<$t>(&**self.0)).tmt_endian_int(site, to_be, orig)
+            }
+        }
+        impl<'a, 'b, 'c> EndianPrim for Endn<'a, &'b &'c $t> {
+            type Bytes = [u8; core::mem::size_of::<$t>()];
+            type Int = $t;
+            #[inline(always)]
+            fn tmt_endian_bytes<F: FnOnce() -> Self::Bytes>(
+                &self,
+                site: u32,
+                to_be: bool,
+                orig: F,
+            ) -> Self::Bytes {
+                (&Endn::<$t>(**self.0)).tmt_endian_bytes(site, to_be, orig)
+            }
+            #[inline(always)]
+            fn tmt_endian_int<F: FnOnce() -> Self::Int>(
+                &self,
+                site: u32,
+                to_be: bool,
+                orig: F,
+            ) -> Self::Int {
+                (&Endn::<$t>(**self.0)).tmt_endian_int(site, to_be, orig)
+            }
+        }
+    )*};
+}
+tmt_endian_ints!(u16, i16, u32, i32, u64, i64, u128, i128, usize, isize);
+
+/// `x.leading_zeros()` <-> `x.trailing_zeros()`, `leading_ones` <-> `trailing_ones`.
+pub struct Btc<'a, A: ?Sized>(pub &'a A);
+
+pub trait BitCountPrim {
+    fn tmt_bit_count<F: FnOnce() -> u32>(&self, site: u32, op: u8, orig: F) -> u32;
+}
+
+pub trait AnyBitCount {
+    fn tmt_bit_count<R, F: FnOnce() -> R>(&self, site: u32, op: u8, orig: F) -> R;
+}
+
+impl<'r, 'a, A: ?Sized> AnyBitCount for &'r Btc<'a, A> {
+    fn tmt_bit_count<R, F: FnOnce() -> R>(&self, site: u32, _op: u8, orig: F) -> R {
+        if !idle(site) {
+            record_bits(b'A', site, ARITH_OPAQUE);
+        }
+        orig()
+    }
+}
+
+macro_rules! tmt_bitcount_ints {
+    ($($t:ty)*) => {$(
+        impl<'a> BitCountPrim for Btc<'a, $t> {
+            #[inline(always)]
+            fn tmt_bit_count<F: FnOnce() -> u32>(&self, site: u32, op: u8, orig: F) -> u32 {
+                if idle(site) {
+                    return orig();
+                }
+                let x = *self.0;
+                let swapped = match op {
+                    0 => x.trailing_zeros(),
+                    1 => x.leading_zeros(),
+                    2 => x.trailing_ones(),
+                    _ => x.leading_ones(),
+                };
+                if mutant_at(site) == Some(Mutant::BitCountSwap) {
+                    return swapped;
+                }
+                let original = orig();
+                if !bits_known(b'A', site, ARITH_SAME | ARITH_DIFFERS) {
+                    record_bits(
+                        b'A',
+                        site,
+                        if original == swapped { ARITH_SAME } else { ARITH_DIFFERS },
+                    );
+                }
+                original
+            }
+        }
+        impl<'a, 'b> BitCountPrim for Btc<'a, &'b $t> {
+            #[inline(always)]
+            fn tmt_bit_count<F: FnOnce() -> u32>(&self, site: u32, op: u8, orig: F) -> u32 {
+                (&Btc::<$t>(*self.0)).tmt_bit_count(site, op, orig)
+            }
+        }
+        impl<'a, 'b> BitCountPrim for Btc<'a, &'b mut $t> {
+            #[inline(always)]
+            fn tmt_bit_count<F: FnOnce() -> u32>(&self, site: u32, op: u8, orig: F) -> u32 {
+                (&Btc::<$t>(&**self.0)).tmt_bit_count(site, op, orig)
+            }
+        }
+        impl<'a, 'b, 'c> BitCountPrim for Btc<'a, &'b &'c $t> {
+            #[inline(always)]
+            fn tmt_bit_count<F: FnOnce() -> u32>(&self, site: u32, op: u8, orig: F) -> u32 {
+                (&Btc::<$t>(**self.0)).tmt_bit_count(site, op, orig)
+            }
+        }
+    )*};
+}
+tmt_bitcount_ints!(i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize);
+
+/// `break` <-> `continue` loop control probe.
+#[inline(always)]
+pub fn loop_ctrl_swap(site: u32) -> bool {
+    if idle(site) {
+        return false;
+    }
+    if mutant_at(site) == Some(Mutant::LoopCtrlSwap) {
+        return true;
+    }
+    record_bits(b'R', site, 1);
+    false
 }

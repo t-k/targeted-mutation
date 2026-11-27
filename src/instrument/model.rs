@@ -171,6 +171,78 @@ pub enum SiteKind {
         /// Byte range of the method name.
         method: (usize, usize),
     },
+    /// `receiver.saturating_{add,sub,mul}(arg)` <-> `receiver.wrapping_{add,sub,mul}(arg)`.
+    SaturatingArith {
+        op: SaturatingOp,
+        receiver: String,
+        argument: String,
+        /// Byte range from receiver end to argument start.
+        call: (usize, usize),
+        /// Byte range from argument end to closing `)` end.
+        close: (usize, usize),
+        /// Byte range of the method name.
+        method: (usize, usize),
+    },
+    /// `receiver.trim()` / `.trim_start()` / `.trim_end()` on strings.
+    StrTrim {
+        op: TrimOp,
+        receiver: String,
+        /// Byte range of `.trim()`.
+        call: (usize, usize),
+        /// Byte range of the method name.
+        method: (usize, usize),
+    },
+    /// `receiver.eq_ignore_ascii_case(arg)` -> strict equality (`==`).
+    StrCaseEq {
+        receiver: String,
+        argument: String,
+        /// Byte range from receiver end to argument start.
+        call: (usize, usize),
+        /// Byte range from argument end to closing `)` end.
+        close: (usize, usize),
+        /// Byte range of the method name.
+        method: (usize, usize),
+    },
+    /// `receiver.abs()` -> `receiver` on signed integers and floats.
+    Abs {
+        receiver: String,
+        /// Byte range of `.abs()`.
+        call: (usize, usize),
+        /// Byte range of the method name.
+        method: (usize, usize),
+    },
+    /// `iter.take(n)` -> `iter.take(usize::MAX)` or `iter.skip(n)` -> `iter.skip(0)`.
+    IterLimit {
+        take: bool,
+        receiver: String,
+        count: String,
+        /// Byte range from receiver end to count start.
+        call: (usize, usize),
+        /// Byte range from count end to closing `)` end.
+        close: (usize, usize),
+        /// Byte range of the method name.
+        method: (usize, usize),
+    },
+    /// `x.to_be_bytes()` <-> `x.to_le_bytes()`, `x.to_be()` <-> `x.to_le()` on multi-byte ints.
+    EndianSwap {
+        op: EndianOp,
+        receiver: String,
+        /// Byte range of `.to_be_bytes()` / `.to_be()`.
+        call: (usize, usize),
+        /// Byte range of the method name.
+        method: (usize, usize),
+    },
+    /// `x.leading_zeros()` <-> `x.trailing_zeros()`, `leading_ones` <-> `trailing_ones`.
+    BitCount {
+        op: BitCountOp,
+        receiver: String,
+        /// Byte range of `.leading_zeros()`.
+        call: (usize, usize),
+        /// Byte range of the method name.
+        method: (usize, usize),
+    },
+    /// Unlabeled, value-less `break` <-> `continue` directly inside a loop.
+    LoopCtrl { is_break: bool },
     /// `[lit1, lit2, ...].contains(&x)`: drop one literal element at a time (source-built).
     LiteralSet {
         receiver: String,
@@ -298,6 +370,190 @@ impl RoundingOp {
                 "a number that rounds away from zero (e.g. 1.5 or -1.6)"
             }
             _ => "not a whole number (e.g. 0.5)",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SaturatingOp {
+    SatAdd,
+    SatSub,
+    SatMul,
+    WrapAdd,
+    WrapSub,
+    WrapMul,
+}
+
+impl SaturatingOp {
+    pub fn code(self) -> u8 {
+        match self {
+            SaturatingOp::SatAdd => 0,
+            SaturatingOp::SatSub => 1,
+            SaturatingOp::SatMul => 2,
+            SaturatingOp::WrapAdd => 3,
+            SaturatingOp::WrapSub => 4,
+            SaturatingOp::WrapMul => 5,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            SaturatingOp::SatAdd => "saturating_add",
+            SaturatingOp::SatSub => "saturating_sub",
+            SaturatingOp::SatMul => "saturating_mul",
+            SaturatingOp::WrapAdd => "wrapping_add",
+            SaturatingOp::WrapSub => "wrapping_sub",
+            SaturatingOp::WrapMul => "wrapping_mul",
+        }
+    }
+
+    pub fn swapped(self) -> Self {
+        match self {
+            SaturatingOp::SatAdd => SaturatingOp::WrapAdd,
+            SaturatingOp::SatSub => SaturatingOp::WrapSub,
+            SaturatingOp::SatMul => SaturatingOp::WrapMul,
+            SaturatingOp::WrapAdd => SaturatingOp::SatAdd,
+            SaturatingOp::WrapSub => SaturatingOp::SatSub,
+            SaturatingOp::WrapMul => SaturatingOp::SatMul,
+        }
+    }
+
+    pub fn overflow_phrase(self) -> &'static str {
+        match self {
+            SaturatingOp::SatAdd | SaturatingOp::WrapAdd => "whose sum overflows",
+            SaturatingOp::SatSub | SaturatingOp::WrapSub => {
+                "whose difference underflows or overflows"
+            }
+            SaturatingOp::SatMul | SaturatingOp::WrapMul => "whose product overflows",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TrimOp {
+    Trim,
+    TrimStart,
+    TrimEnd,
+}
+
+impl TrimOp {
+    pub fn code(self) -> u8 {
+        match self {
+            TrimOp::Trim => 0,
+            TrimOp::TrimStart => 1,
+            TrimOp::TrimEnd => 2,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            TrimOp::Trim => "trim",
+            TrimOp::TrimStart => "trim_start",
+            TrimOp::TrimEnd => "trim_end",
+        }
+    }
+
+    pub fn alt1(self) -> Self {
+        match self {
+            TrimOp::Trim => TrimOp::TrimStart,
+            TrimOp::TrimStart | TrimOp::TrimEnd => TrimOp::Trim,
+        }
+    }
+
+    pub fn alt2(self) -> Option<Self> {
+        match self {
+            TrimOp::Trim => Some(TrimOp::TrimEnd),
+            TrimOp::TrimStart | TrimOp::TrimEnd => None,
+        }
+    }
+
+    pub fn whitespace_phrase(self, alt: TrimOp) -> &'static str {
+        match (self, alt) {
+            (TrimOp::Trim, TrimOp::TrimStart) | (TrimOp::TrimStart, TrimOp::Trim) => {
+                "trailing whitespace"
+            }
+            (TrimOp::Trim, TrimOp::TrimEnd) | (TrimOp::TrimEnd, TrimOp::Trim) => {
+                "leading whitespace"
+            }
+            _ => "leading or trailing whitespace",
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EndianOp {
+    ToBeBytes,
+    ToLeBytes,
+    ToBe,
+    ToLe,
+}
+
+impl EndianOp {
+    pub fn code(self) -> u8 {
+        match self {
+            EndianOp::ToBeBytes => 0,
+            EndianOp::ToLeBytes => 1,
+            EndianOp::ToBe => 2,
+            EndianOp::ToLe => 3,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            EndianOp::ToBeBytes => "to_be_bytes",
+            EndianOp::ToLeBytes => "to_le_bytes",
+            EndianOp::ToBe => "to_be",
+            EndianOp::ToLe => "to_le",
+        }
+    }
+
+    pub fn swapped(self) -> Self {
+        match self {
+            EndianOp::ToBeBytes => EndianOp::ToLeBytes,
+            EndianOp::ToLeBytes => EndianOp::ToBeBytes,
+            EndianOp::ToBe => EndianOp::ToLe,
+            EndianOp::ToLe => EndianOp::ToBe,
+        }
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BitCountOp {
+    LeadingZeros,
+    TrailingZeros,
+    LeadingOnes,
+    TrailingOnes,
+}
+
+impl BitCountOp {
+    pub fn code(self) -> u8 {
+        match self {
+            BitCountOp::LeadingZeros => 0,
+            BitCountOp::TrailingZeros => 1,
+            BitCountOp::LeadingOnes => 2,
+            BitCountOp::TrailingOnes => 3,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            BitCountOp::LeadingZeros => "leading_zeros",
+            BitCountOp::TrailingZeros => "trailing_zeros",
+            BitCountOp::LeadingOnes => "leading_ones",
+            BitCountOp::TrailingOnes => "trailing_ones",
+        }
+    }
+
+    pub fn swapped(self) -> Self {
+        match self {
+            BitCountOp::LeadingZeros => BitCountOp::TrailingZeros,
+            BitCountOp::TrailingZeros => BitCountOp::LeadingZeros,
+            BitCountOp::LeadingOnes => BitCountOp::TrailingOnes,
+            BitCountOp::TrailingOnes => BitCountOp::LeadingOnes,
         }
     }
 }

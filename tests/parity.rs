@@ -100,6 +100,16 @@ fn keys_of(source: &str, site: &Site) -> Vec<Key> {
             SiteKind::Clamp { .. } => key("clamp", site.line, &mutant.what, &mutant.into),
             SiteKind::Rounding { .. } => key("rounding", site.line, &mutant.what, &mutant.into),
             SiteKind::Quantifier { .. } => key("quantifier", site.line, &mutant.what, &mutant.into),
+            SiteKind::SaturatingArith { .. } => {
+                key("saturating", site.line, &mutant.what, &mutant.into)
+            }
+            SiteKind::StrTrim { .. } => key("strtrim", site.line, &mutant.what, &mutant.into),
+            SiteKind::StrCaseEq { .. } => key("strcaseeq", site.line, &mutant.what, &mutant.into),
+            SiteKind::Abs { .. } => key("abs", site.line, &mutant.what, &mutant.into),
+            SiteKind::IterLimit { .. } => key("iterlimit", site.line, &mutant.what, &mutant.into),
+            SiteKind::EndianSwap { .. } => key("endian", site.line, &mutant.what, &mutant.into),
+            SiteKind::BitCount { .. } => key("bitcount", site.line, &mutant.what, &mutant.into),
+            SiteKind::LoopCtrl { .. } => key("loopctrl", site.line, &mutant.what, &mutant.into),
             SiteKind::LiteralSet { .. } => key("literalset", site.line, &mutant.what, &mutant.into),
             SiteKind::Return { .. } | SiteKind::MinMax { .. } => {
                 unreachable!("no source mutants")

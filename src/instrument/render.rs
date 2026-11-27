@@ -450,6 +450,167 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     String::new(),
                 )
             }
+            SiteKind::SaturatingArith {
+                op, call, close, ..
+            } => {
+                let same = op.name();
+                let op_code = op.code();
+                edits.push(Edit {
+                    pos: call.0,
+                    end: call.1,
+                    phase: 1,
+                    order: 0,
+                    text: "), ".into(),
+                    site: site.id,
+                });
+                edits.push(Edit {
+                    pos: close.0,
+                    end: close.1,
+                    phase: 1,
+                    order: 0,
+                    text: format!(
+                        ") {{ (__tmt_a, __tmt_b) => {{ #[allow(unused_imports)] use {rt}::{{AnySaturating as _, SaturatingPrim as _}}; \
+                         (&{rt}::Sat::new(__tmt_a, __tmt_b)).tmt_sat({}u32, {op_code}u8, |__tmt_a, __tmt_b| (*__tmt_a).{same}(__tmt_b)) }} }})",
+                        site.id
+                    ),
+                    site: site.id,
+                });
+                ("(match (&(".to_string(), String::new())
+            }
+            SiteKind::StrTrim { op, call, .. } => {
+                let same = op.name();
+                let op_code = op.code();
+                edits.push(Edit {
+                    pos: call.0,
+                    end: call.1,
+                    phase: 1,
+                    order: 0,
+                    text: format!(
+                        "))).tmt_str_trim({}u32, {op_code}u8, |__tmt_a| (*__tmt_a).{same}()) }})",
+                        site.id
+                    ),
+                    site: site.id,
+                });
+                (
+                    format!(
+                        "({{ #[allow(unused_imports)] use {rt}::{{AnyStrTrim as _, StrTrimPrim as _}}; (&{rt}::Trm(&("
+                    ),
+                    String::new(),
+                )
+            }
+            SiteKind::StrCaseEq { call, close, .. } => {
+                edits.push(Edit {
+                    pos: call.0,
+                    end: call.1,
+                    phase: 1,
+                    order: 0,
+                    text: "), ".into(),
+                    site: site.id,
+                });
+                edits.push(Edit {
+                    pos: close.0,
+                    end: close.1,
+                    phase: 1,
+                    order: 0,
+                    text: format!(
+                        ") {{ (__tmt_a, __tmt_b) => {{ #[allow(unused_imports)] use {rt}::{{AnyCaseEq as _, CaseEqPrim as _}}; \
+                         (&{rt}::Ceq::new(__tmt_a, __tmt_b)).tmt_case_eq({}u32, |__tmt_a, __tmt_b| (*__tmt_a).eq_ignore_ascii_case(__tmt_b)) }} }})",
+                        site.id
+                    ),
+                    site: site.id,
+                });
+                ("(match (&(".to_string(), String::new())
+            }
+            SiteKind::Abs { call, .. } => {
+                edits.push(Edit {
+                    pos: call.0,
+                    end: call.1,
+                    phase: 1,
+                    order: 0,
+                    text: format!(
+                        ")) {{ __tmt_a => {{ #[allow(unused_imports)] use {rt}::{{AnyAbs as _, AbsPrim as _}}; \
+                         (&{rt}::AbsWrap(__tmt_a)).tmt_abs({}u32, || (*__tmt_a).abs()) }} }})",
+                        site.id
+                    ),
+                    site: site.id,
+                });
+                ("(match (&(".to_string(), String::new())
+            }
+            SiteKind::IterLimit {
+                take, call, close, ..
+            } => {
+                let same = if *take { "take" } else { "skip" };
+                edits.push(Edit {
+                    pos: call.0,
+                    end: call.1,
+                    phase: 1,
+                    order: 0,
+                    text: ", ".into(),
+                    site: site.id,
+                });
+                edits.push(Edit {
+                    pos: close.0,
+                    end: close.1,
+                    phase: 1,
+                    order: 0,
+                    text: format!(
+                        ") {{ (__tmt_i, __tmt_n) => {{ #[allow(unused_imports)] use {rt}::{{AnyIterLimit as _, IterLimitPrim as _}}; \
+                         (&{rt}::Ilm::new(__tmt_i, __tmt_n)).tmt_iter_limit({}u32, {take}, |mut __tmt_i, __tmt_n| __tmt_i.{same}(__tmt_n)) }} }})",
+                        site.id
+                    ),
+                    site: site.id,
+                });
+                ("(match (".to_string(), String::new())
+            }
+            SiteKind::EndianSwap { op, call, .. } => {
+                let same = op.name();
+                let (method_call, to_be) = match op {
+                    super::model::EndianOp::ToBeBytes => ("tmt_endian_bytes", true),
+                    super::model::EndianOp::ToLeBytes => ("tmt_endian_bytes", false),
+                    super::model::EndianOp::ToBe => ("tmt_endian_int", true),
+                    super::model::EndianOp::ToLe => ("tmt_endian_int", false),
+                };
+                edits.push(Edit {
+                    pos: call.0,
+                    end: call.1,
+                    phase: 1,
+                    order: 0,
+                    text: format!(
+                        ")) {{ __tmt_a => {{ #[allow(unused_imports)] use {rt}::{{AnyEndian as _, EndianPrim as _}}; \
+                         (&{rt}::Endn(__tmt_a)).{method_call}({}u32, {to_be}, || (*__tmt_a).{same}()) }} }})",
+                        site.id
+                    ),
+                    site: site.id,
+                });
+                ("(match (&(".to_string(), String::new())
+            }
+            SiteKind::BitCount { op, call, .. } => {
+                let same = op.name();
+                let op_code = op.code();
+                edits.push(Edit {
+                    pos: call.0,
+                    end: call.1,
+                    phase: 1,
+                    order: 0,
+                    text: format!(
+                        ")) {{ __tmt_a => {{ #[allow(unused_imports)] use {rt}::{{AnyBitCount as _, BitCountPrim as _}}; \
+                         (&{rt}::Btc(__tmt_a)).tmt_bit_count({}u32, {op_code}u8, || (*__tmt_a).{same}()) }} }})",
+                        site.id
+                    ),
+                    site: site.id,
+                });
+                ("(match (&(".to_string(), String::new())
+            }
+            SiteKind::LoopCtrl { is_break } => {
+                let other = if *is_break { "continue" } else { "break" };
+                (
+                    format!(
+                        "(if {rt}::loop_ctrl_swap({}u32) {{ {other}; }} else {{ ",
+                        site.id
+                    ),
+                    "; })".to_string(),
+                )
+            }
             SiteKind::LiteralSet { .. } => continue,
             SiteKind::Range { inclusive, gap, .. } => {
                 edits.push(Edit {

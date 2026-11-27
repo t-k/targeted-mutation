@@ -189,6 +189,14 @@ For each assertion gap, `cargo tmt` replays one surviving mutant with tracing on
 | `x.clamp(lo, hi)` (numbers) | `x.min(hi)` (drop lower), `x.max(lo)` (drop upper) | no test crossed that bound (impure/panicking bounds use `--rebuild`) |
 | `x.floor()`, `.ceil()`, `.round()`, `.trunc()` (floats) | two alternative rounding modes each | observed inputs gave the same rounded value under the alternative |
 | `iter.all(f)`, `iter.any(f)` (`Iterator` with closure) | swapped `all` ↔ `any` | always run |
+| `a.saturating_{add,sub,mul}(b)` ↔ `a.wrapping_{add,sub,mul}(b)` (integers) | swapped `saturating_*` ↔ `wrapping_*` | no test hit overflow or underflow |
+| `s.trim()`, `.trim_start()`, `.trim_end()` (`str`/`String`) | `trim` → `trim_start`/`trim_end`; `trim_start`/`trim_end` → `trim` | no test had whitespace on the dropped side |
+| `a.eq_ignore_ascii_case(b)` (`str`/`String`/`[u8]`/`u8`) | tightened to `a == b` | no test matched only when ignoring ASCII case |
+| `x.abs()` (signed integers, floats) | dropped `.abs()` (`x`) | no test passed a negative value |
+| `iter.take(n)`, `iter.skip(n)` (`Iterator` with `usize`) | `take(usize::MAX)`, `skip(0)` | `n` was always `usize::MAX` / `0` (otherwise run) |
+| `x.to_be_bytes()`, `.to_le_bytes()`, `.to_be()`, `.to_le()` (multi-byte ints) | swapped BE ↔ LE | every observed value was byte-palindromic |
+| `x.leading_zeros()`, `.trailing_zeros()`, `.leading_ones()`, `.trailing_ones()` (integers) | swapped leading ↔ trailing | leading and trailing counts agreed on every test |
+| `break`, `continue` (unlabeled, value-less inside loops) | swapped `break` ↔ `continue` | always run (reaching tests only) |
 | `[lit1, lit2, ...].contains(&x)` (2–8 distinct literals) | one element removed at a time (`--rebuild` / `--source-only`) | source-built |
 | `a..b`, `a..=b` (integers) | inclusive ↔ exclusive end | always run |
 | `f(x);`, `check()?;`, `x += 1;`, `x = y;` | statement deleted | always run |
