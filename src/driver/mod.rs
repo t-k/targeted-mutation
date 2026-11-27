@@ -3929,6 +3929,13 @@ fn mutation_of(site: &Site, mutant: &instrument::SourceMutant) -> Mutation {
         SiteKind::EndianSwap { .. } => Mutation::EndianSwap,
         SiteKind::BitCount { .. } => Mutation::BitCountSwap,
         SiteKind::LoopCtrl { .. } => Mutation::LoopCtrlSwap,
+        SiteKind::LiteralSet { elements, .. } => {
+            let idx = elements
+                .iter()
+                .position(|(elem, _, _)| elem == &mutant.into)
+                .unwrap_or(0);
+            Mutation::DropLiteralElem(idx as u8)
+        }
         // The other kinds have one mutant of the source: a statement, an arm, a field or
         // a minus that is not there, a body that is another.
         _ => Mutation::Delete,

@@ -1213,7 +1213,8 @@ fn ranges_match_arms_min_max_and_option_results() {
             "arm 0 guarded=false",
             "arm n if n > 5 guarded=true",
             "arm 1..=3 guarded=false",
-            // `1..=2` and `'a'..'z'` have literals at both ends.
+            // `&v[1..=2]` is probed by switching the indexing expression; `'a'..'z'` stays built.
+            "range 1 2 inclusive=true",
             "range 1 limit as usize inclusive=true",
             "return first Some(\"Option<u32>\")",
         ]
@@ -2051,11 +2052,12 @@ fn minus_guards_and_fields() {
         // A literal stays a literal, with the type its place gives it.
         "u32) { -__tmt_a } else { __tmt_a } })",
         "u32) { -5 } else { 5 })",
-        // A guard and the comparison it consists of: the guard goes around.
-        "Kind::A(n) if crate::__tmt_rt::ret(",
+        // A guard and the comparison it consists of: the guard goes around and short-circuits.
+        "Kind::A(n) if (match crate::__tmt_rt::guard_override(",
+        "None => crate::__tmt_rt::guard_record(",
         "u32, (match (&(n), &(1))",
         "n if crate::__tmt_rt::arm(",
-        ") && (crate::__tmt_rt::ret(",
+        ") && ((match crate::__tmt_rt::guard_override(",
         "depth: if crate::__tmt_rt::live(",
         "{ a } else { (base).depth }",
         // A field written by its name alone gets the name back.
@@ -2541,14 +2543,14 @@ fn only_the_range_of_a_for_is_probed() {
             .map(|site| site.line)
             .collect()
     };
-    // Run through directly by a `for`, with or without parentheses.
-    assert_eq!(ranges(&all.sites), [2, 3]);
-    // Kept, indexed with, or given to a method: built, as the source says them.
-    // And two literals wherever they are: nothing gives a probe their type.
-    assert_eq!(ranges(&all.rebuild_sites), [4, 5, 6, 8, 9, 10]);
+    // Run through directly by a `for` (with non-literal bounds), or used in `&v[a..b]`.
+    assert_eq!(ranges(&all.sites), [2, 3, 6, 9]);
+    // Kept, given to a non-indexing method, or two literals in a `for`: built from source.
+    assert_eq!(ranges(&all.rebuild_sites), [4, 5, 8, 10]);
     let literal: Vec<(&str, String)> = all
-        .rebuild_sites
+        .sites
         .iter()
+        .chain(&all.rebuild_sites)
         .filter(|site| site.line == 8 || site.line == 9)
         .flat_map(|site| {
             source_mutants(site)
@@ -3157,9 +3159,9 @@ pub fn checks(s: &str, x: i32, y: f64, xs: &[i32]) -> bool {
             .count(),
         2
     );
-    // LiteralSet goes to rebuild_sites and skips duplicate-element arrays.
+    // LiteralSet is now a probe site outside `const` and skips duplicate-element arrays.
     let literal_sets: Vec<_> = found
-        .rebuild_sites
+        .sites
         .iter()
         .filter(|s| matches!(s.kind, SiteKind::LiteralSet { .. }))
         .collect();
@@ -3284,8 +3286,9 @@ fn panicking_clamp(x: i32, d: i32) -> i32 {
     // Value-equivalent duplicates are rejected from LiteralSet.
     assert!(
         !found
-            .rebuild_sites
+            .sites
             .iter()
+            .chain(&found.rebuild_sites)
             .any(|s| matches!(s.kind, SiteKind::LiteralSet { .. }))
     );
 }
@@ -3997,4 +4000,132 @@ fn disjoint_bits_runtime_cast_bounds_matches_pict_table() {
         rows += 1;
     }
     assert!(rows >= 25, "expected full PICT table, got {rows} rows");
+}
+
+#[test]
+fn probe_lowering_matches_pict_table() {
+    let table = include_str!("../../tests/data/probe-lowering.pict.tsv");
+    let mut rows = 0;
+    for line in table.lines().skip(1).filter(|l| !l.trim().is_empty()) {
+        let cols: Vec<&str> = line.split('\t').collect();
+        assert_eq!(cols.len(), 5, "unexpected row: {line}");
+        let (feature, context, _mutation, _obs, mode) =
+            (cols[0], cols[1], cols[2], cols[3], cols[4]);
+        let src = match (feature, context, mode) {
+            ("guard", "const_fn", _) => {
+                "const fn f(x: u32) -> u32 { match x { n if n > 1 => n, _ => 0 } }".to_string()
+            }
+            ("guard", "nested_probe", _) => {
+                "fn f(x: u32) -> u32 { match x { n if n + 1 > 2 => n, _ => 0 } }".to_string()
+            }
+            ("guard", _, "impure_or_refmut") => {
+                "fn f(x: u32) -> u32 { match x { n if side(n) => n, _ => 0 } }".to_string()
+            }
+            ("guard", _, _) => {
+                "fn f(x: u32) -> u32 { match x { n if n > 1 => n, _ => 0 } }".to_string()
+            }
+            ("litset", "const_fn", _) => {
+                "const fn f(x: u32) -> bool { [1, 3, 5].contains(&x) }".to_string()
+            }
+            ("litset", "nested_probe", _) => {
+                "fn f(x: u32) -> bool { [1, 3, 5].contains(&(x + 1)) }".to_string()
+            }
+            ("litset", _, _) => "fn f(x: u32) -> bool { [1, 3, 5].contains(&x) }".to_string(),
+            ("indexed_range", "const_fn", _) => {
+                "const fn f(s: &[u8], a: usize, b: usize) -> usize { s[a..b].len() }".to_string()
+            }
+            ("indexed_range", "nested_probe", "deref_method") => {
+                "fn f(s: &str, a: usize, b: usize) -> bool { s[a + 1..b - 1].trim().is_empty() }"
+                    .to_string()
+            }
+            ("indexed_range", _, "impure_or_refmut") => {
+                "fn f(s: &mut [u8], a: usize, b: usize) -> &mut [u8] { &mut s[a..b] }".to_string()
+            }
+            ("indexed_range", _, "deref_method") => {
+                "fn f(s: &str, a: usize, b: usize) -> bool { s[a..b].trim().is_empty() }"
+                    .to_string()
+            }
+            ("indexed_range", _, _) => {
+                "fn f(s: &[u8], a: usize, b: usize) -> &[u8] { &s[a..b] }".to_string()
+            }
+            _ => unreachable!("unexpected PICT row: {line}"),
+        };
+        let found = discover(&src, 0).unwrap();
+        let is_target = |s: &Site| match feature {
+            "guard" => matches!(s.kind, SiteKind::Guard { .. }),
+            "litset" => matches!(s.kind, SiteKind::LiteralSet { .. }),
+            "indexed_range" => matches!(s.kind, SiteKind::Range { .. }),
+            _ => false,
+        };
+        if context == "const_fn" {
+            assert!(
+                found.rebuild_sites.iter().any(is_target),
+                "const_fn must stay in rebuild_sites for {line}: {src}"
+            );
+            assert!(
+                !found.sites.iter().any(is_target),
+                "const_fn must not be probed for {line}: {src}"
+            );
+        } else {
+            assert!(
+                found.sites.iter().any(is_target),
+                "expected probe site for {line}: {src}"
+            );
+            let rendered = render(&src, &found.sites, &|_| true);
+            assert_eq!(
+                rendered.text.matches('\n').count(),
+                src.matches('\n').count(),
+                "line count changed for {line}"
+            );
+            assert!(
+                syn::parse_file(&rendered.text).is_ok(),
+                "invalid probe syntax for {line}:\n{}",
+                rendered.text
+            );
+            match feature {
+                "guard" => {
+                    assert!(rendered.text.contains("guard_override("), "{line}");
+                    assert!(rendered.text.contains("guard_record("), "{line}");
+                }
+                "litset" => {
+                    assert!(rendered.text.contains("tmt_lit_set("), "{line}");
+                }
+                "indexed_range" => {
+                    assert!(rendered.text.contains("range_end("), "{line}");
+                }
+                _ => {}
+            }
+        }
+        rows += 1;
+    }
+    assert!(rows >= 15, "expected full PICT table, got {rows} rows");
+
+    // Non-read-only method and mutable-borrow range bounds stay in rebuild_sites.
+    let conservative = r#"
+fn mut_method(xs: &mut [u8], a: usize, b: usize) {
+    xs[a..b].sort();
+}
+fn mut_bound(xs: &[u8], i: &mut usize) -> &[u8] {
+    &xs[take(i)..3]
+}
+fn take(i: &mut usize) -> usize { *i }
+fn mut_ref_bound(xs: &[u8], i: &mut usize) -> &[u8] {
+    &xs[take(&mut *i)..3]
+}
+"#;
+    let found = discover(conservative, 0).unwrap();
+    let probed_lines: Vec<usize> = found
+        .sites
+        .iter()
+        .filter(|s| matches!(s.kind, SiteKind::Range { .. }))
+        .map(|s| s.line)
+        .collect();
+    let rebuilt_lines: Vec<usize> = found
+        .rebuild_sites
+        .iter()
+        .filter(|s| matches!(s.kind, SiteKind::Range { .. }))
+        .map(|s| s.line)
+        .collect();
+    assert_eq!(probed_lines, [6]);
+    assert_eq!(rebuilt_lines, [3, 10]);
 }

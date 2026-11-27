@@ -1,7 +1,7 @@
 //! Probe rendering and compiler-error site blaming.
 
 use super::discover::variable_name;
-use super::model::{ArmGuard, RUNTIME_MOD, Site, SiteKind};
+use super::model::{ArmGuard, RUNTIME_MOD, RangeIndexMode, Site, SiteKind};
 
 /// Instrumented text plus the mapping back to the original, used to blame a site for a
 /// compile error in the rewritten file.
@@ -611,8 +611,90 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     "; })".to_string(),
                 )
             }
-            SiteKind::LiteralSet { .. } => continue,
-            SiteKind::Range { inclusive, gap, .. } => {
+            SiteKind::LiteralSet { call, close, .. } => {
+                edits.push(Edit {
+                    pos: call.0,
+                    end: call.1,
+                    phase: 1,
+                    order: 0,
+                    text: "), ".into(),
+                    site: site.id,
+                });
+                edits.push(Edit {
+                    pos: close.0,
+                    end: close.1,
+                    phase: 1,
+                    order: 0,
+                    text: format!(
+                        ") {{ (__tmt_a, __tmt_x) => {{ #[allow(unused_imports)] use {rt}::{{AnyLitSet as _, LitSetPrim as _}}; \
+                         (&{rt}::Lst::new(__tmt_a, __tmt_x)).tmt_lit_set({}u32, |__tmt_a, __tmt_x| (*__tmt_a).contains(__tmt_x)) }} }})",
+                        site.id
+                    ),
+                    site: site.id,
+                });
+                ("(match (&(".to_string(), String::new())
+            }
+            SiteKind::Range {
+                inclusive,
+                gap,
+                index: Some(idx),
+                ..
+            } => {
+                let (orig_dots, mut_dots) = if *inclusive {
+                    ("..=", "..")
+                } else {
+                    ("..", "..=")
+                };
+                let (borrow, open_str, open_br_text, extra_close) = match idx.mode {
+                    RangeIndexMode::Ref => ("&", "(match (&(", "), (", ""),
+                    RangeIndexMode::RefMut => ("&mut ", "(match (&mut (", ")[..], (", ""),
+                    RangeIndexMode::Deref => ("&", "(*(match (&(", "), (", ")"),
+                };
+                if idx.prefix.0 < idx.prefix.1 {
+                    edits.push(Edit {
+                        pos: idx.prefix.0,
+                        end: idx.prefix.1,
+                        phase: 1,
+                        order: 0,
+                        text: String::new(),
+                        site: site.id,
+                    });
+                }
+                edits.push(Edit {
+                    pos: idx.open_bracket.0,
+                    end: idx.open_bracket.1,
+                    phase: 1,
+                    order: 0,
+                    text: open_br_text.into(),
+                    site: site.id,
+                });
+                edits.push(Edit {
+                    pos: gap.0,
+                    end: gap.1,
+                    phase: 1,
+                    order: 0,
+                    text: "), (".into(),
+                    site: site.id,
+                });
+                edits.push(Edit {
+                    pos: idx.close_bracket.0,
+                    end: idx.close_bracket.1,
+                    phase: 1,
+                    order: 0,
+                    text: format!(
+                        ")) {{ (__tmt_c, __tmt_s, __tmt_e) => if {rt}::range_end({id}u32) {{ {borrow}(*__tmt_c)[__tmt_s{mut_dots}__tmt_e] }} else {{ {borrow}(*__tmt_c)[__tmt_s{orig_dots}__tmt_e] }} }}){extra_close}",
+                        id = site.id,
+                    ),
+                    site: site.id,
+                });
+                (open_str.to_string(), String::new())
+            }
+            SiteKind::Range {
+                inclusive,
+                gap,
+                index: None,
+                ..
+            } => {
                 edits.push(Edit {
                     pos: gap.0,
                     end: gap.1,
@@ -699,7 +781,13 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     ),
                 )
             }
-            SiteKind::Guard { .. } => (format!("{rt}::ret({}u32, ", site.id), ")".to_string()),
+            SiteKind::Guard { .. } => (
+                format!(
+                    "(match {rt}::guard_override({id}u32) {{ Some(__tmt_g) => __tmt_g, None => {rt}::guard_record({id}u32, ",
+                    id = site.id
+                ),
+                ") })".to_string(),
+            ),
             SiteKind::Field {
                 name,
                 shorthand,

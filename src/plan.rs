@@ -368,6 +368,8 @@ pub enum Mutation {
     BitCountSwap,
     /// `break` <-> `continue`.
     LoopCtrlSwap,
+    /// `[lit1, lit2, ...].contains(&x)`: drop the literal element at index `0..8`.
+    DropLiteralElem(u8),
 }
 
 impl Mutation {
@@ -405,6 +407,7 @@ impl Mutation {
             Mutation::EndianSwap => "edn".to_string(),
             Mutation::BitCountSwap => "btc".to_string(),
             Mutation::LoopCtrlSwap => "lpc".to_string(),
+            Mutation::DropLiteralElem(idx) => format!("dle{idx}"),
         }
     }
 }
@@ -1157,6 +1160,35 @@ impl ReturnObs {
     /// Whether replacing the returned value by `value` changes anything for this test.
     pub fn infected_by_const(&self, value: bool) -> bool {
         if value { self.saw_false } else { self.saw_true }
+    }
+}
+
+/// Observations at a `[lit1, lit2, ...].contains(&x)` site.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct LitSetObs {
+    pub reached: bool,
+    pub opaque: bool,
+    /// Bit `i` (`0..8`) is set when the argument equaled literal element `i`.
+    pub matched: u8,
+}
+
+impl LitSetObs {
+    pub fn from_bits(bits: u16) -> LitSetObs {
+        LitSetObs {
+            reached: bits & 256 != 0,
+            opaque: bits & 512 != 0,
+            matched: (bits & 0xFF) as u8,
+        }
+    }
+
+    pub fn merge(&mut self, other: &LitSetObs) {
+        self.reached |= other.reached;
+        self.opaque |= other.opaque;
+        self.matched |= other.matched;
+    }
+
+    pub fn matched_elem(&self, idx: u8) -> bool {
+        idx < 8 && (self.matched & (1u8 << idx)) != 0
     }
 }
 

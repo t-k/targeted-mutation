@@ -30,7 +30,8 @@ pub(crate) use items::ItemIndex;
 pub use items::{NamedItem, enclosing_item, named_items, offset_of};
 pub use model::{
     ArithOp, ArmGuard, BitCountOp, BitValueType, Discovery, EndianOp, LiteralSide, LocalBitType,
-    NO_ID, RUNTIME_MOD, RoundingOp, SaturatingOp, Site, SiteKind, TestModule, TrimOp,
+    NO_ID, RUNTIME_MOD, RangeIndex, RangeIndexMode, RoundingOp, SaturatingOp, Site, SiteKind,
+    TestModule, TrimOp,
 };
 pub use render::{Rendered, blame, render};
 pub use source_mutants::{SourceMutant, keep_line_ends, source_mutants};

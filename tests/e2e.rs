@@ -4599,26 +4599,27 @@ fn an_audit_builds_mutants_from_the_source_and_compares() {
     let report: Value = serde_json::from_str(&run.stdout).unwrap();
     assert_eq!(report["audit"]["not_compared"], 1, "{report:#}");
 
-    // A guard that does something: taken for `true` as a probe it is still evaluated,
-    // replaced by `true` in the source it is not, and the test notices.
+    // A guard with side effects: the probe short-circuits before evaluating the guard,
+    // matching the source mutation so both probe and source builds catch it with zero
+    // disagreements.
     let dir = fixture("guarded", "audit-guarded");
     let run = tmt(&dir, &["--json", "--quiet", "--audit", "1000"]);
     let report: Value = serde_json::from_str(&run.stdout).unwrap();
     let differ = report["audit"]["source_disagreements"].as_array().unwrap();
-    assert_eq!(differ.len(), 1, "{report:#}");
-    assert_eq!(differ[0]["code"], "note(asked)");
-    assert_eq!(
-        differ[0]["mutant"],
-        "the guard `note(asked)` replaced by `true`"
-    );
-    assert_eq!(
-        (differ[0]["as_probe"].as_str(), differ[0]["built"].as_str()),
-        (Some("passes"), Some("fails"))
-    );
-    let text = tmt(&dir, &["--quiet", "--audit", "1000"]).stdout;
+    assert_eq!(differ.len(), 0, "{report:#}");
     assert!(
-        text.contains("the guard `note(asked)` replaced by `true`: passes as a probe, fails built"),
-        "{text}"
+        report["audit"]["compared"].as_u64().unwrap() >= 1,
+        "{report:#}"
+    );
+    let guard_findings: Vec<&Value> = report["findings"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|f| f["code"] == "note(asked)")
+        .collect();
+    assert!(
+        guard_findings.is_empty(),
+        "side-effecting guard replaced by true must be caught as a probe: {report:#}"
     );
 }
 
@@ -5627,18 +5628,19 @@ mod tests {
         "{report:#}"
     );
 
-    // With --rebuild, dropping "PUT" from `["GET", "POST", "PUT"].contains(&m)` survives
-    // and names the removed element.
+    // Dropping "PUT" from `["GET", "POST", "PUT"].contains(&m)` is now probed directly
+    // as a provable input_gap without requiring a rebuild, naming the removed element.
     let run = tmt(
         &dir,
         &["--json", "--quiet", "--rebuild", "--lines", "src/lib.rs:56"],
     );
     assert_eq!(run.code, 2, "{}", run.stderr);
     let rebuilt: Value = serde_json::from_str(&run.stdout).unwrap();
-    let survivors = findings(&rebuilt, "survivor");
-    assert_eq!(survivors.len(), 1, "{rebuilt:#}");
+    assert_eq!(rebuilt["mutants_not_built"], 0, "{rebuilt:#}");
+    let gaps = findings(&rebuilt, "input_gap");
+    assert_eq!(gaps.len(), 1, "{rebuilt:#}");
     assert!(
-        strings(&survivors[0]["survivors"])
+        strings(&gaps[0]["survivors"])
             .iter()
             .any(|s| s.contains("without `\"PUT\"`")),
         "{rebuilt:#}"
@@ -6411,4 +6413,199 @@ fn config_file_workspace_deferred_prerequisites_work_dir_overlap_and_glob_virtua
     let implicit_report: Value = serde_json::from_str(&implicit_run.stdout).unwrap();
     assert_eq!(implicit_report["package"], "only-glob");
     assert_eq!(implicit_report["analysis"]["verified"], false);
+}
+
+#[test]
+fn probed_indexed_ranges_literal_sets_and_short_circuit_guards() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("probed-range-litset-guard");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"probed-rlg\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+use std::cell::Cell;
+
+pub fn slice_ref(s: &str, a: usize, b: usize) -> &str {
+    &s[a..b]
+}
+
+pub fn slice_inclusive(s: &str, a: usize, b: usize) -> &str {
+    &s[a..=b]
+}
+
+pub fn slice_mut_fill(xs: &mut [u8], a: usize, b: usize) {
+    let part = &mut xs[a..b];
+    for x in part {
+        *x = 9;
+    }
+}
+
+pub fn vec_mut_fill(mut xs: Vec<u8>, a: usize, b: usize) -> Vec<u8> {
+    let part = &mut xs[a..=b];
+    for x in part {
+        *x = 7;
+    }
+    xs
+}
+
+pub fn slice_deref_nested(s: &str, a: usize, b: usize) -> bool {
+    s[a + 1..b - 1].trim().is_empty()
+}
+
+pub fn slice_lit_bounds(s: &[u8]) -> &[u8] {
+    &s[0..2]
+}
+
+pub fn in_small_set(x: u16) -> bool {
+    [1, 3, 5].contains(&x)
+}
+
+pub fn in_str_set(s: &str) -> bool {
+    ["alpha", "beta"].contains(&s)
+}
+
+pub struct Bag([u8; 2]);
+impl Bag {
+    pub fn contains(&self, x: &u8) -> bool {
+        self.0[0] == *x
+    }
+}
+pub fn custom_contains(x: u8) -> bool {
+    Bag([1, 2]).contains(&x)
+}
+
+pub fn pure_guard(n: u32) -> &'static str {
+    match n {
+        0 => "zero",
+        k if k > 0 => "pos",
+        _ => "other",
+    }
+}
+
+pub fn impure_guard(n: u32, hits: &Cell<u32>) -> &'static str {
+    match n {
+        0 => "zero",
+        _ if bump(hits) => "hit",
+        _ => "other",
+    }
+}
+
+fn bump(hits: &Cell<u32>) -> bool {
+    hits.set(hits.get() + 1);
+    true
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tests_ranges() {
+        assert_eq!(slice_ref("abcdef", 1, 3), "bc");
+        assert_eq!(slice_inclusive("abcdef", 1, 3), "bcd");
+        let mut buf = [0u8; 5];
+        slice_mut_fill(&mut buf, 1, 3);
+        assert_eq!(buf, [0, 9, 9, 0, 0]);
+        assert_eq!(vec_mut_fill(vec![0, 0, 0, 0], 1, 2), vec![0, 7, 7, 0]);
+        assert!(!slice_deref_nested("  x  ", 0, 5));
+        assert_eq!(slice_lit_bounds(&[10, 20, 30]), &[10, 20]);
+    }
+
+    #[test]
+    fn tests_literal_sets() {
+        // Matches 1 and 5, never 3 -> removing 3 is a provable input gap.
+        assert!(in_small_set(1));
+        assert!(in_small_set(5));
+        assert!(!in_small_set(2));
+
+        assert!(in_str_set("alpha"));
+        assert!(in_str_set("beta"));
+        assert!(!in_str_set("gamma"));
+
+        assert!(custom_contains(1));
+    }
+
+    #[test]
+    fn tests_guards() {
+        assert_eq!(pure_guard(0), "zero");
+        assert_eq!(pure_guard(5), "pos");
+
+        let hits = Cell::new(0);
+        assert_eq!(impure_guard(3, &hits), "hit");
+        assert_eq!(hits.get(), 1);
+        assert_eq!(impure_guard(0, &hits), "zero");
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let run = tmt(&dir, &["--json", "--quiet", "--audit", "1000"]);
+    let report: Value = serde_json::from_str(&run.stdout)
+        .unwrap_or_else(|e| panic!("invalid json: {e}\n{}\n{}", run.stdout, run.stderr));
+    assert_eq!(
+        report["mutants_not_built"], 0,
+        "all indexed ranges and literal sets should be probed without rebuilds: {report:#}"
+    );
+    assert_eq!(
+        report["skipped_sites"], 0,
+        "no probe site should fail to compile: {report:#}"
+    );
+    let audit = &report["audit"];
+    assert_eq!(
+        audit["source_disagreements"].as_array().unwrap().len(),
+        0,
+        "probe and source outcomes must agree: {report:#}"
+    );
+    assert_eq!(
+        audit["disagreements"].as_array().unwrap().len(),
+        0,
+        "targeted predictions must agree with full reruns: {report:#}"
+    );
+
+    let findings = report["findings"].as_array().unwrap();
+    // Unmatched literal element `3` in `[1, 3, 5].contains(&x)` is reported as an input gap.
+    let litset_gap = findings.iter().find(|f| {
+        f["kind"] == "input_gap"
+            && f["survivors"].as_array().is_some_and(|s| {
+                s.iter()
+                    .any(|v| v == "without `3` in `[1, 3, 5].contains(&x)`")
+            })
+    });
+    assert!(
+        litset_gap.is_some(),
+        "expected input_gap for unmatched literal element `3`: {report:#}"
+    );
+    // Matched elements `1`, `5`, `"alpha"`, `"beta"` are caught (not in findings).
+    for caught in [
+        "without `1`",
+        "without `5`",
+        "without `\"alpha\"`",
+        "without `\"beta\"`",
+    ] {
+        assert!(
+            !findings.iter().any(|f| {
+                f["survivors"]
+                    .as_array()
+                    .is_some_and(|s| s.iter().any(|v| v.as_str().unwrap_or("").contains(caught)))
+            }),
+            "expected {caught} to be caught: {report:#}"
+        );
+    }
+    // Pure guard `k > 0` is always true -> input_gap; impure guard `bump(hits)` is caught.
+    assert!(
+        findings
+            .iter()
+            .any(|f| f["kind"] == "input_gap" && f["code"] == "k > 0"),
+        "expected pure guard input_gap: {report:#}"
+    );
+    assert!(
+        !findings.iter().any(|f| f["code"] == "bump(hits)"),
+        "impure guard must be caught by probe: {report:#}"
+    );
 }
