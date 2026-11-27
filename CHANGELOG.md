@@ -5,6 +5,20 @@ All notable changes to `targeted-mutation` (`cargo tmt`) are documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.12.0] - 2026-11-27
+
+### Added
+
+- **Eight new single-build targeted mutation rules** (with autoref specialization so custom types with matching method names remain opaque without false positives, plus matching `--rebuild` / `--source-only` edits):
+  - **Saturating and wrapping arithmetic (`SaturatingArith`)**: `a.saturating_{add,sub,mul}(b)` ↔ `a.wrapping_{add,sub,mul}(b)` on all 12 primitive integer types, emitting a provable `INPUT GAP` when no test triggers differing results under overflow/underflow.
+  - **String whitespace trimming (`StrTrim`)**: `s.trim()` → `s.trim_start()` / `s.trim_end()` and `s.trim_start()` / `s.trim_end()` → `s.trim()`, preserving receiver borrow lifetimes across `&str`, `String`, and `&String` and checking both slice length and pointer position (`core::ptr::eq`) for all-whitespace inputs.
+  - **ASCII case-insensitive equality (`StrCaseEq`)**: `a.eq_ignore_ascii_case(b)` → strict equality across `str`, `String`, `[u8]`, `Vec<u8>`, `[u8; N]`, and `u8` (using `.eq(...)` in source rebuilds to preserve auto-deref/auto-ref resolution), emitting a provable `INPUT GAP` when no test matches only by ignoring ASCII case.
+  - **Absolute value (`Abs`)**: `x.abs()` → `x` on signed integers and floats, checking `to_bits()` on floats (distinguishing `-0.0` and `-NaN`) and `cfg!(debug_assertions)` on signed `T::MIN`, emitting a provable `INPUT GAP` when no test passes a negative value.
+  - **Iterator limits (`IterLimit`)**: `iter.take(n)` → `iter.take(usize::MAX)` and `iter.skip(n)` → `iter.skip(0)` specialized to `Iterator` with `usize` counts (leaving `std::io::Read::take(u64)` and custom methods untouched, and preserving count-expression side effects in source rebuilds).
+  - **Endian byte-order swaps (`EndianSwap`)**: `x.to_be_bytes()` ↔ `x.to_le_bytes()` and `x.to_be()` ↔ `x.to_le()` on multi-byte primitive integers (excluding 1-byte `u8`/`i8`), emitting a provable `INPUT GAP` when every observed value is byte-palindromic (`x == x.swap_bytes()`).
+  - **Bit-count swaps (`BitCount`)**: `x.leading_zeros()` ↔ `x.trailing_zeros()` and `x.leading_ones()` ↔ `x.trailing_ones()` across all 12 primitive integer types, emitting a provable `INPUT GAP` when leading and trailing counts agree on every test.
+  - **Loop control swaps (`LoopCtrl`)**: unlabeled, value-less `break` ↔ `continue` inside loops (restricting `continue` → `break` to unit-typed `for`/`while` loops so value-bearing or diverging `loop` expressions always type-check), run only against reaching tests.
+
 ## [0.11.1] - 2026-11-27
 
 ### Improved
