@@ -189,6 +189,7 @@ For each assertion gap, `cargo tmt` replays one surviving mutant with tracing on
 | `x.clamp(lo, hi)` (numbers) | `x.min(hi)` (drop lower), `x.max(lo)` (drop upper) | no test crossed that bound (impure/panicking bounds use `--rebuild`) |
 | `x.floor()`, `.ceil()`, `.round()`, `.trunc()` (floats) | two alternative rounding modes each | observed inputs gave the same rounded value under the alternative |
 | `iter.all(f)`, `iter.any(f)` (`Iterator` with closure) | swapped `all` ↔ `any` | always run |
+| `iter.position(f)`, `iter.rposition(f)` (`DoubleEndedIterator + ExactSizeIterator` with closure) | swapped `position` ↔ `rposition` | always run (reaching tests only) |
 | `a.saturating_{add,sub,mul}(b)` ↔ `a.wrapping_{add,sub,mul}(b)` (integers) | swapped `saturating_*` ↔ `wrapping_*` | no test hit overflow or underflow |
 | `s.trim()`, `.trim_start()`, `.trim_end()` (`str`/`String`) | `trim` → `trim_start`/`trim_end`; `trim_start`/`trim_end` → `trim` | no test had whitespace on the dropped side |
 | `a.eq_ignore_ascii_case(b)` (`str`/`String`/`[u8]`/`u8`) | tightened to `a == b` | no test matched only when ignoring ASCII case |
@@ -198,7 +199,8 @@ For each assertion gap, `cargo tmt` replays one surviving mutant with tracing on
 | `x.leading_zeros()`, `.trailing_zeros()`, `.leading_ones()`, `.trailing_ones()` (integers) | swapped leading ↔ trailing | leading and trailing counts agreed on every test |
 | `break`, `continue` (unlabeled, value-less inside loops) | swapped `break` ↔ `continue` | always run (reaching tests only) |
 | `[lit1, lit2, ...].contains(&x)` (2–8 distinct literals) | one element removed at a time | no test matched that literal element (non-`&expr` / `const` uses `--rebuild`) |
-| `a..b`, `a..=b` (integers / indexed slices) | inclusive ↔ exclusive end | always run (`for` loops and simple `&xs[a..b]`/`&mut xs[a..b]`/`xs[a..b].read_method()`; others use `--rebuild`) |
+| `(a..b).contains(x)`, `(a..=b).contains(x)` (primitive ordered types) | inclusive ↔ exclusive end | no test passed `x == b` with `a <= b` |
+| `a..b`, `a..=b` (integers / indexed slices) | inclusive ↔ exclusive end | always run (`for` loops, `&xs[a..b]`/`&mut xs[a..b]`/`xs[a..b].read_method()`, and `xs.get(a..b)`/`xs.get_mut(a..b)`; others use `--rebuild`) |
 | `f(x);`, `check()?;`, `x += 1;`, `x = y;` | statement deleted | always run |
 
 - Arithmetic on non-primitive types (`String + &str`, `Duration + Duration`) and `!` on non-`bool` types are left untouched.

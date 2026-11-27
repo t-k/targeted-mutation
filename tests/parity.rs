@@ -92,7 +92,9 @@ fn keys_of(source: &str, site: &Site) -> Vec<Key> {
             // Not mutants of cargo-mutants: results replaced after the body ran, the
             // other of `min` / `max`, the end of a range, a deleted statement.
             // Not one of cargo-mutants either, but it can be written in the source.
-            SiteKind::Range { .. } => key("range", site.line, &mutant.what, &mutant.into),
+            SiteKind::Range { .. } | SiteKind::RangeContains { .. } => {
+                key("range", site.line, &mutant.what, &mutant.into)
+            }
             SiteKind::Stmt => key("statement", site.line, &site.text, ""),
             SiteKind::SliceEnd { .. } => key("end", site.line, &mutant.what, &mutant.into),
             SiteKind::StrAffix { .. } => key("straffix", site.line, &mutant.what, &mutant.into),
@@ -100,6 +102,7 @@ fn keys_of(source: &str, site: &Site) -> Vec<Key> {
             SiteKind::Clamp { .. } => key("clamp", site.line, &mutant.what, &mutant.into),
             SiteKind::Rounding { .. } => key("rounding", site.line, &mutant.what, &mutant.into),
             SiteKind::Quantifier { .. } => key("quantifier", site.line, &mutant.what, &mutant.into),
+            SiteKind::Position { .. } => key("position", site.line, &mutant.what, &mutant.into),
             SiteKind::SaturatingArith { .. } => {
                 key("saturating", site.line, &mutant.what, &mutant.into)
             }

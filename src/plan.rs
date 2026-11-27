@@ -370,6 +370,8 @@ pub enum Mutation {
     LoopCtrlSwap,
     /// `[lit1, lit2, ...].contains(&x)`: drop the literal element at index `0..8`.
     DropLiteralElem(u8),
+    /// `iter.position(f)` <-> `iter.rposition(f)`.
+    PositionSwap,
 }
 
 impl Mutation {
@@ -408,6 +410,7 @@ impl Mutation {
             Mutation::BitCountSwap => "btc".to_string(),
             Mutation::LoopCtrlSwap => "lpc".to_string(),
             Mutation::DropLiteralElem(idx) => format!("dle{idx}"),
+            Mutation::PositionSwap => "psw".to_string(),
         }
     }
 }

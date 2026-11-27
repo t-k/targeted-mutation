@@ -1814,6 +1814,36 @@ impl<'ast> Visit<'ast> for Finder<'_> {
             };
             self.push(kind, start, end, node.receiver.span());
         }
+        if (name == "position" || name == "rposition")
+            && node.args.len() == 1
+            && matches!(&node.args[0], syn::Expr::Closure(_))
+            && node.turbofish.is_none()
+            && node.attrs.is_empty()
+            && let (
+                Some((start, receiver_end)),
+                Some(method),
+                Some((pred_start, pred_end)),
+                Some((_, end)),
+            ) = (
+                self.range(node.receiver.span()),
+                self.range(node.method.span()),
+                self.range(node.args[0].span()),
+                self.range(node.paren_token.span.close()),
+            )
+            && in_order(receiver_end, method.0)
+            && in_order(method.1, pred_start)
+            && in_order(pred_end, end)
+        {
+            let kind = SiteKind::Position {
+                forward: name == "position",
+                receiver: self.source[start..receiver_end].to_string(),
+                predicate: self.source[pred_start..pred_end].to_string(),
+                call: (receiver_end, pred_start),
+                close: (pred_end, end),
+                method,
+            };
+            self.push(kind, start, end, node.receiver.span());
+        }
         if let Some(op) = saturating_op(&name)
             && node.args.len() == 1
             && node.turbofish.is_none()
@@ -2042,6 +2072,107 @@ impl<'ast> Visit<'ast> for Finder<'_> {
                     self.const_depth -= (!probe) as usize;
                 }
             }
+        }
+        if name == "contains"
+            && self.const_depth == 0
+            && node.args.len() == 1
+            && node.turbofish.is_none()
+            && node.attrs.is_empty()
+            && !matches!(
+                strip_parens_ref(&node.args[0]),
+                syn::Expr::Reference(r) if r.mutability.is_some()
+            )
+            && let syn::Expr::Range(range) = strip_parens_ref(&node.receiver)
+            && range.attrs.is_empty()
+            && let (Some(from), Some(to)) = (&range.start, &range.end)
+            && let (
+                Some((start, _)),
+                Some((range_start, lhs_end)),
+                Some((rhs_start, range_end)),
+                Some((arg_start, arg_end)),
+                Some((_, end)),
+            ) = (
+                self.range(node.receiver.span()),
+                self.range(from.span()),
+                self.range(to.span()),
+                self.range(node.args[0].span()),
+                self.range(node.paren_token.span.close()),
+            )
+            && !self.indexed_ranges.contains(&range_start)
+            && in_order(start, range_start)
+            && in_order(lhs_end, rhs_start)
+            && in_order(range_end, arg_start)
+            && in_order(arg_end, end)
+        {
+            self.indexed_ranges.insert(range_start);
+            let kind = SiteKind::RangeContains {
+                inclusive: matches!(range.limits, syn::RangeLimits::Closed(_)),
+                lhs: self.source[range_start..lhs_end].to_string(),
+                rhs: self.source[rhs_start..range_end].to_string(),
+                argument: self.source[arg_start..arg_end].to_string(),
+                open: (start, range_start),
+                gap: (lhs_end, rhs_start),
+                call: (range_end, arg_start),
+                close: (arg_end, end),
+            };
+            self.push(kind, start, end, node.receiver.span());
+        }
+        if (name == "get" || name == "get_mut")
+            && self.const_depth == 0
+            && node.args.len() == 1
+            && node.turbofish.is_none()
+            && node.attrs.is_empty()
+            && is_simple_place(&node.receiver)
+            && let syn::Expr::Range(range) = strip_parens_ref(&node.args[0])
+            && range.attrs.is_empty()
+            && let (Some(from), Some(to)) = (&range.start, &range.end)
+            && is_pure_range_bound(from)
+            && is_pure_range_bound(to)
+            && let (
+                Some((base_start, base_end)),
+                Some((range_start, lhs_end)),
+                Some((rhs_start, range_end)),
+                Some((_, outer_end)),
+            ) = (
+                self.range(node.receiver.span()),
+                self.range(from.span()),
+                self.range(to.span()),
+                self.range(node.paren_token.span.close()),
+            )
+            && !self.indexed_ranges.contains(&range_start)
+            && !self.source[base_start..base_end].contains('\n')
+            && in_order(base_end, range_start)
+            && in_order(lhs_end, rhs_start)
+            && in_order(range_end, outer_end)
+        {
+            self.indexed_ranges.insert(range_start);
+            let at = node.receiver.span().start();
+            let mode = if name == "get_mut" {
+                RangeIndexMode::GetMut
+            } else {
+                RangeIndexMode::Get
+            };
+            let kind = SiteKind::Range {
+                inclusive: matches!(range.limits, syn::RangeLimits::Closed(_)),
+                lhs: self.source[range_start..lhs_end].to_string(),
+                rhs: self.source[rhs_start..range_end].to_string(),
+                gap: (lhs_end, rhs_start),
+                index: Some(RangeIndex {
+                    mode,
+                    base: self.source[base_start..base_end].to_string(),
+                    head: (base_start, range_start),
+                    close_bracket: (range_end, outer_end),
+                }),
+            };
+            self.add(Site {
+                id: 0,
+                kind,
+                line: at.line,
+                column: at.column + 1,
+                start: base_start,
+                end: outer_end,
+                text: self.source[range_start..range_end].to_string(),
+            });
         }
         if is_read_only_slice_method(&name)
             && node.attrs.is_empty()
@@ -2694,6 +2825,7 @@ fn is_infallible_bound(expr: &syn::Expr) -> bool {
     match expr {
         syn::Expr::Paren(e) => is_infallible_bound(&e.expr),
         syn::Expr::Group(e) => is_infallible_bound(&e.expr),
+        syn::Expr::Cast(e) if e.attrs.is_empty() => is_infallible_cast_source(&e.expr),
         syn::Expr::Lit(e) => e.attrs.is_empty(),
         syn::Expr::Unary(syn::ExprUnary {
             attrs,
@@ -2707,6 +2839,26 @@ fn is_infallible_bound(expr: &syn::Expr) -> bool {
             ..
         }) if attrs.is_empty() => is_infallible_bound(expr),
         other => is_plain_place(other),
+    }
+}
+
+/// A cast source that cannot trigger user-defined `Deref` or any side effect.
+fn is_infallible_cast_source(expr: &syn::Expr) -> bool {
+    if has_conditional_or_skip_attr(expr) {
+        return false;
+    }
+    match expr {
+        syn::Expr::Paren(e) => is_infallible_cast_source(&e.expr),
+        syn::Expr::Group(e) => is_infallible_cast_source(&e.expr),
+        syn::Expr::Lit(e) => e.attrs.is_empty(),
+        syn::Expr::Path(e) => e.attrs.is_empty(),
+        syn::Expr::Cast(e) => e.attrs.is_empty() && is_infallible_cast_source(&e.expr),
+        syn::Expr::Unary(syn::ExprUnary {
+            attrs,
+            op: syn::UnOp::Neg(_),
+            expr,
+        }) if attrs.is_empty() => matches!(expr.as_ref(), syn::Expr::Lit(_)),
+        _ => false,
     }
 }
 

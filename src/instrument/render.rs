@@ -450,6 +450,39 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                     String::new(),
                 )
             }
+            SiteKind::Position {
+                forward,
+                call,
+                close,
+                ..
+            } => {
+                let same = if *forward { "position" } else { "rposition" };
+                edits.push(Edit {
+                    pos: call.0,
+                    end: call.1,
+                    phase: 1,
+                    order: 0,
+                    text: ").__tmt_quant_mut(), ".into(),
+                    site: site.id,
+                });
+                edits.push(Edit {
+                    pos: close.0,
+                    end: close.1,
+                    phase: 1,
+                    order: 0,
+                    text: format!(
+                        ") {{ (__tmt_q, __tmt_f) => (&__tmt_q).tmt_pos({}u32, {forward}, __tmt_f, |__tmt_i, __tmt_f| (*__tmt_i).{same}(__tmt_f)) }} }})",
+                        site.id
+                    ),
+                    site: site.id,
+                });
+                (
+                    format!(
+                        "({{ #[allow(unused_imports)] use {rt}::{{AnyPos as _, PosPrim as _, TmtQuantExt as _}}; match (("
+                    ),
+                    String::new(),
+                )
+            }
             SiteKind::SaturatingArith {
                 op, call, close, ..
             } => {
@@ -634,6 +667,55 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                 });
                 ("(match (&(".to_string(), String::new())
             }
+            SiteKind::RangeContains {
+                inclusive,
+                open,
+                gap,
+                call,
+                close,
+                ..
+            } => {
+                let dots = if *inclusive { "..=" } else { ".." };
+                if open.0 < open.1 {
+                    edits.push(Edit {
+                        pos: open.0,
+                        end: open.1,
+                        phase: 1,
+                        order: 0,
+                        text: String::new(),
+                        site: site.id,
+                    });
+                }
+                edits.push(Edit {
+                    pos: gap.0,
+                    end: gap.1,
+                    phase: 1,
+                    order: 0,
+                    text: "), (".into(),
+                    site: site.id,
+                });
+                edits.push(Edit {
+                    pos: call.0,
+                    end: call.1,
+                    phase: 1,
+                    order: 0,
+                    text: "), &*(".into(),
+                    site: site.id,
+                });
+                edits.push(Edit {
+                    pos: close.0,
+                    end: close.1,
+                    phase: 1,
+                    order: 0,
+                    text: format!(
+                        ")) {{ (__tmt_s, __tmt_e, __tmt_x) => {{ #[allow(unused_imports)] use {rt}::{{AnyRangeContains as _, RangeContainsPrim as _}}; \
+                         (&{rt}::Rcn::new(__tmt_s, __tmt_e, __tmt_x)).tmt_range_contains({id}u32, {inclusive}, |__tmt_s, __tmt_e, __tmt_x| (__tmt_s{dots}__tmt_e).contains(__tmt_x)) }} }})",
+                        id = site.id,
+                    ),
+                    site: site.id,
+                });
+                ("(match ((".to_string(), String::new())
+            }
             SiteKind::Range {
                 inclusive,
                 gap,
@@ -645,10 +727,9 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                 } else {
                     ("..", "..=")
                 };
-                let (borrow, open_str, extra_close) = match idx.mode {
-                    RangeIndexMode::Ref => ("&", "(match ((", ""),
-                    RangeIndexMode::RefMut => ("&mut ", "(match ((", ""),
-                    RangeIndexMode::Deref => ("&", "(*(match ((", ")"),
+                let (open_str, extra_close) = match idx.mode {
+                    RangeIndexMode::Deref => ("(*(match ((", ")"),
+                    _ => ("(match ((", ""),
                 };
                 edits.push(Edit {
                     pos: idx.head.0,
@@ -671,15 +752,24 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                 } else {
                     ("__tmt_s", "__tmt_e")
                 };
+                let branch = |dots: &str| match idx.mode {
+                    RangeIndexMode::Ref | RangeIndexMode::Deref => {
+                        format!("&({})[{sv}{dots}{ev}]", idx.base)
+                    }
+                    RangeIndexMode::RefMut => format!("&mut ({})[{sv}{dots}{ev}]", idx.base),
+                    RangeIndexMode::Get => format!("({}).get({sv}{dots}{ev})", idx.base),
+                    RangeIndexMode::GetMut => format!("({}).get_mut({sv}{dots}{ev})", idx.base),
+                };
+                let mut_expr = branch(mut_dots);
+                let orig_expr = branch(orig_dots);
                 edits.push(Edit {
                     pos: idx.close_bracket.0,
                     end: idx.close_bracket.1,
                     phase: 1,
                     order: 0,
                     text: format!(
-                        ")) {{ ({sv}, {ev}) => if {rt}::range_end({id}u32) {{ {borrow}({base})[{sv}{mut_dots}{ev}] }} else {{ {borrow}({base})[{sv}{orig_dots}{ev}] }} }}){extra_close}",
+                        ")) {{ ({sv}, {ev}) => if {rt}::range_end({id}u32) {{ {mut_expr} }} else {{ {orig_expr} }} }}){extra_close}",
                         id = site.id,
-                        base = idx.base,
                     ),
                     site: site.id,
                 });

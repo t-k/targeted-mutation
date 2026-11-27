@@ -342,8 +342,53 @@ impl Session {
             SiteKind::Arm { .. } if reached() => reach_plan(Mutation::Delete),
             SiteKind::Arm { .. } => return Planned::Unreached,
             SiteKind::Quantifier { .. } if reached() => reach_plan(Mutation::QuantifierSwap),
+            SiteKind::Position { .. } if reached() => reach_plan(Mutation::PositionSwap),
             SiteKind::LoopCtrl { .. } if reached() => reach_plan(Mutation::LoopCtrlSwap),
             SiteKind::LoopCtrl { .. } => return Planned::Unreached,
+            SiteKind::RangeContains { .. } => {
+                let merged = self.merged(|t| t.arith.get(&id), plan::ArithObs::merge);
+                if merged.opaque {
+                    return Planned::Nothing;
+                }
+                if !merged.same && !merged.differs {
+                    return Planned::Unreached;
+                }
+                if !merged.differs {
+                    let gaps = report::range_contains_gap_finding(file, site, verify)
+                        .map(|finding| PlannedGap {
+                            finding,
+                            survivors: vec![Mutation::RangeEnd],
+                            constant_expr: None,
+                        })
+                        .into_iter()
+                        .collect();
+                    SitePlan {
+                        constant: false,
+                        cannot_differ: false,
+                        redundant_logic_swap: false,
+                        gaps,
+                        run: vec![],
+                        infected: Box::new(|_, _| BTreeSet::new()),
+                        reaching: Box::new(move |bin| {
+                            tests_where(bin.trace.arith.get(&id), |obs| obs.same || obs.differs)
+                        }),
+                    }
+                } else {
+                    SitePlan {
+                        constant: false,
+                        cannot_differ: false,
+                        redundant_logic_swap: false,
+                        gaps: vec![],
+                        run: vec![Mutation::RangeEnd],
+                        infected: Box::new(move |bin, _| {
+                            tests_where(bin.trace.arith.get(&id), |obs| obs.differs)
+                        }),
+                        reaching: Box::new(move |bin| {
+                            tests_where(bin.trace.arith.get(&id), |obs| obs.same || obs.differs)
+                        }),
+                    }
+                }
+            }
             SiteKind::LiteralSet { elements, .. } => {
                 let merged = self.merged(|t| t.lit_set.get(&id), plan::LitSetObs::merge);
                 if merged.opaque {
@@ -402,7 +447,10 @@ impl Session {
             // `!` on an integer or a user type is not negation of a condition, a range of
             // something other than integers has no "one more", and `.all`/`.any` on a
             // non-`Iterator` type is opaque.
-            SiteKind::Not { .. } | SiteKind::Range { .. } | SiteKind::Quantifier { .. } => {
+            SiteKind::Not { .. }
+            | SiteKind::Range { .. }
+            | SiteKind::Quantifier { .. }
+            | SiteKind::Position { .. } => {
                 if self
                     .merged(|t| t.arith.get(&id), plan::ArithObs::merge)
                     .opaque

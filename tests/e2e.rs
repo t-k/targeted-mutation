@@ -6690,3 +6690,172 @@ mod tests {
         "early-returning guard must be reached and caught by probe: {report:#}"
     );
 }
+
+#[test]
+fn probed_range_contains_get_clamp_cast_and_position_swap() {
+    let dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("probed-v14-features");
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(dir.join("src")).unwrap();
+    fs::write(
+        dir.join("Cargo.toml"),
+        "[package]\nname = \"probed-v14\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.join("src/lib.rs"),
+        r#"
+pub fn in_digit_range(c: char) -> bool {
+    ('0'..='9').contains(&c)
+}
+
+pub fn in_open_range_gap(x: u32) -> bool {
+    (1..10).contains(&x)
+}
+
+pub fn range_contains_mut_reborrow(x: &mut u32) -> bool {
+    let hit = (1..=5).contains(x);
+    *x += 1;
+    hit
+}
+
+pub fn get_slice(xs: &[u8], a: usize, b: usize) -> Option<&[u8]> {
+    xs.get(a..b)
+}
+
+pub fn get_mut_slice(xs: &mut [u8], a: usize, b: usize) -> bool {
+    if let Some(part) = xs.get_mut(a..=b) {
+        for x in part {
+            *x = 4;
+        }
+        true
+    } else {
+        false
+    }
+}
+
+pub fn clamp_with_cast(x: u128) -> u128 {
+    x.clamp(1, i16::MAX as u128)
+}
+
+pub fn clamp_with_cast_gap(x: u128) -> u128 {
+    x.clamp(1, i16::MAX as u128)
+}
+
+pub fn first_match(xs: &[u8], target: u8) -> Option<usize> {
+    xs.iter().position(|&b| b == target)
+}
+
+pub fn last_match(xs: &[u8], target: u8) -> Option<usize> {
+    xs.iter().rposition(|&b| b == target)
+}
+
+// `str::chars()` is not `ExactSizeIterator`: probe must fall back to opaque without error.
+pub fn non_exact_size_position(s: &str) -> Option<usize> {
+    s.chars().position(|c| c == 'x')
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tests_all() {
+        // Exercises upper bound `'9'` -> caught.
+        assert!(in_digit_range('0'));
+        assert!(in_digit_range('9'));
+        assert!(!in_digit_range('a'));
+
+        // Never passes `x == 10` -> provable input_gap for `(1..10).contains(&x)`.
+        assert!(in_open_range_gap(5));
+        assert!(!in_open_range_gap(0));
+        assert!(!in_open_range_gap(20));
+
+        assert_eq!(get_slice(&[1, 2, 3, 4], 1, 3), Some(&[2, 3][..]));
+        let mut buf = [0u8; 4];
+        assert!(get_mut_slice(&mut buf, 1, 2));
+        assert_eq!(buf, [0, 4, 4, 0]);
+
+        assert_eq!(clamp_with_cast(0), 1);
+        assert_eq!(clamp_with_cast(100), 100);
+        assert_eq!(clamp_with_cast(100_000), i16::MAX as u128);
+        // Never exceeds upper bound -> proves `u128` ClampPrim is active (not opaque).
+        assert_eq!(clamp_with_cast_gap(0), 1);
+        assert_eq!(clamp_with_cast_gap(100), 100);
+
+        let mut v = 5u32;
+        assert!(range_contains_mut_reborrow(&mut v));
+        assert_eq!(v, 6);
+
+        assert_eq!(first_match(&[1, 2, 1], 1), Some(0));
+        assert_eq!(last_match(&[1, 2, 1], 1), Some(2));
+        assert_eq!(non_exact_size_position("axbxc"), Some(1));
+    }
+}
+"#,
+    )
+    .unwrap();
+
+    let run = tmt(&dir, &["--json", "--quiet", "--audit", "1000"]);
+    let report: Value = serde_json::from_str(&run.stdout)
+        .unwrap_or_else(|e| panic!("invalid json: {e}\n{}\n{}", run.stdout, run.stderr));
+    assert_eq!(report["mutants_not_built"], 0, "{report:#}");
+    assert_eq!(report["skipped_sites"], 0, "{report:#}");
+    let audit = &report["audit"];
+    assert_eq!(
+        audit["source_disagreements"].as_array().unwrap().len(),
+        0,
+        "probe and source outcomes must agree: {report:#}"
+    );
+    assert_eq!(
+        audit["disagreements"].as_array().unwrap().len(),
+        0,
+        "targeted predictions must agree with full reruns: {report:#}"
+    );
+
+    let findings = report["findings"].as_array().unwrap();
+    // `(1..10).contains(&x)` never saw `x == 10` -> provable input_gap.
+    assert!(
+        findings.iter().any(|f| {
+            f["kind"] == "input_gap"
+                && f["survivors"]
+                    .as_array()
+                    .is_some_and(|s| s.iter().any(|v| v == "`(1..=10).contains(&x)`"))
+        }),
+        "expected input_gap for `(1..10).contains(&x)`: {report:#}"
+    );
+    // `('0'..='9').contains(&c)` saw `'9'` -> caught.
+    assert!(
+        !findings
+            .iter()
+            .any(|f| f["code"] == "('0'..='9').contains(&c)"),
+        "expected digit range contains to be caught: {report:#}"
+    );
+    // `clamp_with_cast_gap` never exceeds upper bound -> provable input_gap on `u128`.
+    assert!(
+        findings.iter().any(|f| {
+            f["kind"] == "input_gap"
+                && f["item"] == "clamp_with_cast_gap"
+                && f["survivors"]
+                    .as_array()
+                    .is_some_and(|s| s.iter().any(|v| v == "`x.max(1)`"))
+        }),
+        "expected u128 clamp input_gap on clamp_with_cast_gap: {report:#}"
+    );
+    // `first_match`, `last_match`, `get_slice`, `get_mut_slice`, `clamp_with_cast` all caught.
+    for caught_code in [
+        "xs.iter().position(|&b| b == target)",
+        "xs.iter().rposition(|&b| b == target)",
+        "a..b",
+        "a..=b",
+        "(1..=5).contains(x)",
+    ] {
+        assert!(
+            !findings.iter().any(|f| f["code"] == caught_code),
+            "expected `{caught_code}` to be caught: {report:#}"
+        );
+    }
+    assert!(
+        !findings.iter().any(|f| f["item"] == "clamp_with_cast"),
+        "expected clamp_with_cast to be fully caught: {report:#}"
+    );
+}

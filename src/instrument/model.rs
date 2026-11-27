@@ -171,6 +171,20 @@ pub enum SiteKind {
         /// Byte range of the method name.
         method: (usize, usize),
     },
+    /// `receiver.position(pred)` <-> `receiver.rposition(pred)` on a double-ended exact-size
+    /// iterator with a closure predicate.
+    Position {
+        /// `true` for `.position(pred)`, `false` for `.rposition(pred)`.
+        forward: bool,
+        receiver: String,
+        predicate: String,
+        /// Byte range from receiver end to predicate start.
+        call: (usize, usize),
+        /// Byte range from predicate end to closing `)` end.
+        close: (usize, usize),
+        /// Byte range of the method name.
+        method: (usize, usize),
+    },
     /// `receiver.saturating_{add,sub,mul}(arg)` <-> `receiver.wrapping_{add,sub,mul}(arg)`.
     SaturatingArith {
         op: SaturatingOp,
@@ -253,6 +267,21 @@ pub enum SiteKind {
         close: (usize, usize),
         /// `(element text, removal start, removal end)` for each element.
         elements: Vec<(String, usize, usize)>,
+    },
+    /// `(lhs..rhs).contains(arg)` <-> `(lhs..=rhs).contains(arg)` on primitive ordered types.
+    RangeContains {
+        inclusive: bool,
+        lhs: String,
+        rhs: String,
+        argument: String,
+        /// Byte range from site start to `lhs` start (leading `(`).
+        open: (usize, usize),
+        /// Byte range of `..` / `..=` and surrounding whitespace.
+        gap: (usize, usize),
+        /// Byte range from `rhs` end to `arg` start (`).contains(`).
+        call: (usize, usize),
+        /// Byte range from `arg` end to closing `)` end.
+        close: (usize, usize),
     },
     /// `lhs..rhs` or `lhs..=rhs` on integers (or inside an indexing expression): the end
     /// moves by one.
@@ -574,6 +603,10 @@ pub enum RangeIndexMode {
     RefMut,
     /// `xs[a..b]` used as the receiver of a known `&self` read-only method.
     Deref,
+    /// `xs.get(a..b)`
+    Get,
+    /// `xs.get_mut(a..b)`
+    GetMut,
 }
 
 #[derive(Clone, PartialEq, Eq, Debug)]

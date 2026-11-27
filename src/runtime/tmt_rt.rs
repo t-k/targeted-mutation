@@ -273,6 +273,8 @@ pub enum Mutant {
     LoopCtrlSwap,
     /// `[lit1, lit2, ...].contains(&x)`: drop element at index `0..8`.
     DropLiteralElem(u8),
+    /// `iter.position(f)` <-> `iter.rposition(f)`.
+    PositionSwap,
 }
 
 pub fn parse_mutant(spec: &str) -> Option<(u32, Mutant)> {
@@ -308,6 +310,7 @@ pub fn parse_mutant(spec: &str) -> Option<(u32, Mutant)> {
         "edn" => Mutant::EndianSwap,
         "btc" => Mutant::BitCountSwap,
         "lpc" => Mutant::LoopCtrlSwap,
+        "psw" => Mutant::PositionSwap,
         _ if m.starts_with("dle") => {
             Mutant::DropLiteralElem(m[3..].parse().ok().filter(|idx| *idx < 8)?)
         }
@@ -2295,7 +2298,7 @@ macro_rules! tmt_clamp_ints {
         }
     )*};
 }
-tmt_clamp_ints!(i8 i16 i32 i64 isize u8 u16 u32 u64 usize);
+tmt_clamp_ints!(i8 i16 i32 i64 i128 isize u8 u16 u32 u64 u128 usize);
 
 macro_rules! tmt_clamp_floats {
     ($($t:ty)*) => {$(
@@ -3515,5 +3518,167 @@ impl<'r, 'a, A: ?Sized, X> AnyLitSet<'a, A, X> for &'r Lst<'a, A, X> {
             record_bits_u16(b'S', site, LITSET_OPAQUE);
         }
         orig(a, x)
+    }
+}
+
+/// `(a..b).contains(x)` <-> `(a..=b).contains(x)` on primitive ordered types.
+pub trait RangeContainsElem: PartialOrd + PartialEq {}
+
+macro_rules! tmt_range_contains_elems {
+    ($($t:ty)*) => {$(
+        impl RangeContainsElem for $t {}
+    )*};
+}
+tmt_range_contains_elems!(
+    i8 i16 i32 i64 i128 isize
+    u8 u16 u32 u64 u128 usize
+    f32 f64 char
+);
+
+pub struct Rcn<S, E, X>(Cell<Option<(S, E, X)>>);
+
+impl<S, E, X> Rcn<S, E, X> {
+    #[inline(always)]
+    pub fn new(s: S, e: E, x: X) -> Self {
+        Rcn(Cell::new(Some((s, e, x))))
+    }
+
+    #[inline(always)]
+    fn take(&self) -> (S, E, X) {
+        self.0.take().expect("range contains operands taken once")
+    }
+}
+
+pub trait RangeContainsPrim<S, E, X> {
+    fn tmt_range_contains<F: FnOnce(S, E, X) -> bool>(
+        &self,
+        site: u32,
+        inclusive: bool,
+        orig: F,
+    ) -> bool;
+}
+
+pub trait AnyRangeContains<S, E, X> {
+    fn tmt_range_contains<R, F: FnOnce(S, E, X) -> R>(
+        &self,
+        site: u32,
+        inclusive: bool,
+        orig: F,
+    ) -> R;
+}
+
+impl<'b, T: RangeContainsElem + Copy> RangeContainsPrim<T, T, &'b T> for Rcn<T, T, &'b T> {
+    #[inline(always)]
+    fn tmt_range_contains<F: FnOnce(T, T, &'b T) -> bool>(
+        &self,
+        site: u32,
+        inclusive: bool,
+        orig: F,
+    ) -> bool {
+        let (s, e, x) = self.take();
+        if idle(site) {
+            return orig(s, e, x);
+        }
+        let mutated = if inclusive {
+            (s..e).contains(x)
+        } else {
+            (s..=e).contains(x)
+        };
+        if mutant_at(site) == Some(Mutant::RangeEnd) {
+            return mutated;
+        }
+        let actual = orig(s, e, x);
+        if !bits_known(b'A', site, ARITH_SAME | ARITH_DIFFERS) {
+            record_bits(
+                b'A',
+                site,
+                if actual == mutated {
+                    ARITH_SAME
+                } else {
+                    ARITH_DIFFERS
+                },
+            );
+        }
+        actual
+    }
+}
+
+impl<'r, S, E, X> AnyRangeContains<S, E, X> for &'r Rcn<S, E, X> {
+    fn tmt_range_contains<R, F: FnOnce(S, E, X) -> R>(
+        &self,
+        site: u32,
+        _inclusive: bool,
+        orig: F,
+    ) -> R {
+        let (s, e, x) = self.take();
+        if !idle(site) {
+            record_bits(b'A', site, ARITH_OPAQUE);
+        }
+        orig(s, e, x)
+    }
+}
+
+/// `iter.position(f)` <-> `iter.rposition(f)`: reach-guided probe specialized to
+/// `DoubleEndedIterator + ExactSizeIterator`.
+pub trait PosPrim<'a, I: ?Sized + 'a> {
+    type Item;
+    fn tmt_pos<P: FnMut(Self::Item) -> bool, G: FnOnce(&'a mut I, P) -> Option<usize>>(
+        &self,
+        site: u32,
+        forward: bool,
+        pred: P,
+        orig: G,
+    ) -> Option<usize>;
+}
+
+pub trait AnyPos<'a, I: ?Sized + 'a> {
+    fn tmt_pos<P, R, G: FnOnce(&'a mut I, P) -> R>(
+        &self,
+        site: u32,
+        forward: bool,
+        pred: P,
+        orig: G,
+    ) -> R;
+}
+
+impl<'a, I: DoubleEndedIterator + ExactSizeIterator> PosPrim<'a, I> for Qnt<'a, I> {
+    type Item = I::Item;
+    #[inline(always)]
+    fn tmt_pos<P: FnMut(I::Item) -> bool, G: FnOnce(&'a mut I, P) -> Option<usize>>(
+        &self,
+        site: u32,
+        forward: bool,
+        pred: P,
+        orig: G,
+    ) -> Option<usize> {
+        let iter = self.take();
+        if idle(site) {
+            return orig(iter, pred);
+        }
+        if mutant_at(site) == Some(Mutant::PositionSwap) {
+            return if forward {
+                iter.rposition(pred)
+            } else {
+                iter.position(pred)
+            };
+        }
+        record_bits(b'R', site, 1);
+        orig(iter, pred)
+    }
+}
+
+impl<'r, 'a, I: ?Sized> AnyPos<'a, I> for &'r Qnt<'a, I> {
+    fn tmt_pos<P, R, G: FnOnce(&'a mut I, P) -> R>(
+        &self,
+        site: u32,
+        _forward: bool,
+        pred: P,
+        orig: G,
+    ) -> R {
+        let iter = self.take();
+        if !idle(site) {
+            record_bits(b'A', site, ARITH_OPAQUE);
+        }
+        orig(iter, pred)
     }
 }

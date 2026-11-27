@@ -3907,7 +3907,7 @@ fn mutation_of(site: &Site, mutant: &instrument::SourceMutant) -> Mutation {
         SiteKind::Guard { .. } => Mutation::Const(mutant.into == "true"),
         SiteKind::Logic { .. } => Mutation::LogicSwap,
         SiteKind::Not { .. } => Mutation::DropNot,
-        SiteKind::Range { .. } => Mutation::RangeEnd,
+        SiteKind::Range { .. } | SiteKind::RangeContains { .. } => Mutation::RangeEnd,
         SiteKind::SliceEnd { .. } => Mutation::OtherEnd,
         SiteKind::StrAffix { .. } => Mutation::StrContains,
         SiteKind::StrReplace { .. } => Mutation::StrReplaceMultiplicity,
@@ -3926,6 +3926,7 @@ fn mutation_of(site: &Site, mutant: &instrument::SourceMutant) -> Mutation {
             }
         }
         SiteKind::Quantifier { .. } => Mutation::QuantifierSwap,
+        SiteKind::Position { .. } => Mutation::PositionSwap,
         SiteKind::SaturatingArith { .. } => Mutation::SaturatingSwap,
         SiteKind::StrTrim { op, .. } => {
             if mutant.into == op.alt1().name() {
