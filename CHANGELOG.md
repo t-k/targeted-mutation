@@ -5,6 +5,15 @@ All notable changes to `targeted-mutation` (`cargo tmt`) are documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.13.0] - 2026-11-27
+
+### Added
+
+- **Single-build targeted probes for indexed ranges, literal sets, and short-circuiting match guards** (reducing source-rebuild candidates on `targeted-mutation` itself from 305 to 217):
+  - **Indexed range endpoint probes (`&xs[a..b]` ↔ `&xs[a..=b]`, `&mut xs[a..b]` ↔ `&mut xs[a..=b]`, `xs[a..b].read_method()`)**: switches between real `Range` and `RangeInclusive` at the indexing expression on simple single-line places with pure bounds, preserving identical return types, borrow modes (without requiring `IndexMut<RangeFull>`), evaluation order, out-of-bounds panics, and `usize::MAX` endpoints without `RANGE_AT_TOP` skips.
+  - **Targeted literal-set element deletion (`[lit1, lit2, ...].contains(&x)`)**: lowers 2–8 distinct primitive literal sets with explicit shared-reference arguments into autoref-specialized probes (`LitSetPrim` / `AnyLitSet`) that record per-element match masks (`S` trace records), report unmatched elements directly as provable `INPUT GAP` findings without running tests, run matched elements only against matching tests, fall back to `opaque` if a trait overrides slice semantics, and unify `b'...'` byte literals with integer literals during duplicate detection.
+  - **Short-circuiting `match` guard probes**: evaluates `guard_override` before the guard expression so constant `true`/`false` replacements skip guard evaluation and match source mutations even when a guard has side effects or early exits (`return`/`?`), while preserving `INPUT GAP` planning for strictly pure guards (trivial literals/paths or runtime-verified primitive comparisons).
+
 ## [0.12.0] - 2026-11-27
 
 ### Added
