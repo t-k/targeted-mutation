@@ -226,6 +226,13 @@ pub(super) fn same_bytes(a: &Path, b: &Path) -> bool {
     let (Ok(a), Ok(b)) = (fs::File::open(a), fs::File::open(b)) else {
         return false;
     };
+    if let (Ok(la), Ok(lb)) = (a.metadata(), b.metadata())
+        && la.is_file()
+        && lb.is_file()
+        && la.len() != lb.len()
+    {
+        return false;
+    }
     compare_streams(a, b).unwrap_or(false)
 }
 

@@ -224,6 +224,13 @@ impl SavedExecutable {
         for _ in 0..1024 {
             let id = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let path = parent.join(format!("tmt-orig-{}-{id}-{name}", std::process::id()));
+            #[cfg(target_os = "macos")]
+            match try_fclonefile_new(&input, &path) {
+                Ok(true) => return Ok(Self { path }),
+                Ok(false) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(_) => {}
+            }
             match fs::OpenOptions::new()
                 .write(true)
                 .create_new(true)
@@ -232,13 +239,35 @@ impl SavedExecutable {
                 Ok(mut output) => {
                     // Own the newly created file immediately so any copy/chmod failure removes it.
                     let saved = Self { path };
-                    std::io::copy(&mut input, &mut output).with_context(|| {
-                        format!(
-                            "preserving original witness binary {} at {}",
-                            exe.display(),
-                            saved.path.display()
+                    #[cfg(all(
+                        target_os = "linux",
+                        any(
+                            target_arch = "x86_64",
+                            target_arch = "aarch64",
+                            target_arch = "x86",
+                            target_arch = "riscv64"
                         )
-                    })?;
+                    ))]
+                    let cloned = try_ficlone(&input, &output);
+                    #[cfg(not(all(
+                        target_os = "linux",
+                        any(
+                            target_arch = "x86_64",
+                            target_arch = "aarch64",
+                            target_arch = "x86",
+                            target_arch = "riscv64"
+                        )
+                    )))]
+                    let cloned = false;
+                    if !cloned {
+                        std::io::copy(&mut input, &mut output).with_context(|| {
+                            format!(
+                                "preserving original witness binary {} at {}",
+                                exe.display(),
+                                saved.path.display()
+                            )
+                        })?;
+                    }
                     output.set_permissions(permissions)?;
                     drop(output);
                     return Ok(saved);
@@ -273,6 +302,65 @@ impl Drop for SavedExecutable {
         #[cfg(not(windows))]
         let _ = fs::remove_file(&self.path);
     }
+}
+
+/// Atomically creates a copy-on-write clone on APFS from an already-opened file descriptor
+/// (`fclonefileat(2)`), preserving resolved symlink targets and `create_new` exclusivity.
+/// Returns `Ok(true)` if cloned, `Ok(false)` to fall back to regular copy,
+/// or `Err(AlreadyExists)` if `dst` already exists.
+#[cfg(target_os = "macos")]
+fn try_fclonefile_new(src: &fs::File, dst: &Path) -> std::io::Result<bool> {
+    use std::ffi::CString;
+    use std::os::fd::AsRawFd;
+    use std::os::macos::fs::MetadataExt;
+    use std::os::unix::ffi::OsStrExt;
+    const AT_FDCWD: std::ffi::c_int = -2;
+    unsafe extern "C" {
+        fn fclonefileat(
+            srcfd: std::ffi::c_int,
+            dst_dirfd: std::ffi::c_int,
+            dst: *const std::ffi::c_char,
+            flags: u32,
+        ) -> std::ffi::c_int;
+    }
+    // Avoid cloning BSD file flags such as `UF_IMMUTABLE` (`uchg`), which would prevent
+    // `SavedExecutable::drop` from unlinking the temporary copy.
+    if src.metadata().map_or(true, |m| m.st_flags() != 0) {
+        return Ok(false);
+    }
+    let Ok(dst_c) = CString::new(dst.as_os_str().as_bytes()) else {
+        return Ok(false);
+    };
+    // SAFETY: `src` is an open regular file FD and `dst_c` is a valid NUL-terminated C string;
+    // `fclonefileat` fails with `EEXIST` if `dst` already exists.
+    if unsafe { fclonefileat(src.as_raw_fd(), AT_FDCWD, dst_c.as_ptr(), 0) } == 0 {
+        return Ok(true);
+    }
+    let err = std::io::Error::last_os_error();
+    if err.kind() == std::io::ErrorKind::AlreadyExists {
+        return Err(err);
+    }
+    Ok(false)
+}
+
+/// Attempts an O(1) copy-on-write reflink on Linux filesystems (Btrfs/XFS) via `FICLONE`.
+#[cfg(all(
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "x86",
+        target_arch = "riscv64"
+    )
+))]
+fn try_ficlone(src: &fs::File, dst: &fs::File) -> bool {
+    use std::os::fd::AsRawFd;
+    const FICLONE: std::ffi::c_ulong = 0x4004_9409;
+    unsafe extern "C" {
+        fn ioctl(fd: std::ffi::c_int, request: std::ffi::c_ulong, ...) -> std::ffi::c_int;
+    }
+    // SAFETY: both FDs are open regular files owned by the caller; `FICLONE` takes `src_fd`.
+    unsafe { ioctl(dst.as_raw_fd(), FICLONE, src.as_raw_fd()) == 0 }
 }
 
 pub(super) struct SharedWitness {

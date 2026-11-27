@@ -534,7 +534,8 @@ fn renders_a_comparison_probe() {
     let out = render(src, &sites, &all);
     assert_eq!(
         out.text,
-        "fn f(a: u8) -> bool { (match (&(a), &(18)) { (__tmt_l, __tmt_r) => { #[allow(unused_imports)] \
+        "fn f(a: u8) -> bool { (match (&(a), &(18)) { (__tmt_l, __tmt_r) => if crate::__tmt_rt::idle(3u32) { \
+             crate::__tmt_rt::fast_ord(3u8, __tmt_l, __tmt_r) } else { #[allow(unused_imports)] \
              use crate::__tmt_rt::{ValAny as _, ValNum as _}; crate::__tmt_rt::ord(3u32, 3u8, __tmt_l, __tmt_r, \
              (&crate::__tmt_rt::W(__tmt_l)).tmt_val(), (&crate::__tmt_rt::W(__tmt_r)).tmt_val()) } }) }"
     );

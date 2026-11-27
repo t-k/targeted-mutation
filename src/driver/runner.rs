@@ -457,6 +457,7 @@ pub(super) fn run_binary(
         }
     };
     let group = child.id();
+    let mut exit_waiter = ExitWaiter::new(group);
     let kill = |child: &mut std::process::Child| {
         if nextest {
             // Nextest creates a process group per test. Let its signal handler
@@ -543,7 +544,22 @@ pub(super) fn run_binary(
             return Ok(Outcome::Timeout);
         }
         // tmt:ignore without the pause the loop only looks more often: the verdict is the same
-        std::thread::sleep(next_test_poll(&mut delay, timeout - elapsed));
+        let remaining = timeout - elapsed;
+        let wait = if output_to_watch.is_none() && exit_waiter.is_event_driven() {
+            if bin.report_slow && running_mutant && !waiting_reported {
+                let slow_at = Duration::from_secs(5).min(timeout / 2);
+                remaining.min(
+                    slow_at
+                        .saturating_sub(elapsed)
+                        .max(Duration::from_millis(1)),
+                )
+            } else {
+                remaining
+            }
+        } else {
+            next_test_poll(&mut delay, remaining)
+        };
+        exit_waiter.wait(wait);
     })();
     // tmt:ignore only Windows needs the file closed before the mark is removed, and these tests are for Unix
     drop(output_to_watch);
@@ -570,6 +586,277 @@ pub(super) struct FailureOutput {
     pub(super) file: fs::File,
     pub(super) line: Vec<u8>,
     pub(super) discarded: bool,
+}
+
+/// Event-driven child exit waiter (`kqueue` on macOS, `pidfd_open` + `poll` on Linux,
+/// falling back to `std::thread::sleep` on other platforms or unsupported kernels).
+struct ExitWaiter {
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    fd: Option<std::os::fd::OwnedFd>,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    exited: bool,
+}
+
+impl ExitWaiter {
+    #[cfg(target_os = "macos")]
+    fn new(pid: u32) -> Self {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        const EVFILT_PROC: i16 = -5;
+        const EV_ADD: u16 = 0x0001;
+        const EV_ONESHOT: u16 = 0x0010;
+        const NOTE_EXIT: u32 = 0x8000_0000;
+        const F_SETFD: std::ffi::c_int = 2;
+        const FD_CLOEXEC: std::ffi::c_int = 1;
+        const ESRCH: i32 = 3;
+
+        #[repr(C)]
+        struct Kevent {
+            ident: usize,
+            filter: i16,
+            flags: u16,
+            fflags: u32,
+            data: isize,
+            udata: *mut std::ffi::c_void,
+        }
+        #[repr(C)]
+        struct Timespec {
+            tv_sec: isize,
+            tv_nsec: isize,
+        }
+        unsafe extern "C" {
+            fn kqueue() -> std::ffi::c_int;
+            fn fcntl(fd: std::ffi::c_int, cmd: std::ffi::c_int, ...) -> std::ffi::c_int;
+            fn kevent(
+                kq: std::ffi::c_int,
+                changelist: *const Kevent,
+                nchanges: std::ffi::c_int,
+                eventlist: *mut Kevent,
+                nevents: std::ffi::c_int,
+                timeout: *const Timespec,
+            ) -> std::ffi::c_int;
+        }
+        // SAFETY: `kqueue()` takes no arguments and returns a new fd or -1.
+        let raw = unsafe { kqueue() };
+        if raw < 0 {
+            return Self {
+                fd: None,
+                exited: false,
+            };
+        }
+        // SAFETY: `raw` is a valid newly opened kqueue descriptor owned by `fd`.
+        let fd = unsafe { OwnedFd::from_raw_fd(raw) };
+        // Prevent concurrent child spawns from inheriting the kqueue descriptor.
+        unsafe { fcntl(raw, F_SETFD, FD_CLOEXEC) };
+        let change = Kevent {
+            ident: pid as usize,
+            filter: EVFILT_PROC,
+            flags: EV_ADD | EV_ONESHOT,
+            fflags: NOTE_EXIT,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        let zero = Timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `change` and `zero` are valid pointers for a 1-element registration.
+        let rc = unsafe { kevent(raw, &change, 1, std::ptr::null_mut(), 0, &zero) };
+        if rc == 0 {
+            Self {
+                fd: Some(fd),
+                exited: false,
+            }
+        } else if std::io::Error::last_os_error().raw_os_error() == Some(ESRCH) {
+            Self {
+                fd: None,
+                exited: true,
+            }
+        } else {
+            Self {
+                fd: None,
+                exited: false,
+            }
+        }
+    }
+
+    #[cfg(all(
+        target_os = "linux",
+        any(
+            all(target_arch = "x86_64", target_pointer_width = "64"),
+            target_arch = "aarch64",
+            target_arch = "x86",
+            target_arch = "riscv64"
+        )
+    ))]
+    fn new(pid: u32) -> Self {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        const SYS_PIDFD_OPEN: std::ffi::c_long = 434;
+        const ESRCH: i32 = 3;
+        unsafe extern "C" {
+            fn syscall(num: std::ffi::c_long, ...) -> std::ffi::c_long;
+        }
+        let Ok(raw_pid) = std::ffi::c_int::try_from(pid) else {
+            return Self {
+                fd: None,
+                exited: false,
+            };
+        };
+        // SAFETY: `pidfd_open(pid, 0)` returns a new O_CLOEXEC fd or -1.
+        let raw = unsafe { syscall(SYS_PIDFD_OPEN, raw_pid, 0 as std::ffi::c_uint) };
+        if raw >= 0 {
+            // SAFETY: `raw` is a newly created valid pidfd owned by this struct.
+            let fd = unsafe { OwnedFd::from_raw_fd(raw as std::os::fd::RawFd) };
+            Self {
+                fd: Some(fd),
+                exited: false,
+            }
+        } else if std::io::Error::last_os_error().raw_os_error() == Some(ESRCH) {
+            Self {
+                fd: None,
+                exited: true,
+            }
+        } else {
+            Self {
+                fd: None,
+                exited: false,
+            }
+        }
+    }
+
+    #[cfg(not(any(
+        target_os = "macos",
+        all(
+            target_os = "linux",
+            any(
+                all(target_arch = "x86_64", target_pointer_width = "64"),
+                target_arch = "aarch64",
+                target_arch = "x86",
+                target_arch = "riscv64"
+            )
+        )
+    )))]
+    fn new(_pid: u32) -> Self {
+        #[cfg(target_os = "linux")]
+        {
+            Self {
+                fd: None,
+                exited: false,
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            Self {}
+        }
+    }
+
+    fn is_event_driven(&self) -> bool {
+        #[cfg(any(target_os = "macos", target_os = "linux"))]
+        {
+            self.fd.is_some() || self.exited
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        {
+            false
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    fn wait(&mut self, duration: Duration) {
+        use std::os::fd::AsRawFd;
+        if self.exited {
+            // `NOTE_EXIT` can fire slightly before `waitpid(WNOHANG)` sees the zombie;
+            // yield briefly rather than busy-spinning.
+            std::thread::sleep(duration.min(TEST_POLL_INITIAL));
+            return;
+        }
+        let Some(fd) = &self.fd else {
+            std::thread::sleep(duration);
+            return;
+        };
+        #[repr(C)]
+        struct Kevent {
+            ident: usize,
+            filter: i16,
+            flags: u16,
+            fflags: u32,
+            data: isize,
+            udata: *mut std::ffi::c_void,
+        }
+        #[repr(C)]
+        struct Timespec {
+            tv_sec: isize,
+            tv_nsec: isize,
+        }
+        unsafe extern "C" {
+            fn kevent(
+                kq: std::ffi::c_int,
+                changelist: *const Kevent,
+                nchanges: std::ffi::c_int,
+                eventlist: *mut Kevent,
+                nevents: std::ffi::c_int,
+                timeout: *const Timespec,
+            ) -> std::ffi::c_int;
+        }
+        let mut ev = Kevent {
+            ident: 0,
+            filter: 0,
+            flags: 0,
+            fflags: 0,
+            data: 0,
+            udata: std::ptr::null_mut(),
+        };
+        let ts = Timespec {
+            tv_sec: duration.as_secs().min(isize::MAX as u64) as isize,
+            tv_nsec: duration.subsec_nanos() as isize,
+        };
+        // SAFETY: `ev` and `ts` are valid stack structs for a 1-event wait.
+        let rc = unsafe { kevent(fd.as_raw_fd(), std::ptr::null(), 0, &mut ev, 1, &ts) };
+        if rc > 0 {
+            self.exited = true;
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn wait(&mut self, duration: Duration) {
+        use std::os::fd::AsRawFd;
+        if self.exited {
+            return;
+        }
+        let Some(fd) = &self.fd else {
+            std::thread::sleep(duration);
+            return;
+        };
+        const POLLIN: std::ffi::c_short = 0x0001;
+        #[repr(C)]
+        struct PollFd {
+            fd: std::ffi::c_int,
+            events: std::ffi::c_short,
+            revents: std::ffi::c_short,
+        }
+        unsafe extern "C" {
+            fn poll(
+                fds: *mut PollFd,
+                nfds: std::ffi::c_ulong,
+                timeout: std::ffi::c_int,
+            ) -> std::ffi::c_int;
+        }
+        let mut pfd = PollFd {
+            fd: fd.as_raw_fd(),
+            events: POLLIN,
+            revents: 0,
+        };
+        let ms = duration.as_millis().clamp(1, std::ffi::c_int::MAX as u128) as std::ffi::c_int;
+        // SAFETY: `pfd` is a valid 1-element `pollfd` array.
+        let rc = unsafe { poll(&mut pfd, 1, ms) };
+        if rc > 0 {
+            self.exited = true;
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    fn wait(&mut self, duration: Duration) {
+        std::thread::sleep(duration);
+    }
 }
 
 impl FailureOutput {

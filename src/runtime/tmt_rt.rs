@@ -289,17 +289,12 @@ pub fn parse_mutant(spec: &str) -> Option<(u32, Mutant)> {
     Some((site, m))
 }
 
+#[inline(always)]
 fn eval_rel(op: u8, rel: u8) -> bool {
-    match (op, rel) {
-        (NE, REL_UN) => true,
-        (_, REL_UN) => false,
-        (LT, r) => r == REL_LT,
-        (LE, r) => r != REL_GT,
-        (GT, r) => r == REL_GT,
-        (GE, r) => r != REL_LT,
-        (EQ, r) => r == REL_EQ,
-        (_, r) => r != REL_EQ,
-    }
+    // 4-bit truth table matching `formal/lean/Planner.lean` (`CmpOp.truthMask`).
+    const TRUTH: [u8; 6] = [0b0001, 0b0011, 0b0100, 0b0110, 0b0010, 0b1101];
+    let idx = if (op as usize) < 6 { op as usize } else { 5 };
+    TRUTH[idx] & rel != 0
 }
 
 fn rel_of_d(d: i128) -> u8 {
@@ -752,11 +747,15 @@ fn flush_backlogs(leaving: Option<&Arc<Mutex<Backlog>>>) {
     };
     let mut tracer = locked(tracer);
     let t = &mut *tracer;
+    let mut batch = String::new();
     for shelf in &t.shelves {
+        let name = &t.names[shelf.test as usize];
         for (site, summary) in locked(&shelf.backlog).drain() {
-            let line = summary.line(site, &t.names[shelf.test as usize]);
-            write_line(&mut t.out, &line);
+            batch.push_str(&summary.line(site, name));
         }
+    }
+    if !batch.is_empty() {
+        write_line(&mut t.out, &batch);
     }
     if let Some(leaving) = leaving {
         t.shelves
@@ -935,6 +934,23 @@ fn finish(site: u32, op: u8, orig: bool, rel: u8, av: Val, bv: Val, d: Diff) -> 
     orig
 }
 
+/// Fast-path ordering comparison when the probe is idle (no `Val` conversion needed).
+#[inline(always)]
+pub fn fast_ord<A: ?Sized + PartialOrd<B>, B: ?Sized>(op: u8, a: &A, b: &B) -> bool {
+    match op {
+        LT => a < b,
+        LE => a <= b,
+        GT => a > b,
+        _ => a >= b,
+    }
+}
+
+/// Fast-path equality comparison when the probe is idle (no `Val` conversion needed).
+#[inline(always)]
+pub fn fast_eq<A: ?Sized + PartialEq<B>, B: ?Sized>(op: u8, a: &A, b: &B) -> bool {
+    if op == EQ { a == b } else { a != b }
+}
+
 /// `a < b`, `a <= b`, `a > b`, `a >= b`.
 ///
 /// While tracing or running a mutant the operands are compared exactly once, through
@@ -951,18 +967,13 @@ pub fn ord<A: ?Sized + PartialOrd<B>, B: ?Sized>(
     bv: Val,
 ) -> bool {
     if idle(site) {
-        return match op {
-            LT => a < b,
-            LE => a <= b,
-            GT => a > b,
-            _ => a >= b,
-        };
+        return fast_ord(op, a, b);
     }
     ord_busy(site, op, a, b, av, bv)
 }
 
 #[inline(never)]
-fn ord_busy<A: ?Sized + PartialOrd<B>, B: ?Sized>(
+pub fn ord_busy<A: ?Sized + PartialOrd<B>, B: ?Sized>(
     site: u32,
     op: u8,
     a: &A,
@@ -990,7 +1001,7 @@ pub fn eq<A: ?Sized + PartialEq<B>, B: ?Sized>(
     av: Val,
     bv: Val,
 ) -> bool {
-    let orig = if op == EQ { a == b } else { a != b };
+    let orig = fast_eq(op, a, b);
     if idle(site) {
         return orig;
     }
@@ -998,7 +1009,7 @@ pub fn eq<A: ?Sized + PartialEq<B>, B: ?Sized>(
 }
 
 #[inline(never)]
-fn eq_busy(site: u32, op: u8, orig: bool, av: Val, bv: Val) -> bool {
+pub fn eq_busy(site: u32, op: u8, orig: bool, av: Val, bv: Val) -> bool {
     let equal = orig == (op == EQ);
     let d = diff(av, bv, equal);
     let rel = match (equal, d) {
@@ -1597,7 +1608,9 @@ macro_rules! tmt_min_max_ints {
                 if mutant_at(site) == Some(Mutant::MinMax) {
                     return true;
                 }
-                record_bits(b'A', site, if self.0 == self.1 { ARITH_SAME } else { ARITH_DIFFERS });
+                if !bits_known(b'A', site, ARITH_SAME | ARITH_DIFFERS) {
+                    record_bits(b'A', site, if self.0 == self.1 { ARITH_SAME } else { ARITH_DIFFERS });
+                }
                 false
             }
         }
@@ -1620,9 +1633,11 @@ macro_rules! tmt_min_max_floats {
                 if mutant_at(site) == Some(Mutant::MinMax) {
                     return true;
                 }
-                // `-0.0.max(0.0)` and `-0.0.min(0.0)` differ in sign bit; NaN is kept on the safe side.
-                let same = float_min_max_same(*self.0 as f64, *self.1 as f64);
-                record_bits(b'A', site, if same { ARITH_SAME } else { ARITH_DIFFERS });
+                if !bits_known(b'A', site, ARITH_SAME | ARITH_DIFFERS) {
+                    // `-0.0.max(0.0)` and `-0.0.min(0.0)` differ in sign bit; NaN is kept on the safe side.
+                    let same = float_min_max_same(*self.0 as f64, *self.1 as f64);
+                    record_bits(b'A', site, if same { ARITH_SAME } else { ARITH_DIFFERS });
+                }
                 false
             }
         }
@@ -1812,6 +1827,22 @@ pub trait TmtStrPat {
     fn tmt_str_replacen1(&self, s: &str, to: &str) -> String;
 }
 
+/// Zero-allocation equivalence check for `s.replace(pat, to) != s.replacen(pat, to, 1)`.
+/// Proven equivalent in `formal/lean/Planner.lean` (`replace_ne_replacen1_iff`).
+#[inline]
+pub fn str_replace_differs(s: &str, pat: &str, to: &str) -> bool {
+    if pat == to {
+        return false;
+    }
+    if pat.is_empty() {
+        return !s.is_empty();
+    }
+    match s.find(pat) {
+        Some(pos) => s[pos + pat.len()..].contains(pat),
+        None => false,
+    }
+}
+
 impl TmtStrPat for &str {
     #[inline(always)]
     fn tmt_affix_differs(&self, s: &str, starts: bool) -> bool {
@@ -1820,7 +1851,10 @@ impl TmtStrPat for &str {
         } else {
             s.ends_with(*self)
         };
-        orig != s.contains(*self)
+        if orig {
+            return false;
+        }
+        s.contains(*self)
     }
 
     #[inline(always)]
@@ -1830,7 +1864,7 @@ impl TmtStrPat for &str {
 
     #[inline(always)]
     fn tmt_replace_differs(&self, s: &str, to: &str) -> bool {
-        s.replace(*self, to) != s.replacen(*self, to, 1)
+        str_replace_differs(s, *self, to)
     }
 
     #[inline(always)]
@@ -1933,7 +1967,10 @@ impl TmtStrPat for char {
         } else {
             s.ends_with(*self)
         };
-        orig != s.contains(*self)
+        if orig {
+            return false;
+        }
+        s.contains(*self)
     }
 
     #[inline(always)]
@@ -1943,7 +1980,9 @@ impl TmtStrPat for char {
 
     #[inline(always)]
     fn tmt_replace_differs(&self, s: &str, to: &str) -> bool {
-        s.replace(*self, to) != s.replacen(*self, to, 1)
+        let mut buf = [0u8; 4];
+        let pat = self.encode_utf8(&mut buf);
+        str_replace_differs(s, pat, to)
     }
 
     #[inline(always)]
@@ -2016,8 +2055,10 @@ impl<'a, A: ?Sized + TmtStrRef, P: TmtStrPat> StrAffixPrim<'a, A, P> for Aff<'a,
         if mutant_at(site) == Some(Mutant::StrContains) {
             return p.tmt_str_contains(a.tmt_as_str());
         }
-        let differs = p.tmt_affix_differs(a.tmt_as_str(), starts);
-        record_bits(b'A', site, if differs { ARITH_DIFFERS } else { ARITH_SAME });
+        if !bits_known(b'A', site, ARITH_SAME | ARITH_DIFFERS) {
+            let differs = p.tmt_affix_differs(a.tmt_as_str(), starts);
+            record_bits(b'A', site, if differs { ARITH_DIFFERS } else { ARITH_SAME });
+        }
         orig(a, p)
     }
 }
@@ -2086,8 +2127,10 @@ impl<'a, A: ?Sized + TmtStrRef, P: TmtStrPat, T: TmtStrRef> StrReplacePrim<'a, A
                 p.tmt_str_replace(a.tmt_as_str(), t.tmt_as_str())
             };
         }
-        let differs = p.tmt_replace_differs(a.tmt_as_str(), t.tmt_as_str());
-        record_bits(b'A', site, if differs { ARITH_DIFFERS } else { ARITH_SAME });
+        if !bits_known(b'A', site, ARITH_SAME | ARITH_DIFFERS) {
+            let differs = p.tmt_replace_differs(a.tmt_as_str(), t.tmt_as_str());
+            record_bits(b'A', site, if differs { ARITH_DIFFERS } else { ARITH_SAME });
+        }
         orig(a, p, t)
     }
 }
@@ -2157,14 +2200,16 @@ macro_rules! tmt_clamp_ints {
                     Some(Mutant::ClampDropUpper) => return x.max(lo),
                     _ => {}
                 }
-                if lo <= hi {
-                    let v = x.clamp(lo, hi);
-                    let mut bits = if v == x.min(hi) { ARITH_SAME } else { ARITH_DIFFERS };
-                    bits |= if v == x.max(lo) { ARITH_SAME2 } else { ARITH_DIFFERS2 };
-                    record_bits(b'A', site, bits);
-                } else {
-                    // `clamp` panics on reversed bounds while `min` and `max` return a value.
-                    record_bits(b'A', site, ARITH_DIFFERS | ARITH_DIFFERS2);
+                if !bits_known(b'A', site, ARITH_SAME | ARITH_DIFFERS | ARITH_SAME2 | ARITH_DIFFERS2) {
+                    if lo <= hi {
+                        let v = x.clamp(lo, hi);
+                        let mut bits = if v == x.min(hi) { ARITH_SAME } else { ARITH_DIFFERS };
+                        bits |= if v == x.max(lo) { ARITH_SAME2 } else { ARITH_DIFFERS2 };
+                        record_bits(b'A', site, bits);
+                    } else {
+                        // `clamp` panics on reversed bounds while `min` and `max` return a value.
+                        record_bits(b'A', site, ARITH_DIFFERS | ARITH_DIFFERS2);
+                    }
                 }
                 orig(a, lo, hi)
             }
@@ -2197,16 +2242,18 @@ macro_rules! tmt_clamp_floats {
                     Some(Mutant::ClampDropUpper) => return x.max(lo),
                     _ => {}
                 }
-                if lo <= hi {
-                    let v = x.clamp(lo, hi) as f64;
-                    let drop_lo = x.min(hi) as f64;
-                    let drop_hi = x.max(lo) as f64;
-                    let mut bits = if float_min_max_same(v, drop_lo) { ARITH_SAME } else { ARITH_DIFFERS };
-                    bits |= if float_min_max_same(v, drop_hi) { ARITH_SAME2 } else { ARITH_DIFFERS2 };
-                    record_bits(b'A', site, bits);
-                } else {
-                    // `clamp` panics on reversed or NaN bounds while `min` and `max` do not.
-                    record_bits(b'A', site, ARITH_DIFFERS | ARITH_DIFFERS2);
+                if !bits_known(b'A', site, ARITH_SAME | ARITH_DIFFERS | ARITH_SAME2 | ARITH_DIFFERS2) {
+                    if lo <= hi {
+                        let v = x.clamp(lo, hi) as f64;
+                        let drop_lo = x.min(hi) as f64;
+                        let drop_hi = x.max(lo) as f64;
+                        let mut bits = if float_min_max_same(v, drop_lo) { ARITH_SAME } else { ARITH_DIFFERS };
+                        bits |= if float_min_max_same(v, drop_hi) { ARITH_SAME2 } else { ARITH_DIFFERS2 };
+                        record_bits(b'A', site, bits);
+                    } else {
+                        // `clamp` panics on reversed or NaN bounds while `min` and `max` do not.
+                        record_bits(b'A', site, ARITH_DIFFERS | ARITH_DIFFERS2);
+                    }
                 }
                 orig(a, lo, hi)
             }
@@ -2270,15 +2317,17 @@ macro_rules! tmt_round_floats {
                     }
                     _ => {}
                 }
-                let (v, alt1, alt2) = match op {
-                    0 => (x.floor(), x.trunc(), x.ceil()),
-                    1 => (x.ceil(), x.floor(), x.trunc()),
-                    2 => (x.round(), x.floor(), x.trunc()),
-                    _ => (x.trunc(), x.floor(), x.round()),
-                };
-                let mut bits = if float_min_max_same(v as f64, alt1 as f64) { ARITH_SAME } else { ARITH_DIFFERS };
-                bits |= if float_min_max_same(v as f64, alt2 as f64) { ARITH_SAME2 } else { ARITH_DIFFERS2 };
-                record_bits(b'A', site, bits);
+                if !bits_known(b'A', site, ARITH_SAME | ARITH_DIFFERS | ARITH_SAME2 | ARITH_DIFFERS2) {
+                    let (v, alt1, alt2) = match op {
+                        0 => (x.floor(), x.trunc(), x.ceil()),
+                        1 => (x.ceil(), x.floor(), x.trunc()),
+                        2 => (x.round(), x.floor(), x.trunc()),
+                        _ => (x.trunc(), x.floor(), x.round()),
+                    };
+                    let mut bits = if float_min_max_same(v as f64, alt1 as f64) { ARITH_SAME } else { ARITH_DIFFERS };
+                    bits |= if float_min_max_same(v as f64, alt2 as f64) { ARITH_SAME2 } else { ARITH_DIFFERS2 };
+                    record_bits(b'A', site, bits);
+                }
                 orig()
             }
         }

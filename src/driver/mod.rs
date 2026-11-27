@@ -1718,66 +1718,62 @@ fn run_package(
     // `(index of the finding, job of its first surviving mutant)`.
     let mut effect_jobs: Vec<(usize, usize)> = vec![];
     for file in &files {
-        for site in file.sites.iter().filter(|s| !disabled.contains(&s.id)) {
-            // An operand of a comparison that is an arithmetic site of its own, run on
-            // primitive numbers in the tests.
-            let primitive = |from: usize, to: usize| {
-                let Some(mut text) = file.original.get(from..to) else {
-                    return false;
-                };
-                let mut start = from;
-                loop {
-                    let trimmed = text.trim_start();
-                    start += text.len() - trimmed.len();
-                    text = trimmed.trim_end();
-                    if matches!(syn::parse_str::<syn::Expr>(text), Ok(syn::Expr::Paren(_)))
-                        && let Some(inner) = text
-                            .strip_prefix('(')
-                            .and_then(|inner| inner.strip_suffix(')'))
-                    {
-                        start += 1;
-                        text = inner;
-                    } else {
-                        break;
-                    }
+        // Pre-index active arithmetic and cast-probe spans once per file to avoid O(sites^2)
+        // linear scans and repeated `syn::parse_str` during site planning.
+        let mut primitive_arith_spans: HashSet<(usize, usize)> = HashSet::new();
+        let mut cast_probe_spans: std::collections::HashMap<(usize, usize), (u32, u32)> =
+            std::collections::HashMap::new();
+        for other in file.sites.iter().filter(|s| !disabled.contains(&s.id)) {
+            if let SiteKind::Arith { cast_probes, .. } = &other.kind {
+                let seen = session.merged(|t| t.arith.get(&other.id), plan::ArithObs::merge);
+                if !seen.opaque && (seen.same || seen.differs || seen.same2 || seen.differs2) {
+                    primitive_arith_spans.insert((other.start, other.end));
                 }
-                file.sites.iter().any(|other| {
-                    matches!(other.kind, SiteKind::Arith { .. })
-                        && other.start == start
-                        && other.end == start + text.len()
-                        && !disabled.contains(&other.id)
-                        && {
-                            let seen =
-                                session.merged(|t| t.arith.get(&other.id), plan::ArithObs::merge);
-                            !seen.opaque
-                                && (seen.same || seen.differs || seen.same2 || seen.differs2)
-                        }
-                })
+                for &(slot, start, end) in cast_probes {
+                    cast_probe_spans
+                        .entry((start, end))
+                        .or_insert((other.id, slot));
+                }
+            }
+        }
+        let primitive = |from: usize, to: usize| {
+            let Some(mut text) = file.original.get(from..to) else {
+                return false;
             };
-            let cast_bounds = |from: usize, to: usize| -> Option<(i128, i128)> {
-                let (owner_id, slot) = file.sites.iter().find_map(|other| {
-                    if disabled.contains(&other.id) {
-                        return None;
-                    }
-                    let SiteKind::Arith { cast_probes, .. } = &other.kind else {
-                        return None;
-                    };
-                    cast_probes
-                        .iter()
-                        .find(|&&(_, start, end)| start == from && end == to)
-                        .map(|&(slot, _, _)| (other.id, slot))
-                })?;
-                let mut recorded = session
-                    .binaries
-                    .iter()
-                    .filter_map(|b| b.trace.cast_bounds.get(&(owner_id, slot)));
-                let first = recorded.next()?;
-                if recorded.all(|other| other == first) {
-                    *first
+            let mut start = from;
+            loop {
+                let trimmed = text.trim_start();
+                start += text.len() - trimmed.len();
+                text = trimmed.trim_end();
+                if text.starts_with('(')
+                    && text.ends_with(')')
+                    && matches!(syn::parse_str::<syn::Expr>(text), Ok(syn::Expr::Paren(_)))
+                    && let Some(inner) = text
+                        .strip_prefix('(')
+                        .and_then(|inner| inner.strip_suffix(')'))
+                {
+                    start += 1;
+                    text = inner;
                 } else {
-                    None
+                    break;
                 }
-            };
+            }
+            primitive_arith_spans.contains(&(start, start + text.len()))
+        };
+        let cast_bounds = |from: usize, to: usize| -> Option<(i128, i128)> {
+            let &(owner_id, slot) = cast_probe_spans.get(&(from, to))?;
+            let mut recorded = session
+                .binaries
+                .iter()
+                .filter_map(|b| b.trace.cast_bounds.get(&(owner_id, slot)));
+            let first = recorded.next()?;
+            if recorded.all(|other| other == first) {
+                *first
+            } else {
+                None
+            }
+        };
+        for site in file.sites.iter().filter(|s| !disabled.contains(&s.id)) {
             let plan = match session.plan(
                 &file.display,
                 site,

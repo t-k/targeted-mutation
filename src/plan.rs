@@ -68,17 +68,28 @@ impl CmpOp {
         !matches!(self, CmpOp::Eq | CmpOp::Ne)
     }
 
-    pub fn eval_rel(self, rel: Rel) -> bool {
-        match (self, rel) {
-            (CmpOp::Ne, Rel::Unordered) => true,
-            (_, Rel::Unordered) => false,
-            (CmpOp::Lt, r) => r == Rel::Less,
-            (CmpOp::Le, r) => r != Rel::Greater,
-            (CmpOp::Gt, r) => r == Rel::Greater,
-            (CmpOp::Ge, r) => r != Rel::Less,
-            (CmpOp::Eq, r) => r == Rel::Equal,
-            (CmpOp::Ne, r) => r != Rel::Equal,
+    /// 4-bit mask of `(lt, eq, gt, un)` relations on which this operator is `true`.
+    /// Proven equivalent to [`CmpOp::eval_rel`] in `formal/lean/Planner.lean`.
+    #[inline]
+    pub fn truth_mask(self) -> u8 {
+        match self {
+            CmpOp::Lt => 0b0001,
+            CmpOp::Le => 0b0011,
+            CmpOp::Gt => 0b0100,
+            CmpOp::Ge => 0b0110,
+            CmpOp::Eq => 0b0010,
+            CmpOp::Ne => 0b1101,
         }
+    }
+
+    pub fn eval_rel(self, rel: Rel) -> bool {
+        let bit = match rel {
+            Rel::Less => 1,
+            Rel::Equal => 2,
+            Rel::Greater => 4,
+            Rel::Unordered => 8,
+        };
+        self.truth_mask() & bit != 0
     }
 
     /// The operator applied to integer operands whose difference is `d`.
@@ -156,8 +167,14 @@ pub struct Obs {
 }
 
 impl Obs {
+    /// Observed relations packed as a 4-bit mask (`lt=1, eq=2, gt=4, un=8`).
+    #[inline]
+    pub fn rels_mask(&self) -> u8 {
+        (self.lt as u8) | ((self.eq as u8) << 1) | ((self.gt as u8) << 2) | ((self.un as u8) << 3)
+    }
+
     pub fn reached(&self) -> bool {
-        self.lt || self.eq || self.gt || self.un
+        self.rels_mask() != 0
     }
 
     pub fn valued(&self) -> bool {
@@ -236,17 +253,6 @@ impl Obs {
             return None;
         }
         Some((self.f_max_neg?, self.f_min_pos?))
-    }
-
-    fn rels(&self) -> impl Iterator<Item = Rel> {
-        [
-            (self.lt, Rel::Less),
-            (self.eq, Rel::Equal),
-            (self.gt, Rel::Greater),
-            (self.un, Rel::Unordered),
-        ]
-        .into_iter()
-        .filter_map(|(seen, rel)| seen.then_some(rel))
     }
 
     /// Whether `d` itself was observed. Exact only for `d` in `-1..=1` on valued sites.
@@ -391,8 +397,15 @@ pub fn eval_mutated_d(op: CmpOp, m: Mutation, d: i128) -> bool {
 /// A test that is not infected executes the mutant exactly like the original.
 pub fn infects(op: CmpOp, m: Mutation, obs: &Obs) -> bool {
     match m {
-        Mutation::Const(c) => obs.rels().any(|r| op.eval_rel(r) != c),
-        Mutation::Op(op2) => obs.rels().any(|r| op.eval_rel(r) != op2.eval_rel(r)),
+        Mutation::Const(c) => {
+            let mask = if c {
+                !op.truth_mask() & 0x0f
+            } else {
+                op.truth_mask()
+            };
+            obs.rels_mask() & mask != 0
+        }
+        Mutation::Op(op2) => obs.rels_mask() & (op.truth_mask() ^ op2.truth_mask()) != 0,
         Mutation::Shift(s) => {
             let Some((lo, hi)) = shift_diff(op, s) else {
                 return false;
@@ -411,6 +424,45 @@ pub fn infects(op: CmpOp, m: Mutation, obs: &Obs) -> bool {
         // Negation, and what is not a mutation of a comparison: every execution differs.
         _ => obs.reached(),
     }
+}
+
+/// Whether two comparison mutations are universally equivalent on every integer
+/// difference `D` in `domain = [lo, hi]` (excluding `D = 0` when `zero_unreachable`).
+/// Proven sound in `formal/lean/Planner.lean` (`interval_equiv_from_samples`).
+pub fn domain_equivalent(
+    op: CmpOp,
+    m1: Mutation,
+    m2: Mutation,
+    domain: (i128, i128),
+    zero_unreachable: bool,
+) -> bool {
+    let (lo, hi) = domain;
+    let supported = |m: Mutation| match m {
+        Mutation::Const(_) | Mutation::Negate | Mutation::Op(_) => true,
+        // Runtime `Shift(s)` computes `d - s` in `i128`; exclude domains that can overflow.
+        Mutation::Shift(-1) => hi < i128::MAX,
+        Mutation::Shift(1) => lo > i128::MIN,
+        _ => false,
+    };
+    if lo > hi || !supported(m1) || !supported(m2) {
+        return false;
+    }
+    let agrees = |d: i128| eval_mutated_d(op, m1, d) == eval_mutated_d(op, m2, d);
+    if lo <= -2 && !agrees(-2) {
+        return false;
+    }
+    if 2 <= hi && !agrees(2) {
+        return false;
+    }
+    for d in [-1_i128, 0, 1] {
+        if d == 0 && zero_unreachable {
+            continue;
+        }
+        if lo <= d && d <= hi && !agrees(d) {
+            return false;
+        }
+    }
+    true
 }
 
 /// The values of `D` on which `lhs op rhs` and `lhs op rhs + s` disagree.
@@ -531,10 +583,10 @@ pub fn plan_cmp(op: CmpOp, obs: &Obs, domain: Option<(i128, i128)>) -> CmpPlan {
     // like another mutant for everything that was seen: once a mutant has changed the
     // way the code goes, the comparison meets values the tests never gave it, and there
     // the two may part.
-    let answers =
-        |other: CmpOp| -> Vec<bool> { obs.rels().map(|rel| other.eval_rel(rel)).collect() };
+    let rels = obs.rels_mask();
+    let op_mask = op.truth_mask();
     for other in op.mistaken_for() {
-        if answers(*other) != answers(op) {
+        if rels & (op_mask ^ other.truth_mask()) != 0 {
             plan.run.push(Mutation::Op(*other));
         }
     }
@@ -543,7 +595,9 @@ pub fn plan_cmp(op: CmpOp, obs: &Obs, domain: Option<(i128, i128)>) -> CmpPlan {
     // integers are known to always have an order. For anything else the two are
     // different mutants and both are run, whether or not the tests gave the comparison
     // such operands: a mutant that changes the way the code goes can be the first to.
-    if matches!(op, CmpOp::Le | CmpOp::Ge) && !obs.valued() && answers(op.negated()) != answers(op)
+    if matches!(op, CmpOp::Le | CmpOp::Ge)
+        && !obs.valued()
+        && rels & (op_mask ^ op.negated().truth_mask()) != 0
     {
         plan.run.push(Mutation::Op(op.negated()));
     }
@@ -551,15 +605,17 @@ pub fn plan_cmp(op: CmpOp, obs: &Obs, domain: Option<(i128, i128)>) -> CmpPlan {
 }
 
 fn plan_boundary(op: CmpOp, obs: &Obs, domain: Option<(i128, i128)>) -> CmpPlan {
-    if !obs.reached() {
+    let rels = obs.rels_mask();
+    if rels == 0 {
         return CmpPlan {
             cannot_differ: false,
             gap: Some(InputGap::Unreached),
             run: vec![],
         };
     }
-    let saw_true = obs.rels().any(|r| op.eval_rel(r));
-    let saw_false = obs.rels().any(|r| !op.eval_rel(r));
+    let op_mask = op.truth_mask();
+    let saw_true = rels & op_mask != 0;
+    let saw_false = rels & (!op_mask & 0x0f) != 0;
     if !(saw_true && saw_false) {
         let always = saw_true;
         // Can the other outcome happen at all? Only checkable on integers with known types.
@@ -2400,5 +2456,111 @@ mod tests {
             rows += 1;
         }
         assert!(rows >= 9, "expected PICT table rows, got {rows}");
+    }
+
+    #[test]
+    fn truth_mask_matches_all_operators_and_relations() {
+        let expected = [
+            (CmpOp::Lt, [true, false, false, false]),
+            (CmpOp::Le, [true, true, false, false]),
+            (CmpOp::Gt, [false, false, true, false]),
+            (CmpOp::Ge, [false, true, true, false]),
+            (CmpOp::Eq, [false, true, false, false]),
+            (CmpOp::Ne, [true, false, true, true]),
+        ];
+        let rels = [
+            (1u8, Rel::Less),
+            (2u8, Rel::Equal),
+            (4u8, Rel::Greater),
+            (8u8, Rel::Unordered),
+        ];
+        for (op, table) in expected {
+            for (idx, (bit, rel)) in rels.into_iter().enumerate() {
+                assert_eq!(op.truth_mask() & bit != 0, table[idx], "{op:?} {rel:?}");
+                assert_eq!(op.eval_rel(rel), table[idx], "{op:?} {rel:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn domain_equivalent_matches_exhaustive_evaluation() {
+        let mutations = [
+            Mutation::Const(false),
+            Mutation::Const(true),
+            Mutation::Negate,
+            Mutation::Shift(-1),
+            Mutation::Shift(1),
+            Mutation::Op(CmpOp::Lt),
+            Mutation::Op(CmpOp::Le),
+            Mutation::Op(CmpOp::Gt),
+            Mutation::Op(CmpOp::Ge),
+            Mutation::Op(CmpOp::Eq),
+            Mutation::Op(CmpOp::Ne),
+        ];
+        let domains = [
+            (0i128, 255),
+            (-255, 0),
+            (-128, 127),
+            (1, 10),
+            (-10, -1),
+            (0, 0),
+            (-1, 1),
+            (-5, -3),
+            (3, 5),
+        ];
+        for op in CmpOp::ALL {
+            for &(lo, hi) in &domains {
+                for zero_unreachable in [false, true] {
+                    for &m1 in &mutations {
+                        for &m2 in &mutations {
+                            let brute = (lo..=hi)
+                                .filter(|&d| !(zero_unreachable && d == 0))
+                                .all(|d| eval_mutated_d(op, m1, d) == eval_mutated_d(op, m2, d));
+                            assert_eq!(
+                                domain_equivalent(op, m1, m2, (lo, hi), zero_unreachable),
+                                brute,
+                                "{op:?} {m1:?} vs {m2:?} on [{lo}, {hi}] zero_unreachable={zero_unreachable}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert!(domain_equivalent(
+            CmpOp::Gt,
+            Mutation::Negate,
+            Mutation::Op(CmpOp::Eq),
+            (0, u64::MAX as i128),
+            false,
+        ));
+        assert!(domain_equivalent(
+            CmpOp::Lt,
+            Mutation::Negate,
+            Mutation::Op(CmpOp::Gt),
+            (-100, 100),
+            true,
+        ));
+        assert!(!domain_equivalent(
+            CmpOp::Gt,
+            Mutation::Shift(2),
+            Mutation::Shift(2),
+            (0, 10),
+            false,
+        ));
+        // i128 overflow endpoints: Shift(-1) at i128::MAX and Shift(1) at i128::MIN are excluded.
+        assert!(!domain_equivalent(
+            CmpOp::Gt,
+            Mutation::Shift(-1),
+            Mutation::Const(true),
+            (0, i128::MAX),
+            false,
+        ));
+        assert!(!domain_equivalent(
+            CmpOp::Lt,
+            Mutation::Shift(1),
+            Mutation::Const(true),
+            (i128::MIN, 0),
+            false,
+        ));
     }
 }

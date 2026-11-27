@@ -75,7 +75,11 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
         let len = 2 * (site.end - site.start) as i64 + wraps as i64;
         let (open, close) = match &site.kind {
             SiteKind::Cmp { op, gap, .. } => {
-                let func = if op.is_ordering() { "ord" } else { "eq" };
+                let (fast, func) = if op.is_ordering() {
+                    ("fast_ord", "ord")
+                } else {
+                    ("fast_eq", "eq")
+                };
                 edits.push(Edit {
                     pos: gap.0,
                     end: gap.1,
@@ -87,7 +91,7 @@ pub fn render(source: &str, sites: &[Site], enabled: &dyn Fn(u32) -> bool) -> Re
                 (
                     "(match (&(".to_string(),
                     format!(
-                        ")) {{ (__tmt_l, __tmt_r) => {{ #[allow(unused_imports)] use {rt}::{{ValAny as _, ValNum as _}}; \
+                        ")) {{ (__tmt_l, __tmt_r) => if {rt}::idle({id}u32) {{ {rt}::{fast}({code}u8, __tmt_l, __tmt_r) }} else {{ #[allow(unused_imports)] use {rt}::{{ValAny as _, ValNum as _}}; \
                          {rt}::{func}({id}u32, {code}u8, __tmt_l, __tmt_r, (&{rt}::W(__tmt_l)).tmt_val(), (&{rt}::W(__tmt_r)).tmt_val()) }} }})",
                         id = site.id,
                         code = op.code(),
