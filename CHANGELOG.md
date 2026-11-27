@@ -5,6 +5,16 @@ All notable changes to `targeted-mutation` (`cargo tmt`) are documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.14.0] - 2026-11-27
+
+### Added
+
+- **Single-build targeted probes for range membership, slice `get`/`get_mut` ranges, `clamp` cast bounds, and `position`/`rposition`** (further reducing library source-rebuild candidates on `targeted-mutation` itself from 131 to 103, 98.1% overall probe coverage):
+  - **Range membership endpoint probes (`(a..b).contains(x)` ↔ `(a..=b).contains(x)`)**: autoref-specialized for primitive ordered types (all 12 integer types, `f32`/`f64`, and `char`), reborrowing arguments (`&*(x)`) to avoid moving `&mut` bindings, emitting a provable `INPUT GAP` when no test passes an input equal to the upper endpoint `b` (with `a <= b`), and running only upper-endpoint-matching tests otherwise.
+  - **Slice/string `.get(a..b)` / `.get_mut(a..b)` range probes**: extends `RangeIndex` (`Get` / `GetMut` modes) to switch between `Range` and `RangeInclusive` directly on simple single-line receivers with pure bounds.
+  - **`clamp` cast bounds and 128-bit integer support**: allows side-effect-free `as` cast sources (literals, paths, and nested casts without `Deref`) in `is_infallible_bound` and adds `i128`/`u128` implementations to `ClampPrim`.
+  - **Iterator `position` ↔ `rposition` probes**: autoref-specialized to `DoubleEndedIterator + ExactSizeIterator` (falling back to `opaque` without compile errors on non-double-ended or non-exact-size iterators such as `str::chars()`), preserving original evaluation and iterator state during tracing and running reaching tests only.
+
 ## [0.13.0] - 2026-11-27
 
 ### Added
