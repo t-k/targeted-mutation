@@ -190,6 +190,8 @@ pub struct Analysis {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub timeout_seconds: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub baseline_timeout_seconds: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub baseline_jobs: Option<usize>,
     pub timeout_recheck: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -238,6 +240,29 @@ pub enum TestBuildScope {
     #[default]
     PackageWide,
     SelectedTargets,
+}
+
+/// Structured diagnostic written when a baseline run exceeds its time budget.
+#[derive(Clone, Debug, PartialEq, Serialize)]
+pub struct BaselineTimeoutDiagnostic {
+    pub schema_version: u32,
+    pub package: String,
+    pub stage: &'static str,
+    pub runner: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub test: Option<String>,
+    pub elapsed_seconds: f64,
+    pub budget_seconds: u64,
+    pub completed_baselines: usize,
+    pub total_baselines: usize,
+    pub partial_baseline: bool,
+    pub log: PathBuf,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub lines: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rerun_args: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub exclude_args: Vec<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]

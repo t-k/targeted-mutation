@@ -7,6 +7,7 @@ pub mod config;
 pub mod driver;
 mod git_index;
 pub mod instrument;
+pub mod interrupt;
 mod leftovers;
 mod modules;
 pub mod output_fixture;
