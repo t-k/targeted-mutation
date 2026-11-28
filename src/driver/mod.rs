@@ -67,6 +67,8 @@ pub struct Options {
     pub opt_level: Option<u8>,
     /// Override the time allowed for each test runner under a mutant.
     pub timeout_seconds: Option<u64>,
+    /// Override the time allowed for each baseline trace invocation.
+    pub baseline_timeout_seconds: Option<u64>,
     pub baseline_jobs: usize,
     pub serial_timeout_rechecks: bool,
     pub wrapper_grace: Duration,
@@ -409,7 +411,13 @@ pub fn run_packages_each_with(
     };
     let Some(shard) = options.shard else {
         for (name, member) in member_options {
+            crate::interrupt::check()?;
             let result = run_package(&member, Some(&batch), None);
+            if let Err(err) = &result
+                && crate::interrupt::is_interrupted_err(err)
+            {
+                return Err(crate::interrupt::Interrupted.into());
+            }
             completed(name, result)?;
         }
         return Ok(());
@@ -948,6 +956,7 @@ fn run_package(
             cargo: options.cargo.clone(),
             opt_level: options.opt_level,
             timeout_seconds: options.timeout_seconds,
+            baseline_timeout_seconds: options.baseline_timeout_seconds,
             baseline_jobs: (options.baseline_jobs > 1).then_some(options.baseline_jobs),
             timeout_recheck: if options.serial_timeout_rechecks {
                 "serial"
@@ -1541,7 +1550,36 @@ fn run_package(
         );
     }
 
-    session.binaries = progress::track_baselines(options.progress, runners.len(), |progress| {
+    let baseline_budget = options
+        .baseline_timeout_seconds
+        .map(Duration::from_secs)
+        .unwrap_or(DEFAULT_BASELINE_TIMEOUT);
+    let baseline_stage = if options.source_only {
+        "baseline_untraced"
+    } else {
+        "baseline_trace"
+    };
+    let diagnostic_path = work.join("baseline-timeout.json");
+    let _ = fs::remove_file(&diagnostic_path);
+    let completed_baselines = std::sync::atomic::AtomicUsize::new(0);
+    let total_baselines = runners.len();
+
+    #[derive(Debug)]
+    struct BaselineTimeoutError(Box<report::BaselineTimeoutDiagnostic>);
+
+    impl std::fmt::Display for BaselineTimeoutError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(
+                f,
+                "baseline timeout in stage `{}` for `{}`",
+                self.0.stage, self.0.runner
+            )
+        }
+    }
+
+    impl std::error::Error for BaselineTimeoutError {}
+
+    let baseline_result = progress::track_baselines(options.progress, runners.len(), |progress| {
         run_pool(runners.len(), baseline_jobs, |slot| {
             let index = slot;
             let (name, runner, cwd) = runners[index].clone();
@@ -1571,13 +1609,57 @@ fn run_package(
                 let started = Instant::now();
                 let trace_env = trace_path.to_string_lossy().into_owned();
                 let trace = [("TMT_TRACE", trace_env.as_str())];
-                run_baseline(
+                match run_baseline(
                     &bin,
                     if options.source_only { &[] } else { &trace },
-                    Duration::from_secs(3600),
+                    baseline_budget,
                     &work.join(format!("baseline-{index}.log")),
                     false,
-                )?;
+                )? {
+                    BaselineRun::Passed => {}
+                    BaselineRun::TimedOut { elapsed, log } => {
+                        let log_path =
+                            log.unwrap_or_else(|| work.join(format!("baseline-{index}.log")));
+                        let isolated_test = match &bin.runner {
+                            Runner::Isolated { test, .. } => Some(test.clone()),
+                            _ => None,
+                        };
+                        let (rerun_args, exclude_args) = match &bin.runner {
+                            Runner::Isolated { test, .. } => (
+                                vec!["--include-test".to_string(), test.clone()],
+                                vec!["--exclude-test".to_string(), test.clone()],
+                            ),
+                            Runner::Exe(_) => {
+                                let target = bin
+                                    .name
+                                    .rsplit_once("::")
+                                    .map_or(bin.name.as_str(), |(_, t)| t)
+                                    .to_string();
+                                (vec!["--test-target".to_string(), target], vec![])
+                            }
+                            Runner::Nextest { .. } | Runner::Doc { .. } => (vec![], vec![]),
+                        };
+                        let completed =
+                            completed_baselines.load(std::sync::atomic::Ordering::Acquire);
+                        let diagnostic = report::BaselineTimeoutDiagnostic {
+                            schema_version: report::SCHEMA_VERSION,
+                            package: package.name.clone(),
+                            stage: baseline_stage,
+                            runner: bin.name.clone(),
+                            test: isolated_test,
+                            elapsed_seconds: (elapsed.as_secs_f64() * 1000.0).round() / 1000.0,
+                            budget_seconds: baseline_budget.as_secs(),
+                            completed_baselines: completed,
+                            total_baselines,
+                            partial_baseline: true,
+                            log: log_path,
+                            lines: options.lines.clone(),
+                            rerun_args,
+                            exclude_args,
+                        };
+                        return Err(BaselineTimeoutError(Box::new(diagnostic)).into());
+                    }
+                }
                 bin.traced = started.elapsed();
                 bin.baseline = bin.traced;
                 if options.source_only {
@@ -1587,13 +1669,16 @@ fn run_package(
                 // is a multiple of this: where it matters, time the tests as the mutants run them.
                 if !options.source_only && bin.traced > SLOW_TRACE {
                     let started = Instant::now();
-                    let passed = run_baseline(
-                        &bin,
-                        &[],
-                        bin.traced,
-                        &work.join(format!("baseline-{index}-untraced.log")),
-                        true,
-                    )?;
+                    let passed = matches!(
+                        run_baseline(
+                            &bin,
+                            &[],
+                            bin.traced,
+                            &work.join(format!("baseline-{index}-untraced.log")),
+                            true,
+                        )?,
+                        BaselineRun::Passed
+                    );
                     let elapsed = started.elapsed();
                     if passed {
                         bin.untraced_baseline = Some(BaselineTiming::Completed(elapsed));
@@ -1621,6 +1706,7 @@ fn run_package(
                     bin.tests =
                         list_tests(exe, &bin.cwd, &work, false, false, work_lock.as_deref())?;
                 }
+                completed_baselines.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
                 Ok(bin)
             })();
             progress.complete(if result.is_ok() {
@@ -1630,7 +1716,84 @@ fn run_package(
             });
             result
         })
-    })?;
+    });
+    session.binaries = match baseline_result {
+        Ok(binaries) => binaries,
+        Err(err) => match err.downcast::<BaselineTimeoutError>() {
+            Ok(BaselineTimeoutError(mut diagnostic)) => {
+                // Record the final completed count after all parallel baseline workers joined
+                // so stderr and baseline-timeout.json always describe the exact same failure.
+                diagnostic.completed_baselines =
+                    completed_baselines.load(std::sync::atomic::Ordering::Acquire);
+                let write_status = serde_json::to_string_pretty(&diagnostic)
+                    .map_err(anyhow::Error::from)
+                    .and_then(|json| {
+                        use std::io::Write as _;
+                        static NEXT_DIAG_TMP: std::sync::atomic::AtomicUsize =
+                            std::sync::atomic::AtomicUsize::new(0);
+                        let seq = NEXT_DIAG_TMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let tmp = work.join(format!(
+                            ".baseline-timeout.{}.{seq}.tmp",
+                            std::process::id()
+                        ));
+                        let mut file = fs::OpenOptions::new()
+                            .write(true)
+                            .create_new(true)
+                            .open(&tmp)?;
+                        if let Err(err) = file
+                            .write_all(format!("{json}\n").as_bytes())
+                            .and_then(|()| file.flush())
+                        {
+                            drop(file);
+                            let _ = fs::remove_file(&tmp);
+                            return Err(err.into());
+                        }
+                        drop(file);
+                        if let Err(rename_err) = fs::rename(&tmp, &diagnostic_path) {
+                            let _ = fs::remove_file(&tmp);
+                            return Err(rename_err.into());
+                        }
+                        Ok(())
+                    });
+                let diag_note = match write_status {
+                    Ok(()) => format!("diagnostic: {}", diagnostic_path.display()),
+                    Err(write_err) => format!(
+                        "failed to write diagnostic {}: {write_err}",
+                        diagnostic_path.display()
+                    ),
+                };
+                let subject = match &diagnostic.test {
+                    Some(test) => format!("`{}` (test `{test}`)", diagnostic.runner),
+                    None => format!("`{}`", diagnostic.runner),
+                };
+                let hint =
+                    if !diagnostic.rerun_args.is_empty() && !diagnostic.exclude_args.is_empty() {
+                        format!(
+                            "; rerun separately with `{}` or exclude with `{}`",
+                            diagnostic.rerun_args.join(" "),
+                            diagnostic.exclude_args.join(" ")
+                        )
+                    } else if !diagnostic.rerun_args.is_empty() {
+                        format!(
+                            "; rerun separately with `{}`",
+                            diagnostic.rerun_args.join(" ")
+                        )
+                    } else {
+                        String::new()
+                    };
+                bail!(
+                    "baseline timeout in stage `{}` for {subject}: elapsed {:.3}s exceeded budget {}s (completed {}/{} baselines; partial baseline was not used as a complete trace); {diag_note}; log: {}{hint}",
+                    diagnostic.stage,
+                    diagnostic.elapsed_seconds,
+                    diagnostic.budget_seconds,
+                    diagnostic.completed_baselines,
+                    diagnostic.total_baselines,
+                    diagnostic.log.display()
+                );
+            }
+            Err(other) => return Err(other),
+        },
+    };
 
     // 6. Plan every site, run the mutants, and put the findings together.
     for file in &files {

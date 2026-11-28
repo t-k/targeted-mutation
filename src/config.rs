@@ -87,6 +87,7 @@ pub struct Settings {
     // ── Performance & Cargo Build ─────────────────────────────────────────────
     pub jobs: Option<u32>,
     pub baseline_jobs: Option<u32>,
+    pub baseline_timeout: Option<u64>,
     pub timeout: Option<u64>,
     pub timeout_recheck: Option<TimeoutRecheck>,
     pub checkpoint: Option<bool>,
@@ -582,6 +583,9 @@ impl Settings {
         if self.baseline_jobs == Some(0) {
             bail!("{context}: `baseline_jobs` must be at least 1");
         }
+        if self.baseline_timeout == Some(0) {
+            bail!("{context}: `baseline_timeout` must be at least 1");
+        }
         if self.timeout == Some(0) {
             bail!("{context}: `timeout` must be at least 1");
         }
@@ -682,6 +686,7 @@ impl Settings {
             baseline: upper.baseline.clone().or_else(|| self.baseline.clone()),
             jobs: upper.jobs.or(self.jobs),
             baseline_jobs: upper.baseline_jobs.or(self.baseline_jobs),
+            baseline_timeout: upper.baseline_timeout.or(self.baseline_timeout),
             timeout: upper.timeout.or(self.timeout),
             timeout_recheck: upper.timeout_recheck.or(self.timeout_recheck),
             checkpoint: upper.checkpoint.or(self.checkpoint),
@@ -1143,15 +1148,17 @@ mod tests {
 
         // Valid boundary values succeed.
         let ok = parse_config(
-            "opt_level = 3\njobs = 1\nbaseline_jobs = 1\ntimeout = 1\n",
+            "opt_level = 3\njobs = 1\nbaseline_jobs = 1\nbaseline_timeout = 1\ntimeout = 1\n",
             "test",
         )
         .unwrap();
         assert_eq!(ok.defaults.opt_level, Some(3));
+        assert_eq!(ok.defaults.baseline_timeout, Some(1));
 
         for bad in [
             "jobs = 0\n",
             "baseline_jobs = 0\n",
+            "baseline_timeout = 0\n",
             "timeout = 0\n",
             "opt_level = 4\n",
             "unknown_field = 1\n",

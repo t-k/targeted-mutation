@@ -337,6 +337,7 @@ pub(super) fn run_binary(
     output: RunOutput<'_>,
     sharing: usize,
 ) -> Result<Outcome> {
+    crate::interrupt::check()?;
     let cores = std::thread::available_parallelism().map_or(2, |n| n.get());
     let threads = test_threads(cores, sharing);
     static RUNS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
@@ -469,12 +470,23 @@ pub(super) fn run_binary(
         let _ = child.kill();
         let _ = child.wait();
     };
+    let mut reaped_for_interrupt = false;
     let started = Instant::now();
     let mut delay = TEST_POLL_INITIAL;
     let mut waiting_reported = false;
     let running_mutant = env.iter().any(|(key, _)| *key == "TMT_MUTANT")
         || matches!(output, RunOutput::FirstFailure);
     let result: Result<Outcome> = (|| loop {
+        if crate::interrupt::is_interrupted() {
+            stop_for_interrupt(
+                &mut child,
+                group,
+                nextest,
+                crate::interrupt::INTERRUPT_GRACE,
+            );
+            reaped_for_interrupt = true;
+            return Err(crate::interrupt::Interrupted.into());
+        }
         if let Some(status) = child.try_wait()? {
             if matches!(bin.runner, Runner::Isolated { .. }) || output_to_watch.is_some() {
                 kill_test_group(group);
@@ -534,6 +546,9 @@ pub(super) fn run_binary(
                 signal_test_group(group, 15);
                 let began = Instant::now();
                 while began.elapsed() < bin.wrapper_grace && child.try_wait().ok() == Some(None) {
+                    if crate::interrupt::force_kill_requested() {
+                        break;
+                    }
                     std::thread::sleep(
                         Duration::from_millis(10)
                             .min(bin.wrapper_grace.saturating_sub(began.elapsed())),
@@ -566,11 +581,18 @@ pub(super) fn run_binary(
     // Stop the runner before sweeping leftovers so a live child is never still holding
     // the watch lock when the sweep begins.
     if result.is_err() {
-        kill(&mut child);
+        if !reaped_for_interrupt {
+            kill(&mut child);
+        }
         let _ = release_mark(&unable_mark);
     }
     // The run is over, whichever way: what it started and did not stop is stopped now.
-    leftovers::count(&watch.finish(leftovers::leave()));
+    let leave_leftovers = if reaped_for_interrupt {
+        false
+    } else {
+        leftovers::leave()
+    };
+    leftovers::count(&watch.finish(leave_leftovers));
     let outcome = result?;
 
     // Whatever the tests made of it, a run that left the mark was not the mutant's. The
@@ -595,6 +617,8 @@ struct ExitWaiter {
     fd: Option<std::os::fd::OwnedFd>,
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     exited: bool,
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    wake_registered: bool,
 }
 
 impl ExitWaiter {
@@ -641,6 +665,7 @@ impl ExitWaiter {
             return Self {
                 fd: None,
                 exited: false,
+                wake_registered: false,
             };
         }
         // SAFETY: `raw` is a valid newly opened kqueue descriptor owned by `fd`.
@@ -662,19 +687,37 @@ impl ExitWaiter {
         // SAFETY: `change` and `zero` are valid pointers for a 1-element registration.
         let rc = unsafe { kevent(raw, &change, 1, std::ptr::null_mut(), 0, &zero) };
         if rc == 0 {
+            let mut wake_registered = false;
+            if let Some(wake_fd) = crate::interrupt::wake_read_fd() {
+                const EVFILT_READ: i16 = -1;
+                let wake_change = Kevent {
+                    ident: wake_fd as usize,
+                    filter: EVFILT_READ,
+                    flags: EV_ADD,
+                    fflags: 0,
+                    data: 0,
+                    udata: std::ptr::null_mut(),
+                };
+                // SAFETY: `wake_change` and `zero` are valid stack structs.
+                wake_registered =
+                    unsafe { kevent(raw, &wake_change, 1, std::ptr::null_mut(), 0, &zero) } == 0;
+            }
             Self {
                 fd: Some(fd),
                 exited: false,
+                wake_registered,
             }
         } else if std::io::Error::last_os_error().raw_os_error() == Some(ESRCH) {
             Self {
                 fd: None,
                 exited: true,
+                wake_registered: false,
             }
         } else {
             Self {
                 fd: None,
                 exited: false,
+                wake_registered: false,
             }
         }
     }
@@ -699,6 +742,7 @@ impl ExitWaiter {
             return Self {
                 fd: None,
                 exited: false,
+                wake_registered: false,
             };
         };
         // SAFETY: `pidfd_open(pid, 0)` returns a new O_CLOEXEC fd or -1.
@@ -709,16 +753,19 @@ impl ExitWaiter {
             Self {
                 fd: Some(fd),
                 exited: false,
+                wake_registered: crate::interrupt::wake_read_fd().is_some(),
             }
         } else if std::io::Error::last_os_error().raw_os_error() == Some(ESRCH) {
             Self {
                 fd: None,
                 exited: true,
+                wake_registered: false,
             }
         } else {
             Self {
                 fd: None,
                 exited: false,
+                wake_registered: false,
             }
         }
     }
@@ -741,6 +788,7 @@ impl ExitWaiter {
             Self {
                 fd: None,
                 exited: false,
+                wake_registered: false,
             }
         }
         #[cfg(not(target_os = "linux"))]
@@ -770,7 +818,7 @@ impl ExitWaiter {
             return;
         }
         let Some(fd) = &self.fd else {
-            std::thread::sleep(duration);
+            sleep_interruptible(duration);
             return;
         };
         #[repr(C)]
@@ -805,13 +853,19 @@ impl ExitWaiter {
             data: 0,
             udata: std::ptr::null_mut(),
         };
-        let ts = Timespec {
-            tv_sec: duration.as_secs().min(isize::MAX as u64) as isize,
-            tv_nsec: duration.subsec_nanos() as isize,
+        let bounded = if self.wake_registered {
+            duration
+        } else {
+            duration.min(Duration::from_millis(50))
         };
+        let ts = Timespec {
+            tv_sec: bounded.as_secs().min(isize::MAX as u64) as isize,
+            tv_nsec: bounded.subsec_nanos() as isize,
+        };
+        const EVFILT_PROC: i16 = -5;
         // SAFETY: `ev` and `ts` are valid stack structs for a 1-event wait.
         let rc = unsafe { kevent(fd.as_raw_fd(), std::ptr::null(), 0, &mut ev, 1, &ts) };
-        if rc > 0 {
+        if rc > 0 && ev.filter == EVFILT_PROC {
             self.exited = true;
         }
     }
@@ -823,7 +877,7 @@ impl ExitWaiter {
             return;
         }
         let Some(fd) = &self.fd else {
-            std::thread::sleep(duration);
+            sleep_interruptible(duration);
             return;
         };
         const POLLIN: std::ffi::c_short = 0x0001;
@@ -840,23 +894,113 @@ impl ExitWaiter {
                 timeout: std::ffi::c_int,
             ) -> std::ffi::c_int;
         }
-        let mut pfd = PollFd {
-            fd: fd.as_raw_fd(),
-            events: POLLIN,
-            revents: 0,
+        let mut pfds = [
+            PollFd {
+                fd: fd.as_raw_fd(),
+                events: POLLIN,
+                revents: 0,
+            },
+            PollFd {
+                fd: crate::interrupt::wake_read_fd().unwrap_or(-1),
+                events: POLLIN,
+                revents: 0,
+            },
+        ];
+        let nfds = if pfds[1].fd >= 0 { 2 } else { 1 };
+        let bounded = if self.wake_registered && nfds == 2 {
+            duration
+        } else {
+            duration.min(Duration::from_millis(50))
         };
-        let ms = duration.as_millis().clamp(1, std::ffi::c_int::MAX as u128) as std::ffi::c_int;
-        // SAFETY: `pfd` is a valid 1-element `pollfd` array.
-        let rc = unsafe { poll(&mut pfd, 1, ms) };
-        if rc > 0 {
+        let ms = bounded.as_millis().clamp(1, std::ffi::c_int::MAX as u128) as std::ffi::c_int;
+        // SAFETY: `pfds` is a valid `pollfd` array of length `nfds`.
+        let rc = unsafe { poll(pfds.as_mut_ptr(), nfds, ms) };
+        if rc > 0 && pfds[0].revents != 0 {
             self.exited = true;
         }
     }
 
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     fn wait(&mut self, duration: Duration) {
-        std::thread::sleep(duration);
+        sleep_interruptible(duration);
     }
+}
+
+fn sleep_interruptible(duration: Duration) {
+    const SLICE: Duration = Duration::from_millis(50);
+    let started = Instant::now();
+    while started.elapsed() < duration && !crate::interrupt::is_interrupted() {
+        let left = duration.saturating_sub(started.elapsed());
+        std::thread::sleep(left.min(SLICE));
+    }
+}
+
+/// Stops an owned child process group on SIGINT: sends SIGTERM, waits up to `grace`
+/// (aborting early on a second SIGINT), escalates to SIGKILL if still alive, and reaps
+/// the child before returning.
+pub(super) fn stop_for_interrupt(
+    child: &mut std::process::Child,
+    group: u32,
+    nextest: bool,
+    grace: Duration,
+) {
+    let effective_grace = if crate::interrupt::force_kill_requested() {
+        Duration::ZERO
+    } else {
+        grace
+    };
+    if nextest {
+        stop_nextest(child, effective_grace);
+        return;
+    }
+    // Snapshot owned process groups while the leader is still un-reaped (so `group`
+    // cannot be recycled by the OS). Include any process still in `group` even if the
+    // leader already exited and reparented it to PID 1.
+    #[cfg(unix)]
+    let mut owned = owned_test_processes(group);
+    #[cfg(unix)]
+    for process in test_processes() {
+        if process.group == group && !owned.iter().any(|existing| existing.pid == process.pid) {
+            owned.push(process);
+        }
+    }
+    if child.try_wait().ok().flatten().is_some() {
+        #[cfg(unix)]
+        for surviving in surviving_groups(&owned, &test_processes()) {
+            kill_test_group(surviving);
+        }
+        return;
+    }
+    if !effective_grace.is_zero() {
+        signal_test_group(group, 15);
+        let began = Instant::now();
+        while began.elapsed() < effective_grace {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    #[cfg(unix)]
+                    for surviving in surviving_groups(&owned, &test_processes()) {
+                        kill_test_group(surviving);
+                    }
+                    return;
+                }
+                Ok(None) => {
+                    if crate::interrupt::force_kill_requested() {
+                        break;
+                    }
+                    let left = effective_grace.saturating_sub(began.elapsed());
+                    std::thread::sleep(Duration::from_millis(10).min(left));
+                }
+                Err(_) => break,
+            }
+        }
+    }
+    kill_test_group(group);
+    #[cfg(unix)]
+    for surviving in surviving_groups(&owned, &test_processes()) {
+        kill_test_group(surviving);
+    }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 impl FailureOutput {
@@ -900,7 +1044,9 @@ pub(super) fn stop_nextest(child: &mut std::process::Child, grace: Duration) {
                 // tmt:ignore a runner taken for running is signalled again and collected at the end all the same: what this spares is signals to a group that is gone
                 Ok(Some(_)) => return true,
                 // tmt:ignore how long a runner that does not end is waited for can only be told by the clock
-                Ok(None) if started.elapsed() < limit => {
+                Ok(None)
+                    if started.elapsed() < limit && !crate::interrupt::force_kill_requested() =>
+                {
                     // tmt:ignore without the pause the loop only looks more often
                     std::thread::sleep(Duration::from_millis(10));
                 }
@@ -922,7 +1068,7 @@ pub(super) fn stop_nextest(child: &mut std::process::Child, grace: Duration) {
     }
     signal_test_group(group, 15);
     let mut reaped = wait(child, grace);
-    if !reaped {
+    if !reaped && !crate::interrupt::force_kill_requested() {
         // The second signal asks nextest to force its units to stop.
         signal_test_group(group, 15);
         reaped = wait(child, grace.min(Duration::from_secs(1)));
@@ -1061,6 +1207,17 @@ pub(super) fn signal_test_group(id: u32, signal: i32) {
     let _ = (id, signal);
 }
 
+pub(super) const DEFAULT_BASELINE_TIMEOUT: Duration = Duration::from_secs(3600);
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum BaselineRun {
+    Passed,
+    TimedOut {
+        elapsed: Duration,
+        log: Option<PathBuf>,
+    },
+}
+
 /// Keeps diagnostics on disk so a descendant holding stdout open cannot hold up the driver.
 pub(super) fn run_baseline(
     bin: &TestBinary,
@@ -1068,7 +1225,7 @@ pub(super) fn run_baseline(
     timeout: Duration,
     path: &Path,
     timing_only: bool,
-) -> Result<bool> {
+) -> Result<BaselineRun> {
     use std::io::{Read, Seek, SeekFrom};
 
     let mut suffix = 0;
@@ -1092,6 +1249,7 @@ pub(super) fn run_baseline(
             }
         }
     };
+    let started = Instant::now();
     let result =
         run_binary(bin, None, env, timeout, RunOutput::Capture(&log), 1).with_context(|| {
             format!(
@@ -1100,15 +1258,26 @@ pub(super) fn run_baseline(
                 path.display()
             )
         })?;
-    if result == Outcome::Pass || (timing_only && result == Outcome::Timeout) {
+    let elapsed = started.elapsed();
+    if result == Outcome::Pass {
         drop(log);
         fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
-        return Ok(result == Outcome::Pass);
+        return Ok(BaselineRun::Passed);
+    }
+    if result == Outcome::Timeout {
+        if timing_only {
+            drop(log);
+            fs::remove_file(&path).with_context(|| format!("removing {}", path.display()))?;
+            return Ok(BaselineRun::TimedOut { elapsed, log: None });
+        }
+        return Ok(BaselineRun::TimedOut {
+            elapsed,
+            log: Some(path),
+        });
     }
     let reason = match result {
-        Outcome::Pass => unreachable!("pass handled above"),
+        Outcome::Pass | Outcome::Timeout => unreachable!("handled above"),
         Outcome::Fail => "do not pass on the unmutated code",
-        Outcome::Timeout => "timed out on the unmutated code",
         Outcome::Unable => "could not be evaluated on the unmutated code",
     };
     const LIMIT: u64 = 16 * 1024;
@@ -1164,7 +1333,7 @@ pub(super) fn run_pool<T: Send>(
             .map(|_| {
                 scope.spawn(|| {
                     let mut mine = vec![];
-                    while !stop.load(Ordering::Acquire) {
+                    while !stop.load(Ordering::Acquire) && !crate::interrupt::is_interrupted() {
                         let index = next.fetch_add(1, Ordering::Relaxed);
                         if index >= count {
                             break;
@@ -1187,6 +1356,9 @@ pub(super) fn run_pool<T: Send>(
     let mut ordered: Vec<Option<Result<T>>> = (0..count).map(|_| None).collect();
     for (index, result) in done.into_iter().flatten() {
         ordered[index] = Some(result);
+    }
+    if crate::interrupt::is_interrupted() {
+        return Err(crate::interrupt::Interrupted.into());
     }
     ordered.into_iter().flatten().collect()
 }

@@ -1011,7 +1011,9 @@ impl Session {
             if pending.len() > 1 {
                 let parallel_sharing = workers.clamp(1, jobs.len().max(1));
                 for index in pending {
+                    crate::interrupt::check()?;
                     for (bin_index, filter) in &jobs[index].tests {
+                        crate::interrupt::check()?;
                         self.binaries[*bin_index].filtered_limit(
                             filter.as_deref(),
                             false,
@@ -1084,6 +1086,7 @@ pub(super) fn evaluate_jobs(
     if serial_rechecks {
         progress::track_timeout_rechecks(progress_enabled, pending.len(), |progress| {
             for index in pending {
+                crate::interrupt::check()?;
                 let mut confirmed = run(index, 1)?;
                 confirmed.first_pass_timeout = true;
                 let outcome = if confirmed.timed_out {

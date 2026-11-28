@@ -42,6 +42,7 @@ pict formal/pict/planner.pict /o:3 /e:formal/pict/planner.seed.tsv > tests/data/
 | `TargetCoverage.tla` | Uncompiled source targets remain unevaluated and mutated files are restored before recording verdicts |
 | `OutputFixture.tla` | Unowned output preservation and ownership journaling across interruptions |
 | `WorkLock.tla` | Exclusive cross-process work-directory locking and legacy sentinel isolation |
+| `InterruptReap.tla` | Cooperative SIGINT scheduling stop, bounded-grace SIGTERM→SIGKILL worker reaping, and follow-on work-lock reacquisition |
 | `Leftovers.tla` | Subreaper/PID-1 orphan sweeping (`is_left_candidate`) never stops active sibling children and always drains leftovers |
 | `NextestStop.tla` | Process-group reaping before publishing test verdicts |
 | `WorkspaceRun.tla` | Multi-package workspace scheduling and isolated member error handling |

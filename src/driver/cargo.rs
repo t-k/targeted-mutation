@@ -868,9 +868,9 @@ pub(super) fn run_cargo_with_progress_interval(
     use std::io::{BufRead, BufReader, Read};
     use std::sync::{Mutex, mpsc};
 
-    if !progress {
-        return command.output().context("running cargo test --no-run");
-    }
+    crate::interrupt::check()?;
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(command, 0);
 
     let mut child = command
         .stdin(std::process::Stdio::null())
@@ -878,6 +878,7 @@ pub(super) fn run_cargo_with_progress_interval(
         .stderr(std::process::Stdio::piped())
         .spawn()
         .context("running cargo test --no-run")?;
+    let group = child.id();
     let stdout = child.stdout.take().expect("stdout is piped");
     let mut stderr = child.stderr.take().expect("stderr is piped");
     let state = Mutex::new(BuildProgressState::default());
@@ -893,19 +894,43 @@ pub(super) fn run_cargo_with_progress_interval(
         let reporter = scope.spawn(move || {
             let started = std::time::Instant::now();
             let mut last_line: Option<String> = None;
-            while done_rx.recv_timeout(interval) == Err(mpsc::RecvTimeoutError::Timeout) {
-                let line = state_ref
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .format_line();
-                if last_line.as_deref() == Some(line.as_str()) {
-                    emit(&format!(
-                        "{line} ({}s elapsed)",
-                        started.elapsed().as_secs()
-                    ));
-                } else {
-                    emit(&line);
-                    last_line = Some(line);
+            let mut last_emit = started;
+            let poll_step = interval.min(std::time::Duration::from_millis(50));
+            let mut signaled_at: Option<std::time::Instant> = None;
+            loop {
+                match done_rx.recv_timeout(poll_step) {
+                    Ok(()) | Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        if crate::interrupt::is_interrupted() {
+                            let first = signaled_at.get_or_insert_with(|| {
+                                super::runner::signal_test_group(group, 15);
+                                std::time::Instant::now()
+                            });
+                            if crate::interrupt::force_kill_requested()
+                                || first.elapsed() >= crate::interrupt::INTERRUPT_GRACE
+                            {
+                                super::runner::kill_test_group(group);
+                                break;
+                            }
+                            continue;
+                        }
+                        if progress && last_emit.elapsed() >= interval {
+                            let line = state_ref
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .format_line();
+                            if last_line.as_deref() == Some(line.as_str()) {
+                                emit(&format!(
+                                    "{line} ({}s elapsed)",
+                                    started.elapsed().as_secs()
+                                ));
+                            } else {
+                                emit(&line);
+                                last_line = Some(line);
+                            }
+                            last_emit = std::time::Instant::now();
+                        }
+                    }
                 }
             }
         });
@@ -914,27 +939,74 @@ pub(super) fn run_cargo_with_progress_interval(
         let mut reader = BufReader::new(stdout);
         let mut raw_line = Vec::new();
         loop {
+            if crate::interrupt::is_interrupted() {
+                break;
+            }
             raw_line.clear();
-            let read = reader.read_until(b'\n', &mut raw_line)?;
+            let read = match reader.read_until(b'\n', &mut raw_line) {
+                Ok(n) => n,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {
+                    if crate::interrupt::is_interrupted() {
+                        break;
+                    }
+                    continue;
+                }
+                Err(err) => return Err(err.into()),
+            };
             if read == 0 {
                 break;
             }
             stdout_buf.extend_from_slice(&raw_line);
-            let lossy = String::from_utf8_lossy(&raw_line);
-            state
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .observe_line(&lossy);
+            if progress {
+                let lossy = String::from_utf8_lossy(&raw_line);
+                state
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .observe_line(&lossy);
+            }
         }
-        drop(done_tx);
-        let _ = reporter.join();
+        if crate::interrupt::is_interrupted() {
+            // Stop and reap the cargo process group before joining reader threads so
+            // descendants holding stdout/stderr open cannot block shutdown.
+            super::runner::stop_for_interrupt(
+                &mut child,
+                group,
+                false,
+                crate::interrupt::INTERRUPT_GRACE,
+            );
+            drop(done_tx);
+            let _ = reporter.join();
+            let _ = stderr_thread.join();
+            return Err(crate::interrupt::Interrupted.into());
+        }
+        // Join stderr while `reporter` is still active so a SIGINT arriving after stdout
+        // EOF still signals and escalates the cargo process group.
         let stderr_buf = stderr_thread
             .join()
             .expect("stderr reader thread panicked")?;
+        drop(done_tx);
+        let _ = reporter.join();
         Ok((stdout_buf, stderr_buf))
     })?;
 
-    let status = child.wait().context("waiting for cargo test --no-run")?;
+    let status = loop {
+        if crate::interrupt::is_interrupted() {
+            super::runner::stop_for_interrupt(
+                &mut child,
+                group,
+                false,
+                crate::interrupt::INTERRUPT_GRACE,
+            );
+            return Err(crate::interrupt::Interrupted.into());
+        }
+        if let Some(status) = child
+            .try_wait()
+            .context("waiting for cargo test --no-run")?
+        {
+            break status;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    };
     Ok(std::process::Output {
         status,
         stdout: stdout_bytes,

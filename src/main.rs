@@ -376,6 +376,15 @@ struct Cli {
     )]
     baseline_jobs: Option<u32>,
 
+    /// Time budget per baseline trace invocation, in seconds (default: 3600).
+    #[arg(
+        long,
+        value_name = "SECONDS",
+        value_parser = clap::value_parser!(u64).range(1..),
+        help_heading = HEADING_BUILD
+    )]
+    baseline_timeout: Option<u64>,
+
     /// Timeout per test runner invocation under a mutant, in seconds.
     #[arg(
         long,
@@ -570,6 +579,7 @@ impl Cli {
             baseline: self.baseline.clone(),
             jobs: self.jobs,
             baseline_jobs: self.baseline_jobs,
+            baseline_timeout: self.baseline_timeout,
             timeout: self.timeout,
             timeout_recheck: self.timeout_recheck.map(Into::into),
             checkpoint: self.checkpoint.then_some(true),
@@ -685,6 +695,7 @@ fn build_driver_options(
         },
         opt_level: effective.opt_level,
         timeout_seconds: effective.timeout,
+        baseline_timeout_seconds: effective.baseline_timeout,
         baseline_jobs: effective.baseline_jobs.unwrap_or(1) as usize,
         serial_timeout_rechecks: !matches!(
             effective.timeout_recheck,
@@ -760,8 +771,9 @@ fn parse_cli(given: impl IntoIterator<Item = std::ffi::OsString>) -> Result<Cli,
     Ok(cli)
 }
 
-/// Exit codes: 0 no gaps, 1 analysis/CLI error, 2 gaps found, 3 incomplete evaluation.
+/// Exit codes: 0 no gaps, 1 analysis/CLI error, 2 gaps found, 3 incomplete evaluation, 130 SIGINT.
 fn main() -> ExitCode {
+    targeted_mutation::interrupt::install();
     let cli = match parse_cli(std::env::args_os()) {
         Ok(cli) => cli,
         Err(code) => return code,
@@ -839,7 +851,18 @@ fn main() -> ExitCode {
     }
     if is_workspace {
         let members = match driver::run_packages_with(&options, &cli.package, per_package) {
+            Ok(_) if targeted_mutation::interrupt::is_interrupted() => {
+                eprintln!("tmt: interrupted");
+                return ExitCode::from(130);
+            }
             Ok(members) => members,
+            Err(err)
+                if targeted_mutation::interrupt::is_interrupted()
+                    || targeted_mutation::interrupt::is_interrupted_err(&err) =>
+            {
+                eprintln!("tmt: interrupted");
+                return ExitCode::from(130);
+            }
             Err(err) => {
                 eprintln!(
                     "tmt: error: {}",
@@ -851,9 +874,20 @@ fn main() -> ExitCode {
         return show_workspace(members, output_format, show_unreached);
     }
     match driver::run(&options) {
+        Ok(_) if targeted_mutation::interrupt::is_interrupted() => {
+            eprintln!("tmt: interrupted");
+            ExitCode::from(130)
+        }
         Ok(result) => {
             show_report(&result, output_format, show_unreached);
             ExitCode::from(report_exit(&result))
+        }
+        Err(err)
+            if targeted_mutation::interrupt::is_interrupted()
+                || targeted_mutation::interrupt::is_interrupted_err(&err) =>
+        {
+            eprintln!("tmt: interrupted");
+            ExitCode::from(130)
         }
         Err(err) => {
             eprintln!(
@@ -946,6 +980,9 @@ fn stream_reports(
     let mut stdout = std::io::stdout().lock();
     let mut status = (0, 0);
     let mut emit = |name: String, result: anyhow::Result<report::Report>| -> anyhow::Result<()> {
+        if targeted_mutation::interrupt::is_interrupted() {
+            return Err(targeted_mutation::interrupt::Interrupted.into());
+        }
         let (record, rank) = match result {
             Ok(result) => {
                 let code = report_exit(&result);
@@ -965,14 +1002,19 @@ fn stream_reports(
                 record["report"] = report_json(&result);
                 (record, (priority, code))
             }
-            Err(err) => (
-                serde_json::json!({
-                    "schema_version": report::SCHEMA_VERSION,
-                    "package": name,
-                    "error": format!("{err:#}"),
-                }),
-                (4, 1),
-            ),
+            Err(err) => {
+                if targeted_mutation::interrupt::is_interrupted_err(&err) {
+                    return Err(err);
+                }
+                (
+                    serde_json::json!({
+                        "schema_version": report::SCHEMA_VERSION,
+                        "package": name,
+                        "error": format!("{err:#}"),
+                    }),
+                    (4, 1),
+                )
+            }
         };
         status = status.max(rank);
         serde_json::to_writer(&mut stdout, &record)?;
@@ -989,11 +1031,21 @@ fn stream_reports(
         )
     };
     if let Err(err) = result {
+        if targeted_mutation::interrupt::is_interrupted()
+            || targeted_mutation::interrupt::is_interrupted_err(&err)
+        {
+            eprintln!("tmt: interrupted");
+            return ExitCode::from(130);
+        }
         eprintln!(
             "tmt: error: {}",
             report::sanitize_terminal(&format!("{err:#}"))
         );
         return ExitCode::FAILURE;
+    }
+    if targeted_mutation::interrupt::is_interrupted() {
+        eprintln!("tmt: interrupted");
+        return ExitCode::from(130);
     }
     ExitCode::from(status.1)
 }
@@ -1168,6 +1220,7 @@ mod tests {
             &["--config", "tmt.toml", "--no-config"][..],
             &["--jobs", "0"][..],
             &["--baseline-jobs", "0"][..],
+            &["--baseline-timeout", "0"][..],
             &["--timeout", "0"][..],
             &["--opt-level", "4"][..],
         ] {
