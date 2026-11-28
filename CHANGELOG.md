@@ -5,6 +5,21 @@ All notable changes to `targeted-mutation` (`cargo tmt`) are documented in this 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.15.0] - 2026-11-28
+
+### Added
+
+- **Independent baseline trace time budget (`--baseline-timeout` / `baseline_timeout`)**:
+  - Added `--baseline-timeout <SECONDS>` and `tmt.toml` `baseline_timeout` (validated `>= 1`, default compatible 3600s, recorded in `report.analysis.baseline_timeout_seconds`) independent of `--timeout` for mutant trials.
+  - On budget exceedance, atomically writes structured rerun/exclusion diagnostics to `<work-dir>/baseline-timeout.json` (capturing `stage`, `runner`, isolated `test`, `elapsed_seconds`, `budget_seconds`, `completed_baselines`/`total_baselines`, `partial_baseline: true`, `log`, `lines`, `rerun_args`, and `exclude_args`), reports matching details on stderr, and aborts with exit code 1 so a partial baseline is never treated or reported as a complete trace.
+
+### Fixed
+
+- **Cooperative SIGINT worker reaping and work-directory lock release**:
+  - Installed an async-signal-safe Unix `SIGINT` handler with a non-blocking self-pipe wake channel integrated into `kqueue`/`pidfd` child exit waiters and Cargo build progress loops.
+  - On the first `SIGINT`, stops scheduling new work, sends `SIGTERM` to owned active test/build process groups with a bounded 2-second grace period (escalating immediately to `SIGKILL` on a second `SIGINT` or after grace expiry), reaps all owned children and surviving group descendants before exiting with status `130`, and releases the work-directory lock so follow-on invocations acquire it cleanly while preserving mutual exclusion while any worker is alive.
+  - Added TLA+ model `formal/tla/InterruptReap.tla` and macOS/Unix real-process integration tests covering `SIGTERM`-obeying and `SIGTERM`-ignoring mutant workers.
+
 ## [0.14.0] - 2026-11-27
 
 ### Added
